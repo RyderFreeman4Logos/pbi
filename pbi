@@ -49,9 +49,18 @@ process.stdin.on("end", () => {
 }
 
 compact_search_locations() {
-  local line
+  local line file
   while IFS= read -r line; do
-    if [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
+    if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
+      file="${BASH_REMATCH[1]}"
+      file="${file%%, Lines:*}"
+      if [[ "$file" == "$PWD/"* ]]; then
+        file="${file#"$PWD/"}"
+      fi
+      if [[ "$file" != /* && -f "$file" ]]; then
+        printf '%s:1\n' "$file"
+      fi
+    elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
       printf '%s\n' "${BASH_REMATCH[1]}"
     fi
   done <<<"$1"
@@ -86,6 +95,7 @@ operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
 max_retries="3"
 probe_path="$(resolve_probe)"
 search_uses_local_model=false
+search_fallback_locations=""
 
 configure_local_routing() {
   api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-}}"
@@ -195,6 +205,7 @@ case "${1:-}" in
       exit 1
     fi
     candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
+    search_fallback_locations="$(compact_search_locations "$candidates")"
     set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates"
     ;;
 esac
@@ -271,5 +282,12 @@ if probe_reported_error "$output"; then
 fi
 if [[ "$search_uses_local_model" == true ]]; then
   output="$(compact_search_locations "$output")"
+  if [[ -z "$output" ]]; then
+    output="$search_fallback_locations"
+  fi
+  if [[ -z "$output" ]]; then
+    printf '%s\n' 'pbi: local search returned no compact locations' >&2
+    exit 1
+  fi
 fi
 printf '%s\n' "$output"
