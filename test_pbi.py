@@ -115,6 +115,19 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(providers[0]["maxRetries"], 3)
         self.assertEqual(providers[1]["maxRetries"], 0)
 
+    def test_search_delegates_to_probe_without_an_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            env = os.environ.copy()
+            env["HOME"] = temporary
+            env.pop("CLIPROXY_API_KEY", None)
+            env.pop("OPENAI_API_KEY", None)
+            result = self.run_pbi(
+                "search", "PBI_VERSION", "--format", "plain", "--max-results", "1", env=env, cwd=ROOT
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("File:", result.stdout)
+        self.assertIn("/pbi/pbi", result.stdout)
+
     def test_defaults_probe_folder_to_the_calling_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

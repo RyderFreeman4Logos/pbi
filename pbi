@@ -53,6 +53,10 @@ case "${1:-}" in
     printf 'pbi %s\n' "$PBI_VERSION"
     exit 0
     ;;
+  search)
+    shift
+    exec "$(resolve_probe)" search "$@"
+    ;;
   '')
     printf '%s\n' 'pbi: --message is required; interactive mode is disabled' >&2
     exit 2
