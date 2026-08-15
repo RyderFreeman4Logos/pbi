@@ -117,6 +117,7 @@ export REQUEST_TIMEOUT="$request_timeout"
 export MAX_OPERATION_TIMEOUT="$operation_timeout"
 export MAX_RETRIES="$max_retries"
 export FALLBACK_PROVIDERS="$fallback_providers"
+export ALLOWED_FOLDERS="$PWD"
 
 if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "$@")"; then
   status=0

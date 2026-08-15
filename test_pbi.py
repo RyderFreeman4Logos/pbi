@@ -20,13 +20,16 @@ PROBE_SHIM = "/usr/local/share/mise/shims/probe"
 
 
 class PbiTest(unittest.TestCase):
-    def run_pbi(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_pbi(
+        self, *args: str, env: dict[str, str] | None = None, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(PBI), *args],
             text=True,
             capture_output=True,
             check=False,
             env=env,
+            cwd=cwd,
         )
 
     def fake_environment(self, directory: Path) -> tuple[dict[str, str], Path]:
@@ -45,7 +48,7 @@ class PbiTest(unittest.TestCase):
             "import json, os, sys\n"
             "keys = ('PROBE_BINARY_PATH', 'FORCE_PROVIDER', 'MODEL_NAME', 'OPENAI_API_KEY', "
             "'OPENAI_API_URL', 'LLM_BASE_URL', 'REQUEST_TIMEOUT', "
-            "'MAX_OPERATION_TIMEOUT', 'MAX_RETRIES', 'FALLBACK_PROVIDERS')\n"
+            "'MAX_OPERATION_TIMEOUT', 'MAX_RETRIES', 'FALLBACK_PROVIDERS', 'ALLOWED_FOLDERS')\n"
             "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
             "    json.dump({'argv': sys.argv[1:], 'env': {k: os.environ.get(k) for k in keys}}, f)\n"
             "raise SystemExit(23)\n"
@@ -111,6 +114,17 @@ class PbiTest(unittest.TestCase):
         self.assertEqual([provider["model"] for provider in providers], [PRIMARY, FALLBACK])
         self.assertEqual(providers[0]["maxRetries"], 3)
         self.assertEqual(providers[1]["maxRetries"], 0)
+
+    def test_defaults_probe_folder_to_the_calling_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            codebase = directory / "codebase"
+            codebase.mkdir()
+            result = self.run_pbi("--message", "hello", env=env, cwd=codebase)
+            recorded = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(recorded["env"]["ALLOWED_FOLDERS"], str(codebase))
 
     def test_fails_closed_when_probe_reports_a_json_api_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
