@@ -59,11 +59,48 @@ case "${1:-}" in
   search)
     shift
     for argument in "$@"; do
-      if [[ "$argument" == "--timeout" || "$argument" == --timeout=* ]]; then
+      if [[ "$argument" == "--help" || "$argument" == "-h" ]]; then
         exec "$(resolve_probe)" search "$@"
       fi
     done
-    exec "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" "$@"
+    search_options=()
+    search_pattern_parts=()
+    search_timeout_set=false
+    while (($#)); do
+      argument="$1"
+      shift
+      case "$argument" in
+        --)
+          search_pattern_parts+=("$@")
+          break
+          ;;
+        --timeout|--timeout=*)
+          search_timeout_set=true
+          search_options+=("$argument")
+          if [[ "$argument" == "--timeout" && $# -gt 0 ]]; then
+            search_options+=("$1")
+            shift
+          fi
+          ;;
+        --ignore|-i|--reranker|-r|--language|-l|--max-results|--max-bytes|--max-tokens|--merge-threshold|--format|-o|--session|--question)
+          search_options+=("$argument")
+          if (($#)); then
+            search_options+=("$1")
+            shift
+          fi
+          ;;
+        -*)
+          search_options+=("$argument")
+          ;;
+        *)
+          search_pattern_parts+=("$argument")
+          ;;
+      esac
+    done
+    if [[ "$search_timeout_set" == false ]]; then
+      search_options=(--timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" "${search_options[@]}")
+    fi
+    exec "$(resolve_probe)" search "${search_options[@]}" -- "${search_pattern_parts[*]}"
     ;;
   '')
     printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2

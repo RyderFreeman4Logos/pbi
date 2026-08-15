@@ -209,7 +209,30 @@ class PbiTest(unittest.TestCase):
             )
             argv = json.loads(trace.read_text())
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(argv, ["search", "PBI_VERSION", "--timeout", "12"])
+        self.assertEqual(argv, ["search", "--timeout", "12", "--", "PBI_VERSION"])
+
+    def test_search_combines_unquoted_words_into_one_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            self.record_probe_argv(probe)
+            result = self.run_pbi(
+                "search",
+                "SessionDB",
+                "FTS5",
+                "session",
+                "search",
+                env=env,
+                binary=self.fake_pbi(directory, probe),
+            )
+            argv = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            argv,
+            ["search", "--timeout", "540", "--", "SessionDB FTS5 session search"],
+        )
+        self.assertNotIn("FTS5", argv)
 
     def test_defaults_probe_folder_to_the_calling_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
