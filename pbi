@@ -11,7 +11,9 @@ readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
-  printf '%s\n' "Usage: pbi --message <question> [probe-chat options]"
+  printf '%s\n' "Usage: pbi <question...> [--json]"
+  printf '%s\n' "       pbi search <query>"
+  printf '%s\n' "       pbi --message <question> [probe-chat options]"
   printf '%s\n' "       pbi --debug-config"
   printf '%s\n' "Routes OpenAI-compatible requests to localhost:8317/v1 with primary retries then fallback."
 }
@@ -58,10 +60,36 @@ case "${1:-}" in
     exec "$(resolve_probe)" search "$@"
     ;;
   '')
-    printf '%s\n' 'pbi: --message is required; interactive mode is disabled' >&2
+    printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
     exit 2
     ;;
 esac
+
+if [[ "$1" == "--message" ]]; then
+  shift
+  if (($# == 0)); then
+    printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
+    exit 2
+  fi
+  chat_args=(--message "$1")
+  shift
+  chat_args+=("$@")
+else
+  message_parts=()
+  chat_args=()
+  for argument in "$@"; do
+    if [[ "$argument" == "--json" ]]; then
+      chat_args+=("$argument")
+    else
+      message_parts+=("$argument")
+    fi
+  done
+  if ((${#message_parts[@]} == 0)); then
+    printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
+    exit 2
+  fi
+  chat_args=(--message "${message_parts[*]}" "${chat_args[@]}")
+fi
 
 config_file="${PBI_CONFIG_FILE:-$HOME/.pbi/config}"
 if [[ -r "$config_file" ]]; then
@@ -123,7 +151,7 @@ export MAX_RETRIES="$max_retries"
 export FALLBACK_PROVIDERS="$fallback_providers"
 export ALLOWED_FOLDERS="$PWD"
 
-if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "$@")"; then
+if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
   status=0
 else
   status=$?

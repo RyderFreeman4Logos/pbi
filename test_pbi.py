@@ -76,8 +76,40 @@ class PbiTest(unittest.TestCase):
         self.assertIn("Probe Chat wrapper", help_result.stdout)
         self.assertEqual(version_result.returncode, 0, version_result.stderr)
         self.assertIn("pbi", version_result.stdout)
+        self.assertIn("Usage: pbi <question...>", help_result.stdout)
+        self.assertIn("pbi search <query>", help_result.stdout)
         self.assertEqual(no_args_result.returncode, 2)
-        self.assertIn("--message", no_args_result.stderr)
+        self.assertIn("question is required", no_args_result.stderr)
+
+    def test_positional_question_is_compact_chat_and_preserves_json_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
+                "    json.dump({'argv': sys.argv[1:]}, f)\n"
+                "print('compact answer')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("where", "is", "the", "entrypoint", "--json", env=env)
+            recorded = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "compact answer\n")
+        self.assertEqual(
+            recorded["argv"],
+            [
+                "--force-provider",
+                "openai",
+                "--model-name",
+                PRIMARY,
+                "--message",
+                "where is the entrypoint",
+                "--json",
+            ],
+        )
 
     def test_routes_primary_retries_then_fallback_and_forwards_args(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
