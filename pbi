@@ -9,11 +9,12 @@ readonly DEFAULT_FALLBACK_MODEL="opencode/deepseek-v4-flash"
 readonly DEFAULT_REQUEST_TIMEOUT_MS="1700000"
 readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
+readonly DEFAULT_SEARCH_RERANKER="ms-marco-minilm-l6"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
   printf '%s\n' "Usage: pbi <question...> [--json]"
-  printf '%s\n' "       pbi search <query>"
+  printf '%s\n' "       pbi search [--bm25] <query>"
   printf '%s\n' "       pbi --message <question> [probe-chat options]"
   printf '%s\n' "       pbi --debug-config"
   printf '%s\n' "Routes OpenAI-compatible requests to localhost:8317/v1 with primary retries then fallback."
@@ -56,6 +57,57 @@ case "${1:-}" in
     printf 'pbi %s\n' "$PBI_VERSION"
     exit 0
     ;;
+  '')
+    printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
+    exit 2
+    ;;
+esac
+
+config_file="${PBI_CONFIG_FILE:-$HOME/.pbi/config}"
+if [[ -r "$config_file" ]]; then
+  # shellcheck disable=SC1090
+  source "$config_file"
+fi
+
+base_url="${CLIPROXY_BASE_URL:-$DEFAULT_BASE_URL}"
+primary_model="${LOCAL_MODEL:-$DEFAULT_PRIMARY_MODEL}"
+fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
+request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
+operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
+max_retries="3"
+probe_path="$(resolve_probe)"
+
+configure_local_routing() {
+  api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-}}"
+  if [[ -z "$api_key" ]]; then
+    printf '%s\n' 'pbi: set CLIPROXY_API_KEY or OPENAI_API_KEY in the environment or ~/.pbi/config' >&2
+    return 78
+  fi
+
+  fallback_providers="$(
+    PBI_BASE_URL="$base_url" PBI_API_KEY="$api_key" PBI_PRIMARY_MODEL="$primary_model" \
+      PBI_FALLBACK_MODEL="$fallback_model" node -e '
+const {PBI_BASE_URL, PBI_API_KEY, PBI_PRIMARY_MODEL, PBI_FALLBACK_MODEL} = process.env;
+process.stdout.write(JSON.stringify([
+  {provider: "openai", apiKey: PBI_API_KEY, baseURL: PBI_BASE_URL, model: PBI_PRIMARY_MODEL, maxRetries: 3},
+  {provider: "openai", apiKey: PBI_API_KEY, baseURL: PBI_BASE_URL, model: PBI_FALLBACK_MODEL, maxRetries: 0}
+]));'
+  )"
+
+  export PROBE_BINARY_PATH="$probe_path"
+  export FORCE_PROVIDER="openai"
+  export MODEL_NAME="$primary_model"
+  export OPENAI_API_KEY="$api_key"
+  export OPENAI_API_URL="$base_url"
+  export LLM_BASE_URL="$base_url"
+  export REQUEST_TIMEOUT="$request_timeout"
+  export MAX_OPERATION_TIMEOUT="$operation_timeout"
+  export MAX_RETRIES="$max_retries"
+  export FALLBACK_PROVIDERS="$fallback_providers"
+  export ALLOWED_FOLDERS="$PWD"
+}
+
+case "${1:-}" in
   search)
     shift
     for argument in "$@"; do
@@ -66,10 +118,14 @@ case "${1:-}" in
     search_options=()
     search_pattern_parts=()
     search_timeout_set=false
+    search_bm25=false
     while (($#)); do
       argument="$1"
       shift
       case "$argument" in
+        --bm25)
+          search_bm25=true
+          ;;
         --)
           search_pattern_parts+=("$@")
           break
@@ -100,11 +156,22 @@ case "${1:-}" in
     if [[ "$search_timeout_set" == false ]]; then
       search_options=(--timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" "${search_options[@]}")
     fi
-    exec "$(resolve_probe)" search "${search_options[@]}" -- "${search_pattern_parts[*]}"
-    ;;
-  '')
-    printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
-    exit 2
+    if [[ "$search_bm25" == true ]]; then
+      exec "$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}"
+    fi
+    configure_local_routing
+    search_options=("${search_options[@]}" --reranker "$DEFAULT_SEARCH_RERANKER" --question "${search_pattern_parts[*]}")
+    if output="$("$(resolve_probe)" search "${search_options[@]}" -- "${search_pattern_parts[*]}")"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ "$output" == *"BERT reranker"* && "$output" == *"not available"* ]]; then
+      set -- --message "Rank these Probe search candidates for ${search_pattern_parts[*]} and return the best matching locations only:"$'\n\n'"$output"
+    else
+      printf '%s\n' "$output"
+      exit "$status"
+    fi
     ;;
 esac
 
@@ -134,19 +201,6 @@ else
   chat_args=(--message "${message_parts[*]}" "${chat_args[@]}")
 fi
 
-config_file="${PBI_CONFIG_FILE:-$HOME/.pbi/config}"
-if [[ -r "$config_file" ]]; then
-  # shellcheck disable=SC1090
-  source "$config_file"
-fi
-
-base_url="${CLIPROXY_BASE_URL:-$DEFAULT_BASE_URL}"
-primary_model="${LOCAL_MODEL:-$DEFAULT_PRIMARY_MODEL}"
-fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
-request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
-operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
-max_retries="3"
-probe_path="$(resolve_probe)"
 agent_command="$(command -v probe-chat || true)"
 if [[ -z "$agent_command" ]]; then
   printf '%s\n' 'pbi: probe-chat is unavailable on PATH' >&2
@@ -163,37 +217,13 @@ if [[ "${1:-}" == "--debug-config" ]]; then
   printf '%s\n' "max_operation_timeout_ms=$operation_timeout"
   printf '%s\n' "max_retries=$max_retries"
   printf '%s\n' "search_timeout_seconds=$DEFAULT_SEARCH_TIMEOUT_SECONDS"
+  printf '%s\n' "search_default_reranker=$DEFAULT_SEARCH_RERANKER"
+  printf '%s\n' 'search_bm25_opt_in=--bm25'
   printf '%s\n' 'api_key=[REDACTED]'
   exit 0
 fi
 
-api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-}}"
-if [[ -z "$api_key" ]]; then
-  printf '%s\n' 'pbi: set CLIPROXY_API_KEY or OPENAI_API_KEY in the environment or ~/.pbi/config' >&2
-  exit 78
-fi
-
-fallback_providers="$(
-  PBI_BASE_URL="$base_url" PBI_API_KEY="$api_key" PBI_PRIMARY_MODEL="$primary_model" \
-    PBI_FALLBACK_MODEL="$fallback_model" node -e '
-const {PBI_BASE_URL, PBI_API_KEY, PBI_PRIMARY_MODEL, PBI_FALLBACK_MODEL} = process.env;
-process.stdout.write(JSON.stringify([
-  {provider: "openai", apiKey: PBI_API_KEY, baseURL: PBI_BASE_URL, model: PBI_PRIMARY_MODEL, maxRetries: 3},
-  {provider: "openai", apiKey: PBI_API_KEY, baseURL: PBI_BASE_URL, model: PBI_FALLBACK_MODEL, maxRetries: 0}
-]));'
-)"
-
-export PROBE_BINARY_PATH="$probe_path"
-export FORCE_PROVIDER="openai"
-export MODEL_NAME="$primary_model"
-export OPENAI_API_KEY="$api_key"
-export OPENAI_API_URL="$base_url"
-export LLM_BASE_URL="$base_url"
-export REQUEST_TIMEOUT="$request_timeout"
-export MAX_OPERATION_TIMEOUT="$operation_timeout"
-export MAX_RETRIES="$max_retries"
-export FALLBACK_PROVIDERS="$fallback_providers"
-export ALLOWED_FOLDERS="$PWD"
+configure_local_routing
 
 if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
   status=0
