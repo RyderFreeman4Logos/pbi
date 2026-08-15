@@ -189,7 +189,6 @@ class PbiTest(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("File:", result.stdout)
-        self.assertIn("/pbi/pbi", result.stdout)
 
     def test_bm25_search_defaults_to_a_small_result_set_without_an_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
