@@ -43,7 +43,7 @@ class PbiTest(unittest.TestCase):
         (directory / "probe-chat").write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
-            "keys = ('PROBE_BINARY_PATH', 'FORCE_PROVIDER', 'MODEL_NAME', "
+            "keys = ('PROBE_BINARY_PATH', 'FORCE_PROVIDER', 'MODEL_NAME', 'OPENAI_API_KEY', "
             "'OPENAI_API_URL', 'LLM_BASE_URL', 'REQUEST_TIMEOUT', "
             "'MAX_OPERATION_TIMEOUT', 'MAX_RETRIES', 'FALLBACK_PROVIDERS')\n"
             "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
@@ -99,6 +99,7 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(configured["PROBE_BINARY_PATH"], PROBE_SHIM)
         self.assertEqual(configured["FORCE_PROVIDER"], "openai")
         self.assertEqual(configured["MODEL_NAME"], PRIMARY)
+        self.assertEqual(configured["OPENAI_API_KEY"], "test-key")
         self.assertEqual(configured["OPENAI_API_URL"], BASE_URL)
         self.assertEqual(configured["LLM_BASE_URL"], BASE_URL)
         self.assertEqual(configured["MAX_RETRIES"], "3")

@@ -92,6 +92,7 @@ process.stdout.write(JSON.stringify([
 export PROBE_BINARY_PATH="$probe_path"
 export FORCE_PROVIDER="openai"
 export MODEL_NAME="$primary_model"
+export OPENAI_API_KEY="$api_key"
 export OPENAI_API_URL="$base_url"
 export LLM_BASE_URL="$base_url"
 export REQUEST_TIMEOUT="$request_timeout"
