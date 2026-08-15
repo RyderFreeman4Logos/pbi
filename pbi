@@ -49,7 +49,7 @@ process.stdin.on("end", () => {
 }
 
 compact_search_locations() {
-  local line file
+  local line file location suffix
   while IFS= read -r line; do
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
@@ -59,7 +59,16 @@ compact_search_locations() {
         printf '%s:1\n' "$file"
       fi
     elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
-      printf '%s\n' "${BASH_REMATCH[1]}"
+      location="${BASH_REMATCH[1]}"
+      if [[ "$location" == /* ]]; then
+        file="$(realpath --relative-to="$PWD" -- "${location%:*}" 2>/dev/null || true)"
+        suffix="${location##*:}"
+        if [[ "$file" != /* && "$file" != ../* && -f "$file" ]]; then
+          printf '%s:%s\n' "$file" "$suffix"
+        fi
+      else
+        printf '%s\n' "$location"
+      fi
     fi
   done <<<"$1"
 }
