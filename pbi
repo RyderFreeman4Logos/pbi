@@ -54,10 +54,8 @@ compact_search_locations() {
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
       file="${file%%, Lines:*}"
-      if [[ "$file" == "$PWD/"* ]]; then
-        file="${file#"$PWD/"}"
-      fi
-      if [[ "$file" != /* && -f "$file" ]]; then
+      file="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+      if [[ "$file" != /* && "$file" != ../* && -f "$file" ]]; then
         printf '%s:1\n' "$file"
       fi
     elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then

@@ -292,12 +292,17 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "pbi/pbi:5\n")
         self.assertEqual(result.stderr, "")
 
-    def test_search_falls_back_to_retrieved_location_after_chat_narration(self) -> None:
+    def test_search_falls_back_to_absolute_retrieved_location_from_symlinked_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
+            cwd = directory / "repo"
+            cwd.symlink_to(ROOT, target_is_directory=True)
+            env["PWD"] = str(cwd)
             probe = directory / "probe"
-            probe.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'File: pbi, Lines: 1-292'\n")
+            probe.write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-292'\n"
+            )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
@@ -306,7 +311,9 @@ class PbiTest(unittest.TestCase):
                 "printf '%s\\n' 'AI SDK Warning: ignored.' >&2\n"
             )
             fake_chat.chmod(0o755)
-            result = self.run_pbi("search", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, probe))
+            result = self.run_pbi(
+                "search", "PBI_VERSION", env=env, cwd=cwd, binary=self.fake_pbi(directory, probe)
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "pbi:1\n")
         self.assertEqual(result.stderr, "")
