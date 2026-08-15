@@ -116,31 +116,56 @@ class PbiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as f:\n"
+                "    print(json.dumps(sys.argv[1:]), file=f)\n"
+                f"print('File: {PBI}, Lines: 1-40')\n"
+                "print('readonly PBI_VERSION=0.1.0')\n"
+            )
+            probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
-                "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
-                "    json.dump({'argv': sys.argv[1:]}, f)\n"
-                "print('compact answer')\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    print(json.dumps({'argv': sys.argv[1:]}), file=f)\n"
+                "if any('Convert the code question' in arg for arg in sys.argv):\n"
+                "    print('entrypoint CLI parsing')\n"
+                "    print('command dispatch match')\n"
+                "    print('clap Subcommand derive')\n"
+                "else:\n"
+                "    print(f'- {os.getcwd()} ✓')\n"
+                "    print('The entrypoint is pbi:1.')\n"
+                "    print('AI SDK Warning: System messages are risky.', file=sys.stderr)\n"
             )
             fake_chat.chmod(0o755)
-            result = self.run_pbi("where", "is", "the", "entrypoint", "--json", env=env)
-            recorded = json.loads(trace.read_text())
+            result = self.run_pbi(
+                "where", "is", "the", "entrypoint", "--json", env=env, binary=self.fake_pbi(directory, probe)
+            )
+            recorded = [json.loads(line) for line in trace.read_text().splitlines()]
+            probe_trace = directory / "probe-trace.json"
+            self.assertTrue(probe_trace.exists(), "positional questions must retrieve code first")
+            probe_calls = [json.loads(line) for line in probe_trace.read_text().splitlines()]
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "compact answer\n")
+        self.assertEqual(result.stdout, "The entrypoint is pbi:1.\n")
         self.assertEqual(
-            recorded["argv"],
-            [
-                "--force-provider",
-                "openai",
-                "--model-name",
-                PRIMARY,
-                "--message",
-                "where is the entrypoint",
-                "--json",
-            ],
+            [call[-1] for call in probe_calls],
+            ["entrypoint CLI parsing", "command dispatch match", "clap Subcommand derive"],
         )
+        self.assertTrue(all(call[1:7] == ["--timeout", "540", "--max-results", "4", "--max-tokens", "4000"] for call in probe_calls))
+        self.assertEqual(len(recorded), 2)
+        planner, answer = recorded
+        self.assertIn("Convert the code question", planner["argv"][5])
+        self.assertEqual(planner["argv"][6:8], ["--max-iterations", "1"])
+        self.assertEqual(answer["argv"][:5], ["--force-provider", "openai", "--model-name", PRIMARY, "--message"])
+        self.assertIn("Question: where is the entrypoint", answer["argv"][5])
+        self.assertIn("Code excerpts:\nFile:", answer["argv"][5])
+        self.assertEqual(answer["argv"][6:8], ["--max-iterations", "1"])
+        self.assertIn("--prompt", answer["argv"])
+        self.assertEqual(answer["argv"][-1], "--json")
 
     def test_routes_primary_retries_then_fallback_and_forwards_args(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -238,6 +263,12 @@ class PbiTest(unittest.TestCase):
             ],
         )
         self.assertNotIn("ms-marco-minilm-l6", probe_recorded["argv"])
+        self.assertEqual(
+            chat_recorded["argv"][:5],
+            ["--force-provider", "openai", "--model-name", PRIMARY, "--message"],
+        )
+        self.assertEqual(chat_recorded["argv"][6:8], ["--max-iterations", "1"])
+        self.assertEqual(chat_recorded["argv"][8], "--prompt")
         self.assertEqual(chat_recorded["env"]["FORCE_PROVIDER"], "openai")
         self.assertEqual(chat_recorded["env"]["MODEL_NAME"], PRIMARY)
         self.assertEqual(chat_recorded["env"]["OPENAI_API_KEY"], "test-key")
@@ -274,6 +305,10 @@ class PbiTest(unittest.TestCase):
                 "--message",
                 "Use Probe BM25 candidates to find SessionDB. Return only the best matching "
                 "path:symbol or path:line locations; no narration.\n\n",
+                "--max-iterations",
+                "1",
+                "--prompt",
+                "Select locations only from the supplied candidates. Do not call tools.",
             ],
         )
 
