@@ -196,6 +196,7 @@ case "${1:-}" in
     if [[ "$search_bm25" == true ]]; then
       exec "$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}"
     fi
+    search_options+=(--ignore drafts)
     configure_local_routing
     search_uses_local_model=true
     if ! candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then

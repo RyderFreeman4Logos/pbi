@@ -226,6 +226,8 @@ class PbiTest(unittest.TestCase):
                 "540",
                 "--max-results",
                 "8",
+                "--ignore",
+                "drafts",
                 "--reranker",
                 "bm25",
                 "--format",
@@ -329,7 +331,10 @@ class PbiTest(unittest.TestCase):
             )
             argv = json.loads((directory / "probe-trace.json").read_text())
         self.assertEqual(result.returncode, 23, result.stderr)
-        self.assertEqual(argv[:7], ["search", "--timeout", "540", "--max-results", "8", "--reranker", "bm25"])
+        self.assertEqual(
+            argv[:9],
+            ["search", "--timeout", "540", "--max-results", "8", "--ignore", "drafts", "--reranker", "bm25"],
+        )
 
     def test_search_preserves_a_caller_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -355,6 +360,8 @@ class PbiTest(unittest.TestCase):
                 "12",
                 "--max-results",
                 "8",
+                "--ignore",
+                "drafts",
                 "--reranker",
                 "bm25",
                 "--format",
@@ -390,6 +397,8 @@ class PbiTest(unittest.TestCase):
                 "540",
                 "--max-results",
                 "8",
+                "--ignore",
+                "drafts",
                 "--reranker",
                 "bm25",
                 "--format",
