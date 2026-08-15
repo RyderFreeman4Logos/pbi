@@ -58,6 +58,7 @@ class PbiTest(unittest.TestCase):
         env["PBI_TEST_PROBE"] = str(fake_probe)
         env["HOME"] = str(directory)
         env["CLIPROXY_API_KEY"] = "test-key"
+        env["MAX_RETRIES"] = "1"
         return env, trace
 
     def test_static_interface_never_starts_an_agent(self) -> None:

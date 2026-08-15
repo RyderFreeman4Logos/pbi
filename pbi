@@ -51,7 +51,7 @@ primary_model="${LOCAL_MODEL:-$DEFAULT_PRIMARY_MODEL}"
 fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
 request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
 operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
-max_retries="${MAX_RETRIES:-3}"
+max_retries="3"
 probe_path="$(resolve_probe)"
 agent_command="$(command -v probe-chat || true)"
 if [[ -z "$agent_command" ]]; then
