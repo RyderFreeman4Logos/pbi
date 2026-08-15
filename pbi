@@ -26,6 +26,24 @@ resolve_probe() {
   printf '%s' "$probe_path"
 }
 
+probe_reported_error() {
+  local output="$1"
+  if printf '%s' "$output" | node -e '
+let input = "";
+process.stdin.on("data", chunk => { input += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const response = JSON.parse(input);
+    process.exit(response && (response.error || response.errors || response.status === "error") ? 0 : 1);
+  } catch {
+    process.exit(1);
+  }
+});'; then
+    return 0
+  fi
+  grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$output"
+}
+
 case "${1:-}" in
   --help|-h)
     usage
@@ -100,4 +118,16 @@ export MAX_OPERATION_TIMEOUT="$operation_timeout"
 export MAX_RETRIES="$max_retries"
 export FALLBACK_PROVIDERS="$fallback_providers"
 
-exec "$agent_command" --force-provider openai --model-name "$primary_model" "$@"
+if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "$@")"; then
+  status=0
+else
+  status=$?
+fi
+printf '%s\n' "$output"
+if ((status != 0)); then
+  exit "$status"
+fi
+if probe_reported_error "$output"; then
+  printf '%s\n' 'pbi: probe-chat reported an API error' >&2
+  exit 1
+fi

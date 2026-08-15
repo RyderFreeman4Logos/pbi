@@ -112,6 +112,20 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(providers[0]["maxRetries"], 3)
         self.assertEqual(providers[1]["maxRetries"], 0)
 
+    def test_fails_closed_when_probe_reports_a_json_api_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"error\": {\"code\": \"invalid_request\", \"message\": \"model not found\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", "--json", env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "invalid_request")
+
     def test_debug_config_is_redacted_and_does_not_launch_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env, trace = self.fake_environment(Path(temporary))
