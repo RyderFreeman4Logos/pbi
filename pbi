@@ -9,7 +9,7 @@ readonly DEFAULT_FALLBACK_MODEL="opencode/deepseek-v4-flash"
 readonly DEFAULT_REQUEST_TIMEOUT_MS="1700000"
 readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
-readonly DEFAULT_SEARCH_RERANKER="ms-marco-minilm-l6"
+readonly DEFAULT_SEARCH_MAX_RESULTS="8"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
@@ -17,7 +17,7 @@ usage() {
   printf '%s\n' "       pbi search [--bm25] <query>"
   printf '%s\n' "       pbi --message <question> [probe-chat options]"
   printf '%s\n' "       pbi --debug-config"
-  printf '%s\n' "Routes OpenAI-compatible requests to localhost:8317/v1 with primary retries then fallback."
+  printf '%s\n' "Search defaults to local-model ranking; use --bm25 for no-LLM Probe output."
 }
 
 resolve_probe() {
@@ -48,6 +48,15 @@ process.stdin.on("end", () => {
   grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$output"
 }
 
+compact_search_locations() {
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+  done <<<"$1"
+}
+
 case "${1:-}" in
   --help|-h)
     usage
@@ -76,6 +85,7 @@ request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
 operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
 max_retries="3"
 probe_path="$(resolve_probe)"
+search_uses_local_model=false
 
 configure_local_routing() {
   api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-}}"
@@ -118,6 +128,7 @@ case "${1:-}" in
     search_options=()
     search_pattern_parts=()
     search_timeout_set=false
+    search_max_results_set=false
     search_bm25=false
     while (($#)); do
       argument="$1"
@@ -138,7 +149,22 @@ case "${1:-}" in
             shift
           fi
           ;;
-        --ignore|-i|--reranker|-r|--language|-l|--max-results|--max-bytes|--max-tokens|--merge-threshold|--format|-o|--session|--question)
+        --max-results|--max-results=*)
+          search_max_results_set=true
+          search_options+=("$argument")
+          if [[ "$argument" == "--max-results" && $# -gt 0 ]]; then
+            search_options+=("$1")
+            shift
+          fi
+          ;;
+        --reranker|-r)
+          if (($#)); then
+            shift
+          fi
+          ;;
+        --reranker=*)
+          ;;
+        --ignore|-i|--language|-l|--max-bytes|--max-tokens|--merge-threshold|--format|-o|--session|--question)
           search_options+=("$argument")
           if (($#)); then
             search_options+=("$1")
@@ -156,22 +182,20 @@ case "${1:-}" in
     if [[ "$search_timeout_set" == false ]]; then
       search_options=(--timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" "${search_options[@]}")
     fi
+    if [[ "$search_max_results_set" == false ]]; then
+      search_options+=(--max-results "$DEFAULT_SEARCH_MAX_RESULTS")
+    fi
     if [[ "$search_bm25" == true ]]; then
       exec "$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}"
     fi
     configure_local_routing
-    search_options=("${search_options[@]}" --reranker "$DEFAULT_SEARCH_RERANKER" --question "${search_pattern_parts[*]}")
-    if output="$("$(resolve_probe)" search "${search_options[@]}" -- "${search_pattern_parts[*]}")"; then
-      status=0
-    else
-      status=$?
+    search_uses_local_model=true
+    if ! candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then
+      printf '%s\n' "$candidates" >&2
+      exit 1
     fi
-    if [[ "$output" == *"BERT reranker"* && "$output" == *"not available"* ]]; then
-      set -- --message "Rank these Probe search candidates for ${search_pattern_parts[*]} and return the best matching locations only:"$'\n\n'"$output"
-    else
-      printf '%s\n' "$output"
-      exit "$status"
-    fi
+    candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
+    set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates"
     ;;
 esac
 
@@ -217,7 +241,7 @@ if [[ "${1:-}" == "--debug-config" ]]; then
   printf '%s\n' "max_operation_timeout_ms=$operation_timeout"
   printf '%s\n' "max_retries=$max_retries"
   printf '%s\n' "search_timeout_seconds=$DEFAULT_SEARCH_TIMEOUT_SECONDS"
-  printf '%s\n' "search_default_reranker=$DEFAULT_SEARCH_RERANKER"
+  printf '%s\n' 'search_default=local_model'
   printf '%s\n' 'search_bm25_opt_in=--bm25'
   printf '%s\n' 'api_key=[REDACTED]'
   exit 0
@@ -225,16 +249,27 @@ fi
 
 configure_local_routing
 
-if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
+if [[ "$search_uses_local_model" == true ]]; then
+  if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+elif output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
   status=0
 else
   status=$?
 fi
-printf '%s\n' "$output"
 if ((status != 0)); then
+  printf '%s\n' "$output"
   exit "$status"
 fi
 if probe_reported_error "$output"; then
+  printf '%s\n' "$output"
   printf '%s\n' 'pbi: probe-chat reported an API error' >&2
   exit 1
 fi
+if [[ "$search_uses_local_model" == true ]]; then
+  output="$(compact_search_locations "$output")"
+fi
+printf '%s\n' "$output"

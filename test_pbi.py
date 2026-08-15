@@ -63,6 +63,7 @@ class PbiTest(unittest.TestCase):
         env = os.environ.copy()
         env["PATH"] = f"{directory}:{env['PATH']}"
         env["PBI_TEST_TRACE"] = str(trace)
+        env["PBI_TEST_PROBE_TRACE"] = str(directory / "probe-trace.json")
         env["PBI_TEST_PROBE"] = str(fake_probe)
         env["HOME"] = str(directory)
         env["CLIPROXY_API_KEY"] = "test-key"
@@ -79,7 +80,7 @@ class PbiTest(unittest.TestCase):
         probe.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
-            "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
+            "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
             "    json.dump(sys.argv[1:], f)\n"
         )
         probe.chmod(0o755)
@@ -90,7 +91,7 @@ class PbiTest(unittest.TestCase):
             "import json, os, sys\n"
             "keys = ('FORCE_PROVIDER', 'MODEL_NAME', 'OPENAI_API_KEY', "
             "'OPENAI_API_URL', 'MAX_RETRIES', 'FALLBACK_PROVIDERS')\n"
-            "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
+            "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
             "    json.dump({'argv': sys.argv[1:], 'env': {k: os.environ.get(k) for k in keys}}, f)\n"
         )
         probe.chmod(0o755)
@@ -190,7 +191,23 @@ class PbiTest(unittest.TestCase):
         self.assertIn("File:", result.stdout)
         self.assertIn("/pbi/pbi", result.stdout)
 
-    def test_search_defaults_to_local_model_reranking(self) -> None:
+    def test_bm25_search_defaults_to_a_small_result_set_without_an_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            env.pop("CLIPROXY_API_KEY", None)
+            env.pop("OPENAI_API_KEY", None)
+            probe = directory / "probe"
+            self.record_probe_argv(probe)
+            result = self.run_pbi("search", "--bm25", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, probe))
+            argv = json.loads((directory / "probe-trace.json").read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            argv,
+            ["search", "--reranker", "bm25", "--timeout", "540", "--max-results", "8", "--", "PBI_VERSION"],
+        )
+
+    def test_search_defaults_to_local_model_without_bert(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
@@ -199,33 +216,38 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi(
                 "search", "SessionDB", "FTS5", "session", "search", env=env, binary=self.fake_pbi(directory, probe)
             )
-            recorded = json.loads(trace.read_text())
-        self.assertEqual(result.returncode, 0, result.stderr)
+            probe_recorded = json.loads((directory / "probe-trace.json").read_text())
+            chat_recorded = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(
-            recorded["argv"],
+            probe_recorded["argv"],
             [
                 "search",
                 "--timeout",
                 "540",
+                "--max-results",
+                "8",
                 "--reranker",
-                "ms-marco-minilm-l6",
-                "--question",
-                "SessionDB FTS5 session search",
+                "bm25",
+                "--format",
+                "plain",
+                "--dry-run",
                 "--",
                 "SessionDB FTS5 session search",
             ],
         )
-        self.assertEqual(recorded["env"]["FORCE_PROVIDER"], "openai")
-        self.assertEqual(recorded["env"]["MODEL_NAME"], PRIMARY)
-        self.assertEqual(recorded["env"]["OPENAI_API_KEY"], "test-key")
-        self.assertEqual(recorded["env"]["OPENAI_API_URL"], BASE_URL)
-        self.assertEqual(recorded["env"]["MAX_RETRIES"], "3")
+        self.assertNotIn("ms-marco-minilm-l6", probe_recorded["argv"])
+        self.assertEqual(chat_recorded["env"]["FORCE_PROVIDER"], "openai")
+        self.assertEqual(chat_recorded["env"]["MODEL_NAME"], PRIMARY)
+        self.assertEqual(chat_recorded["env"]["OPENAI_API_KEY"], "test-key")
+        self.assertEqual(chat_recorded["env"]["OPENAI_API_URL"], BASE_URL)
+        self.assertEqual(chat_recorded["env"]["MAX_RETRIES"], "3")
         self.assertEqual(
-            [provider["model"] for provider in json.loads(recorded["env"]["FALLBACK_PROVIDERS"])],
+            [provider["model"] for provider in json.loads(chat_recorded["env"]["FALLBACK_PROVIDERS"])],
             [PRIMARY, FALLBACK],
         )
 
-    def test_search_uses_local_chat_when_the_probe_lacks_bert_reranking(self) -> None:
+    def test_search_hides_mocked_bert_fallback_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
@@ -239,6 +261,8 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi("search", "SessionDB", env=env, binary=self.fake_pbi(directory, probe))
             recorded = json.loads(trace.read_text())
         self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertNotIn("BERT reranker", result.stdout)
+        self.assertNotIn("Falling back to BM25", result.stdout)
         self.assertEqual(
             recorded["argv"],
             [
@@ -247,10 +271,27 @@ class PbiTest(unittest.TestCase):
                 "--model-name",
                 PRIMARY,
                 "--message",
-                "Rank these Probe search candidates for SessionDB and return the best matching locations only:\n\n"
-                "BERT reranker 'ms-marco-minilm-l6' is not available.\nFalling back to BM25 ranking...",
+                "Use Probe BM25 candidates to find SessionDB. Return only the best matching "
+                "path:symbol or path:line locations; no narration.\n\n",
             ],
         )
+
+    def test_search_prints_only_compact_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '- /repo ✓' 'pbi/pbi:5' "
+                "'AI SDK Warning: System messages can enable prompt injection.'\n"
+                "printf '%s\\n' 'AI SDK Warning: System messages can enable prompt injection.' >&2\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("search", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi/pbi:5\n")
+        self.assertEqual(result.stderr, "")
 
     def test_search_injects_a_long_default_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -261,9 +302,9 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi(
                 "search", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, probe)
             )
-            argv = json.loads(trace.read_text())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(argv[:5], ["search", "--timeout", "540", "--reranker", "ms-marco-minilm-l6"])
+            argv = json.loads((directory / "probe-trace.json").read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(argv[:7], ["search", "--timeout", "540", "--max-results", "8", "--reranker", "bm25"])
 
     def test_search_preserves_a_caller_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -279,18 +320,21 @@ class PbiTest(unittest.TestCase):
                 env=env,
                 binary=self.fake_pbi(directory, probe),
             )
-            argv = json.loads(trace.read_text())
-        self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads((directory / "probe-trace.json").read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(
             argv,
             [
                 "search",
                 "--timeout",
                 "12",
+                "--max-results",
+                "8",
                 "--reranker",
-                "ms-marco-minilm-l6",
-                "--question",
-                "PBI_VERSION",
+                "bm25",
+                "--format",
+                "plain",
+                "--dry-run",
                 "--",
                 "PBI_VERSION",
             ],
@@ -311,18 +355,21 @@ class PbiTest(unittest.TestCase):
                 env=env,
                 binary=self.fake_pbi(directory, probe),
             )
-            argv = json.loads(trace.read_text())
-        self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads((directory / "probe-trace.json").read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(
             argv,
             [
                 "search",
                 "--timeout",
                 "540",
+                "--max-results",
+                "8",
                 "--reranker",
-                "ms-marco-minilm-l6",
-                "--question",
-                "SessionDB FTS5 session search",
+                "bm25",
+                "--format",
+                "plain",
+                "--dry-run",
                 "--",
                 "SessionDB FTS5 session search",
             ],
@@ -365,7 +412,7 @@ class PbiTest(unittest.TestCase):
         self.assertIn(f"base_url={BASE_URL}", result.stdout)
         self.assertIn("max_retries=3", result.stdout)
         self.assertIn("search_timeout_seconds=540", result.stdout)
-        self.assertIn("search_default_reranker=ms-marco-minilm-l6", result.stdout)
+        self.assertIn("search_default=local_model", result.stdout)
         self.assertIn("search_bm25_opt_in=--bm25", result.stdout)
         self.assertIn("api_key=[REDACTED]", result.stdout)
 
