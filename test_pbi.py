@@ -21,10 +21,14 @@ PROBE_SHIM = "/usr/local/share/mise/shims/probe"
 
 class PbiTest(unittest.TestCase):
     def run_pbi(
-        self, *args: str, env: dict[str, str] | None = None, cwd: Path | None = None
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        cwd: Path | None = None,
+        binary: Path = PBI,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(PBI), *args],
+            [str(binary), *args],
             text=True,
             capture_output=True,
             check=False,
@@ -64,6 +68,21 @@ class PbiTest(unittest.TestCase):
         env["CLIPROXY_API_KEY"] = "test-key"
         env["MAX_RETRIES"] = "1"
         return env, trace
+
+    def fake_pbi(self, directory: Path, fake_probe: Path) -> Path:
+        binary = directory / "pbi"
+        binary.write_text(PBI.read_text().replace(PROBE_SHIM, str(fake_probe)))
+        binary.chmod(0o755)
+        return binary
+
+    def record_probe_argv(self, probe: Path) -> None:
+        probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
+            "    json.dump(sys.argv[1:], f)\n"
+        )
+        probe.chmod(0o755)
 
     def test_static_interface_never_starts_an_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -160,6 +179,38 @@ class PbiTest(unittest.TestCase):
         self.assertIn("File:", result.stdout)
         self.assertIn("/pbi/pbi", result.stdout)
 
+    def test_search_injects_a_long_default_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            self.record_probe_argv(probe)
+            result = self.run_pbi(
+                "search", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, probe)
+            )
+            argv = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(argv[:2], ["search", "--timeout"])
+        self.assertGreaterEqual(int(argv[2]), 540)
+
+    def test_search_preserves_a_caller_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            self.record_probe_argv(probe)
+            result = self.run_pbi(
+                "search",
+                "PBI_VERSION",
+                "--timeout",
+                "12",
+                env=env,
+                binary=self.fake_pbi(directory, probe),
+            )
+            argv = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(argv, ["search", "PBI_VERSION", "--timeout", "12"])
+
     def test_defaults_probe_folder_to_the_calling_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -195,6 +246,7 @@ class PbiTest(unittest.TestCase):
         self.assertIn(f"fallback_model={FALLBACK}", result.stdout)
         self.assertIn(f"base_url={BASE_URL}", result.stdout)
         self.assertIn("max_retries=3", result.stdout)
+        self.assertIn("search_timeout_seconds=540", result.stdout)
         self.assertIn("api_key=[REDACTED]", result.stdout)
 
 

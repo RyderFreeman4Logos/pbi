@@ -8,6 +8,7 @@ readonly DEFAULT_PRIMARY_MODEL="qwen3.6-27b-decensor-by-aeon"
 readonly DEFAULT_FALLBACK_MODEL="opencode/deepseek-v4-flash"
 readonly DEFAULT_REQUEST_TIMEOUT_MS="1700000"
 readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
+readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
@@ -57,7 +58,12 @@ case "${1:-}" in
     ;;
   search)
     shift
-    exec "$(resolve_probe)" search "$@"
+    for argument in "$@"; do
+      if [[ "$argument" == "--timeout" || "$argument" == --timeout=* ]]; then
+        exec "$(resolve_probe)" search "$@"
+      fi
+    done
+    exec "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" "$@"
     ;;
   '')
     printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
@@ -119,6 +125,7 @@ if [[ "${1:-}" == "--debug-config" ]]; then
   printf '%s\n' "request_timeout_ms=$request_timeout"
   printf '%s\n' "max_operation_timeout_ms=$operation_timeout"
   printf '%s\n' "max_retries=$max_retries"
+  printf '%s\n' "search_timeout_seconds=$DEFAULT_SEARCH_TIMEOUT_SECONDS"
   printf '%s\n' 'api_key=[REDACTED]'
   exit 0
 fi
