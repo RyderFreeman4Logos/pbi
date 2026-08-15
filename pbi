@@ -18,7 +18,8 @@ usage() {
 
 resolve_probe() {
   local probe_path
-  if ! probe_path="$(mise which probe 2>/dev/null)" || [[ ! -x "$probe_path" ]]; then
+  probe_path="/usr/local/share/mise/shims/probe"
+  if [[ ! -x "$probe_path" ]]; then
     printf '%s\n' 'pbi: mise-installed probe is unavailable' >&2
     return 127
   fi

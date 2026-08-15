@@ -16,6 +16,7 @@ PBI = ROOT / "pbi"
 PRIMARY = "qwen3.6-27b-decensor-by-aeon"
 FALLBACK = "opencode/deepseek-v4-flash"
 BASE_URL = "http://localhost:8317/v1"
+PROBE_SHIM = "/usr/local/share/mise/shims/probe"
 
 
 class PbiTest(unittest.TestCase):
@@ -95,7 +96,7 @@ class PbiTest(unittest.TestCase):
             ],
         )
         configured = recorded["env"]
-        self.assertTrue(configured["PROBE_BINARY_PATH"].endswith("/probe"))
+        self.assertEqual(configured["PROBE_BINARY_PATH"], PROBE_SHIM)
         self.assertEqual(configured["FORCE_PROVIDER"], "openai")
         self.assertEqual(configured["MODEL_NAME"], PRIMARY)
         self.assertEqual(configured["OPENAI_API_URL"], BASE_URL)
