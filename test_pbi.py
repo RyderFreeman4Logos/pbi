@@ -210,18 +210,10 @@ class PbiTest(unittest.TestCase):
         self.assertIn("Repository entrypoint landmarks", draft["argv"][5])
         self.assertIn("main.rs:2", draft["argv"][5])
         self.assertEqual(draft["argv"][6:8], ["--max-iterations", "1"])
-        self.assertIn("--prompt", draft["argv"])
-        answer_prompt = draft["argv"][draft["argv"].index("--prompt") + 1]
-        self.assertIn("3 to 8 single-line Markdown bullets", answer_prompt)
-        self.assertIn("The first character of the answer must be -", answer_prompt)
-        self.assertIn("No title, preamble, conclusion, or repeated reference list", answer_prompt)
-        self.assertIn("final - Uncertain: bullet", answer_prompt)
+        self.assertTrue(all("--prompt" not in call["argv"] for call in recorded))
         self.assertIn("Review and compress the draft answer", reviewer["argv"][5])
         self.assertIn("Draft answer:\nThe entrypoint is pbi:1.", reviewer["argv"][5])
         self.assertIn("Evidence:\nFile:", reviewer["argv"][5])
-        review_prompt = reviewer["argv"][reviewer["argv"].index("--prompt") + 1]
-        self.assertIn("never more than 8 lines total", review_prompt)
-        self.assertIn("Discard tangential examples", review_prompt)
         self.assertEqual(reviewer["argv"][-1], "--json")
         self.assertIn("Audit every source citation", citation_auditor["argv"][5])
         self.assertIn("Answer to audit:\nThe entrypoint is pbi:1.", citation_auditor["argv"][5])
@@ -311,25 +303,93 @@ class PbiTest(unittest.TestCase):
         self.assertTrue(planner_messages[0].startswith("Convert the code question"))
         self.assertTrue(planner_messages[1].startswith("Identify missing evidence"))
 
-    def test_query_planning_reports_system_message_rejection(self) -> None:
+    def test_loads_cwd_dotenv_for_local_router_without_leaking_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            for name in (
+                "CLIPROXY_API_KEY",
+                "OPENAI_API_KEY",
+                "CLIPROXY_BASE_URL",
+                "LOCAL_ROUTER_API_KEY",
+                "LOCAL_ROUTER_BASEURL",
+                "LOCAL_MODEL",
+                "LLM_MODEL",
+                "FALLBACK_MODEL",
+            ):
+                env.pop(name, None)
+            (directory / ".env").write_text(
+                "LOCAL_ROUTER_BASEURL=http://router.invalid/v1\n"
+                "LOCAL_ROUTER_API_KEY=dummy-dotenv-key\n"
+                "LLM_MODEL=dummy-primary\n"
+                "FALLBACK_MODEL=dummy-fallback\n"
+            )
+            result = self.run_pbi("--message", "hello", env=env, cwd=directory, binary=self.fake_pbi(directory, directory / "probe"))
+            recorded = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(recorded["env"]["OPENAI_API_KEY"], "dummy-dotenv-key")
+        self.assertEqual(recorded["env"]["OPENAI_API_URL"], "http://router.invalid/v1")
+        self.assertEqual(recorded["env"]["MODEL_NAME"], "dummy-primary")
+        self.assertNotIn("dummy-dotenv-key", result.stdout + result.stderr)
+
+    def test_process_environment_overrides_cwd_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            env.pop("CLIPROXY_API_KEY", None)
+            env.pop("OPENAI_API_KEY", None)
+            env.update(
+                {
+                    "LOCAL_ROUTER_BASEURL": "http://process.invalid/v1",
+                    "LOCAL_ROUTER_API_KEY": "dummy-process-key",
+                    "LLM_MODEL": "process-primary",
+                    "FALLBACK_MODEL": "process-fallback",
+                }
+            )
+            (directory / ".env").write_text(
+                "LOCAL_ROUTER_BASEURL=http://dotenv.invalid/v1\n"
+                "LOCAL_ROUTER_API_KEY=dummy-dotenv-key\n"
+                "LLM_MODEL=dotenv-primary\n"
+                "FALLBACK_MODEL=dotenv-fallback\n"
+            )
+            result = self.run_pbi("--message", "hello", env=env, cwd=directory, binary=self.fake_pbi(directory, directory / "probe"))
+            recorded = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(recorded["env"]["OPENAI_API_KEY"], "dummy-process-key")
+        self.assertEqual(recorded["env"]["OPENAI_API_URL"], "http://process.invalid/v1")
+        self.assertEqual(recorded["env"]["MODEL_NAME"], "process-primary")
+        self.assertEqual(
+            [provider["model"] for provider in json.loads(recorded["env"]["FALLBACK_PROVIDERS"])],
+            ["process-primary", "process-fallback"],
+        )
+
+    def test_query_planning_warning_falls_back_to_compact_bm25(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
+            (directory / "probe").write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+            )
+            (directory / "probe").chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env bash\n"
                 "printf '%s\\n' 'AI SDK Warning: System messages are risky.'\n"
             )
             fake_chat.chmod(0o755)
-            result = self.run_pbi("where is the entrypoint", env=env, binary=self.fake_pbi(directory, directory / "probe"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("system-message field", result.stderr)
-        self.assertIn("OpenAI-compatible backend", result.stderr)
+            result = self.run_pbi("where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi:1\n")
+        self.assertNotIn("system-message field", result.stderr)
 
-    def test_query_planning_reports_nonzero_system_message_rejection_without_output(self) -> None:
+    def test_nonzero_query_planning_warning_falls_back_without_echoing_sentinels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
+            (directory / "probe").write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+            )
+            (directory / "probe").chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env bash\n"
@@ -338,10 +398,9 @@ class PbiTest(unittest.TestCase):
                 "exit 7\n"
             )
             fake_chat.chmod(0o755)
-            result = self.run_pbi("where is the entrypoint", env=env, binary=self.fake_pbi(directory, directory / "probe"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("system-message field", result.stderr)
-        self.assertIn("OpenAI-compatible backend", result.stderr)
+            result = self.run_pbi("where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi:1\n")
         self.assertNotIn("PROMPT_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("SECRET_SENTINEL", result.stdout + result.stderr)
 
@@ -446,7 +505,7 @@ class PbiTest(unittest.TestCase):
             ["--force-provider", "openai", "--model-name", PRIMARY, "--message"],
         )
         self.assertEqual(chat_recorded["argv"][6:8], ["--max-iterations", "1"])
-        self.assertEqual(chat_recorded["argv"][8], "--prompt")
+        self.assertNotIn("--prompt", chat_recorded["argv"])
         self.assertEqual(chat_recorded["env"]["FORCE_PROVIDER"], "openai")
         self.assertEqual(chat_recorded["env"]["MODEL_NAME"], PRIMARY)
         self.assertEqual(chat_recorded["env"]["OPENAI_API_KEY"], "test-key")
@@ -485,8 +544,6 @@ class PbiTest(unittest.TestCase):
                 "path:symbol or path:line locations; no narration.\n\n",
                 "--max-iterations",
                 "1",
-                "--prompt",
-                "Select locations only from the supplied candidates. Do not call tools.",
             ],
         )
 
@@ -646,7 +703,9 @@ class PbiTest(unittest.TestCase):
             fake_chat.chmod(0o755)
             result = self.run_pbi("--message", "hello", "--json", env=env)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(json.loads(result.stdout)["error"]["code"], "invalid_request")
+        self.assertEqual(result.stdout, "")
+        self.assertIn("probe-chat reported an API error", result.stderr)
+        self.assertNotIn("invalid_request", result.stdout + result.stderr)
 
     def test_debug_config_is_redacted_and_does_not_launch_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
