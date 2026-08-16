@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parent
@@ -26,6 +27,7 @@ class PbiTest(unittest.TestCase):
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
         binary: Path = PBI,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(binary), *args],
@@ -34,6 +36,7 @@ class PbiTest(unittest.TestCase):
             check=False,
             env=env,
             cwd=cwd,
+            timeout=timeout,
         )
 
     def fake_environment(self, directory: Path) -> tuple[dict[str, str], Path]:
@@ -225,7 +228,7 @@ class PbiTest(unittest.TestCase):
         self.assertIn("Source evidence:\nFile:", citation_auditor["argv"][5])
         self.assertEqual(citation_auditor["argv"][-1], "--json")
 
-    def test_query_planning_omits_inventory_and_times_out_to_direct_bm25(self) -> None:
+    def test_term_resistant_initial_planner_times_out_to_direct_bm25(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
@@ -242,26 +245,71 @@ class PbiTest(unittest.TestCase):
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env python3\n"
-                "import json, os, sys, time\n"
+                "import json, os, signal, sys, time\n"
                 "message = sys.argv[sys.argv.index('--message') + 1]\n"
                 "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
                 "    json.dump({'argv': sys.argv[1:]}, f)\n"
                 "if message.startswith('Convert the code question'):\n"
-                "    time.sleep(2)\n"
-                "    print('delayed query')\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
                 "else:\n"
                 "    raise SystemExit(2)\n"
             )
             fake_chat.chmod(0o755)
+            started = time.monotonic()
             result = self.run_pbi(
-                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe)
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
             )
+            elapsed = time.monotonic() - started
             planner = json.loads(trace.read_text())
             probe_argv = json.loads((directory / "probe-trace.json").read_text())
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 3)
         self.assertEqual(result.stdout, "pbi:1\n")
         self.assertNotIn("Repository files:", planner["argv"][5])
         self.assertEqual(probe_argv[-1], "where is the entrypoint")
+
+    def test_term_resistant_refinement_planner_times_out_to_direct_bm25(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "print(f'File: {os.getcwd()}/pbi, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, signal, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    print(json.dumps(message), file=f)\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('initial query')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
+                "else:\n"
+                "    raise SystemExit(2)\n"
+            )
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
+            )
+            elapsed = time.monotonic() - started
+            planner_messages = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 3)
+        self.assertTrue(result.stdout.splitlines())
+        self.assertTrue(all(location == "pbi:1" for location in result.stdout.splitlines()), result.stdout)
+        self.assertEqual(len(planner_messages), 2)
+        self.assertTrue(planner_messages[0].startswith("Convert the code question"))
+        self.assertTrue(planner_messages[1].startswith("Identify missing evidence"))
 
     def test_query_planning_reports_system_message_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -277,6 +325,25 @@ class PbiTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("system-message field", result.stderr)
         self.assertIn("OpenAI-compatible backend", result.stderr)
+
+    def test_query_planning_reports_nonzero_system_message_rejection_without_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'AI SDK Warning: System messages are risky.'\n"
+                "printf '%s\\n' 'PROMPT_SENTINEL SECRET_SENTINEL' >&2\n"
+                "exit 7\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("where is the entrypoint", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("system-message field", result.stderr)
+        self.assertIn("OpenAI-compatible backend", result.stderr)
+        self.assertNotIn("PROMPT_SENTINEL", result.stdout + result.stderr)
+        self.assertNotIn("SECRET_SENTINEL", result.stdout + result.stderr)
 
     def test_routes_primary_retries_then_fallback_and_forwards_args(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
