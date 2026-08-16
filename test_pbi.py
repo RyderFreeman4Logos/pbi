@@ -363,24 +363,42 @@ class PbiTest(unittest.TestCase):
             ["process-primary", "process-fallback"],
         )
 
-    def test_query_planning_warning_falls_back_to_compact_bm25(self) -> None:
+    def test_query_planning_system_message_warning_keeps_local_model_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            env, _ = self.fake_environment(directory)
+            env, trace = self.fake_environment(directory)
             (directory / "probe").write_text(
                 f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
             )
             (directory / "probe").chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
-                "#!/usr/bin/env bash\n"
-                "printf '%s\\n' 'AI SDK Warning: System messages are risky.'\n"
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    print(json.dumps(sys.argv[1:]), file=f)\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('AI SDK Warning: System messages are risky.')\n"
+                "    print('entrypoint CLI parsing')\n"
+                "    print('command dispatch match')\n"
+                "    print('clap Subcommand derive')\n"
+                "    print('persistence write callers')\n"
+                "    print('result return formatting')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "elif message.startswith('Answer the question'):\n"
+                "    print('MODEL_ANSWER pbi:9')\n"
+                "elif message.startswith('Review and compress') or message.startswith('Audit every'):\n"
+                "    print('MODEL_ANSWER pbi:9')\n"
             )
             fake_chat.chmod(0o755)
             result = self.run_pbi("where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, directory / "probe"))
+            calls = [json.loads(line) for line in trace.read_text().splitlines()]
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "pbi:1\n")
-        self.assertNotIn("system-message field", result.stderr)
+        self.assertEqual(result.stdout, "MODEL_ANSWER pbi:9\n")
+        self.assertNotEqual(result.stdout, "pbi:1\n")
+        self.assertTrue(any(call[call.index("--message") + 1].startswith("Answer the question") for call in calls))
 
     def test_nonzero_query_planning_warning_falls_back_without_echoing_sentinels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -53,6 +53,10 @@ probe_system_message_warning() {
   grep -Eiq '^AI SDK Warning: System messages' <<<"$1"
 }
 
+strip_probe_chrome() {
+  grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' <<<"$1" || true
+}
+
 planner_timeout_or_kill() {
   [[ "$1" == 124 || "$1" == 137 ]]
 }
@@ -147,6 +151,7 @@ search_fallback_locations=""
 planner_stdout=""
 planner_stderr=""
 planner_status=0
+planner_had_system_message_warning=false
 
 run_planner() {
   local stderr_file
@@ -158,6 +163,12 @@ run_planner() {
   fi
   planner_stderr="$(<"$stderr_file")"
   rm -f -- "$stderr_file"
+  planner_had_system_message_warning=false
+  if probe_system_message_warning "$planner_stdout"$'\n'"$planner_stderr"; then
+    planner_had_system_message_warning=true
+  fi
+  planner_stdout="$(strip_probe_chrome "$planner_stdout")"
+  planner_stderr="$(strip_probe_chrome "$planner_stderr")"
 }
 
 configure_local_routing() {
@@ -328,22 +339,28 @@ else
   run_planner --force-provider openai --model-name "$primary_model" \
       --message "Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: $question" \
       --max-iterations 1
-  if probe_system_message_warning "$planner_stdout"$'\n'"$planner_stderr"; then
+  generated_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
+  if planner_timeout_or_kill "$planner_status"; then
     planner_timed_out=true
     planned_queries="$question"
-  elif ((planner_status == 0)); then
-    generated_queries="$(printf '%s\n' "$planner_stdout" | grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' | sed -n '/./p' | head -n 5 || true)"
+  elif ((planner_status == 0)) || [[ -n "$generated_queries" ]]; then
     if [[ -z "$generated_queries" ]] || probe_reported_error "$generated_queries"; then
-      printf '%s\n' 'pbi: local query planning failed' >&2
-      exit 1
+      if [[ "$planner_had_system_message_warning" == true && -z "$generated_queries" ]]; then
+        planner_timed_out=true
+        planned_queries="$question"
+      else
+        printf '%s\n' 'pbi: local query planning failed' >&2
+        exit 1
+      fi
+    else
+      planned_queries="$question"$'\n'"$generated_queries"
     fi
-    planned_queries="$question"$'\n'"$generated_queries"
-  elif planner_timeout_or_kill "$planner_status"; then
+  elif [[ "$planner_had_system_message_warning" == true ]]; then
     planner_timed_out=true
     planned_queries="$question"
   else
-    printf '%s\n' 'pbi: local query planning failed' >&2
-    exit 1
+      printf '%s\n' 'pbi: local query planning failed' >&2
+      exit 1
   fi
   candidates=""
   while IFS= read -r planned_query; do
@@ -391,15 +408,13 @@ else
     run_planner --force-provider openai --model-name "$primary_model" \
         --message "Identify missing evidence needed to answer the question completely from source. This is refinement round $gap_round of 2. Return up to five new exact identifiers or short literal source phrases, one plain line each, targeting missing callers, callees, transformations, persistence, or result paths. Prefer distinctive symbols such as fn main, Cli::parse, or insert_record over generic words. Do not repeat an attempted query. Return NONE only when the excerpts directly establish the complete answer."$'\n\n'"Question: $question"$'\n\nSearches already tried:\n'"$attempted_queries"$'\n\nExisting excerpts:\n'"$candidates" \
         --max-iterations 1
-    if probe_system_message_warning "$planner_stdout"$'\n'"$planner_stderr"; then
-      break
-    elif planner_timeout_or_kill "$planner_status"; then
+    gap_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
+    if planner_timeout_or_kill "$planner_status"; then
       planner_timed_out=true
       break
-    elif ((planner_status != 0)); then
+    elif ((planner_status != 0)) && [[ -z "$gap_queries" ]]; then
       break
     fi
-    gap_queries="$(printf '%s\n' "$planner_stdout" | grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' | sed -n '/./p' | head -n 5 || true)"
     if [[ -z "$gap_queries" || "$gap_queries" == "NONE" ]] || probe_reported_error "$gap_queries"; then
       break
     fi
