@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parent
@@ -26,6 +27,7 @@ class PbiTest(unittest.TestCase):
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
         binary: Path = PBI,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(binary), *args],
@@ -34,6 +36,7 @@ class PbiTest(unittest.TestCase):
             check=False,
             env=env,
             cwd=cwd,
+            timeout=timeout,
         )
 
     def fake_environment(self, directory: Path) -> tuple[dict[str, str], Path]:
@@ -116,31 +119,231 @@ class PbiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
+            (directory / "main.rs").write_text("struct Cli {}\nfn main() { Cli::parse(); }\n")
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as f:\n"
+                "    print(json.dumps(sys.argv[1:]), file=f)\n"
+                f"print('File: {directory / 'pbi'}, Lines: 1-40')\n"
+                "print('readonly PBI_VERSION=0.1.0')\n"
+                "print('query=' + sys.argv[-1])\n"
+            )
+            probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
-                "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
-                "    json.dump({'argv': sys.argv[1:]}, f)\n"
-                "print('compact answer')\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    print(json.dumps({'argv': sys.argv[1:]}), file=f)\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('entrypoint CLI parsing')\n"
+                "    print('command dispatch match')\n"
+                "    print('clap Subcommand derive')\n"
+                "    print('persistence write callers')\n"
+                "    print('result return formatting')\n"
+                "elif message.startswith('Review and compress the draft answer'):\n"
+                "    print('The entrypoint is pbi:1.')\n"
+                "elif message.startswith('Audit every source citation'):\n"
+                "    print('The entrypoint is pbi:1.')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    if 'refinement round 2 of 2' in message:\n"
+                "        print('NONE')\n"
+                "    else:\n"
+                "        print('readonly PBI_VERSION')\n"
+                "        print('compact_search_locations')\n"
+                "        print('DEFAULT_SEARCH_TIMEOUT_SECONDS')\n"
+                "else:\n"
+                "    print(f'- {os.getcwd()} ✓')\n"
+                "    print('The entrypoint is pbi:1.')\n"
+                "    print('AI SDK Warning: System messages are risky.', file=sys.stderr)\n"
             )
             fake_chat.chmod(0o755)
-            result = self.run_pbi("where", "is", "the", "entrypoint", "--json", env=env)
-            recorded = json.loads(trace.read_text())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "compact answer\n")
-        self.assertEqual(
-            recorded["argv"],
-            [
-                "--force-provider",
-                "openai",
-                "--model-name",
-                PRIMARY,
-                "--message",
-                "where is the entrypoint",
+            result = self.run_pbi(
+                "where",
+                "is",
+                "the",
+                "entrypoint",
                 "--json",
+                env=env,
+                cwd=directory,
+                binary=self.fake_pbi(directory, probe),
+            )
+            recorded = [json.loads(line) for line in trace.read_text().splitlines()]
+            probe_trace = directory / "probe-trace.json"
+            self.assertTrue(probe_trace.exists(), "positional questions must retrieve code first")
+            probe_calls = [json.loads(line) for line in probe_trace.read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "The entrypoint is pbi:1.\n")
+        self.assertEqual(
+            [call[-1] for call in probe_calls],
+            [
+                "where is the entrypoint",
+                "entrypoint CLI parsing",
+                "command dispatch match",
+                "clap Subcommand derive",
+                "persistence write callers",
+                "result return formatting",
+                "readonly PBI_VERSION",
+                "compact_search_locations",
+                "DEFAULT_SEARCH_TIMEOUT_SECONDS",
             ],
         )
+        self.assertTrue(all(call[1:7] == ["--timeout", "540", "--max-results", "4", "--max-tokens", "4000"] for call in probe_calls))
+        self.assertEqual(len(recorded), 6)
+        planner, gap_planner, second_gap_planner, draft, reviewer, citation_auditor = recorded
+        self.assertIn("Convert the code question", planner["argv"][5])
+        self.assertNotIn("Repository files:\n", planner["argv"][5])
+        self.assertEqual(planner["argv"][6:8], ["--max-iterations", "1"])
+        self.assertIn("Identify missing evidence", gap_planner["argv"][5])
+        self.assertNotIn("Repository files:\n", gap_planner["argv"][5])
+        self.assertIn("query=entrypoint CLI parsing", gap_planner["argv"][5])
+        self.assertIn("Identify missing evidence", second_gap_planner["argv"][5])
+        self.assertIn("query=readonly PBI_VERSION", second_gap_planner["argv"][5])
+        self.assertEqual(draft["argv"][:5], ["--force-provider", "openai", "--model-name", PRIMARY, "--message"])
+        self.assertIn("Question: where is the entrypoint", draft["argv"][5])
+        self.assertIn("Code excerpts:\nFile:", draft["argv"][5])
+        self.assertIn("query=DEFAULT_SEARCH_TIMEOUT_SECONDS", draft["argv"][5])
+        self.assertIn("Exact literal matches for readonly PBI_VERSION", draft["argv"][5])
+        self.assertIn("Repository entrypoint landmarks", draft["argv"][5])
+        self.assertIn("main.rs:2", draft["argv"][5])
+        self.assertEqual(draft["argv"][6:8], ["--max-iterations", "1"])
+        self.assertIn("--prompt", draft["argv"])
+        answer_prompt = draft["argv"][draft["argv"].index("--prompt") + 1]
+        self.assertIn("3 to 8 single-line Markdown bullets", answer_prompt)
+        self.assertIn("The first character of the answer must be -", answer_prompt)
+        self.assertIn("No title, preamble, conclusion, or repeated reference list", answer_prompt)
+        self.assertIn("final - Uncertain: bullet", answer_prompt)
+        self.assertIn("Review and compress the draft answer", reviewer["argv"][5])
+        self.assertIn("Draft answer:\nThe entrypoint is pbi:1.", reviewer["argv"][5])
+        self.assertIn("Evidence:\nFile:", reviewer["argv"][5])
+        review_prompt = reviewer["argv"][reviewer["argv"].index("--prompt") + 1]
+        self.assertIn("never more than 8 lines total", review_prompt)
+        self.assertIn("Discard tangential examples", review_prompt)
+        self.assertEqual(reviewer["argv"][-1], "--json")
+        self.assertIn("Audit every source citation", citation_auditor["argv"][5])
+        self.assertIn("Answer to audit:\nThe entrypoint is pbi:1.", citation_auditor["argv"][5])
+        self.assertIn("Source evidence:\nFile:", citation_auditor["argv"][5])
+        self.assertEqual(citation_auditor["argv"][-1], "--json")
+
+    def test_term_resistant_initial_planner_times_out_to_direct_bm25(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
+                "    json.dump(sys.argv[1:], f)\n"
+                "print(f'File: {os.getcwd()}/pbi, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, signal, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
+                "    json.dump({'argv': sys.argv[1:]}, f)\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
+                "else:\n"
+                "    raise SystemExit(2)\n"
+            )
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
+            )
+            elapsed = time.monotonic() - started
+            planner = json.loads(trace.read_text())
+            probe_argv = json.loads((directory / "probe-trace.json").read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 3)
+        self.assertEqual(result.stdout, "pbi:1\n")
+        self.assertNotIn("Repository files:", planner["argv"][5])
+        self.assertEqual(probe_argv[-1], "where is the entrypoint")
+
+    def test_term_resistant_refinement_planner_times_out_to_direct_bm25(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "print(f'File: {os.getcwd()}/pbi, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, signal, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    print(json.dumps(message), file=f)\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('initial query')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
+                "else:\n"
+                "    raise SystemExit(2)\n"
+            )
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
+            )
+            elapsed = time.monotonic() - started
+            planner_messages = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 3)
+        self.assertTrue(result.stdout.splitlines())
+        self.assertTrue(all(location == "pbi:1" for location in result.stdout.splitlines()), result.stdout)
+        self.assertEqual(len(planner_messages), 2)
+        self.assertTrue(planner_messages[0].startswith("Convert the code question"))
+        self.assertTrue(planner_messages[1].startswith("Identify missing evidence"))
+
+    def test_query_planning_reports_system_message_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'AI SDK Warning: System messages are risky.'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("where is the entrypoint", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("system-message field", result.stderr)
+        self.assertIn("OpenAI-compatible backend", result.stderr)
+
+    def test_query_planning_reports_nonzero_system_message_rejection_without_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'AI SDK Warning: System messages are risky.'\n"
+                "printf '%s\\n' 'PROMPT_SENTINEL SECRET_SENTINEL' >&2\n"
+                "exit 7\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("where is the entrypoint", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("system-message field", result.stderr)
+        self.assertIn("OpenAI-compatible backend", result.stderr)
+        self.assertNotIn("PROMPT_SENTINEL", result.stdout + result.stderr)
+        self.assertNotIn("SECRET_SENTINEL", result.stdout + result.stderr)
 
     def test_routes_primary_retries_then_fallback_and_forwards_args(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -238,6 +441,12 @@ class PbiTest(unittest.TestCase):
             ],
         )
         self.assertNotIn("ms-marco-minilm-l6", probe_recorded["argv"])
+        self.assertEqual(
+            chat_recorded["argv"][:5],
+            ["--force-provider", "openai", "--model-name", PRIMARY, "--message"],
+        )
+        self.assertEqual(chat_recorded["argv"][6:8], ["--max-iterations", "1"])
+        self.assertEqual(chat_recorded["argv"][8], "--prompt")
         self.assertEqual(chat_recorded["env"]["FORCE_PROVIDER"], "openai")
         self.assertEqual(chat_recorded["env"]["MODEL_NAME"], PRIMARY)
         self.assertEqual(chat_recorded["env"]["OPENAI_API_KEY"], "test-key")
@@ -274,6 +483,10 @@ class PbiTest(unittest.TestCase):
                 "--message",
                 "Use Probe BM25 candidates to find SessionDB. Return only the best matching "
                 "path:symbol or path:line locations; no narration.\n\n",
+                "--max-iterations",
+                "1",
+                "--prompt",
+                "Select locations only from the supplied candidates. Do not call tools.",
             ],
         )
 
