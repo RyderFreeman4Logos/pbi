@@ -192,12 +192,10 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(len(recorded), 6)
         planner, gap_planner, second_gap_planner, draft, reviewer, citation_auditor = recorded
         self.assertIn("Convert the code question", planner["argv"][5])
-        self.assertIn("Repository files:\n", planner["argv"][5])
-        self.assertIn("\npbi", planner["argv"][5])
+        self.assertNotIn("Repository files:\n", planner["argv"][5])
         self.assertEqual(planner["argv"][6:8], ["--max-iterations", "1"])
         self.assertIn("Identify missing evidence", gap_planner["argv"][5])
-        self.assertIn("Repository files:\n", gap_planner["argv"][5])
-        self.assertIn("\npbi", gap_planner["argv"][5])
+        self.assertNotIn("Repository files:\n", gap_planner["argv"][5])
         self.assertIn("query=entrypoint CLI parsing", gap_planner["argv"][5])
         self.assertIn("Identify missing evidence", second_gap_planner["argv"][5])
         self.assertIn("query=readonly PBI_VERSION", second_gap_planner["argv"][5])
@@ -226,6 +224,59 @@ class PbiTest(unittest.TestCase):
         self.assertIn("Answer to audit:\nThe entrypoint is pbi:1.", citation_auditor["argv"][5])
         self.assertIn("Source evidence:\nFile:", citation_auditor["argv"][5])
         self.assertEqual(citation_auditor["argv"][-1], "--json")
+
+    def test_query_planning_omits_inventory_and_times_out_to_direct_bm25(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
+                "    json.dump(sys.argv[1:], f)\n"
+                "print(f'File: {os.getcwd()}/pbi, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'w') as f:\n"
+                "    json.dump({'argv': sys.argv[1:]}, f)\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    time.sleep(2)\n"
+                "    print('delayed query')\n"
+                "else:\n"
+                "    raise SystemExit(2)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe)
+            )
+            planner = json.loads(trace.read_text())
+            probe_argv = json.loads((directory / "probe-trace.json").read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi:1\n")
+        self.assertNotIn("Repository files:", planner["argv"][5])
+        self.assertEqual(probe_argv[-1], "where is the entrypoint")
+
+    def test_query_planning_reports_system_message_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'AI SDK Warning: System messages are risky.'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("where is the entrypoint", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("system-message field", result.stderr)
+        self.assertIn("OpenAI-compatible backend", result.stderr)
 
     def test_routes_primary_retries_then_fallback_and_forwards_args(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -10,6 +10,7 @@ readonly DEFAULT_REQUEST_TIMEOUT_MS="1700000"
 readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
 readonly DEFAULT_SEARCH_MAX_RESULTS="8"
+readonly DEFAULT_PLANNER_TIMEOUT_SECONDS="${PBI_PLANNER_TIMEOUT_SECONDS:-45}"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
@@ -46,6 +47,10 @@ process.stdin.on("end", () => {
     return 0
   fi
   grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$output"
+}
+
+probe_system_message_warning() {
+  grep -Eiq '^AI SDK Warning: System messages' <<<"$1"
 }
 
 compact_search_locations() {
@@ -269,25 +274,27 @@ else
   fi
   question="${message_parts[*]}"
   configure_local_routing
-  repository_context=""
-  if [[ -n "$rg_command" ]]; then
-    repository_files="$("$rg_command" --files "${rg_ignores[@]}" 2>/dev/null | sed -n '1,2000p' || true)"
-    if [[ -n "$repository_files" ]]; then
-      repository_context=$'\n\nRepository files:\n'"$repository_files"
-    fi
-  fi
-  if ! planned_query="$("$agent_command" --force-provider openai --model-name "$primary_model" \
-      --message "Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Use the repository file inventory to ground likely names. Return exactly five plain lines, with no bullets, quotes, or explanation: $question$repository_context" \
+  planner_timed_out=false
+  if planned_query="$(timeout "$DEFAULT_PLANNER_TIMEOUT_SECONDS" "$agent_command" --force-provider openai --model-name "$primary_model" \
+      --message "Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: $question" \
       --max-iterations 1 --prompt "Return exactly five concise code-search query lines. Do not call tools." 2>&1)"; then
+    generated_queries="$(printf '%s\n' "$planned_query" | grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' | sed -n '/./p' | head -n 5 || true)"
+    if [[ -z "$generated_queries" ]] || probe_reported_error "$generated_queries"; then
+      if probe_system_message_warning "$planned_query"; then
+        printf '%s\n' 'pbi: query planning rejected the system-message field at the probe-chat OpenAI-compatible backend' >&2
+      else
+        printf '%s\n' 'pbi: local query planning failed' >&2
+      fi
+      exit 1
+    fi
+    planned_queries="$question"$'\n'"$generated_queries"
+  elif [[ $? -eq 124 ]]; then
+    planner_timed_out=true
+    planned_queries="$question"
+  else
     printf '%s\n' "$planned_query"
     exit 1
   fi
-  generated_queries="$(printf '%s\n' "$planned_query" | grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' | sed -n '/./p' | head -n 5 || true)"
-  if [[ -z "$generated_queries" ]] || probe_reported_error "$generated_queries"; then
-    printf '%s\n' 'pbi: local query planning failed' >&2
-    exit 1
-  fi
-  planned_queries="$question"$'\n'"$generated_queries"
   candidates=""
   while IFS= read -r planned_query; do
     if ! candidate_batch="$("$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
@@ -301,6 +308,14 @@ else
       candidates+="$candidate_batch"
     fi
   done <<<"$planned_queries"
+  if [[ "$planner_timed_out" == true ]]; then
+    if [[ -z "$(compact_search_locations "$candidates")" ]]; then
+      printf '%s\n' 'pbi: code exploration found no candidates' >&2
+      exit 1
+    fi
+    compact_search_locations "$candidates"
+    exit 0
+  fi
   if [[ -n "$rg_command" ]]; then
     repository_landmarks="$("$rg_command" -n -m 4 -C 4 "${rg_ignores[@]}" \
       -e '(^|[[:space:]])(async[[:space:]]+)?fn[[:space:]]+main[[:space:]]*\(' \
@@ -323,7 +338,7 @@ else
   attempted_queries="$planned_queries"
   for gap_round in 1 2; do
     if ! gap_query_output="$("$agent_command" --force-provider openai --model-name "$primary_model" \
-        --message "Identify missing evidence needed to answer the question completely from source. This is refinement round $gap_round of 2. Return up to five new exact identifiers or short literal source phrases, one plain line each, targeting missing callers, callees, transformations, persistence, or result paths. Prefer distinctive symbols such as fn main, Cli::parse, or insert_record over generic words. Use the repository file inventory to ground likely names. Do not repeat an attempted query. Return NONE only when the excerpts directly establish the complete answer."$'\n\n'"Question: $question$repository_context"$'\n\nSearches already tried:\n'"$attempted_queries"$'\n\nExisting excerpts:\n'"$candidates" \
+        --message "Identify missing evidence needed to answer the question completely from source. This is refinement round $gap_round of 2. Return up to five new exact identifiers or short literal source phrases, one plain line each, targeting missing callers, callees, transformations, persistence, or result paths. Prefer distinctive symbols such as fn main, Cli::parse, or insert_record over generic words. Do not repeat an attempted query. Return NONE only when the excerpts directly establish the complete answer."$'\n\n'"Question: $question"$'\n\nSearches already tried:\n'"$attempted_queries"$'\n\nExisting excerpts:\n'"$candidates" \
         --max-iterations 1 --prompt "Find evidence gaps and return only exact identifiers, literal source phrases, or NONE. Do not call tools." 2>&1)"; then
       break
     fi
