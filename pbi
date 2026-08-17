@@ -520,4 +520,8 @@ if [[ "$search_uses_local_model" == true ]]; then
     exit 1
   fi
 fi
+if [[ -z "${output//[[:space:]]/}" ]]; then
+  printf '%s\n' 'pbi: no source locations found' >&2
+  exit 1
+fi
 printf '%s\n' "$output"

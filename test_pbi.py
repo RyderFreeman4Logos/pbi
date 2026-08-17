@@ -363,6 +363,40 @@ class PbiTest(unittest.TestCase):
             ["process-primary", "process-fallback"],
         )
 
+    def test_default_query_fails_closed_when_answer_has_no_usable_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                f"printf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+                "printf '%s\\n' 'SEARCH_SENTINEL' >&2\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('entrypoint query')\n"
+                "    print('PLANNER_SENTINEL', file=sys.stderr)\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('AI SDK Warning: System messages are risky.')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe)
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("pbi: no source locations found", result.stderr)
+        self.assertNotIn("SEARCH_SENTINEL", result.stdout + result.stderr)
+        self.assertNotIn("PLANNER_SENTINEL", result.stdout + result.stderr)
+
     def test_query_planning_system_message_warning_keeps_local_model_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
