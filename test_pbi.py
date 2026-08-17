@@ -397,6 +397,27 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("SEARCH_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("PLANNER_SENTINEL", result.stdout + result.stderr)
 
+    def test_no_colon_warning_only_stdout_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-10'\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'AI SDK Warning System messages are not supported'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is anything", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe)
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("pbi: no source locations found", result.stderr)
+        self.assertNotIn("AI SDK Warning", result.stdout)
+
     def test_query_planning_system_message_warning_keeps_local_model_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
