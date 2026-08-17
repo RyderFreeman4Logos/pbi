@@ -50,11 +50,11 @@ process.stdin.on("end", () => {
 }
 
 probe_system_message_warning() {
-  grep -Eiq '^AI SDK Warning: System messages' <<<"$1"
+  grep -Eiq '^AI SDK Warning:?[[:space:]]+System messages' <<<"$1"
 }
 
 strip_probe_chrome() {
-  grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' <<<"$1" || true
+  grep -Ev '^AI SDK Warning:?[[:space:]]+System messages|^- .+ ✓$' <<<"$1" || true
 }
 
 planner_timeout_or_kill() {
@@ -346,8 +346,8 @@ else
   elif ((planner_status == 0)) || [[ -n "$generated_queries" ]]; then
     if [[ -z "$generated_queries" ]] || probe_reported_error "$generated_queries"; then
       if [[ "$planner_had_system_message_warning" == true && -z "$generated_queries" ]]; then
-        planner_timed_out=true
-        planned_queries="$question"
+        printf '%s\n' 'pbi: no source locations found' >&2
+        exit 1
       else
         printf '%s\n' 'pbi: local query planning failed' >&2
         exit 1
@@ -472,9 +472,7 @@ if ((status != 0)); then
   fi
   exit "$status"
 fi
-if [[ "$explore_uses_local_model" == true ]]; then
-  output="$(printf '%s\n' "$output" | grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' || true)"
-fi
+output="$(strip_probe_chrome "$output")"
 if probe_reported_error "$output"; then
   printf '%s\n' 'pbi: probe-chat reported an API error' >&2
   exit 1
@@ -493,7 +491,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     "${final_format_args[@]}"
   )
   if reviewed_output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}" 2>&1)"; then
-    reviewed_output="$(printf '%s\n' "$reviewed_output" | grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' || true)"
+    reviewed_output="$(strip_probe_chrome "$reviewed_output")"
     if [[ -n "$reviewed_output" ]] && ! probe_reported_error "$reviewed_output"; then
       output="$reviewed_output"
     fi
@@ -504,7 +502,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     "${final_format_args[@]}"
   )
   if audited_output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}" 2>&1)"; then
-    audited_output="$(printf '%s\n' "$audited_output" | grep -Ev '^AI SDK Warning: System messages|^- .+ ✓$' || true)"
+    audited_output="$(strip_probe_chrome "$audited_output")"
     if [[ -n "$audited_output" ]] && ! probe_reported_error "$audited_output"; then
       output="$audited_output"
     fi
@@ -519,5 +517,9 @@ if [[ "$search_uses_local_model" == true ]]; then
     printf '%s\n' 'pbi: local search returned no compact locations' >&2
     exit 1
   fi
+fi
+if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ]]; then
+  printf '%s\n' 'pbi: no source locations found' >&2
+  exit 1
 fi
 printf '%s\n' "$output"
