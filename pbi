@@ -11,6 +11,7 @@ readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
 readonly DEFAULT_SEARCH_MAX_RESULTS="8"
 readonly DEFAULT_PLANNER_TIMEOUT_SECONDS="45"
+readonly DEFAULT_CHAT_TIMEOUT_SECONDS="30"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
@@ -136,6 +137,11 @@ fi
 planner_timeout_seconds="${PBI_PLANNER_TIMEOUT_SECONDS:-$DEFAULT_PLANNER_TIMEOUT_SECONDS}"
 if ! [[ "$planner_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
   planner_timeout_seconds="$DEFAULT_PLANNER_TIMEOUT_SECONDS"
+fi
+
+chat_timeout_seconds="${PBI_CHAT_TIMEOUT_SECONDS:-$DEFAULT_CHAT_TIMEOUT_SECONDS}"
+if ! [[ "$chat_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  chat_timeout_seconds="$DEFAULT_CHAT_TIMEOUT_SECONDS"
 fi
 
 base_url="${CLIPROXY_BASE_URL:-${LOCAL_ROUTER_BASEURL:-$DEFAULT_BASE_URL}}"
@@ -454,18 +460,20 @@ fi
 configure_local_routing
 
 if [[ "$search_uses_local_model" == true || "$explore_uses_local_model" == true ]]; then
-  if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>&1)"; then
+  if output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>&1)"; then
     status=0
   else
     status=$?
   fi
-elif output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
+elif output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
   status=0
 else
   status=$?
 fi
 if ((status != 0)); then
-  if probe_reported_error "$output"; then
+  if planner_timeout_or_kill "$status"; then
+    printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
+  elif probe_reported_error "$output"; then
     printf '%s\n' 'pbi: probe-chat reported an API error' >&2
   else
     printf '%s\n' 'pbi: probe-chat failed' >&2
@@ -490,7 +498,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  if reviewed_output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}" 2>&1)"; then
+  if reviewed_output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}" 2>&1)"; then
     reviewed_output="$(strip_probe_chrome "$reviewed_output")"
     if [[ -n "$reviewed_output" ]] && ! probe_reported_error "$reviewed_output"; then
       output="$reviewed_output"
@@ -501,7 +509,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  if audited_output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}" 2>&1)"; then
+  if audited_output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}" 2>&1)"; then
     audited_output="$(strip_probe_chrome "$audited_output")"
     if [[ -n "$audited_output" ]] && ! probe_reported_error "$audited_output"; then
       output="$audited_output"

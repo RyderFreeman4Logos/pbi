@@ -780,6 +780,22 @@ class PbiTest(unittest.TestCase):
         self.assertIn("probe-chat reported an API error", result.stderr)
         self.assertNotIn("invalid_request", result.stdout + result.stderr)
 
+    def test_chat_hang_fails_closed_in_bounded_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.time()
+            result = self.run_pbi("--message", "hello", env=env, timeout=20)
+            elapsed = time.time() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 10, "hung probe-chat must be killed, not hang pbi")
+        self.assertIn("timed out answering the question", result.stderr)
+
     def test_debug_config_is_redacted_and_does_not_launch_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env, trace = self.fake_environment(Path(temporary))
