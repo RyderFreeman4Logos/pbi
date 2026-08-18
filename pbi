@@ -492,6 +492,10 @@ else
   status=$?
 fi
 if ((status != 0)); then
+  if ((status == 126)); then
+    printf '%s\n' 'pbi: probe-chat found on PATH but failed to launch (exit 126: not executable or bad interpreter)' >&2
+    exit "$status"
+  fi
   if planner_timeout_or_kill "$status"; then
     printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
   elif probe_reported_error "$output"; then
