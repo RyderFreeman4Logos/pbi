@@ -710,6 +710,28 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "pbi:5\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_stamp_only_model_answer_fails_closed(self) -> None:
+        # #12 r2: a search whose compacted stdout is only bare `path:1` stamps
+        # (the model echoing the BM25 candidate set) must not report success.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'agent/conversation_compression.py:1' 'router/dispatch.rs:1'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "HERMES_TUI_RPC_TIMEOUT_MS",
+                env=env,
+                binary=self.fake_pbi(directory, directory / "probe"),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("location stamps", result.stderr)
+
     def test_search_falls_back_to_absolute_retrieved_location_from_symlinked_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -719,7 +741,7 @@ class PbiTest(unittest.TestCase):
             env["PWD"] = str(cwd)
             probe = directory / "probe"
             probe.write_text(
-                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-292'\n"
+                f"#!/usr/bin/env bash\nprintf '%s\\n' '{PBI}:37'\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -733,7 +755,7 @@ class PbiTest(unittest.TestCase):
                 "search", "PBI_VERSION", env=env, cwd=cwd, binary=self.fake_pbi(directory, probe)
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "pbi:1\n")
+        self.assertEqual(result.stdout, "pbi:37\n")
         self.assertEqual(result.stderr, "")
 
     def test_search_injects_a_long_default_timeout(self) -> None:

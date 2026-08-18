@@ -534,7 +534,7 @@ if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")"
   printf '%s\n' 'pbi: no source locations found' >&2
   exit 1
 fi
-if [[ "$search_uses_local_model" != true ]] && is_stamp_dump "$output"; then
+if is_stamp_dump "$output"; then
   printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
   exit 1
 fi
