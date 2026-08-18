@@ -398,6 +398,79 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("SEARCH_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("PLANNER_SENTINEL", result.stdout + result.stderr)
 
+    def test_question_stamp_only_model_answer_fails_closed(self) -> None:
+        # #12: a local-model "answer" that is only raw BM25 `path:1` stamps
+        # (the model mirroring the candidate echo) must not count as success.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            (directory / "probe").write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+            )
+            (directory / "probe").chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('entrypoint CLI parsing')\n"
+                "    print('command dispatch match')\n"
+                "    print('clap Subcommand derive')\n"
+                "    print('persistence write callers')\n"
+                "    print('result return formatting')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    for i in range(23):\n"
+                "        print(f'agent/conversation_compression.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where",
+                "is",
+                "the",
+                "entrypoint",
+                env=env,
+                cwd=ROOT,
+                binary=self.fake_pbi(directory, directory / "probe"),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("location stamps", result.stderr)
+
+    def test_question_stamp_per_line_narrative_answer_still_succeeds(self) -> None:
+        # #12: a real compact answer (narrative + citation) still prints, even
+        # when it includes a `path:1`-style citation line.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            (directory / "probe").write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+            )
+            (directory / "probe").chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('entrypoint CLI parsing')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('The entrypoint is pbi:9.')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is the entrypoint",
+                env=env,
+                cwd=ROOT,
+                binary=self.fake_pbi(directory, directory / "probe"),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "The entrypoint is pbi:9.\n")
+
     def test_no_colon_warning_only_stdout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -638,6 +711,28 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "pbi:5\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_stamp_only_model_answer_fails_closed(self) -> None:
+        # #12 r2: a search whose compacted stdout is only bare `path:1` stamps
+        # (the model echoing the BM25 candidate set) must not report success.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'agent/conversation_compression.py:1' 'router/dispatch.rs:1'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "HERMES_TUI_RPC_TIMEOUT_MS",
+                env=env,
+                binary=self.fake_pbi(directory, directory / "probe"),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("location stamps", result.stderr)
+
     def test_search_falls_back_to_absolute_retrieved_location_from_symlinked_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -647,7 +742,7 @@ class PbiTest(unittest.TestCase):
             env["PWD"] = str(cwd)
             probe = directory / "probe"
             probe.write_text(
-                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-292'\n"
+                f"#!/usr/bin/env bash\nprintf '%s\\n' '{PBI}:37'\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -661,7 +756,7 @@ class PbiTest(unittest.TestCase):
                 "search", "PBI_VERSION", env=env, cwd=cwd, binary=self.fake_pbi(directory, probe)
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "pbi:1\n")
+        self.assertEqual(result.stdout, "pbi:37\n")
         self.assertEqual(result.stderr, "")
 
     def test_search_injects_a_long_default_timeout(self) -> None:
@@ -780,6 +875,22 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("probe-chat reported an API error", result.stderr)
         self.assertNotIn("invalid_request", result.stdout + result.stderr)
+
+    def test_chat_hang_fails_closed_in_bounded_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.time()
+            result = self.run_pbi("--message", "hello", env=env, timeout=20)
+            elapsed = time.time() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 10, "hung probe-chat must be killed, not hang pbi")
+        self.assertIn("timed out answering the question", result.stderr)
 
     def test_debug_config_is_redacted_and_does_not_launch_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

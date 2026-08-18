@@ -11,6 +11,7 @@ readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
 readonly DEFAULT_SEARCH_MAX_RESULTS="8"
 readonly DEFAULT_PLANNER_TIMEOUT_SECONDS="45"
+readonly DEFAULT_CHAT_TIMEOUT_SECONDS="30"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
@@ -61,27 +62,44 @@ planner_timeout_or_kill() {
   [[ "$1" == 124 || "$1" == 137 ]]
 }
 
+is_stamp_dump() {
+  # True when every non-empty line is a bare relative `path:1` stamp — the BM25
+  # `File: ...Lines:` echo the model mirrors back instead of writing an answer.
+  # Absolute paths (/*) are not treated as stamps here.
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[[:alnum:]_./-]+:1$ ]] || return 1
+  done <<<"$1"
+  return 0
+}
+
 compact_search_locations() {
-  local line file location suffix
+  local line file location suffix relative
   while IFS= read -r line; do
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
       file="${file%%, Lines:*}"
-      file="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
-      if [[ "$file" != /* && "$file" != ../* && -f "$file" ]]; then
-        printf '%s:1\n' "$file"
+      if [[ -f "$file" ]]; then
+        relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+        if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
+          printf '%s:1\n' "$relative"
+        else
+          printf '%s:1\n' "$(basename -- "$file")"
+        fi
       fi
     elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
       location="${BASH_REMATCH[1]}"
       if [[ "$location" == /* ]]; then
-        file="$(realpath --relative-to="$PWD" -- "${location%:*}" 2>/dev/null || true)"
         suffix="${location##*:}"
-        if [[ "$file" != /* && "$file" != ../* && -f "$file" ]]; then
-          printf '%s:%s\n' "$file" "$suffix"
-        elif [[ -f "$file" ]]; then
-          # ponytail: file exists but is outside $PWD (e.g. search root differs from
-          # the invocation cwd); emit basename so the compact location still prints.
-          printf '%s:%s\n' "${file##*/}" "$suffix"
+        file="${location%:*}"
+        if [[ -f "$file" ]]; then
+          relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+          if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
+            printf '%s:%s\n' "$relative" "$suffix"
+          else
+            printf '%s:%s\n' "$(basename -- "$file")" "$suffix"
+          fi
         fi
       else
         printf '%s\n' "$location"
@@ -140,6 +158,11 @@ fi
 planner_timeout_seconds="${PBI_PLANNER_TIMEOUT_SECONDS:-$DEFAULT_PLANNER_TIMEOUT_SECONDS}"
 if ! [[ "$planner_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
   planner_timeout_seconds="$DEFAULT_PLANNER_TIMEOUT_SECONDS"
+fi
+
+chat_timeout_seconds="${PBI_CHAT_TIMEOUT_SECONDS:-$DEFAULT_CHAT_TIMEOUT_SECONDS}"
+if ! [[ "$chat_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  chat_timeout_seconds="$DEFAULT_CHAT_TIMEOUT_SECONDS"
 fi
 
 base_url="${CLIPROXY_BASE_URL:-${LOCAL_ROUTER_BASEURL:-$DEFAULT_BASE_URL}}"
@@ -458,12 +481,12 @@ fi
 configure_local_routing
 
 if [[ "$search_uses_local_model" == true || "$explore_uses_local_model" == true ]]; then
-  if output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>&1)"; then
+  if output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>&1)"; then
     status=0
   else
     status=$?
   fi
-elif output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
+elif output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
   status=0
 else
   status=$?
@@ -473,7 +496,9 @@ if ((status != 0)); then
     printf '%s\n' 'pbi: probe-chat found on PATH but failed to launch (exit 126: not executable or bad interpreter)' >&2
     exit "$status"
   fi
-  if probe_reported_error "$output"; then
+  if planner_timeout_or_kill "$status"; then
+    printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
+  elif probe_reported_error "$output"; then
     printf '%s\n' 'pbi: probe-chat reported an API error' >&2
   else
     printf '%s\n' 'pbi: probe-chat failed' >&2
@@ -498,7 +523,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  if reviewed_output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}" 2>&1)"; then
+  if reviewed_output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}" 2>&1)"; then
     reviewed_output="$(strip_probe_chrome "$reviewed_output")"
     if [[ -n "$reviewed_output" ]] && ! probe_reported_error "$reviewed_output"; then
       output="$reviewed_output"
@@ -509,7 +534,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  if audited_output="$("$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}" 2>&1)"; then
+  if audited_output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}" 2>&1)"; then
     audited_output="$(strip_probe_chrome "$audited_output")"
     if [[ -n "$audited_output" ]] && ! probe_reported_error "$audited_output"; then
       output="$audited_output"
@@ -528,6 +553,10 @@ if [[ "$search_uses_local_model" == true ]]; then
 fi
 if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ]]; then
   printf '%s\n' 'pbi: no source locations found' >&2
+  exit 1
+fi
+if is_stamp_dump "$output"; then
+  printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
   exit 1
 fi
 printf '%s\n' "$output"
