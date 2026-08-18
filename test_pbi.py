@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -794,6 +795,28 @@ class PbiTest(unittest.TestCase):
         self.assertIn("search_default=local_model", result.stdout)
         self.assertIn("search_bm25_opt_in=--bm25", result.stdout)
         self.assertIn("api_key=[REDACTED]", result.stdout)
+
+
+    def test_fails_closed_with_diagnostic_when_probe_chat_cannot_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            # Non-executable probe-chat on PATH: execve fails, bash returns exit 126.
+            (directory / "probe-chat").write_text(
+                "#! /usr/bin/env bash\necho should-not-run\n"
+            )
+            (directory / "probe-chat").chmod(0o644)
+            # Drop PATH entries that carry a real executable probe-chat so the non-exec
+            # fake is what command -v resolves; keep node (pbi config) and core utils.
+            node_bin = os.path.dirname(shutil.which("node") or "/usr/bin/node")
+            env["PATH"] = f"{directory}:{node_bin}:/usr/bin:/bin"
+            result = self.run_pbi("--message", "hello", env=env, cwd=ROOT)
+        self.assertEqual(result.returncode, 126, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("failed to launch", result.stderr)
+        self.assertIn("126", result.stderr)
+        self.assertNotIn("probe-chat reported an API error", result.stderr)
+        self.assertNotIn("probe-chat failed", result.stderr)
 
 
 if __name__ == "__main__":

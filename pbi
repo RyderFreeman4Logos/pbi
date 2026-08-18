@@ -465,6 +465,10 @@ else
   status=$?
 fi
 if ((status != 0)); then
+  if ((status == 126)); then
+    printf '%s\n' 'pbi: probe-chat found on PATH but failed to launch (exit 126: not executable or bad interpreter)' >&2
+    exit "$status"
+  fi
   if probe_reported_error "$output"; then
     printf '%s\n' 'pbi: probe-chat reported an API error' >&2
   else
