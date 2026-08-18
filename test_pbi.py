@@ -772,6 +772,63 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("location stamps", result.stderr)
 
+    def test_search_stamp_only_echo_recovers_real_location_from_candidates(self) -> None:
+        # #17: when a search answers with only BM25-style `path:1` stamps (the
+        # model echoing the candidate set) and the query names a real in-tree
+        # symbol, pbi must recover a real location from the BM25/candidate set
+        # already in hand instead of reporting the stamp echo as the answer —
+        # and must not print the stamp sentence on stdout as a success.
+        symbol = "readonly_stats_with_diagnostic_busy_timeout"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+
+            # Model echoes only a bare stamp; the BM25 candidate set (probe
+            # dry-run) already points at the file that holds the symbol.
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                f"print(f'File: {repo}/real.py, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'real.py:1'\n")
+            fake_chat.chmod(0o755)
+            right = self.run_pbi(
+                "search",
+                f"Locate {symbol}", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+
+            # Same repo, but the BM25 candidate set points at a file that exists
+            # yet lacks the named symbol -> recovered location must fail closed (#8).
+            env2, _ = self.fake_environment(directory)
+            (repo / "other.py").write_text("def unrelated():\n    return 0\n")
+            probe2 = directory / "probe"
+            probe2.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(f'File: {repo}/other.py, Lines: 1-4')\n"
+            )
+            probe2.chmod(0o755)
+            fake_chat2 = directory / "probe-chat"
+            fake_chat2.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'other.py:1'\n")
+            fake_chat2.chmod(0o755)
+            wrong = self.run_pbi(
+                "search",
+                f"Locate {symbol}", env=env2, cwd=repo,
+                binary=self.fake_pbi(directory, probe2),
+            )
+        self.assertEqual(right.returncode, 0, right.stderr)
+        self.assertEqual(right.stdout, "real.py:1\n")
+        self.assertNotIn("location stamps", right.stdout)
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertEqual(wrong.stdout, "")
+        self.assertIn("contains the queried symbol", wrong.stderr)
+
     def test_search_falls_back_to_absolute_retrieved_location_from_symlinked_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

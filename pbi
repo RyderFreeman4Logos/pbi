@@ -568,8 +568,21 @@ if [[ "$explore_uses_local_model" == true ]]; then
 fi
 if [[ "$search_uses_local_model" == true ]]; then
   output="$(compact_search_locations "$output")"
-  if [[ -z "$output" ]]; then
+  recovered_from_candidates=false
+  if is_stamp_dump "$output"; then
+    # #17: a local-model answer that only echoes the BM25 candidate set
+    # (bare `path:1` stamps) is not a real localization. Recover a real
+    # location from the compacted candidate set already in hand instead of
+    # reporting the stamp echo as success; fail closed if none is available.
+    if [[ -z "$search_fallback_locations" ]]; then
+      printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+      exit 1
+    fi
     output="$search_fallback_locations"
+    recovered_from_candidates=true
+  elif [[ -z "$output" ]]; then
+    output="$search_fallback_locations"
+    recovered_from_candidates=true
   fi
   if [[ -z "$output" ]]; then
     printf '%s\n' 'pbi: local search returned no compact locations' >&2
@@ -580,9 +593,11 @@ if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")"
   printf '%s\n' 'pbi: no source locations found' >&2
   exit 1
 fi
-if is_stamp_dump "$output"; then
-  printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
-  exit 1
+if [[ "${recovered_from_candidates:-false}" != true ]]; then
+  if is_stamp_dump "$output"; then
+    printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+    exit 1
+  fi
 fi
 if [[ "$search_uses_local_model" == true ]]; then
   symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
