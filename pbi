@@ -61,6 +61,18 @@ planner_timeout_or_kill() {
   [[ "$1" == 124 || "$1" == 137 ]]
 }
 
+is_stamp_dump() {
+  # True when every non-empty line is a bare relative `path:1` stamp — the BM25
+  # `File: ...Lines:` echo the model mirrors back instead of writing an answer.
+  # Absolute paths (/*) are not treated as stamps here.
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[[:alnum:]_./-]+:1$ ]] || return 1
+  done <<<"$1"
+  return 0
+}
+
 compact_search_locations() {
   local line file location suffix
   while IFS= read -r line; do
@@ -520,6 +532,10 @@ if [[ "$search_uses_local_model" == true ]]; then
 fi
 if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ]]; then
   printf '%s\n' 'pbi: no source locations found' >&2
+  exit 1
+fi
+if is_stamp_dump "$output"; then
+  printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
   exit 1
 fi
 printf '%s\n' "$output"
