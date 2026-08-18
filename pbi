@@ -108,6 +108,31 @@ compact_search_locations() {
   done <<<"$1"
 }
 
+# Longest identifier token in a query that looks like a code symbol
+# (snake_case / camelCase / UPPER_SNAKE: has an underscore or an uppercase
+# letter). Empty when the query names no distinguishable real symbol.
+search_named_symbol() {
+  printf '%s\n' "$1" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | awk '
+    { if (($0 ~ /_/ || $0 ~ /[A-Z]/) && length($0) > max) { max = length($0); sym = $0 } }
+    END { print sym }'
+}
+
+# True iff any location line in $1 references a file that actually contains
+# the given token (i.e. the returned path is not an unrelated wrong file).
+search_output_contains_symbol() {
+  local output="$1" token="$2" loc file
+  while IFS= read -r loc; do
+    [[ -z "$loc" ]] && continue
+    [[ "$loc" =~ ^(.+):([^:]+)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    if [[ -f "$file" ]] && grep -qF -- "$token" "$file"; then
+      return 0
+    fi
+  done <<<"$output"
+  return 1
+}
+
 case "${1:-}" in
   --help|-h)
     usage
@@ -558,5 +583,12 @@ fi
 if is_stamp_dump "$output"; then
   printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
   exit 1
+fi
+if [[ "$search_uses_local_model" == true ]]; then
+  symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
+  if [[ -n "$symbol" ]] && ! search_output_contains_symbol "$output" "$symbol"; then
+    printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
+    exit 1
+  fi
 fi
 printf '%s\n' "$output"

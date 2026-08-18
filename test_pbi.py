@@ -711,6 +711,45 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "pbi:5\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_named_symbol_does_not_succeed_with_unrelated_file(self) -> None:
+        # #8: a search whose query names a real symbol must not print an
+        # unrelated compact location (wrong file) as success. The completed
+        # location is only printed when its file actually contains the symbol.
+        symbol = "test_first_api_call_reports_cache_hit_to_tui_callback"
+        query = f"Locate {symbol} and callback signature"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+            (repo / "other.py").write_text("def other():\n    return 0\n")
+
+            # Model picks an unrelated file that lacks the named symbol -> fail closed.
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'other.py:5'\n")
+            fake_chat.chmod(0o755)
+            wrong = self.run_pbi(
+                "search", query, env=env,
+                cwd=repo, binary=self.fake_pbi(directory, directory / "probe"),
+            )
+
+            # Same repo, model points at the file that holds the symbol -> succeed.
+            env2, _ = self.fake_environment(directory)
+            fake_chat2 = directory / "probe-chat"
+            fake_chat2.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'real.py:5'\n")
+            fake_chat2.chmod(0o755)
+            right = self.run_pbi(
+                "search", query, env=env2,
+                cwd=repo, binary=self.fake_pbi(directory, directory / "probe"),
+            )
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertEqual(wrong.stdout, "")
+        self.assertIn("contains the queried symbol", wrong.stderr)
+        self.assertEqual(right.returncode, 0, right.stderr)
+        self.assertEqual(right.stdout, "real.py:5\n")
+        self.assertEqual(right.stderr, "")
+
     def test_search_stamp_only_model_answer_fails_closed(self) -> None:
         # #12 r2: a search whose compacted stdout is only bare `path:1` stamps
         # (the model echoing the BM25 candidate set) must not report success.
