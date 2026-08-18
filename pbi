@@ -78,6 +78,10 @@ compact_search_locations() {
         suffix="${location##*:}"
         if [[ "$file" != /* && "$file" != ../* && -f "$file" ]]; then
           printf '%s:%s\n' "$file" "$suffix"
+        elif [[ -f "$file" ]]; then
+          # ponytail: file exists but is outside $PWD (e.g. search root differs from
+          # the invocation cwd); emit basename so the compact location still prints.
+          printf '%s:%s\n' "${file##*/}" "$suffix"
         fi
       else
         printf '%s\n' "$location"
