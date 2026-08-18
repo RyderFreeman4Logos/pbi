@@ -63,22 +63,31 @@ planner_timeout_or_kill() {
 }
 
 compact_search_locations() {
-  local line file location suffix
+  local line file location suffix relative
   while IFS= read -r line; do
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
       file="${file%%, Lines:*}"
-      file="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
-      if [[ "$file" != /* && "$file" != ../* && -f "$file" ]]; then
-        printf '%s:1\n' "$file"
+      if [[ -f "$file" ]]; then
+        relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+        if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
+          printf '%s:1\n' "$relative"
+        else
+          printf '%s:1\n' "$(basename -- "$file")"
+        fi
       fi
     elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
       location="${BASH_REMATCH[1]}"
       if [[ "$location" == /* ]]; then
-        file="$(realpath --relative-to="$PWD" -- "${location%:*}" 2>/dev/null || true)"
         suffix="${location##*:}"
-        if [[ "$file" != /* && "$file" != ../* && -f "$file" ]]; then
-          printf '%s:%s\n' "$file" "$suffix"
+        file="${location%:*}"
+        if [[ -f "$file" ]]; then
+          relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+          if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
+            printf '%s:%s\n' "$relative" "$suffix"
+          else
+            printf '%s:%s\n' "$(basename -- "$file")" "$suffix"
+          fi
         fi
       else
         printf '%s\n' "$location"
