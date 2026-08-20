@@ -359,7 +359,7 @@ load_config_toml() {
   [[ -f "$config_file" && -r "$config_file" ]] || return 0
   if grep -qF '"""' -- "$config_file" || \
       grep -qF "'''" -- "$config_file" || \
-      grep -qE '^[[:space:]]*\[\[' -- "$config_file"; then
+      grep -qE '^[[:space:]]*\[' -- "$config_file"; then
     return 0
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
