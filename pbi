@@ -133,6 +133,12 @@ search_output_contains_symbol() {
   return 1
 }
 
+recover_search_from_candidates() {
+  [[ "$search_uses_local_model" == true && -n "$search_fallback_locations" ]] || return 1
+  output="$search_fallback_locations"
+  recovered_from_candidates=true
+}
+
 case "${1:-}" in
   --help|-h)
     usage
@@ -200,6 +206,7 @@ probe_path="$(resolve_probe)"
 search_uses_local_model=false
 explore_uses_local_model=false
 search_fallback_locations=""
+recovered_from_candidates=false
 planner_stdout=""
 planner_stderr=""
 planner_status=0
@@ -523,17 +530,24 @@ if ((status != 0)); then
   fi
   if planner_timeout_or_kill "$status"; then
     printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
-  elif probe_reported_error "$output"; then
-    printf '%s\n' 'pbi: probe-chat reported an API error' >&2
+    exit "$status"
+  elif probe_reported_error "$output" && recover_search_from_candidates; then
+    :
   else
-    printf '%s\n' 'pbi: probe-chat failed' >&2
+    if probe_reported_error "$output"; then
+      printf '%s\n' 'pbi: probe-chat reported an API error' >&2
+    else
+      printf '%s\n' 'pbi: probe-chat failed' >&2
+    fi
+    exit "$status"
   fi
-  exit "$status"
 fi
 output="$(strip_probe_chrome "$output")"
 if probe_reported_error "$output"; then
-  printf '%s\n' 'pbi: probe-chat reported an API error' >&2
-  exit 1
+  if ! recover_search_from_candidates; then
+    printf '%s\n' 'pbi: probe-chat reported an API error' >&2
+    exit 1
+  fi
 fi
 if [[ "$explore_uses_local_model" == true ]]; then
   final_format_args=()
@@ -568,7 +582,6 @@ if [[ "$explore_uses_local_model" == true ]]; then
 fi
 if [[ "$search_uses_local_model" == true ]]; then
   output="$(compact_search_locations "$output")"
-  recovered_from_candidates=false
   if is_stamp_dump "$output"; then
     # #17: a local-model answer that only echoes the BM25 candidate set
     # (bare `path:1` stamps) is not a real localization. Recover a real
