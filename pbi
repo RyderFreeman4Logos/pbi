@@ -71,17 +71,16 @@ process.stdin.on("end", () => {
     return "";
   };
   const candidates = [input.trim(), ...input.split(/\r?\n/).map(line => line.trim())];
-  let response;
+  const responses = [];
   for (const candidate of candidates) {
     if (!candidate) continue;
     try {
       const parsed = JSON.parse(candidate);
-      if (objectValue(parsed)) {
-        response = parsed;
-        break;
-      }
+      if (objectValue(parsed)) responses.push(parsed);
     } catch {}
   }
+  const isErrorResponse = value => value.error || value.errors || value.status === "error";
+  const response = responses.find(isErrorResponse) || responses[0];
   let status = "";
   let request = "";
   if (response) {
@@ -93,11 +92,13 @@ process.stdin.on("end", () => {
       }
     }
     if (!status) status = fields(response, ["status"]);
-    request = fields(response, ["request_id", "requestId", "id", "session", "session_id"]);
-    if (!request) request = fields(response.error, ["request_id", "requestId", "id", "session", "session_id"]);
-    if (!request && Array.isArray(response.errors)) {
-      for (const error of response.errors) {
-        request = fields(error, ["request_id", "requestId", "id", "session", "session_id"]);
+    for (const value of [response, response.error, ...(Array.isArray(response.errors) ? response.errors : [])]) {
+      request = fields(value, ["request_id", "requestId"]);
+      if (request) break;
+    }
+    if (!request) {
+      for (const value of [response, response.error, ...(Array.isArray(response.errors) ? response.errors : [])]) {
+        request = fields(value, ["id", "session", "session_id"]);
         if (request) break;
       }
     }

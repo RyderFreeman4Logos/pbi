@@ -1066,6 +1066,42 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("sk-secret", result.stderr)
         self.assertNotIn("model not found", result.stderr)
 
+    def test_api_error_diagnostic_prefers_nested_request_id_over_conflicting_root_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"id\":\"response_123\",\"error\":{\"code\":\"invalid_request\",\"request_id\":\"req_real\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=invalid_request", result.stderr)
+        self.assertIn("request=req_real", result.stderr)
+        self.assertNotIn("request=response_123", result.stderr)
+
+    def test_api_error_diagnostic_prefers_error_json_in_mixed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"status\":\"completed\",\"id\":\"resp_123\"}'\n"
+                "printf '%s\\n' '{\"error\":{\"code\":\"invalid_request\",\"requestId\":\"req_real\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=invalid_request", result.stderr)
+        self.assertIn("request=req_real", result.stderr)
+        self.assertNotIn("status=completed", result.stderr)
+        self.assertNotIn("request=resp_123", result.stderr)
+
     def test_api_error_diagnostic_omits_missing_request_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
