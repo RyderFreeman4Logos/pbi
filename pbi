@@ -427,9 +427,19 @@ case "${1:-}" in
     fi
     search_options+=(--ignore drafts)
     search_uses_local_model=true
-    if ! candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then
-      printf '%s\n' "$candidates" >&2
-      exit 1
+    search_status=0
+    if candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then
+      search_status=0
+    else
+      search_status=$?
+    fi
+    if ((search_status != 0)); then
+      if planner_timeout_or_kill "$search_status"; then
+        printf '%s\n' 'pbi: probe search timed out' >&2
+      else
+        printf '%s\n' "$candidates" >&2
+      fi
+      exit "$search_status"
     fi
     candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
     symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
