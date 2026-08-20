@@ -859,14 +859,43 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertEqual(result.stderr, "")
 
-    def test_search_hang_fails_closed_with_valid_candidates(self) -> None:
-        # #22: a timed-out search must not turn valid BM25 candidates into success.
-        symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
+    def test_search_skips_hanging_chat_when_candidates_contain_named_symbol(self) -> None:
+        symbol = "rest_response_prefers_created_ids_when_both_fields_exist"
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
             repo.mkdir()
             (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(f'File: {repo}/real.py, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.time()
+            result = self.run_pbi(
+                "search", f"Locate {symbol}", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            elapsed = time.time() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertLess(elapsed, 5)
+
+    def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
+        # #22: a timed-out search must not turn unrelated BM25 candidates into success.
+        symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text("def unrelated():\n    return True\n")
             env, _ = self.fake_environment(directory)
             env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"

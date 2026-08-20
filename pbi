@@ -342,6 +342,11 @@ case "${1:-}" in
     search_fallback_locations="$(compact_search_locations "$candidates")"
     set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates" \
       --max-iterations 1
+    symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
+    if [[ -n "$symbol" ]] && search_output_contains_symbol "$search_fallback_locations" "$symbol"; then
+      printf '%s\n' "$search_fallback_locations"
+      exit 0
+    fi
     ;;
 esac
 
