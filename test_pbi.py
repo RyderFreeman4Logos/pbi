@@ -116,6 +116,61 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(no_args_result.returncode, 2)
         self.assertIn("question is required", no_args_result.stderr)
 
+    def test_bm25_search_skips_an_unconfigured_mise_probe_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            shim_dir = directory / "shim-root" / "mise" / "shims"
+            real_bin = directory / "real-bin"
+            shim_dir.mkdir(parents=True)
+            real_bin.mkdir()
+            broken_probe = shim_dir / "probe"
+            broken_probe.write_text(
+                "#!/usr/bin/env bash\nprintf '%s\n' 'mise ERROR No version is set for shim: probe' >&2\nexit 1\n"
+            )
+            broken_probe.chmod(0o755)
+            real_probe = real_bin / "probe"
+            real_probe.write_text("#!/usr/bin/env bash\nprintf '%s\n' 'real.py:1'\n")
+            real_probe.chmod(0o755)
+            env["PATH"] = f"{shim_dir}:{real_bin}:{directory}:/usr/bin:/bin"
+            env["PBI_TEST_PROBE"] = str(directory / "missing-probe")
+            result = self.run_pbi(
+                "search", "--bm25", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, broken_probe)
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertNotIn("mise ERROR", result.stdout + result.stderr)
+
+    def test_local_routing_skips_an_unconfigured_mise_node_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            shim_dir = directory / "shim-root" / "mise" / "shims"
+            real_bin = directory / "real-bin"
+            shim_dir.mkdir(parents=True)
+            real_bin.mkdir()
+            broken_node = shim_dir / "node"
+            broken_node.write_text(
+                "#!/usr/bin/env bash\nprintf '%s\n' 'mise ERROR No version is set for shim: node' >&2\nexit 1\n"
+            )
+            broken_node.chmod(0o755)
+            real_node = real_bin / "node"
+            real_node.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if 'PBI_BASE_URL' in sys.argv[-1]:\n"
+                "    print('[]')\n"
+                "else:\n"
+                "    raise SystemExit(1)\n"
+            )
+            real_node.chmod(0o755)
+            env["PATH"] = f"{shim_dir}:{real_bin}:{directory}:/usr/bin:/bin"
+            result = self.run_pbi("--message", "hello", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: probe-chat failed\n")
+        self.assertNotIn("mise ERROR", result.stdout + result.stderr)
+
     def test_positional_question_is_compact_chat_and_preserves_json_request(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -802,7 +857,8 @@ class PbiTest(unittest.TestCase):
             ],
         )
         configured = recorded["env"]
-        self.assertEqual(configured["PROBE_BINARY_PATH"], PROBE_SHIM)
+        self.assertTrue(configured["PROBE_BINARY_PATH"].endswith("/probe"))
+        self.assertNotIn("/mise/shims/", configured["PROBE_BINARY_PATH"])
         self.assertEqual(configured["FORCE_PROVIDER"], "openai")
         self.assertEqual(configured["MODEL_NAME"], PRIMARY)
         self.assertEqual(configured["OPENAI_API_KEY"], "test-key")

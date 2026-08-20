@@ -22,19 +22,47 @@ usage() {
   printf '%s\n' "Search defaults to local-model ranking; use --bm25 for no-LLM Probe output."
 }
 
+resolve_command() {
+  local command_name="$1" candidate resolved mise_path
+  if mise_path="$(mise which "$command_name" 2>/dev/null)" && [[ -x "$mise_path" ]]; then
+    printf '%s' "$mise_path"
+    return 0
+  fi
+  while IFS= read -r candidate; do
+    [[ -x "$candidate" ]] || continue
+    if resolved="$(readlink -f -- "$candidate" 2>/dev/null)"; then
+      :
+    else
+      resolved="$candidate"
+    fi
+    [[ "$candidate" == */mise/shims/* || "$resolved" == */mise/shims/* || "$resolved" == */mise ]] && continue
+    printf '%s' "$candidate"
+    return 0
+  done < <(type -ap "$command_name" 2>/dev/null || true)
+  return 127
+}
+
 resolve_probe() {
   local probe_path
-  probe_path="/usr/local/share/mise/shims/probe"
-  if [[ ! -x "$probe_path" ]]; then
-    printf '%s\n' 'pbi: mise-installed probe is unavailable' >&2
+  if ! probe_path="$(resolve_command probe)"; then
+    printf '%s\n' 'pbi: probe is unavailable on PATH' >&2
     return 127
   fi
   printf '%s' "$probe_path"
 }
 
+resolve_node() {
+  local node_path
+  if ! node_path="$(resolve_command node)"; then
+    printf '%s\n' 'pbi: node is unavailable on PATH' >&2
+    return 127
+  fi
+  printf '%s' "$node_path"
+}
+
 probe_reported_error() {
   local output="$1"
-  if printf '%s' "$output" | node -e '
+  if printf '%s' "$output" | "$node_command" -e '
 let input = "";
 process.stdin.on("data", chunk => { input += chunk; });
 process.stdin.on("end", () => {
@@ -56,7 +84,7 @@ process.stdin.on("end", () => {
 
 probe_api_error_diagnostic() {
   local output="$1" diagnostic
-  diagnostic="$(printf '%s' "$output" | node -e '
+  diagnostic="$(printf '%s' "$output" | "$node_command" -e '
 let input = "";
 process.stdin.on("data", chunk => { input += chunk; });
 process.stdin.on("end", () => {
@@ -342,7 +370,13 @@ fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
 request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
 operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
 max_retries="3"
-probe_path="$(resolve_probe)"
+node_command=
+probe_path=
+if [[ "${1:-}" == "--debug-config" ]]; then
+  if ! probe_path="$(resolve_probe 2>/dev/null)"; then
+    probe_path="[unavailable]"
+  fi
+fi
 search_uses_local_model=false
 explore_uses_local_model=false
 search_fallback_locations=""
@@ -381,10 +415,11 @@ configure_local_routing() {
     printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment or ~/.pbi/config' >&2
     return 78
   fi
+  node_command="$(resolve_node)"
 
   fallback_providers="$(
     PBI_BASE_URL="$base_url" PBI_API_KEY="$api_key" PBI_PRIMARY_MODEL="$primary_model" \
-      PBI_FALLBACK_MODEL="$fallback_model" node -e '
+      PBI_FALLBACK_MODEL="$fallback_model" "$node_command" -e '
 const {PBI_BASE_URL, PBI_API_KEY, PBI_PRIMARY_MODEL, PBI_FALLBACK_MODEL} = process.env;
 process.stdout.write(JSON.stringify([
   {provider: "openai", apiKey: PBI_API_KEY, baseURL: PBI_BASE_URL, model: PBI_PRIMARY_MODEL, maxRetries: 3},
@@ -404,6 +439,12 @@ process.stdout.write(JSON.stringify([
   export FALLBACK_PROVIDERS="$fallback_providers"
   export ALLOWED_FOLDERS="$PWD"
 }
+
+if [[ "${1:-}" != "--debug-config" ]]; then
+  if ! probe_path="$(resolve_probe)"; then
+    exit 127
+  fi
+fi
 
 case "${1:-}" in
   search)
@@ -526,7 +567,7 @@ case "${1:-}" in
 esac
 
 agent_command="$(command -v probe-chat || true)"
-if [[ -z "$agent_command" ]]; then
+if [[ "${1:-}" != "--debug-config" && -z "$agent_command" ]]; then
   printf '%s\n' 'pbi: probe-chat is unavailable on PATH' >&2
   exit 127
 fi
