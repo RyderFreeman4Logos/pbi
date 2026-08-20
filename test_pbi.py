@@ -859,6 +859,36 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_hang_fails_closed_with_valid_candidates(self) -> None:
+        # #22: a timed-out search must not turn valid BM25 candidates into success.
+        symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(f'File: {repo}/real.py, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.time()
+            result = self.run_pbi(
+                "search", f"Locate {symbol}", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=20,
+            )
+            elapsed = time.time() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 10, "hung search probe-chat must be killed, not hang pbi")
+        self.assertIn("pbi: probe-chat timed out answering the question", result.stderr)
+
     def test_search_falls_back_to_absolute_retrieved_location_from_symlinked_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
