@@ -213,7 +213,7 @@ is_stamp_dump() {
 
 named_symbol_definition_line() {
   local file="$1" symbol="$2"
-  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:space:](<{:]|$)" "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
+  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:space:](<{:]|$)" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
 }
 
 compact_search_locations() {
