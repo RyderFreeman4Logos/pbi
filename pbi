@@ -352,20 +352,32 @@ config_model=
 load_config_toml() {
   local line key value config_valid=true
   local parsed_primary_model= parsed_model=
-  local double_quoted single_quoted bare
+  local double_quoted single_quoted bare assignment
   double_quoted='^"([^"]*)"[[:space:]]*(#.*)?$'
   single_quoted="^'([^']*)'[[:space:]]*(#.*)?$"
   bare='^([A-Za-z0-9._:/@+-]+)[[:space:]]*(#.*)?$'
+  assignment='^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$'
   [[ -f "$config_file" && -r "$config_file" ]] || return 0
-  if grep -qE "^[[:space:]]*[A-Za-z_][A-Za-z0-9_.-]*[[:space:]]*=[[:space:]]*(\"\"\"|''')" -- "$config_file" || \
-      grep -qE '^[[:space:]]*\[' -- "$config_file"; then
-    return 0
-  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == \[* ]] && return 0
+    if [[ "$line" =~ $assignment ]]; then
+      value="${BASH_REMATCH[2]}"
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      if [[ "$value" =~ $double_quoted || "$value" =~ $single_quoted || "$value" =~ $bare ]]; then
+        continue
+      fi
+    fi
+    [[ "$line" == *\"\"\"* || "$line" == *"'''"* ]] && return 0 || :
+  done <"$config_file" || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
-    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    [[ "$line" =~ $assignment ]] || continue
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
     value="${value#"${value%%[![:space:]]*}"}"

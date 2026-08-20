@@ -1885,6 +1885,30 @@ class PbiTest(unittest.TestCase):
             ),
             (
                 'primary_model = "spark"\n'
+                '"description" = """\n'
+                'primary_model = "shadow"\n'
+                '"""\n'
+            ),
+            (
+                'primary_model = "spark"\n'
+                'description = ["""\n'
+                'primary_model = "shadow"\n'
+                '"""]\n'
+            ),
+            (
+                'model = "spark"\n'
+                '"description" = ' + (chr(39) * 3) + '\n'
+                'model = "shadow"\n'
+                + (chr(39) * 3) + '\n'
+            ),
+            (
+                'model = "spark"\n'
+                'description = [' + (chr(39) * 3) + '\n'
+                'model = "shadow"\n'
+                + (chr(39) * 3) + ']\n'
+            ),
+            (
+                'primary_model = "spark"\n'
                 '[[providers]]\n'
                 'primary_model = "shadow"\n'
             ),
