@@ -1202,6 +1202,114 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_keeps_in_range_non_declaration_symbol_hit(self) -> None:
+        symbol = "PBI_VERSION"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "pbi"
+            source.write_text("\n".join(["# filler"] * 4 + [f"{symbol}=\"0.1.0\"", "# filler"]) + "\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-10\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "printf \"%s\\n\" \"{\\\"error\\\": {\\\"code\\\": \\\"invalid_request\\\"}}\"\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi:5\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "an in-range symbol hit must skip Probe Chat")
+
+    def test_search_handles_leading_dash_candidate_filename(self) -> None:
+        symbol = "OptionLike"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "--help"
+            source.write_text(f"class {symbol}:\n    pass\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source.name}, Lines: 1-2\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "--help:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "an in-range candidate must skip Probe Chat")
+
+    def test_search_recovers_named_symbol_definition_outside_bm25_snippet(self) -> None:
+        query = "WriteSpool _replay_operation"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text(
+                "\n".join(
+                    [
+                        "# module filler",
+                        "# module filler",
+                        "# definitions are outside the BM25 snippet",
+                        "class WriteSpool:",
+                        "    def __init__(self):",
+                        "        self.value = 0",
+                        "",
+                        "def _replay_operation(spool):",
+                        "    return spool.value",
+                        "",
+                        "# BM25 snippet contains call sites, not definitions",
+                        "def helper(spool):",
+                        "    return spool._replay_operation()",
+                        "",
+                        "spool = WriteSpool()",
+                        "spool._replay_operation()",
+                    ]
+                )
+                + "\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 11-12\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "printf \"%s\\n\" \"{\\\"error\\\": {\\\"code\\\": \\\"invalid_request\\\"}}\"\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", *query.split(), env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:8\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "verified definition should skip Probe Chat")
+
     def test_search_recovers_shorter_named_symbol_from_dual_symbol_candidates(self) -> None:
         query = "WriteSpool _replay_operation"
         with tempfile.TemporaryDirectory() as temporary:

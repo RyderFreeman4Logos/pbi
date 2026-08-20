@@ -211,9 +211,16 @@ is_stamp_dump() {
   return 0
 }
 
+named_symbol_definition_line() {
+  local file="$1" symbol="$2"
+  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:space:](<{:]|$)" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
+}
+
 compact_search_locations() {
   local line file location suffix relative symbol line_start line_end line_number
+  local allow_outside symbol_in_range definition_line first_symbol_line
   symbol="${2:-}"
+  allow_outside="${3:-false}"
   while IFS= read -r line; do
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
@@ -230,12 +237,23 @@ compact_search_locations() {
         line_number=1
         if [[ -n "$symbol" ]]; then
           line_number=""
+          symbol_in_range=false
+          first_symbol_line=""
           while IFS=: read -r candidate_line _; do
             if ((candidate_line >= line_start && (line_end == 0 || candidate_line <= line_end))); then
-              line_number="$candidate_line"
+              symbol_in_range=true
+              first_symbol_line="$candidate_line"
               break
             fi
           done < <(grep -nF -- "$symbol" "$file" 2>/dev/null || true)
+          definition_line="$(named_symbol_definition_line "$file" "$symbol")"
+          if [[ -n "$definition_line" ]] && ((definition_line >= line_start && (line_end == 0 || definition_line <= line_end))); then
+            line_number="$definition_line"
+          elif [[ "$symbol_in_range" == true ]]; then
+            line_number="$first_symbol_line"
+          elif [[ "$allow_outside" == true && -n "$definition_line" ]]; then
+            line_number="$definition_line"
+          fi
           [[ -n "$line_number" ]] || continue
         fi
         relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
@@ -568,6 +586,17 @@ case "${1:-}" in
           break
         fi
       done < <(search_named_symbols "${search_pattern_parts[*]}")
+      if [[ -z "$search_fallback_locations" ]]; then
+        while IFS= read -r candidate_symbol; do
+          [[ -n "$candidate_symbol" ]] || continue
+          candidate_locations="$(compact_search_locations "$candidates" "$candidate_symbol" true)"
+          if [[ -n "$candidate_locations" ]]; then
+            search_fallback_locations="$candidate_locations"
+            symbol="$candidate_symbol"
+            break
+          fi
+        done < <(search_named_symbols "${search_pattern_parts[*]}")
+      fi
     else
       search_fallback_locations="$(compact_search_locations "$candidates")"
     fi
