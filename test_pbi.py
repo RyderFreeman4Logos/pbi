@@ -65,7 +65,7 @@ class PbiTest(unittest.TestCase):
         for command in (directory / "mise", directory / "probe-chat", directory / "npx"):
             command.chmod(0o755)
         env = os.environ.copy()
-        for name in ("LOCAL_MODEL", "LLM_MODEL", "FALLBACK_MODEL"):
+        for name in ("LOCAL_MODEL", "LLM_MODEL", "FALLBACK_MODEL", "XDG_CONFIG_HOME", "PBI_CONFIG_FILE"):
             env.pop(name, None)
         env["PATH"] = f"{directory}:{env['PATH']}"
         env["PBI_TEST_TRACE"] = str(trace)
@@ -1826,6 +1826,53 @@ class PbiTest(unittest.TestCase):
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("primary_model=override", result.stdout)
+
+    def test_api_key_diagnostic_names_environment_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            for name in ("LOCAL_ROUTER_API_KEY", "CLIPROXY_API_KEY", "OPENAI_API_KEY"):
+                env.pop(name, None)
+            result = self.run_pbi("--message", "hello", env=env, cwd=directory)
+        self.assertEqual(result.returncode, 78)
+        self.assertEqual(
+            result.stderr,
+            "pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment\n",
+        )
+
+    def test_config_toml_honors_xdg_config_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            home = directory / "home"
+            xdg_config_home = directory / "xdg-config"
+            home.mkdir()
+            config_path = xdg_config_home / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text('primary_model = "spark"\n')
+            env["HOME"] = str(home)
+            env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+            result = self.run_pbi("--debug-config", env=env, cwd=directory)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("primary_model=spark", result.stdout)
+
+    def test_config_toml_ignores_unknown_keys_without_discarding_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                'primary_model = "spark"\n'
+                "timeout = 1\n"
+                "unknown = [1]\n"
+            )
+            result = self.run_pbi("--debug-config", env=env, cwd=directory)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("primary_model=spark", result.stdout)
+
 
     def test_fails_closed_with_diagnostic_when_probe_chat_cannot_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

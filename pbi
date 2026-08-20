@@ -342,12 +342,16 @@ case "${1:-}" in
     ;;
 esac
 
-config_file="${PBI_CONFIG_FILE:-$HOME/.config/pbi/config.toml}"
+if [[ -v PBI_CONFIG_FILE ]]; then
+  config_file="$PBI_CONFIG_FILE"
+else
+  config_file="${XDG_CONFIG_HOME:-$HOME/.config}/pbi/config.toml"
+fi
 config_primary_model=
 config_model=
 load_config_toml() {
   local line key value first last in_table=false config_valid=true
-  local parsed_primary_model= parsed_model=
+  local parsed_primary_model= parsed_model= known_key=false
   [[ -f "$config_file" && -r "$config_file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"
@@ -371,17 +375,28 @@ load_config_toml() {
     value="${BASH_REMATCH[2]}"
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
+    [[ -n "$value" ]] || { config_valid=false; break; }
     first="${value:0:1}"
     last="${value: -1}"
-    if [[ "$first" == '"' && "$last" == '"' ]]; then
+    known_key=false
+    case "$key" in
+      primary_model|model) known_key=true ;;
+    esac
+    if [[ "$first" == '"' || "$first" == "'" || "$last" == '"' || "$last" == "'" ]]; then
+      if [[ "$first" != "$last" ]]; then
+        config_valid=false
+        break
+      fi
       value="${value:1:${#value}-2}"
-    elif [[ "$first" == "'" && "$last" == "'" ]]; then
-      value="${value:1:${#value}-2}"
-    elif [[ ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
-      config_valid=false
-      break
+    elif [[ "$known_key" == true ]]; then
+      if [[ ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
+        config_valid=false
+        break
+      fi
+    else
+      continue
     fi
-    if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
+    if [[ "$known_key" == true && ( -z "$value" || ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ) ]]; then
       config_valid=false
       break
     fi
@@ -491,7 +506,7 @@ run_planner() {
 configure_local_routing() {
   api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-${LOCAL_ROUTER_API_KEY:-}}}"
   if [[ -z "$api_key" ]]; then
-    printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment or ~/.pbi/config' >&2
+    printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment' >&2
     return 78
   fi
   node_command="$(resolve_node)"
