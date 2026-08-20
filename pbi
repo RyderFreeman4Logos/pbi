@@ -351,14 +351,18 @@ config_primary_model=
 config_model=
 load_config_toml() {
   local line key value config_valid=true
+  local non_comment_lines
   local parsed_primary_model= parsed_model=
   local double_quoted single_quoted bare
   double_quoted='^"([^"]*)"[[:space:]]*(#.*)?$'
   single_quoted="^'([^']*)'[[:space:]]*(#.*)?$"
   bare='^([A-Za-z0-9._:/@+-]+)[[:space:]]*(#.*)?$'
   [[ -f "$config_file" && -r "$config_file" ]] || return 0
-  if grep -qF '"""' -- "$config_file" || \
-      grep -qF "'''" -- "$config_file" || \
+  if ! non_comment_lines="$(grep -vE '^[[:space:]]*#' -- "$config_file")"; then
+    return 0
+  fi
+  if grep -qF '"""' <<<"$non_comment_lines" || \
+      grep -qF "'''" <<<"$non_comment_lines" || \
       grep -qE '^[[:space:]]*\[' -- "$config_file"; then
     return 0
   fi
