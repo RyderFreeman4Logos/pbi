@@ -468,8 +468,8 @@ else
       --max-iterations 1
   generated_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
   if planner_timeout_or_kill "$planner_status"; then
-    planner_timed_out=true
-    planned_queries="$question"
+    printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
+    exit 1
   elif ((planner_status == 0)) || [[ -n "$generated_queries" ]]; then
     if [[ -z "$generated_queries" ]] || probe_reported_error "$generated_queries"; then
       if [[ "$planner_had_system_message_warning" == true && -z "$generated_queries" ]]; then
@@ -504,8 +504,8 @@ else
   done <<<"$planned_queries"
   bm25_candidates="$candidates"
   if [[ "$planner_timed_out" == true ]]; then
-    if [[ -z "$(compact_search_locations "$bm25_candidates")" ]]; then
-      printf '%s\n' 'pbi: code exploration found no candidates' >&2
+    if planner_timeout_or_kill "$planner_status"; then
+      printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
       exit 1
     fi
     compact_search_locations "$bm25_candidates"
@@ -563,8 +563,8 @@ else
     attempted_queries+=$'\n'"$gap_queries"
   done
   if [[ "$planner_timed_out" == true ]]; then
-    if [[ -z "$(compact_search_locations "$bm25_candidates")" ]]; then
-      printf '%s\n' 'pbi: code exploration found no candidates' >&2
+    if planner_timeout_or_kill "$planner_status"; then
+      printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
       exit 1
     fi
     compact_search_locations "$bm25_candidates"
