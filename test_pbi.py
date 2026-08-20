@@ -221,6 +221,95 @@ class PbiTest(unittest.TestCase):
         self.assertIn("Source evidence:\nFile:", citation_auditor["argv"][5])
         self.assertEqual(citation_auditor["argv"][-1], "--json")
 
+    def test_default_query_chat_signal_emits_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                + "printf '%s\\n' 'File: "
+                + str(directory / "pbi")
+                + ", Lines: 1-1'\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import signal, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('entrypoint')\n"
+                "    print('main')\n"
+                "    print('dispatch')\n"
+                "    print('handler')\n"
+                "    print('test')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
+            )
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = subprocess.run(
+                [
+                    "timeout",
+                    "--kill-after=1s",
+                    "2s",
+                    str(self.fake_pbi(directory, probe)),
+                    "where is the entrypoint",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+                cwd=ROOT,
+                timeout=6,
+            )
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
+        self.assertLess(elapsed, 5)
+
+    def test_default_query_planner_signal_emits_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import signal, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
+                "raise SystemExit(2)\n"
+            )
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = subprocess.run(
+                [
+                    "timeout",
+                    "--kill-after=1s",
+                    "2s",
+                    str(self.fake_pbi(directory, directory / "probe")),
+                    "where is the entrypoint",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+                cwd=ROOT,
+                timeout=6,
+            )
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
+        self.assertLess(elapsed, 5)
+
     def test_term_resistant_initial_planner_times_out_to_direct_bm25(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
