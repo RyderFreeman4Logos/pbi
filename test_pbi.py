@@ -1785,6 +1785,27 @@ class PbiTest(unittest.TestCase):
         self.assertIn("primary_model=spark", result.stdout)
 
 
+    def test_config_toml_rejects_relative_xdg_config_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            home = directory / "home"
+            home_config = home / ".config" / "pbi" / "config.toml"
+            home_config.parent.mkdir(parents=True)
+            home_config.write_text('primary_model = "spark"\n')
+            for xdg_config_home in (".", "relative/config"):
+                relative_config = directory / xdg_config_home / "pbi" / "config.toml"
+                relative_config.parent.mkdir(parents=True, exist_ok=True)
+                relative_config.write_text('primary_model = "shadow"\n')
+                env["HOME"] = str(home)
+                env["XDG_CONFIG_HOME"] = xdg_config_home
+                result = self.run_pbi("--debug-config", env=env, cwd=directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("primary_model=spark", result.stdout)
+                self.assertNotIn("primary_model=shadow", result.stdout)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+
+
     def test_config_toml_multiline_string_does_not_shadow_primary_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

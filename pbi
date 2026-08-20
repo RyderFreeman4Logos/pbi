@@ -344,8 +344,10 @@ esac
 
 if [[ -v PBI_CONFIG_FILE ]]; then
   config_file="$PBI_CONFIG_FILE"
+elif [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+  config_file="$XDG_CONFIG_HOME/pbi/config.toml"
 else
-  config_file="${XDG_CONFIG_HOME:-$HOME/.config}/pbi/config.toml"
+  config_file="$HOME/.config/pbi/config.toml"
 fi
 config_primary_model=
 config_model=
