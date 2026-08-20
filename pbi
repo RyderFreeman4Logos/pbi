@@ -423,13 +423,43 @@ case "${1:-}" in
       search_options+=(--max-results "$DEFAULT_SEARCH_MAX_RESULTS")
     fi
     if [[ "$search_bm25" == true ]]; then
-      exec "$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}"
+      bm25_stderr_file="$(mktemp)"
+      search_status=0
+      if bm25_output="$("$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}" 2>"$bm25_stderr_file")"; then
+        search_status=0
+      else
+        search_status=$?
+      fi
+      bm25_stderr="$(<"$bm25_stderr_file")"
+      rm -f -- "$bm25_stderr_file"
+      if ((search_status != 0)); then
+        if planner_timeout_or_kill "$search_status"; then
+          printf '%s\n' 'pbi: probe search timed out' >&2
+        else
+          [[ -z "$bm25_output" ]] || printf '%s\n' "$bm25_output"
+          [[ -z "$bm25_stderr" ]] || printf '%s\n' "$bm25_stderr" >&2
+        fi
+        exit "$search_status"
+      fi
+      [[ -z "$bm25_output" ]] || printf '%s\n' "$bm25_output"
+      [[ -z "$bm25_stderr" ]] || printf '%s\n' "$bm25_stderr" >&2
+      exit 0
     fi
     search_options+=(--ignore drafts)
     search_uses_local_model=true
-    if ! candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then
-      printf '%s\n' "$candidates" >&2
-      exit 1
+    search_status=0
+    if candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then
+      search_status=0
+    else
+      search_status=$?
+    fi
+    if ((search_status != 0)); then
+      if planner_timeout_or_kill "$search_status"; then
+        printf '%s\n' 'pbi: probe search timed out' >&2
+      else
+        printf '%s\n' "$candidates" >&2
+      fi
+      exit "$search_status"
     fi
     candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
     symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
