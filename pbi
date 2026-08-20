@@ -153,7 +153,7 @@ compact_search_locations() {
         file="${file%%, Lines:*}"
       fi
       if [[ -f "$file" ]]; then
-        line_number="$line_start"
+        line_number=1
         if [[ -n "$symbol" ]]; then
           line_number=""
           while IFS=: read -r candidate_line _; do

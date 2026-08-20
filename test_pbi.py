@@ -369,6 +369,28 @@ class PbiTest(unittest.TestCase):
             ["process-primary", "process-fallback"],
         )
 
+    def test_default_query_symbol_less_range_stays_a_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(f"#!/usr/bin/env bash\nprintf \"%s\\n\" \"File: {PBI}, Lines: 211-220\"\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "print(\"AI SDK Warning: System messages are risky.\")\n"
+                "raise SystemExit(7)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe)
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertNotIn("pbi:211", result.stdout + result.stderr)
+
     def test_default_query_fails_closed_when_answer_has_no_usable_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
