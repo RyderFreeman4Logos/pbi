@@ -423,7 +423,22 @@ case "${1:-}" in
       search_options+=(--max-results "$DEFAULT_SEARCH_MAX_RESULTS")
     fi
     if [[ "$search_bm25" == true ]]; then
-      exec "$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}"
+      search_status=0
+      if bm25_output="$("$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}" 2>&1)"; then
+        search_status=0
+      else
+        search_status=$?
+      fi
+      if ((search_status != 0)); then
+        if planner_timeout_or_kill "$search_status"; then
+          printf '%s\n' 'pbi: probe search timed out' >&2
+        else
+          printf '%s\n' "$bm25_output" >&2
+        fi
+        exit "$search_status"
+      fi
+      printf '%s\n' "$bm25_output"
+      exit 0
     fi
     search_options+=(--ignore drafts)
     search_uses_local_model=true
