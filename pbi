@@ -138,17 +138,37 @@ is_stamp_dump() {
 }
 
 compact_search_locations() {
-  local line file location suffix relative
+  local line file location suffix relative symbol line_start line_end line_number
+  symbol="${2:-}"
   while IFS= read -r line; do
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
-      file="${file%%, Lines:*}"
+      line_start=1
+      line_end=0
+      if [[ "$file" =~ ^(.+),[[:space:]]Lines:[[:space:]]+([[:digit:]]+)(-([[:digit:]]+))?$ ]]; then
+        file="${BASH_REMATCH[1]}"
+        line_start="${BASH_REMATCH[2]}"
+        line_end="${BASH_REMATCH[4]:-$line_start}"
+      else
+        file="${file%%, Lines:*}"
+      fi
       if [[ -f "$file" ]]; then
+        line_number="$line_start"
+        if [[ -n "$symbol" ]]; then
+          line_number=""
+          while IFS=: read -r candidate_line _; do
+            if ((candidate_line >= line_start && (line_end == 0 || candidate_line <= line_end))); then
+              line_number="$candidate_line"
+              break
+            fi
+          done < <(grep -nF -- "$symbol" "$file" 2>/dev/null || true)
+          [[ -n "$line_number" ]] || continue
+        fi
         relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
         if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
-          printf '%s:1\n' "$relative"
+          printf '%s:%s\n' "$relative" "$line_number"
         else
-          printf '%s:1\n' "$(basename -- "$file")"
+          printf '%s:%s\n' "$(basename -- "$file")" "$line_number"
         fi
       fi
     elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
@@ -412,10 +432,10 @@ case "${1:-}" in
       exit 1
     fi
     candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
-    search_fallback_locations="$(compact_search_locations "$candidates")"
+    symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
+    search_fallback_locations="$(compact_search_locations "$candidates" "$symbol")"
     set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates" \
       --max-iterations 1
-    symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
     if [[ -n "$symbol" ]] && search_output_contains_symbol "$search_fallback_locations" "$symbol"; then
       printf '%s\n' "$search_fallback_locations"
       exit 0

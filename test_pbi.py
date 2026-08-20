@@ -813,7 +813,7 @@ class PbiTest(unittest.TestCase):
             repo = directory / "repo"
             repo.mkdir()
             source = repo / "real.py"
-            source.write_text(f"def {symbol}():\n    return True\n")
+            source.write_text("\n".join(["# filler"] * 210) + f"\ndef {symbol}():\n    return True\n")
             env, trace = self.fake_environment(directory)
             for name in (
                 "CLIPROXY_API_KEY",
@@ -824,7 +824,7 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
-                f"print(f'File: {source}, Lines: 1-2')\n"
+                f"print(f'File: {source}, Lines: 211-212')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -841,7 +841,7 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stdout, "real.py:211\n")
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "a verified BM25 location must not invoke stamp-producing chat")
 
