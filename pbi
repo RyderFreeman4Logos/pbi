@@ -126,13 +126,13 @@ planner_timeout_or_kill() {
 }
 
 is_stamp_dump() {
-  # True when every non-empty line is a bare relative `path:1` stamp — the BM25
-  # `File: ...Lines:` echo the model mirrors back instead of writing an answer.
-  # Absolute paths (/*) are not treated as stamps here.
+  # True when every non-empty line is a bare relative `path:1` or `path:line`
+  # stamp — the BM25 `File: ...Lines:` echo the model mirrors back instead of
+  # writing an answer. Absolute paths (/*) are not treated as stamps here.
   local line
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    [[ "$line" =~ ^[[:alnum:]_./-]+:1$ ]] || return 1
+    [[ "$line" =~ ^[[:alnum:]_./-]+:(1|line)$ ]] || return 1
   done <<<"$1"
   return 0
 }
