@@ -1865,8 +1865,11 @@ class PbiTest(unittest.TestCase):
             config_path.parent.mkdir(parents=True)
             config_path.write_text(
                 'primary_model = "spark"\n'
+                'description = "cost #1"\n'
                 "timeout = 1\n"
-                "unknown = [1]\n"
+                "tags = [\n"
+                "  \"one\"\n"
+                "]\n"
             )
             result = self.run_pbi("--debug-config", env=env, cwd=directory)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")

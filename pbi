@@ -350,53 +350,41 @@ fi
 config_primary_model=
 config_model=
 load_config_toml() {
-  local line key value first last in_table=false config_valid=true
-  local parsed_primary_model= parsed_model= known_key=false
+  local line key value in_table=false config_valid=true
+  local parsed_primary_model= parsed_model=
+  local table double_quoted single_quoted bare
+  table='^\[[^]]+\][[:space:]]*(#.*)?$'
+  double_quoted='^"([^"]*)"[[:space:]]*(#.*)?$'
+  single_quoted="^'([^']*)'[[:space:]]*(#.*)?$"
+  bare='^([A-Za-z0-9._:/@+-]+)[[:space:]]*(#.*)?$'
   [[ -f "$config_file" && -r "$config_file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%%#*}"
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
     if [[ "$line" == \[* ]]; then
-      if [[ "$line" =~ ^\[.*\]$ ]]; then
-        in_table=true
-        continue
-      fi
-      config_valid=false
-      break
+      [[ "$line" =~ $table ]] && in_table=true
+      continue
     fi
     [[ "$in_table" == true ]] && continue
-    if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-      config_valid=false
-      break
-    fi
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
     key="${BASH_REMATCH[1]}"
+    case "$key" in
+      primary_model|model) ;;
+      *) continue ;;
+    esac
     value="${BASH_REMATCH[2]}"
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
-    [[ -n "$value" ]] || { config_valid=false; break; }
-    first="${value:0:1}"
-    last="${value: -1}"
-    known_key=false
-    case "$key" in
-      primary_model|model) known_key=true ;;
-    esac
-    if [[ "$first" == '"' || "$first" == "'" || "$last" == '"' || "$last" == "'" ]]; then
-      if [[ "$first" != "$last" ]]; then
-        config_valid=false
-        break
-      fi
-      value="${value:1:${#value}-2}"
-    elif [[ "$known_key" == true ]]; then
-      if [[ ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
-        config_valid=false
-        break
-      fi
+    if [[ "$value" =~ $double_quoted || "$value" =~ $single_quoted ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ $bare ]]; then
+      value="${BASH_REMATCH[1]}"
     else
-      continue
+      config_valid=false
+      break
     fi
-    if [[ "$known_key" == true && ( -z "$value" || ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ) ]]; then
+    if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
       config_valid=false
       break
     fi
