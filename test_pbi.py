@@ -1041,7 +1041,102 @@ class PbiTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertIn("probe-chat reported an API error", result.stderr)
-        self.assertNotIn("invalid_request", result.stdout + result.stderr)
+        self.assertIn("status=invalid_request", result.stderr)
+        self.assertNotIn('"message":"model not found"', result.stdout + result.stderr)
+        self.assertNotIn('{"error":', result.stdout + result.stderr)
+
+    def test_api_error_diagnostic_includes_safe_request_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"error\": {\"code\": \"invalid_request\", \"message\": \"model not found\", \"Authorization\": \"Bearer sk-secret\"}, \"request_id\": \"req_abc\", \"api_key\": \"sk-secret\"}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=invalid_request", result.stderr)
+        self.assertIn("request=req_abc", result.stderr)
+        self.assertNotIn('{"error":', result.stderr)
+        self.assertNotIn("Authorization", result.stderr)
+        self.assertNotIn("api_key", result.stderr)
+        self.assertNotIn("sk-secret", result.stderr)
+        self.assertNotIn("model not found", result.stderr)
+
+    def test_api_error_diagnostic_prefers_nested_request_id_over_conflicting_root_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"id\":\"response_123\",\"error\":{\"code\":\"invalid_request\",\"request_id\":\"req_real\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=invalid_request", result.stderr)
+        self.assertIn("request=req_real", result.stderr)
+        self.assertNotIn("request=response_123", result.stderr)
+
+    def test_api_error_diagnostic_prefers_error_json_in_mixed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"status\":\"completed\",\"id\":\"resp_123\"}'\n"
+                "printf '%s\\n' '{\"error\":{\"code\":\"invalid_request\",\"requestId\":\"req_real\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=invalid_request", result.stderr)
+        self.assertIn("request=req_real", result.stderr)
+        self.assertNotIn("status=completed", result.stderr)
+        self.assertNotIn("request=resp_123", result.stderr)
+
+    def test_api_error_detector_handles_rate_limit_error_in_mixed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"status\":\"completed\",\"id\":\"resp_123\"}'\n"
+                "printf '%s\\n' '{\"error\":{\"code\":\"rate_limit_exceeded\",\"requestId\":\"req_real\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=rate_limit_exceeded", result.stderr)
+        self.assertIn("request=req_real", result.stderr)
+        self.assertNotIn('{"error":', result.stderr)
+        self.assertNotIn("request=resp_123", result.stderr)
+
+    def test_api_error_diagnostic_omits_missing_request_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"error\": {\"code\": \"invalid_request\", \"message\": \"model not found\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=invalid_request", result.stderr)
+        self.assertNotIn("request=", result.stderr)
+        self.assertNotIn("model not found", result.stderr)
 
     def test_chat_hang_fails_closed_in_bounded_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
