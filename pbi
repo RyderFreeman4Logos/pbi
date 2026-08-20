@@ -50,6 +50,64 @@ process.stdin.on("end", () => {
   grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$output"
 }
 
+probe_api_error_diagnostic() {
+  local output="$1" diagnostic
+  diagnostic="$(printf '%s' "$output" | node -e '
+let input = "";
+process.stdin.on("data", chunk => { input += chunk; });
+process.stdin.on("end", () => {
+  const safeToken = value => {
+    if (typeof value !== "string" && typeof value !== "number") return "";
+    const token = String(value);
+    return /^[A-Za-z0-9._:-]{1,128}$/.test(token) ? token : "";
+  };
+  const objectValue = value => value && typeof value === "object" && !Array.isArray(value);
+  const fields = (value, names) => {
+    if (!objectValue(value)) return "";
+    for (const name of names) {
+      const token = safeToken(value[name]);
+      if (token) return token;
+    }
+    return "";
+  };
+  const candidates = [input.trim(), ...input.split(/\r?\n/).map(line => line.trim())];
+  let response;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (objectValue(parsed)) {
+        response = parsed;
+        break;
+      }
+    } catch {}
+  }
+  let status = "";
+  let request = "";
+  if (response) {
+    status = fields(response.error, ["code", "status"]);
+    if (!status && Array.isArray(response.errors)) {
+      for (const error of response.errors) {
+        status = fields(error, ["code", "status"]);
+        if (status) break;
+      }
+    }
+    if (!status) status = fields(response, ["status"]);
+    request = fields(response, ["request_id", "requestId", "id", "session", "session_id"]);
+    if (!request) request = fields(response.error, ["request_id", "requestId", "id", "session", "session_id"]);
+    if (!request && Array.isArray(response.errors)) {
+      for (const error of response.errors) {
+        request = fields(error, ["request_id", "requestId", "id", "session", "session_id"]);
+        if (request) break;
+      }
+    }
+  }
+  process.stdout.write(`status=${status || "error"}${request ? ` request=${request}` : ""}`);
+});'
+  )"
+  printf '%s\n' "pbi: probe-chat reported an API error ($diagnostic)" >&2
+}
+
 probe_system_message_warning() {
   grep -Eiq '^AI SDK Warning:?[[:space:]]+System messages' <<<"$1"
 }
@@ -517,17 +575,21 @@ fi
 
 configure_local_routing
 
+probe_stderr_file="$(mktemp)"
 if [[ "$search_uses_local_model" == true || "$explore_uses_local_model" == true ]]; then
-  if output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>&1)"; then
+  if output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>"$probe_stderr_file")"; then
     status=0
   else
     status=$?
   fi
-elif output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}")"; then
+elif output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>"$probe_stderr_file")"; then
   status=0
 else
   status=$?
 fi
+probe_stderr="$(<"$probe_stderr_file")"
+rm -f -- "$probe_stderr_file"
+probe_diagnostic_input="$output"$'\n'"$probe_stderr"
 if ((status != 0)); then
   if ((status == 126)); then
     printf '%s\n' 'pbi: probe-chat found on PATH but failed to launch (exit 126: not executable or bad interpreter)' >&2
@@ -536,11 +598,11 @@ if ((status != 0)); then
   if planner_timeout_or_kill "$status"; then
     printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
     exit "$status"
-  elif probe_reported_error "$output" && recover_search_from_candidates; then
+  elif probe_reported_error "$probe_diagnostic_input" && recover_search_from_candidates; then
     :
   else
-    if probe_reported_error "$output"; then
-      printf '%s\n' 'pbi: probe-chat reported an API error' >&2
+    if probe_reported_error "$probe_diagnostic_input"; then
+      probe_api_error_diagnostic "$probe_diagnostic_input"
     else
       printf '%s\n' 'pbi: probe-chat failed' >&2
     fi
@@ -548,9 +610,9 @@ if ((status != 0)); then
   fi
 fi
 output="$(strip_probe_chrome "$output")"
-if probe_reported_error "$output"; then
+if probe_reported_error "$probe_diagnostic_input"; then
   if ! recover_search_from_candidates; then
-    printf '%s\n' 'pbi: probe-chat reported an API error' >&2
+    probe_api_error_diagnostic "$probe_diagnostic_input"
     exit 1
   fi
 fi
