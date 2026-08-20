@@ -350,18 +350,33 @@ fi
 config_primary_model=
 config_model=
 load_config_toml() {
-  local line key value in_table=false config_valid=true
+  local line key value in_table=false in_multiline_string=false in_array=false config_valid=true
   local parsed_primary_model= parsed_model=
-  local table double_quoted single_quoted bare
+  local multiline_basic multiline_literal multiline_delimiter
+  local table double_quoted single_quoted bare array_end
+  multiline_basic='"""'
+  multiline_literal="'''"
   table='^\[[^]]+\][[:space:]]*(#.*)?$'
   double_quoted='^"([^"]*)"[[:space:]]*(#.*)?$'
   single_quoted="^'([^']*)'[[:space:]]*(#.*)?$"
   bare='^([A-Za-z0-9._:/@+-]+)[[:space:]]*(#.*)?$'
+  array_end='^\]+[[:space:]]*(#.*)?$'
   [[ -f "$config_file" && -r "$config_file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
+    if [[ "$in_multiline_string" == true ]]; then
+      if [[ "$line" == *"$multiline_delimiter"* ]]; then
+        in_multiline_string=false
+        multiline_delimiter=
+      fi
+      continue
+    fi
+    if [[ "$in_array" == true ]]; then
+      [[ "$line" =~ $array_end ]] && in_array=false
+      continue
+    fi
     if [[ "$line" == \[* ]]; then
       [[ "$line" =~ $table ]] && in_table=true
       continue
@@ -369,13 +384,28 @@ load_config_toml() {
     [[ "$in_table" == true ]] && continue
     [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
     key="${BASH_REMATCH[1]}"
-    case "$key" in
-      primary_model|model) ;;
-      *) continue ;;
-    esac
     value="${BASH_REMATCH[2]}"
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      primary_model|model) ;;
+      *)
+        if [[ "$value" == "$multiline_basic"* ]]; then
+          if [[ "${value:${#multiline_basic}}" != *"$multiline_basic"* ]]; then
+            in_multiline_string=true
+            multiline_delimiter="$multiline_basic"
+          fi
+        elif [[ "$value" == "$multiline_literal"* ]]; then
+          if [[ "${value:${#multiline_literal}}" != *"$multiline_literal"* ]]; then
+            in_multiline_string=true
+            multiline_delimiter="$multiline_literal"
+          fi
+        elif [[ "$value" == \[* && "$value" != *']'* ]]; then
+          in_array=true
+        fi
+        continue
+        ;;
+    esac
     if [[ "$value" =~ $double_quoted || "$value" =~ $single_quoted ]]; then
       value="${BASH_REMATCH[1]}"
     elif [[ "$value" =~ $bare ]]; then

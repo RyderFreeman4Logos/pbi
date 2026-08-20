@@ -1784,6 +1784,26 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("primary_model=spark", result.stdout)
 
+
+    def test_config_toml_multiline_string_does_not_shadow_primary_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                'primary_model = "spark"\n'
+                'description = """\n'
+                'primary_model = "shadow"\n'
+                '"""\n'
+            )
+            result = self.run_pbi("--debug-config", env=env)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("primary_model=spark", result.stdout)
+        self.assertNotIn("primary_model=shadow", result.stdout)
+
+
     def test_missing_or_empty_config_toml_uses_compiled_in_primary_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
