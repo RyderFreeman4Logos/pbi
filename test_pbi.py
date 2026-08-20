@@ -1800,8 +1800,44 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi("--debug-config", env=env)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("primary_model=spark", result.stdout)
+        self.assertIn(f"primary_model={PRIMARY}", result.stdout)
         self.assertNotIn("primary_model=shadow", result.stdout)
+
+
+    def test_config_toml_unsafe_multiline_and_array_tables_are_ignored(self) -> None:
+        cases = (
+            (
+                'primary_model = "spark"\n'
+                'description = """\n'
+                'escaped ' + chr(92) + '""" delimiter\n'
+                'primary_model = "shadow"\n'
+                '"""\n'
+            ),
+            (
+                'primary_model = "spark"\n'
+                "description = '''\n"
+                'primary_model = "shadow"\n'
+                "'''\n"
+            ),
+            (
+                'primary_model = "spark"\n'
+                '[[providers]]\n'
+                'primary_model = "shadow"\n'
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            for config_text in cases:
+                with self.subTest(config_text=config_text):
+                    config_path.write_text(config_text)
+                    result = self.run_pbi("--debug-config", env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"primary_model={PRIMARY}", result.stdout)
+                    self.assertNotIn("primary_model=shadow", result.stdout)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
 
 
     def test_missing_or_empty_config_toml_uses_compiled_in_primary_model(self) -> None:
