@@ -829,6 +829,36 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(wrong.stdout, "")
         self.assertIn("contains the queried symbol", wrong.stderr)
 
+    def test_search_api_error_recovers_named_symbol_from_candidates(self) -> None:
+        # #22: an API-error payload must not hide an already-retrieved location
+        # for the named symbol; the #17 recovery remains subject to #8 validation.
+        symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(f'File: {repo}/real.py, Lines: 1-10')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"error\": {\"code\": \"invalid_request\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", f"Locate {symbol}", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stderr, "")
+
     def test_search_falls_back_to_absolute_retrieved_location_from_symlinked_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
