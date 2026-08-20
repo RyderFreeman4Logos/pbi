@@ -1202,6 +1202,58 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_recovers_named_symbol_definition_outside_bm25_snippet(self) -> None:
+        query = "WriteSpool _replay_operation"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text(
+                "\n".join(
+                    [
+                        "# module filler",
+                        "# module filler",
+                        "# definitions are outside the BM25 snippet",
+                        "class WriteSpool:",
+                        "    def __init__(self):",
+                        "        self.value = 0",
+                        "",
+                        "def _replay_operation(spool):",
+                        "    return spool.value",
+                        "",
+                        "# BM25 snippet contains call sites, not definitions",
+                        "def helper(spool):",
+                        "    return spool._replay_operation()",
+                        "",
+                        "spool = WriteSpool()",
+                        "spool._replay_operation()",
+                    ]
+                )
+                + "\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 12-16\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf \"%s\\n\" \"{\\\"error\\\": {\\\"code\\\": \\\"invalid_request\\\"}}\"\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", *query.split(), env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:8\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "verified definition should skip Probe Chat")
+
     def test_search_recovers_shorter_named_symbol_from_dual_symbol_candidates(self) -> None:
         query = "WriteSpool _replay_operation"
         with tempfile.TemporaryDirectory() as temporary:
