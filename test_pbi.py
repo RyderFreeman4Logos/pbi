@@ -1818,6 +1818,12 @@ class PbiTest(unittest.TestCase):
                 '# primary_model = "shadow"\n'
                 '# ' + (chr(39) * 3) + '\n'
             ),
+            (
+                'primary_model = "spark" # multiline example: """\n'
+            ),
+            (
+                'primary_model = "spark" # multiline example: ' + (chr(39) * 3) + '\n'
+            ),
         )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
