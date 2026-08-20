@@ -342,7 +342,59 @@ case "${1:-}" in
     ;;
 esac
 
-config_file="${PBI_CONFIG_FILE:-$HOME/.pbi/config}"
+config_file="${PBI_CONFIG_FILE:-$HOME/.config/pbi/config.toml}"
+config_primary_model=
+config_model=
+load_config_toml() {
+  local line key value first last in_table=false config_valid=true
+  local parsed_primary_model= parsed_model=
+  [[ -f "$config_file" && -r "$config_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    if [[ "$line" == \[* ]]; then
+      if [[ "$line" =~ ^\[.*\]$ ]]; then
+        in_table=true
+        continue
+      fi
+      config_valid=false
+      break
+    fi
+    [[ "$in_table" == true ]] && continue
+    if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      config_valid=false
+      break
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    first="${value:0:1}"
+    last="${value: -1}"
+    if [[ "$first" == '"' && "$last" == '"' ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$first" == "'" && "$last" == "'" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
+      config_valid=false
+      break
+    fi
+    if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
+      config_valid=false
+      break
+    fi
+    case "$key" in
+      primary_model) parsed_primary_model="$value" ;;
+      model) parsed_model="$value" ;;
+    esac
+  done <"$config_file" || return 0
+  [[ "$config_valid" == true ]] || return 0
+  config_primary_model="$parsed_primary_model"
+  config_model="$parsed_model"
+}
+
 load_cwd_dotenv() {
   local dotenv_file line name value
   dotenv_file="$PWD/.env"
@@ -369,10 +421,7 @@ load_cwd_dotenv() {
 }
 
 load_cwd_dotenv
-if [[ -r "$config_file" ]]; then
-  # shellcheck disable=SC1090
-  source "$config_file"
-fi
+load_config_toml
 
 planner_timeout_seconds="${PBI_PLANNER_TIMEOUT_SECONDS:-$DEFAULT_PLANNER_TIMEOUT_SECONDS}"
 if ! [[ "$planner_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
@@ -385,7 +434,17 @@ if ! [[ "$chat_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 base_url="${CLIPROXY_BASE_URL:-${LOCAL_ROUTER_BASEURL:-$DEFAULT_BASE_URL}}"
-primary_model="${LOCAL_MODEL:-${LLM_MODEL:-$DEFAULT_PRIMARY_MODEL}}"
+if [[ -n "${LOCAL_MODEL:-}" ]]; then
+  primary_model="$LOCAL_MODEL"
+elif [[ -n "${LLM_MODEL:-}" ]]; then
+  primary_model="$LLM_MODEL"
+elif [[ -n "$config_primary_model" ]]; then
+  primary_model="$config_primary_model"
+elif [[ -n "$config_model" ]]; then
+  primary_model="$config_model"
+else
+  primary_model="$DEFAULT_PRIMARY_MODEL"
+fi
 fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
 request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
 operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"

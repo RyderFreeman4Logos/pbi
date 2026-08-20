@@ -1772,6 +1772,61 @@ class PbiTest(unittest.TestCase):
         self.assertIn("api_key=[REDACTED]", result.stdout)
 
 
+    def test_config_toml_primary_model_is_used_without_model_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text('primary_model = "spark"\n')
+            result = self.run_pbi("--debug-config", env=env)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("primary_model=spark", result.stdout)
+
+    def test_missing_or_empty_config_toml_uses_compiled_in_primary_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            missing_result = self.run_pbi("--debug-config", env=env)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text("")
+            empty_result = self.run_pbi("--debug-config", env=env)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        for result in (missing_result, empty_result):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"primary_model={PRIMARY}", result.stdout)
+
+    def test_config_toml_does_not_override_llm_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text('primary_model = "spark"\n')
+            env["LLM_MODEL"] = "from-env"
+            result = self.run_pbi("--debug-config", env=env)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("primary_model=from-env", result.stdout)
+
+    def test_pbi_config_file_overrides_xdg_config_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            xdg_path = directory / ".config" / "pbi" / "config.toml"
+            xdg_path.parent.mkdir(parents=True)
+            xdg_path.write_text('primary_model = "xdg"\n')
+            override_path = directory / "custom" / "model.toml"
+            override_path.parent.mkdir()
+            override_path.write_text('primary_model = "override"\n')
+            env["PBI_CONFIG_FILE"] = str(override_path)
+            result = self.run_pbi("--debug-config", env=env)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("primary_model=override", result.stdout)
+
     def test_fails_closed_with_diagnostic_when_probe_chat_cannot_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
