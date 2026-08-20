@@ -342,7 +342,74 @@ case "${1:-}" in
     ;;
 esac
 
-config_file="${PBI_CONFIG_FILE:-$HOME/.pbi/config}"
+if [[ -v PBI_CONFIG_FILE ]]; then
+  config_file="$PBI_CONFIG_FILE"
+elif [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+  config_file="$XDG_CONFIG_HOME/pbi/config.toml"
+else
+  config_file="$HOME/.config/pbi/config.toml"
+fi
+config_primary_model=
+config_model=
+load_config_toml() {
+  local line key value config_valid=true
+  local parsed_primary_model= parsed_model=
+  local double_quoted single_quoted bare assignment
+  double_quoted='^"([^"]*)"[[:space:]]*(#.*)?$'
+  single_quoted="^'([^']*)'[[:space:]]*(#.*)?$"
+  bare='^([A-Za-z0-9._:/@+-]+)[[:space:]]*(#.*)?$'
+  assignment='^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$'
+  [[ -f "$config_file" && -r "$config_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == \[* ]] && return 0
+    if [[ "$line" =~ $assignment ]]; then
+      value="${BASH_REMATCH[2]}"
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      if [[ "$value" =~ $double_quoted || "$value" =~ $single_quoted || "$value" =~ $bare ]]; then
+        continue
+      fi
+    fi
+    [[ "$line" == *\"\"\"* || "$line" == *"'''"* ]] && return 0 || :
+  done <"$config_file" || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ $assignment ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      primary_model|model) ;;
+      *) continue ;;
+    esac
+    if [[ "$value" =~ $double_quoted || "$value" =~ $single_quoted ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ $bare ]]; then
+      value="${BASH_REMATCH[1]}"
+    else
+      config_valid=false
+      break
+    fi
+    if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
+      config_valid=false
+      break
+    fi
+    case "$key" in
+      primary_model) parsed_primary_model="$value" ;;
+      model) parsed_model="$value" ;;
+    esac
+  done <"$config_file" || return 0
+  [[ "$config_valid" == true ]] || return 0
+  config_primary_model="$parsed_primary_model"
+  config_model="$parsed_model"
+}
+
 load_cwd_dotenv() {
   local dotenv_file line name value
   dotenv_file="$PWD/.env"
@@ -369,10 +436,7 @@ load_cwd_dotenv() {
 }
 
 load_cwd_dotenv
-if [[ -r "$config_file" ]]; then
-  # shellcheck disable=SC1090
-  source "$config_file"
-fi
+load_config_toml
 
 planner_timeout_seconds="${PBI_PLANNER_TIMEOUT_SECONDS:-$DEFAULT_PLANNER_TIMEOUT_SECONDS}"
 if ! [[ "$planner_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
@@ -385,7 +449,17 @@ if ! [[ "$chat_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 base_url="${CLIPROXY_BASE_URL:-${LOCAL_ROUTER_BASEURL:-$DEFAULT_BASE_URL}}"
-primary_model="${LOCAL_MODEL:-${LLM_MODEL:-$DEFAULT_PRIMARY_MODEL}}"
+if [[ -n "${LOCAL_MODEL:-}" ]]; then
+  primary_model="$LOCAL_MODEL"
+elif [[ -n "${LLM_MODEL:-}" ]]; then
+  primary_model="$LLM_MODEL"
+elif [[ -n "$config_primary_model" ]]; then
+  primary_model="$config_primary_model"
+elif [[ -n "$config_model" ]]; then
+  primary_model="$config_model"
+else
+  primary_model="$DEFAULT_PRIMARY_MODEL"
+fi
 fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
 request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
 operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
@@ -432,7 +506,7 @@ run_planner() {
 configure_local_routing() {
   api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-${LOCAL_ROUTER_API_KEY:-}}}"
   if [[ -z "$api_key" ]]; then
-    printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment or ~/.pbi/config' >&2
+    printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment' >&2
     return 78
   fi
   node_command="$(resolve_node)"
