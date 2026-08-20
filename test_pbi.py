@@ -225,6 +225,9 @@ class PbiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
+            tmpdir = directory / "tmp"
+            tmpdir.mkdir()
+            env["TMPDIR"] = str(tmpdir)
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env bash\n"
@@ -268,6 +271,7 @@ class PbiTest(unittest.TestCase):
                 timeout=6,
             )
             elapsed = time.monotonic() - started
+            self.assertEqual(list(tmpdir.iterdir()), [])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
@@ -277,6 +281,9 @@ class PbiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
+            tmpdir = directory / "tmp"
+            tmpdir.mkdir()
+            env["TMPDIR"] = str(tmpdir)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env python3\n"
@@ -305,6 +312,7 @@ class PbiTest(unittest.TestCase):
                 timeout=6,
             )
             elapsed = time.monotonic() - started
+            self.assertEqual(list(tmpdir.iterdir()), [])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
