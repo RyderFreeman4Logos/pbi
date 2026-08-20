@@ -125,6 +125,52 @@ planner_timeout_or_kill() {
   [[ "$1" == 124 || "$1" == 137 ]]
 }
 
+active_timeout_pid=
+active_timeout_diagnostic=
+active_temp_files=()
+
+track_temp_file() {
+  active_temp_files+=("$1")
+}
+
+cleanup_temp_files() {
+  local temp_file
+  for temp_file in "${active_temp_files[@]}"; do
+    rm -f -- "$temp_file"
+  done
+  active_temp_files=()
+}
+
+handle_timeout_signal() {
+  if [[ -n "$active_timeout_pid" ]]; then
+    kill -- "-$active_timeout_pid" 2>/dev/null || kill "$active_timeout_pid" 2>/dev/null || true
+    printf '%s\n' "$active_timeout_diagnostic" >&2
+  fi
+  cleanup_temp_files
+  exit 1
+}
+
+trap handle_timeout_signal TERM INT ALRM
+trap cleanup_temp_files EXIT
+
+run_timed_command() {
+  local timeout_seconds="$1" stdout_file="$2" stderr_file="$3" status
+  shift 3
+  if [[ "$stdout_file" == "$stderr_file" ]]; then
+    setsid sh -c 'timeout --kill-after=1s "$@"' sh "$timeout_seconds" "$@" >"$stdout_file" 2>&1 &
+  else
+    setsid sh -c 'timeout --kill-after=1s "$@"' sh "$timeout_seconds" "$@" >"$stdout_file" 2>"$stderr_file" &
+  fi
+  active_timeout_pid="$!"
+  if wait "$active_timeout_pid"; then
+    status=0
+  else
+    status="$?"
+  fi
+  active_timeout_pid=
+  return "$status"
+}
+
 is_stamp_dump() {
   # True when every non-empty line is a bare relative `path:1` or `path:line`
   # stamp — the BM25 `File: ...Lines:` echo the model mirrors back instead of
@@ -307,15 +353,20 @@ planner_status=0
 planner_had_system_message_warning=false
 
 run_planner() {
-  local stderr_file
+  local stderr_file planner_stdout_file
   stderr_file="$(mktemp)"
-  if planner_stdout="$(timeout --kill-after=1s "$planner_timeout_seconds" "$agent_command" "$@" 2>"$stderr_file")"; then
+  track_temp_file "$stderr_file"
+  planner_stdout_file="$(mktemp)"
+  track_temp_file "$planner_stdout_file"
+  active_timeout_diagnostic='pbi: planner timed out before producing a source answer'
+  if run_timed_command "$planner_timeout_seconds" "$planner_stdout_file" "$stderr_file" "$agent_command" "$@"; then
     planner_status=0
   else
     planner_status=$?
   fi
+  active_timeout_diagnostic=
+  planner_stdout="$(<"$planner_stdout_file")"
   planner_stderr="$(<"$stderr_file")"
-  rm -f -- "$stderr_file"
   planner_had_system_message_warning=false
   if probe_system_message_warning "$planner_stdout"$'\n'"$planner_stderr"; then
     planner_had_system_message_warning=true
@@ -639,20 +690,20 @@ fi
 
 configure_local_routing
 
+probe_stdout_file="$(mktemp)"
+track_temp_file "$probe_stdout_file"
 probe_stderr_file="$(mktemp)"
-if [[ "$search_uses_local_model" == true || "$explore_uses_local_model" == true ]]; then
-  if output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>"$probe_stderr_file")"; then
-    status=0
-  else
-    status=$?
-  fi
-elif output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}" 2>"$probe_stderr_file")"; then
+track_temp_file "$probe_stderr_file"
+active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
+if run_timed_command "$chat_timeout_seconds" "$probe_stdout_file" "$probe_stderr_file" \
+    "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}"; then
   status=0
 else
   status=$?
 fi
+active_timeout_diagnostic=
+output="$(<"$probe_stdout_file")"
 probe_stderr="$(<"$probe_stderr_file")"
-rm -f -- "$probe_stderr_file"
 probe_diagnostic_input="$output"$'\n'"$probe_stderr"
 if ((status != 0)); then
   if ((status == 126)); then
@@ -693,23 +744,35 @@ if [[ "$explore_uses_local_model" == true ]]; then
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  if reviewed_output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}" 2>&1)"; then
+  reviewed_output_file="$(mktemp)"
+  track_temp_file "$reviewed_output_file"
+  active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
+  if run_timed_command "$chat_timeout_seconds" "$reviewed_output_file" "$reviewed_output_file" \
+      "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}"; then
+    reviewed_output="$(<"$reviewed_output_file")"
     reviewed_output="$(strip_probe_chrome "$reviewed_output")"
     if [[ -n "$reviewed_output" ]] && ! probe_reported_error "$reviewed_output"; then
       output="$reviewed_output"
     fi
   fi
+  active_timeout_diagnostic=
   audit_args=(
     --message "Audit every source citation in the answer against the supplied source evidence. Correct a path or line number only by copying an exact location from the evidence, and remove a claim when no exact supporting location exists."$'\n\n'"Question: $question"$'\n\nAnswer to audit:\n'"$output"$'\n\nSource evidence:\n'"$candidates"
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  if audited_output="$(timeout --kill-after=1s "$chat_timeout_seconds" "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}" 2>&1)"; then
+  audited_output_file="$(mktemp)"
+  track_temp_file "$audited_output_file"
+  active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
+  if run_timed_command "$chat_timeout_seconds" "$audited_output_file" "$audited_output_file" \
+      "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}"; then
+    audited_output="$(<"$audited_output_file")"
     audited_output="$(strip_probe_chrome "$audited_output")"
     if [[ -n "$audited_output" ]] && ! probe_reported_error "$audited_output"; then
       output="$audited_output"
     fi
   fi
+  active_timeout_diagnostic=
 fi
 if [[ "$search_uses_local_model" == true ]]; then
   output="$(compact_search_locations "$output")"
