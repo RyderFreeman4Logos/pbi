@@ -423,21 +423,26 @@ case "${1:-}" in
       search_options+=(--max-results "$DEFAULT_SEARCH_MAX_RESULTS")
     fi
     if [[ "$search_bm25" == true ]]; then
+      bm25_stderr_file="$(mktemp)"
       search_status=0
-      if bm25_output="$("$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}" 2>&1)"; then
+      if bm25_output="$("$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}" 2>"$bm25_stderr_file")"; then
         search_status=0
       else
         search_status=$?
       fi
+      bm25_stderr="$(<"$bm25_stderr_file")"
+      rm -f -- "$bm25_stderr_file"
       if ((search_status != 0)); then
         if planner_timeout_or_kill "$search_status"; then
           printf '%s\n' 'pbi: probe search timed out' >&2
         else
-          printf '%s\n' "$bm25_output" >&2
+          [[ -z "$bm25_output" ]] || printf '%s\n' "$bm25_output"
+          [[ -z "$bm25_stderr" ]] || printf '%s\n' "$bm25_stderr" >&2
         fi
         exit "$search_status"
       fi
-      printf '%s\n' "$bm25_output"
+      [[ -z "$bm25_output" ]] || printf '%s\n' "$bm25_output"
+      [[ -z "$bm25_stderr" ]] || printf '%s\n' "$bm25_stderr" >&2
       exit 0
     fi
     search_options+=(--ignore drafts)

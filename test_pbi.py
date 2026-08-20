@@ -749,6 +749,22 @@ class PbiTest(unittest.TestCase):
             ["search", "--reranker", "bm25", "--timeout", "540", "--max-results", "8", "--", "PBI_VERSION"],
         )
 
+    def test_bm25_search_keeps_probe_stdout_and_stderr_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'pbi:37'\n"
+                "printf '%s\\n' 'Probe warning' >&2\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi("search", "--bm25", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, probe))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi:37\n")
+        self.assertEqual(result.stderr, "Probe warning\n")
+
     def test_search_defaults_to_local_model_without_bert(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
