@@ -746,7 +746,7 @@ class PbiTest(unittest.TestCase):
                 "elif message.startswith('Identify missing evidence'):\n"
                 "    print('NONE')\n"
                 "else:\n"
-                "    print('The entrypoint is pbi:9.')\n"
+                "    print('The entrypoint is pbi:1')\n"
             )
             fake_chat.chmod(0o755)
             result = self.run_pbi(
@@ -756,7 +756,7 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, directory / "probe"),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "The entrypoint is pbi:9.\n")
+        self.assertEqual(result.stdout, "The entrypoint is pbi:1\n")
 
     def test_no_colon_warning_only_stdout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
