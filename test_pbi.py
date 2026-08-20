@@ -478,6 +478,46 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
+    def test_default_query_real_path_stamp_only_answer_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            paths = (
+                directory / "website/docs/developer-guide/trajectory-format.md",
+                directory / "tui_gateway/server.py",
+                directory / "apps/desktop/electron/main.ts",
+                directory / "tools/delegate_tool.py",
+            )
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("source\n")
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                + "\n".join(f"print('File: {path}, Lines: 1-40')" for path in paths)
+                + "\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('AI SDK Warning: System messages are risky.')\n"
+                "    raise SystemExit(7)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is the entrypoint",
+                env=env,
+                cwd=directory,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+
     def test_question_stamp_per_line_narrative_answer_still_succeeds(self) -> None:
         # #12: a real compact answer (narrative + citation) still prints, even
         # when it includes a `path:1`-style citation line.
@@ -568,7 +608,7 @@ class PbiTest(unittest.TestCase):
         self.assertNotEqual(result.stdout, "pbi:1\n")
         self.assertTrue(any(call[call.index("--message") + 1].startswith("Answer the question") for call in calls))
 
-    def test_nonzero_query_planning_warning_falls_back_without_echoing_sentinels(self) -> None:
+    def test_nonzero_query_planning_warning_fails_closed_without_echoing_sentinels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
@@ -585,8 +625,9 @@ class PbiTest(unittest.TestCase):
             )
             fake_chat.chmod(0o755)
             result = self.run_pbi("where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, directory / "probe"))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "pbi:1\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
         self.assertNotIn("PROMPT_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("SECRET_SENTINEL", result.stdout + result.stderr)
 

@@ -171,6 +171,17 @@ compact_search_locations() {
   done <<<"$1"
 }
 
+emit_bm25_locations_or_fail_closed() {
+  local locations
+  locations="$(compact_search_locations "$bm25_candidates")"
+  if is_stamp_dump "$locations"; then
+    printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+    exit 1
+  fi
+  printf '%s\n' "$locations"
+  exit 0
+}
+
 # Longest identifier token in a query that looks like a code symbol
 # (snake_case / camelCase / UPPER_SNAKE: has an underscore or an uppercase
 # letter). Empty when the query names no distinguishable real symbol.
@@ -508,8 +519,7 @@ else
       printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
       exit 1
     fi
-    compact_search_locations "$bm25_candidates"
-    exit 0
+    emit_bm25_locations_or_fail_closed
   fi
   if [[ -n "$rg_command" ]]; then
     repository_landmarks="$("$rg_command" -n -m 4 -C 4 "${rg_ignores[@]}" \
@@ -567,8 +577,7 @@ else
       printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
       exit 1
     fi
-    compact_search_locations "$bm25_candidates"
-    exit 0
+    emit_bm25_locations_or_fail_closed
   fi
   explore_uses_local_model=true
   chat_args=(
