@@ -276,13 +276,15 @@ emit_bm25_locations_or_fail_closed() {
   exit 0
 }
 
-# Longest identifier token in a query that looks like a code symbol
-# (snake_case / camelCase / UPPER_SNAKE: has an underscore or an uppercase
-# letter). Empty when the query names no distinguishable real symbol.
-search_named_symbol() {
+# Code-symbol tokens in a query, longest first. Empty when the query names no distinguishable real symbol.
+search_named_symbols() {
   printf '%s\n' "$1" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | awk '
-    { if (($0 ~ /_/ || $0 ~ /[A-Z]/) && length($0) > max) { max = length($0); sym = $0 } }
-    END { print sym }'
+    ($0 ~ /_/ || substr($0, 2) ~ /[A-Z]/) && !seen[$0]++ { print length($0) "\t" $0 }
+  ' | sort -rn | cut -f2-
+}
+
+search_named_symbol() {
+  search_named_symbols "$1" | awk 'NR == 1 { first = $0 } END { print first }'
 }
 
 # True iff any location line in $1 references a file that actually contains
@@ -555,7 +557,20 @@ case "${1:-}" in
     fi
     candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
     symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
-    search_fallback_locations="$(compact_search_locations "$candidates" "$symbol")"
+    search_fallback_locations=""
+    if [[ -n "$symbol" ]]; then
+      while IFS= read -r candidate_symbol; do
+        [[ -n "$candidate_symbol" ]] || continue
+        candidate_locations="$(compact_search_locations "$candidates" "$candidate_symbol")"
+        if [[ -n "$candidate_locations" ]]; then
+          search_fallback_locations="$candidate_locations"
+          symbol="$candidate_symbol"
+          break
+        fi
+      done < <(search_named_symbols "${search_pattern_parts[*]}")
+    else
+      search_fallback_locations="$(compact_search_locations "$candidates")"
+    fi
     set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates" \
       --max-iterations 1
     if [[ -n "$symbol" ]] && search_output_contains_symbol "$search_fallback_locations" "$symbol"; then
