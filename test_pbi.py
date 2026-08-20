@@ -806,6 +806,45 @@ class PbiTest(unittest.TestCase):
             ],
         )
 
+    def test_named_symbol_candidate_skips_stamp_diagnostic_without_api_key(self) -> None:
+        symbol = "soft_delete_drawer"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text(f"def {symbol}():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            for name in (
+                "CLIPROXY_API_KEY",
+                "OPENAI_API_KEY",
+                "LOCAL_ROUTER_API_KEY",
+            ):
+                env.pop(name, None)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(f'File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'pbi: model returned only BM25 location stamps; no source answer'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                symbol,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "a verified BM25 location must not invoke stamp-producing chat")
+
     def test_search_prints_only_compact_locations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

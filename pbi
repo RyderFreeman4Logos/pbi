@@ -406,7 +406,6 @@ case "${1:-}" in
       exec "$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}"
     fi
     search_options+=(--ignore drafts)
-    configure_local_routing
     search_uses_local_model=true
     if ! candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then
       printf '%s\n' "$candidates" >&2
@@ -421,6 +420,7 @@ case "${1:-}" in
       printf '%s\n' "$search_fallback_locations"
       exit 0
     fi
+    configure_local_routing
     ;;
 esac
 
