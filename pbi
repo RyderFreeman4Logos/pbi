@@ -504,8 +504,8 @@ else
   done <<<"$planned_queries"
   bm25_candidates="$candidates"
   if [[ "$planner_timed_out" == true ]]; then
-    if [[ -z "$(compact_search_locations "$bm25_candidates")" ]]; then
-      printf '%s\n' 'pbi: code exploration found no candidates' >&2
+    if planner_timeout_or_kill "$planner_status"; then
+      printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
       exit 1
     fi
     compact_search_locations "$bm25_candidates"
@@ -563,8 +563,8 @@ else
     attempted_queries+=$'\n'"$gap_queries"
   done
   if [[ "$planner_timed_out" == true ]]; then
-    if [[ -z "$(compact_search_locations "$bm25_candidates")" ]]; then
-      printf '%s\n' 'pbi: code exploration found no candidates' >&2
+    if planner_timeout_or_kill "$planner_status"; then
+      printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
       exit 1
     fi
     compact_search_locations "$bm25_candidates"

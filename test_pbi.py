@@ -232,7 +232,7 @@ class PbiTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
                 "    json.dump(sys.argv[1:], f)\n"
-                "print(f'File: {os.getcwd()}/pbi, Lines: 1-10')\n"
+                "print(f'File: {os.getcwd()}/LICENSE, Lines: 1-10')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -256,9 +256,11 @@ class PbiTest(unittest.TestCase):
             elapsed = time.monotonic() - started
             planner = json.loads(trace.read_text())
             probe_argv = json.loads((directory / "probe-trace.json").read_text())
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertLess(elapsed, 3)
-        self.assertEqual(result.stdout, "pbi:1\n")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
+        self.assertNotIn("LICENSE:1", result.stdout + result.stderr)
         self.assertNotIn("Repository files:", planner["argv"][5])
         self.assertEqual(probe_argv[-1], "where is the entrypoint")
 
@@ -271,7 +273,7 @@ class PbiTest(unittest.TestCase):
             probe.write_text(
                 "#!/usr/bin/env python3\n"
                 "import os\n"
-                "print(f'File: {os.getcwd()}/pbi, Lines: 1-10')\n"
+                "print(f'File: {os.getcwd()}/LICENSE, Lines: 1-10')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -296,10 +298,11 @@ class PbiTest(unittest.TestCase):
             )
             elapsed = time.monotonic() - started
             planner_messages = [json.loads(line) for line in trace.read_text().splitlines()]
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertLess(elapsed, 3)
-        self.assertTrue(result.stdout.splitlines())
-        self.assertTrue(all(location == "pbi:1" for location in result.stdout.splitlines()), result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
+        self.assertNotIn("LICENSE:1", result.stdout + result.stderr)
         self.assertEqual(len(planner_messages), 2)
         self.assertTrue(planner_messages[0].startswith("Convert the code question"))
         self.assertTrue(planner_messages[1].startswith("Identify missing evidence"))
