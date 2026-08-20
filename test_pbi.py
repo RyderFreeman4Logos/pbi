@@ -518,6 +518,38 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
+    def test_default_query_spaced_and_punctuated_real_path_stamps_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            paths = (directory / "docs/user guide.md", directory / "src/foo+bar.rs")
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("source\n")
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                + "\n".join(f"print('File: {path}, Lines: 1-40')" for path in paths)
+                + "\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('AI SDK Warning: System messages are risky.')\n"
+                "raise SystemExit(7)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is the entrypoint",
+                env=env,
+                cwd=directory,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+
     def test_question_stamp_per_line_narrative_answer_still_succeeds(self) -> None:
         # #12: a real compact answer (narrative + citation) still prints, even
         # when it includes a `path:1`-style citation line.

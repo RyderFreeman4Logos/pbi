@@ -132,7 +132,7 @@ is_stamp_dump() {
   local line
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    [[ "$line" =~ ^[[:alnum:]_./-]+:(1|line)$ ]] || return 1
+    [[ "$line" != /* && "$line" =~ .+:(1|line)$ ]] || return 1
   done <<<"$1"
   return 0
 }
