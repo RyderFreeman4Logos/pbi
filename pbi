@@ -38,12 +38,16 @@ probe_reported_error() {
 let input = "";
 process.stdin.on("data", chunk => { input += chunk; });
 process.stdin.on("end", () => {
-  try {
-    const response = JSON.parse(input);
-    process.exit(response && (response.error || response.errors || response.status === "error") ? 0 : 1);
-  } catch {
-    process.exit(1);
+  const objectValue = value => value && typeof value === "object" && !Array.isArray(value);
+  const isErrorResponse = value => objectValue(value) && (value.error || value.errors || value.status === "error");
+  const candidates = [input.trim(), ...input.split(/\r?\n/).map(line => line.trim())];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      if (isErrorResponse(JSON.parse(candidate))) process.exit(0);
+    } catch {}
   }
+  process.exit(1);
 });'; then
     return 0
   fi

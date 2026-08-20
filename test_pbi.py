@@ -1102,6 +1102,25 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("status=completed", result.stderr)
         self.assertNotIn("request=resp_123", result.stderr)
 
+    def test_api_error_detector_handles_rate_limit_error_in_mixed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"status\":\"completed\",\"id\":\"resp_123\"}'\n"
+                "printf '%s\\n' '{\"error\":{\"code\":\"rate_limit_exceeded\",\"requestId\":\"req_real\"}}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("--message", "hello", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("status=rate_limit_exceeded", result.stderr)
+        self.assertIn("request=req_real", result.stderr)
+        self.assertNotIn('{"error":', result.stderr)
+        self.assertNotIn("request=resp_123", result.stderr)
+
     def test_api_error_diagnostic_omits_missing_request_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
