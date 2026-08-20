@@ -206,7 +206,7 @@ is_stamp_dump() {
   local line
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    [[ "$line" != /* && "$line" =~ ^(([^:/]+/)+[^:]+|[^:[:space:]]+|[^:/]+\.[A-Za-z0-9]+):(1|line)$ ]] || return 1
+    [[ "$line" != /* && "$line" =~ ^(([^:/[:space:]]+([ ][^:/[:space:]]+)?/[^:]+|[^:/[:space:]]+[ ][^:/[:space:]]+\.[A-Za-z0-9]+|[^:[:space:]]+):(1|line))$ ]] || return 1
   done <<<"$1"
   return 0
 }
