@@ -279,7 +279,7 @@ emit_bm25_locations_or_fail_closed() {
 # Code-symbol tokens in a query, longest first. Empty when the query names no distinguishable real symbol.
 search_named_symbols() {
   printf '%s\n' "$1" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | awk '
-    ($0 ~ /_/ || $0 ~ /[A-Z]/) && !seen[$0]++ { print length($0) "\t" $0 }
+    ($0 ~ /_/ || substr($0, 2) ~ /[A-Z]/) && !seen[$0]++ { print length($0) "\t" $0 }
   ' | sort -rn | cut -f2-
 }
 

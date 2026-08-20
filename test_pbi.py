@@ -1268,6 +1268,37 @@ class PbiTest(unittest.TestCase):
         self.assertIn("pbi: probe-chat reported an API error", result.stderr)
         self.assertNotIn("model not found", result.stderr)
         self.assertNotIn('{\"error\":', result.stderr)
+    def test_search_does_not_recover_capitalized_prose_as_a_named_symbol(self) -> None:
+        query = "Locate MissingClass _definitely_missing"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "prose.py"
+            source.write_text("# Locate is prose, not a requested symbol\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-1\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf \"%s\\n\" \"{\\\"error\\\": {\\\"code\\\": \\\"invalid_request\\\"}}\"\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", *query.split(), env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.count("\n"), 1)
+        self.assertIn("pbi: probe-chat reported an API error", result.stderr)
+        self.assertNotIn("prose.py:1", result.stdout + result.stderr)
+
     def test_search_skips_hanging_chat_when_candidates_contain_named_symbol(self) -> None:
         symbol = "rest_response_prefers_created_ids_when_both_fields_exist"
         with tempfile.TemporaryDirectory() as temporary:
