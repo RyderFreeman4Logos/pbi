@@ -1296,6 +1296,46 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "an in-range candidate must skip Probe Chat")
 
+    def test_search_prefers_named_symbol_over_all_caps_acronyms(self) -> None:
+        query = "daemon_mcp_listen_port HTTP MCP session roots project isolation"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src" / "api"
+            source_dir.mkdir(parents=True)
+            unrelated = source_dir / "mcp.rs"
+            unrelated.write_text("const HTTP_REQUEST_TIMEOUT: u64 = 30;\n")
+            definition = source_dir / "mcp_tests.rs"
+            definition.write_text(
+                "async fn daemon_mcp_listen_port_fails_closed_when_daemon_down() {}\n"
+            )
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {unrelated}, Lines: 1-1\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "sleep 30\n"
+            )
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "search", *query.split(), env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp_tests.rs:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "a verified named symbol must skip Probe Chat")
+        self.assertLess(elapsed, 5)
+
     def test_search_recovers_named_symbol_definition_outside_bm25_snippet(self) -> None:
         query = "WriteSpool _replay_operation"
         with tempfile.TemporaryDirectory() as temporary:

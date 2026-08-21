@@ -213,7 +213,7 @@ is_stamp_dump() {
 
 named_symbol_definition_line() {
   local file="$1" symbol="$2"
-  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:space:](<{:]|$)|^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+${symbol}[[:space:]]*=" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
+  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:alnum:]_]*)([[:space:](<{:]|$)|^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+${symbol}([[:alnum:]_]*)([[:space:]]*=)" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
 }
 
 compact_search_locations() {
@@ -297,7 +297,7 @@ emit_bm25_locations_or_fail_closed() {
 # Code-symbol tokens in a query, longest first. Empty when the query names no distinguishable real symbol.
 search_named_symbols() {
   printf '%s\n' "$1" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | awk '
-    ($0 ~ /_/ || substr($0, 2) ~ /[A-Z]/) && !seen[$0]++ { print length($0) "\t" $0 }
+    ($0 ~ /_/ || substr($0, 2) ~ /[A-Z]/) && ($0 ~ /_/ || $0 ~ /[a-z]/) && !seen[$0]++ { print length($0) "\t" $0 }
   ' | sort -rn | cut -f2-
 }
 
