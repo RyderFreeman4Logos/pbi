@@ -1146,6 +1146,11 @@ if [[ "$explore_uses_local_model" == true ]]; then
       fi
     fi
   fi
+  if [[ "${named_symbol_recovery_required:-false}" == true &&
+        "${recovered_from_candidates:-false}" != true ]]; then
+    printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+    exit 1
+  fi
 fi
 if [[ "${recovered_from_candidates:-false}" != true ]]; then
   if is_stamp_dump "$output"; then
