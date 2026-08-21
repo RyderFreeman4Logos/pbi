@@ -213,7 +213,28 @@ is_stamp_dump() {
 
 named_symbol_definition_line() {
   local file="$1" symbol="$2"
-  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:alnum:]_]*)([[:space:](<{:]|$)|^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+${symbol}([[:alnum:]_]*)([[:space:]]*=)" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
+  awk -v symbol="$symbol" '
+    BEGIN {
+      declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
+      assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
+    }
+    {
+      if (in_block) {
+        if ($0 ~ "^[[:space:]]*[*]/[[:space:]]*$") in_block = 0
+        next
+      }
+      if ($0 ~ "^[[:space:]]*/[*].*[*]/[[:space:]]*$") next
+      if ($0 ~ "^[[:space:]]*/[*][[:space:]]*$") {
+        in_block = 1
+        next
+      }
+      if ($0 ~ "^[[:space:]]*[*]/[[:space:]]*$" || $0 ~ "^[[:space:]]*(//|#)") next
+      if ($0 ~ declaration || $0 ~ assignment) {
+        print NR
+        exit
+      }
+    }
+  ' < "$file" 2>/dev/null || true
 }
 
 compact_search_locations() {
