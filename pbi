@@ -213,7 +213,7 @@ is_stamp_dump() {
 
 named_symbol_definition_line() {
   local file="$1" symbol="$2"
-  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:space:](<{:]|$)" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
+  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:space:](<{:]|$)|^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+${symbol}[[:space:]]*=" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
 }
 
 compact_search_locations() {
@@ -325,6 +325,31 @@ recover_search_from_candidates() {
   [[ "$search_uses_local_model" == true && -n "$search_fallback_locations" ]] || return 1
   output="$search_fallback_locations"
   recovered_from_candidates=true
+}
+
+recover_named_symbol_definition() {
+  local symbol="$1" file locations rg_command
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  while IFS= read -r file; do
+    locations="$(compact_search_locations "File: $file, Lines: 1-1" "$symbol" true)"
+    if [[ -n "$locations" ]]; then
+      printf "%s\n" "$locations"
+      return 0
+    fi
+  done < <("$rg_command" -l -F --glob "!drafts/**" --glob "!docs/plans/**" \
+    --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
+    -- "$symbol" . 2>/dev/null || true)
+  return 1
+}
+
+repo_contains_named_symbol() {
+  local symbol="$1" rg_command
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  "$rg_command" -q -F --glob "!drafts/**" --glob "!docs/plans/**" \
+    --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
+    -- "$symbol" . 2>/dev/null
 }
 
 case "${1:-}" in
@@ -673,6 +698,13 @@ case "${1:-}" in
       fi
     else
       search_fallback_locations="$(compact_search_locations "$candidates")"
+    fi
+    if [[ -n "$symbol" && -z "$search_fallback_locations" ]]; then
+      search_fallback_locations="$(recover_named_symbol_definition "$symbol" || true)"
+      if [[ -z "$search_fallback_locations" ]] && ! repo_contains_named_symbol "$symbol"; then
+        printf "%s\n" "pbi: no source location contains the queried symbol" >&2
+        exit 1
+      fi
     fi
     set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates" \
       --max-iterations 1
