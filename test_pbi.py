@@ -1469,6 +1469,96 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "pbi:5\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_compact_stamp_fallback_fails_closed_without_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            sources = {
+                name: repo / name for name in ("a.py", "b.rs", "c.md")
+            }
+            for source in sources.values():
+                source.write_text("unrelated = True\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                + "\n".join(
+                    f"print(\"File: {source}, Lines: 1-2\")"
+                    for source in sources.values()
+                )
+                + "\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'a.py:1' 'b.rs:1' 'c.md:1'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "find",
+                "breaker-open",
+                "receipt",
+                "#927",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "pbi: model returned only BM25 location stamps; no source answer\n",
+        )
+        self.assertNotIn("a.py:1", result.stdout + result.stderr)
+        self.assertNotIn("b.rs:1", result.stdout + result.stderr)
+        self.assertNotIn("c.md:1", result.stdout + result.stderr)
+
+    def test_search_compact_stamp_fallback_recovers_distinctive_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            sources = {
+                "a.py": repo / "a.py",
+                "b.rs": repo / "b.rs",
+                "c.md": repo / "c.md",
+            }
+            sources["a.py"].write_text("unrelated = True\n")
+            sources["b.rs"].write_text("// breaker-open appears in a comment\nstate = breaker-open\n")
+            sources["c.md"].write_text("unrelated\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                + "\n".join(
+                    f"print(\"File: {source}, Lines: 1-2\")"
+                    for source in sources.values()
+                )
+                + "\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'a.py:1' 'b.rs:1' 'c.md:1'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "find",
+                "breaker-open",
+                "receipt",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "b.rs:2\n")
+        self.assertEqual(result.stderr, "")
+
     def test_search_named_symbol_does_not_succeed_with_unrelated_file(self) -> None:
         # #8: a search whose query names a real symbol must not print an
         # unrelated compact location (wrong file) as success. The completed
@@ -2224,6 +2314,93 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertEqual(result.stderr, "")
         self.assertLess(elapsed, 5)
+
+    def test_search_probe_timeout_recovers_compact_candidates_without_named_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text("# breaker-open appears in a comment first\nstate = breaker-open\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-2\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", "find", "the", "breaker-open", "implementation",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:2\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_probe_timeout_recovers_issue_number_after_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text("# 927 appears in a comment first\nissue = 927\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-2\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", "find", "issue", "#927", "implementation",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:2\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_probe_timeout_rejects_stamp_only_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "stamp.py"
+            source.write_text("unrelated = True\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-1\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", "find", "breaker-open", "receipt", "#927",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
 
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
         # #22: a timed-out search must not turn unrelated BM25 candidates into success.
