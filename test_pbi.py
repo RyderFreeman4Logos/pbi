@@ -382,6 +382,52 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "src/api/mcp.rs:2\nsrc/api/mcp.rs:3\n")
         self.assertEqual(result.stderr, "")
 
+    def test_planner_warning_mixed_bm25_stamps_recover_named_symbol_definitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_file = repo / "src" / "api" / "mcp.rs"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text(
+                "fn reap_expired_sessions() {}\n"
+                "fn reserve_http_session() {}\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source_file}, Lines: 1-20')\n"
+                "print('1970-01-01T00:00')\n"
+                "print('127.0.0.1:3080')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    f.write(message.splitlines()[0] + '\\n')\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('AI SDK Warning: System messages are risky.', file=sys.stderr)\n"
+                "    raise SystemExit(2)\n"
+                "raise SystemExit(99)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where are reserve_http_session and reap_expired_sessions?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            chat_calls = trace.read_text().splitlines()
+        self.assertEqual(chat_calls, ["Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: where are reserve_http_session and reap_expired_sessions?"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("1970-01-01T00:00", result.stdout)
+        self.assertNotIn("127.0.0.1:3080", result.stdout)
+
     def test_default_query_mixed_stamps_recover_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
