@@ -212,13 +212,83 @@ is_stamp_dump() {
 }
 
 named_symbol_definition_line() {
-  local file="$1" symbol="$2"
-  grep -nE "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+${symbol}([[:space:](<{:]|$)|^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+${symbol}[[:space:]]*=" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1; exit }' || true
+  local file="$1" symbol="$2" mode="${3:-definition}"
+  local line_start="${4:-0}" line_end="${5:-0}"
+  awk -v symbol="$symbol" -v mode="$mode" -v line_start="$line_start" -v line_end="$line_end" '
+    BEGIN {
+      declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
+      assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
+    }
+    function hash_comment_pos(line,    i, previous, leading, include_boundary) {
+      for (i = 1; i <= length(line); i++) {
+        if (substr(line, i, 1) != "#") continue
+        previous = (i == 1 ? "" : substr(line, i - 1, 1))
+        leading = (substr(line, 1, i - 1) ~ /^[[:space:]]*$/)
+        include_boundary = substr(line, i + 8, 1)
+        if ((i == 1 || previous ~ /[[:space:]]/) &&
+            !(leading &&
+              ((substr(line, i, 8) == "#include" && include_boundary !~ /[[:alnum:]_]/) ||
+               substr(line, i, 2) == "#[" || substr(line, i, 3) == "#![")))
+          return i
+      }
+      return 0
+    }
+    function strip_comments(line,    remaining, block_pos, slash_pos, hash_pos, comment_pos, comment_kind, close_pos, prefix) {
+      remaining = line
+      while (1) {
+        if (in_block) {
+          close_pos = index(remaining, "*/")
+          if (!close_pos) return ""
+          remaining = " " substr(remaining, close_pos + 2)
+          in_block = 0
+          continue
+        }
+        block_pos = index(remaining, "/*")
+        slash_pos = index(remaining, "//")
+        hash_pos = hash_comment_pos(remaining)
+        comment_pos = 0
+        comment_kind = ""
+        if (block_pos && (!comment_pos || block_pos < comment_pos)) {
+          comment_pos = block_pos
+          comment_kind = "block"
+        }
+        if (slash_pos && (!comment_pos || slash_pos < comment_pos)) {
+          comment_pos = slash_pos
+          comment_kind = "line"
+        }
+        if (hash_pos && (!comment_pos || hash_pos < comment_pos)) {
+          comment_pos = hash_pos
+          comment_kind = "line"
+        }
+        if (!comment_pos) return remaining
+        if (comment_kind == "block") {
+          prefix = substr(remaining, 1, comment_pos - 1)
+          remaining = substr(remaining, comment_pos + 2)
+          close_pos = index(remaining, "*/")
+          if (!close_pos) {
+            in_block = 1
+            return prefix
+          }
+          remaining = prefix " " substr(remaining, close_pos + 2)
+          continue
+        }
+        return substr(remaining, 1, comment_pos - 1)
+      }
+    }
+    {
+      code = strip_comments($0)
+      if ((line_start && NR < line_start) || (line_end && NR > line_end)) next
+      if (code ~ declaration || code ~ assignment || (mode == "any" && index(code, symbol))) {
+        print NR
+        exit
+      }
+    }
+  ' < "$file" 2>/dev/null || true
 }
 
 compact_search_locations() {
   local line file location suffix relative symbol line_start line_end line_number
-  local allow_outside symbol_in_range definition_line first_symbol_line
+  local allow_outside definition_line first_symbol_line
   symbol="${2:-}"
   allow_outside="${3:-false}"
   while IFS= read -r line; do
@@ -237,19 +307,12 @@ compact_search_locations() {
         line_number=1
         if [[ -n "$symbol" ]]; then
           line_number=""
-          symbol_in_range=false
           first_symbol_line=""
-          while IFS=: read -r candidate_line _; do
-            if ((candidate_line >= line_start && (line_end == 0 || candidate_line <= line_end))); then
-              symbol_in_range=true
-              first_symbol_line="$candidate_line"
-              break
-            fi
-          done < <(grep -nF -- "$symbol" "$file" 2>/dev/null || true)
           definition_line="$(named_symbol_definition_line "$file" "$symbol")"
+          first_symbol_line="$(named_symbol_definition_line "$file" "$symbol" any "$line_start" "$line_end")"
           if [[ -n "$definition_line" ]] && ((definition_line >= line_start && (line_end == 0 || definition_line <= line_end))); then
             line_number="$definition_line"
-          elif [[ "$symbol_in_range" == true ]]; then
+          elif [[ -n "$first_symbol_line" ]] && ((first_symbol_line >= line_start && (line_end == 0 || first_symbol_line <= line_end))); then
             line_number="$first_symbol_line"
           elif [[ "$allow_outside" == true && -n "$definition_line" ]]; then
             line_number="$definition_line"
@@ -297,7 +360,7 @@ emit_bm25_locations_or_fail_closed() {
 # Code-symbol tokens in a query, longest first. Empty when the query names no distinguishable real symbol.
 search_named_symbols() {
   printf '%s\n' "$1" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | awk '
-    ($0 ~ /_/ || substr($0, 2) ~ /[A-Z]/) && !seen[$0]++ { print length($0) "\t" $0 }
+    ($0 ~ /_/ || substr($0, 2) ~ /[A-Z]/) && ($0 ~ /_/ || $0 ~ /[a-z]/) && !seen[$0]++ { print length($0) "\t" $0 }
   ' | sort -rn | cut -f2-
 }
 
@@ -314,7 +377,7 @@ search_output_contains_symbol() {
     [[ "$loc" =~ ^(.+):([^:]+)$ ]] || continue
     file="${BASH_REMATCH[1]}"
     [[ "$file" != /* ]] && file="$PWD/$file"
-    if [[ -f "$file" ]] && grep -qF -- "$token" "$file"; then
+    if [[ -f "$file" ]] && [[ -n "$(named_symbol_definition_line "$file" "$token" any)" ]]; then
       return 0
     fi
   done <<<"$output"
