@@ -2635,6 +2635,7 @@ class PbiTest(unittest.TestCase):
                     "(model not found) baseURL=https://first.example/v1 apiKey=first-fixture-secret'\n"
                     "printf '%s\\n' '[FallbackManager] ✅ Success with provider: second-model "
                     "baseURL=https://second.example/v1 apiKey=second-fixture-secret'\n"
+                    "printf '%s\\n' 'AI SDK Warning System: To turn off warning logging, set the AI_SDK_LOG_WARNINGS global to false.'\n"
                     "printf '%s\\n' 'pong'\n"
                 )
                 fake_chat.chmod(0o755)

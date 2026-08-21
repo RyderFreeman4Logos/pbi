@@ -171,7 +171,7 @@ emit_fallback_debug() {
 }
 
 strip_probe_chrome() {
-  grep -Ev '^AI SDK Warning:?[[:space:]]+System messages|^- .+ ✓$|^\[FallbackManager\] (Attempting provider:|✅ Success with provider:)' <<<"$1" || true
+  grep -Ev '^AI SDK Warning:?[[:space:]]+System messages|^AI SDK Warning System: To turn off warning logging, set the AI_SDK_LOG_WARNINGS global to false\.$|^- .+ ✓$|^\[FallbackManager\] (Attempting provider:|✅ Success with provider:)' <<<"$1" || true
 }
 
 planner_timeout_or_kill() {
