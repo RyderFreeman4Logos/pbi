@@ -1076,6 +1076,36 @@ if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")"
   printf '%s\n' 'pbi: no source locations found' >&2
   exit 1
 fi
+if [[ "$explore_uses_local_model" == true ]]; then
+  named_symbols="$(search_named_symbols "$question")"
+  named_symbol_found=false
+  if [[ -n "$named_symbols" ]]; then
+    while IFS= read -r candidate_symbol; do
+      [[ -n "$candidate_symbol" ]] || continue
+      if search_output_contains_symbol "$output" "$candidate_symbol"; then
+        named_symbol_found=true
+        break
+      fi
+    done <<<"$named_symbols"
+    if [[ "$named_symbol_found" != true ]]; then
+      recovered_named_locations=""
+      while IFS= read -r candidate_symbol; do
+        [[ -n "$candidate_symbol" ]] || continue
+        candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" || true)"
+        if [[ -n "$candidate_locations" ]]; then
+          [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
+          recovered_named_locations+="$candidate_locations"
+        fi
+      done <<<"$named_symbols"
+      if [[ -n "$recovered_named_locations" ]]; then
+        output="$recovered_named_locations"
+      else
+        printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
 if [[ "${recovered_from_candidates:-false}" != true ]]; then
   if is_stamp_dump "$output"; then
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2

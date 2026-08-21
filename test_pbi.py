@@ -382,6 +382,55 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "src/api/mcp.rs:2\nsrc/api/mcp.rs:3\n")
         self.assertEqual(result.stderr, "")
 
+    def test_default_query_mixed_stamps_recover_named_symbol_definitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_file = repo / "src" / "api" / "mcp.rs"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text(
+                "fn reap_expired_sessions() {}\n"
+                "fn reserve_http_session() {}\n"
+            )
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source_file}, Lines: 1-20')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('dummy query one')\n"
+                "    print('dummy query two')\n"
+                "    print('dummy query three')\n"
+                "    print('dummy query four')\n"
+                "    print('dummy query five')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('src/core/db.rs:1')\n"
+                "    print('1970-01-01T00:00')\n"
+                "    print('src/mcp/daemon_rest.rs:1')\n"
+                "    print('127.0.0.1:3080')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where are reserve_http_session and reap_expired_sessions?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("1970-01-01T00:00", result.stdout)
+        self.assertNotIn("127.0.0.1:3080", result.stdout)
+
     def test_default_query_planner_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
