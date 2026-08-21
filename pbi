@@ -340,6 +340,10 @@ compact_search_locations() {
       fi
     elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
       location="${BASH_REMATCH[1]}"
+      if [[ "$location" =~ ^[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}T[[:digit:]]{2}:[[:digit:]]{2}(:[[:digit:]]{2})?$ ||
+            "$location" =~ ^(([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}|localhost):[[:digit:]]+$ ]]; then
+        continue
+      fi
       if [[ "$location" == /* ]]; then
         suffix="${location##*:}"
         file="${location%:*}"
@@ -359,9 +363,22 @@ compact_search_locations() {
 }
 
 emit_bm25_locations_or_fail_closed() {
-  local locations
+  local locations recovered_named_locations candidate_symbol candidate_locations
   locations="$(compact_search_locations "$bm25_candidates")"
-  if is_stamp_dump "$locations"; then
+  recovered_named_locations=""
+  while IFS= read -r candidate_symbol; do
+    [[ -n "$candidate_symbol" ]] || continue
+    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" || true)"
+    if [[ -n "$candidate_locations" ]]; then
+      [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
+      recovered_named_locations+="$candidate_locations"
+    fi
+  done < <(search_named_symbols "${question:-}")
+  if [[ -n "$recovered_named_locations" ]]; then
+    printf '%s\n' "$recovered_named_locations"
+    exit 0
+  fi
+  if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi
