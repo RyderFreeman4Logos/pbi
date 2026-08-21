@@ -1027,8 +1027,12 @@ if ((status != 0)); then
     exit "$status"
   fi
   if planner_timeout_or_kill "$status"; then
-    printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
-    exit "$status"
+    if recover_search_from_candidates; then
+      :
+    else
+      printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
+      exit "$status"
+    fi
   elif recover_search_from_candidates; then
     :
   else

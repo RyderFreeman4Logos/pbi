@@ -2225,6 +2225,35 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertLess(elapsed, 5)
 
+    def test_search_probe_timeout_recovers_compact_candidates_without_named_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text("def unrelated():\n    return True\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-2\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", "find", "the", "real", "implementation",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stderr, "")
+
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
         # #22: a timed-out search must not turn unrelated BM25 candidates into success.
         symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
