@@ -726,37 +726,76 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
+    def test_question_spaced_relative_path_stamps_fail_closed(self) -> None:
+        for answer in ("user guide.md:1", "user docs/foo.md:1"):
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                env, _ = self.fake_environment(directory)
+                (directory / "probe").write_text(
+                    f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+                )
+                (directory / "probe").chmod(0o755)
+                fake_chat = directory / "probe-chat"
+                fake_chat.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                    "if message.startswith('Convert the code question'):\n"
+                    "    print('entrypoint CLI parsing')\n"
+                    "elif message.startswith('Identify missing evidence'):\n"
+                    "    print('NONE')\n"
+                    "else:\n"
+                    f"    print({answer!r})\n"
+                )
+                fake_chat.chmod(0o755)
+                result = self.run_pbi(
+                    "where is the entrypoint",
+                    env=env,
+                    cwd=ROOT,
+                    binary=self.fake_pbi(directory, directory / "probe"),
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n"
+            )
+
     def test_question_stamp_per_line_narrative_answer_still_succeeds(self) -> None:
         # #12: a real compact answer (narrative + citation) still prints, even
         # when it includes a `path:1`-style citation line.
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            env, _ = self.fake_environment(directory)
-            (directory / "probe").write_text(
-                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
-            )
-            (directory / "probe").chmod(0o755)
-            fake_chat = directory / "probe-chat"
-            fake_chat.write_text(
-                "#!/usr/bin/env python3\n"
-                "import sys\n"
-                "message = sys.argv[sys.argv.index('--message') + 1]\n"
-                "if message.startswith('Convert the code question'):\n"
-                "    print('entrypoint CLI parsing')\n"
-                "elif message.startswith('Identify missing evidence'):\n"
-                "    print('NONE')\n"
-                "else:\n"
-                "    print('The entrypoint is pbi:9.')\n"
-            )
-            fake_chat.chmod(0o755)
-            result = self.run_pbi(
-                "where is the entrypoint",
-                env=env,
-                cwd=ROOT,
-                binary=self.fake_pbi(directory, directory / "probe"),
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "The entrypoint is pbi:9.\n")
+        for answer in (
+            "The entrypoint is pbi:1",
+            "The entrypoint is ./pbi:1",
+            "The tests are in test_pbi.py:1",
+        ):
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                env, _ = self.fake_environment(directory)
+                (directory / "probe").write_text(
+                    f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+                )
+                (directory / "probe").chmod(0o755)
+                fake_chat = directory / "probe-chat"
+                fake_chat.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                    "if message.startswith('Convert the code question'):\n"
+                    "    print('entrypoint CLI parsing')\n"
+                    "elif message.startswith('Identify missing evidence'):\n"
+                    "    print('NONE')\n"
+                    "else:\n"
+                    f"    print({answer!r})\n"
+                )
+                fake_chat.chmod(0o755)
+                result = self.run_pbi(
+                    "where is the entrypoint",
+                    env=env,
+                    cwd=ROOT,
+                    binary=self.fake_pbi(directory, directory / "probe"),
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, f"{answer}\n")
 
     def test_no_colon_warning_only_stdout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
