@@ -1330,10 +1330,10 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe), timeout=5,
             )
             elapsed = time.monotonic() - started
+            self.assertFalse(trace.exists(), "a verified named symbol must skip Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "src/api/mcp_tests.rs:1\n")
         self.assertEqual(result.stderr, "")
-        self.assertFalse(trace.exists(), "a verified named symbol must skip Probe Chat")
         self.assertLess(elapsed, 5)
 
     def test_search_ignores_commented_prefix_definition_before_real_definition(self) -> None:
@@ -1350,6 +1350,18 @@ class PbiTest(unittest.TestCase):
                 "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
             "trailing hash comment":
                 "x = 1 # daemon_mcp_listen_port_fake_comment\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "mid-line hash include text":
+                "value = 1 #include daemon_mcp_listen_port_fake_comment\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "mid-line hash attribute text":
+                "value = 1 #[derive] daemon_mcp_listen_port_fake_comment\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "mid-line hash inner attribute text":
+                "value = 1 #![allow] daemon_mcp_listen_port_fake_comment\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "leading hash include prefix":
+                "#included daemon_mcp_listen_port_fake_comment\n"
                 "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
             "mid-line block comment":
                 "code /* daemon_mcp_listen_port_fake_comment\n"
@@ -1390,11 +1402,48 @@ class PbiTest(unittest.TestCase):
                     binary=self.fake_pbi(directory, probe), timeout=5,
                 )
                 elapsed = time.monotonic() - started
+                self.assertFalse(trace.exists(), "a commented prefix must not skip Probe Chat")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "src/api/mcp_tests.rs:1\n")
             self.assertEqual(result.stderr, "")
-            self.assertFalse(trace.exists(), "a commented prefix must not skip Probe Chat")
             self.assertLess(elapsed, 5)
+
+    def test_search_keeps_line_leading_hash_directives_as_code(self) -> None:
+        query = "daemon_mcp_listen_port HTTP MCP session roots project isolation"
+        real_cases = {
+            "line-leading include": "#include daemon_mcp_listen_port_real_hit\n",
+            "line-leading attribute": "#[derive] daemon_mcp_listen_port_real_hit\n",
+        }
+        for real_case, source_text in real_cases.items():
+            with self.subTest(real_case=real_case), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repo = directory / "repo"
+                repo.mkdir()
+                source = repo / "real.py"
+                source.write_text(source_text)
+                env, trace = self.fake_environment(directory)
+                env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+                probe = directory / "probe"
+                probe.write_text(
+                    "#!/usr/bin/env python3\n"
+                    f"print(\"File: {source}, Lines: 1-1\")\n"
+                )
+                probe.chmod(0o755)
+                fake_chat = directory / "probe-chat"
+                fake_chat.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "touch \"$PBI_TEST_TRACE\"\n"
+                    "sleep 30\n"
+                )
+                fake_chat.chmod(0o755)
+                result = self.run_pbi(
+                    "search", *query.split(), env=env, cwd=repo,
+                    binary=self.fake_pbi(directory, probe), timeout=5,
+                )
+                self.assertFalse(trace.exists(), "a line-leading directive must skip Probe Chat")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "real.py:1\n")
+            self.assertEqual(result.stderr, "")
 
     def test_search_accepts_later_uncommented_symbol_hit_inside_bm25_range(self) -> None:
         symbol = "search_fallback_locations"
@@ -1433,10 +1482,10 @@ class PbiTest(unittest.TestCase):
                 "search", symbol, env=env, cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
+            self.assertFalse(trace.exists(), "an in-range hit must skip Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "real.py:5\n")
         self.assertEqual(result.stderr, "")
-        self.assertFalse(trace.exists(), "an in-range hit must skip Probe Chat")
 
     def test_search_recovers_named_symbol_definition_outside_bm25_snippet(self) -> None:
         query = "WriteSpool _replay_operation"

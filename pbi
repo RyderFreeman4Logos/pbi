@@ -219,13 +219,16 @@ named_symbol_definition_line() {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
     }
-    function hash_comment_pos(line,    i, previous, following) {
+    function hash_comment_pos(line,    i, previous, leading, include_boundary) {
       for (i = 1; i <= length(line); i++) {
         if (substr(line, i, 1) != "#") continue
         previous = (i == 1 ? "" : substr(line, i - 1, 1))
-        following = substr(line, i + 1, 1)
+        leading = (substr(line, 1, i - 1) ~ /^[[:space:]]*$/)
+        include_boundary = substr(line, i + 8, 1)
         if ((i == 1 || previous ~ /[[:space:]]/) &&
-            following != "[" && following != "!" && substr(line, i, 8) != "#include")
+            !(leading &&
+              ((substr(line, i, 8) == "#include" && include_boundary !~ /[[:alnum:]_]/) ||
+               substr(line, i, 2) == "#[" || substr(line, i, 3) == "#![")))
           return i
       }
       return 0
