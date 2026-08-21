@@ -1663,6 +1663,43 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_api_error_recovers_string_only_named_symbol_outside_bm25_range(self) -> None:
+        symbol = "IPv6"
+        query = "MCP Host allowlist IPv6 loopback bracketed authority"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "src" / "api" / "mcp_ipv6_tests.rs"
+            source.parent.mkdir(parents=True)
+            lines = ["// filler"] * 26
+            lines.append('const FIRST: &str = "IPv6 Host with bracketed authority was rejected";')
+            lines.extend(["// filler"] * 15)
+            lines.append('const SECOND: &str = "portless IPv6 Host was accepted";')
+            lines.extend(["// filler"] * 16)
+            lines.append('const THIRD: &str = "non-loopback IPv6 Host was accepted";')
+            source.write_text("\n".join(lines) + "\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-1\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"status\": \"error\"}'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", *query.split(), env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp_ipv6_tests.rs:27\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "candidate recovery must skip Probe Chat")
+
     def test_search_keeps_in_range_non_declaration_symbol_hit(self) -> None:
         symbol = "PBI_VERSION"
         with tempfile.TemporaryDirectory() as temporary:

@@ -328,6 +328,8 @@ compact_search_locations() {
             line_number="$first_symbol_line"
           elif [[ "$allow_outside" == true && -n "$definition_line" ]]; then
             line_number="$definition_line"
+          elif [[ "$allow_outside" == true && ( -n "${candidates:-}" || -n "${bm25_candidates:-}" ) ]]; then
+            line_number="$(named_symbol_definition_line "$file" "$symbol" any)"
           fi
           [[ -n "$line_number" ]] || continue
         fi
