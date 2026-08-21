@@ -443,7 +443,7 @@ recover_timeout_location_from_bm25() {
     [[ -n "$token" ]] || continue
     while IFS= read -r file; do
       line_number="$(named_symbol_definition_line "$file" "$token" any)"
-      [[ "$line_number" =~ ^[[:digit:]]+$ ]] && ((line_number > 1)) || continue
+      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
       location="$(compact_search_locations "$(printf "File: %s, Lines: %s-%s\n" "$file" "$line_number" "$line_number")" "$token")"
       if [[ -n "$location" ]]; then
         printf "%s\n" "$location"
@@ -1165,11 +1165,15 @@ if [[ "$search_uses_local_model" == true ]]; then
     # (bare `path:1` stamps) is not a real localization. Recover a real
     # location from the compacted candidate set already in hand instead of
     # reporting the stamp echo as success; fail closed if none is available.
-    if [[ -z "$search_fallback_locations" ]]; then
-      printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
-      exit 1
+    if [[ -z "$search_fallback_locations" ]] || is_stamp_dump "$search_fallback_locations"; then
+      output="$(recover_timeout_location_from_bm25 || true)"
+      if [[ -z "$output" ]]; then
+        printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+        exit 1
+      fi
+    else
+      output="$search_fallback_locations"
     fi
-    output="$search_fallback_locations"
     recovered_from_candidates=true
   elif [[ -z "$output" ]]; then
     output="$search_fallback_locations"

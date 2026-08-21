@@ -1455,18 +1455,91 @@ class PbiTest(unittest.TestCase):
     def test_search_prints_only_compact_locations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            sources = {
+                name: repo / name for name in ("a.py", "b.rs", "c.md")
+            }
+            for source in sources.values():
+                source.write_text("unrelated = True\n")
             env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                + "\n".join(
+                    f"print(\"File: {source}, Lines: 1-2\")"
+                    for source in sources.values()
+                )
+                + "\n"
+            )
+            probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
-                f"#!/usr/bin/env bash\n"
-                f"printf '%s\\n' '- /repo ✓' '{PBI}:5' "
-                "'AI SDK Warning: System messages can enable prompt injection.'\n"
-                "printf '%s\\n' 'AI SDK Warning: System messages can enable prompt injection.' >&2\n"
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'a.py:1' 'b.rs:1' 'c.md:1'\n"
             )
             fake_chat.chmod(0o755)
-            result = self.run_pbi("search", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+            result = self.run_pbi(
+                "search",
+                "find",
+                "breaker-open",
+                "receipt",
+                "#927",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "pbi: model returned only BM25 location stamps; no source answer\n",
+        )
+        self.assertNotIn("a.py:1", result.stdout + result.stderr)
+        self.assertNotIn("b.rs:1", result.stdout + result.stderr)
+        self.assertNotIn("c.md:1", result.stdout + result.stderr)
+
+    def test_search_compact_stamp_fallback_recovers_distinctive_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            sources = {
+                "a.py": repo / "a.py",
+                "b.rs": repo / "b.rs",
+                "c.md": repo / "c.md",
+            }
+            sources["a.py"].write_text("unrelated = True\n")
+            sources["b.rs"].write_text("// breaker-open appears in a comment\nstate = breaker-open\n")
+            sources["c.md"].write_text("unrelated\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                + "\n".join(
+                    f"print(\"File: {source}, Lines: 1-2\")"
+                    for source in sources.values()
+                )
+                + "\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'a.py:1' 'b.rs:1' 'c.md:1'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "find",
+                "breaker-open",
+                "receipt",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "pbi:5\n")
+        self.assertEqual(result.stdout, "b.rs:2\n")
         self.assertEqual(result.stderr, "")
 
     def test_search_named_symbol_does_not_succeed_with_unrelated_file(self) -> None:
