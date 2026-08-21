@@ -843,6 +843,19 @@ else
       --max-iterations 1
   generated_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
   if planner_timeout_or_kill "$planner_status"; then
+    recovered_named_locations=""
+    while IFS= read -r candidate_symbol; do
+      [[ -n "$candidate_symbol" ]] || continue
+      candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" || true)"
+      if [[ -n "$candidate_locations" ]]; then
+        [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
+        recovered_named_locations+="$candidate_locations"
+      fi
+    done < <(search_named_symbols "$question")
+    if [[ -n "$recovered_named_locations" ]]; then
+      printf '%s\n' "$recovered_named_locations"
+      exit 0
+    fi
     printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
     exit 1
   elif ((planner_status == 0)) || [[ -n "$generated_queries" ]]; then

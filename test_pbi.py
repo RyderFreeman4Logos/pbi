@@ -334,6 +334,54 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
         self.assertLess(elapsed, 5)
 
+    def test_default_query_timeout_recovers_named_symbol_definitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src" / "api"
+            source_dir.mkdir(parents=True)
+            (source_dir / "mcp.rs").write_text(
+                "// reserve_http_session is documented here, not defined\n"
+                "fn reap_expired_sessions() {}\n"
+                "fn reserve_http_session() {}\n"
+            )
+            (source_dir / "mcp_reservation_tests.rs").write_text(
+                "fn reservation_tests_cover_mcp() {}\n"
+            )
+            env, _ = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
+                "    f.write('invoked')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import signal, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
+                "raise SystemExit(2)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where are reserve_http_session, reap_expired_sessions, and their MCP reservation tests, and what is the current lookup flow?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=4,
+            )
+            probe_trace = directory / "probe-trace.json"
+            self.assertFalse(probe_trace.exists(), "initial planner timeout must not invoke Probe BM25")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp.rs:2\nsrc/api/mcp.rs:3\n")
+        self.assertEqual(result.stderr, "")
+
     def test_default_query_planner_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
