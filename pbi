@@ -404,6 +404,68 @@ search_named_symbols() {
   ' | sort -rn | cut -f2-
 }
 
+search_distinctive_tokens() {
+  local token
+  search_named_symbols "$1"
+  while IFS= read -r token; do
+    token="${token#\#}"
+    token="${token%%[,:;.!?]*}"
+    [[ "$token" =~ ^[[:digit:]][[:digit:]][[:digit:]]*$ ||
+       "$token" =~ ^[[:alnum:]]+-[[:alnum:]-]+$ ]] || continue
+    printf "%s\n" "$token"
+  done < <(printf "%s\n" "$1" | tr "[:space:]" "\n")
+  while IFS= read -r token; do
+    token="${token#\#}"
+    token="${token%%[,:;.!?]*}"
+    case "$token" in
+      a|an|and|answer|are|code|current|does|find|for|from|how|implementation|is|locate|of|query|return|search|show|source|the|their|this|to|what|where|which|with)
+        continue
+        ;;
+    esac
+    [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{5,}$ ]] || continue
+    printf "%s\n" "$token"
+  done < <(printf "%s\n" "$1" | tr "[:space:]" "\n")
+}
+
+candidate_files_from_bm25() {
+  local line file
+  while IFS= read -r line; do
+    [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+    file="${file%%, Lines:*}"
+    [[ -f "$file" ]] && printf "%s\n" "$file"
+  done <<< "${bm25_candidates:-}"
+}
+
+recover_timeout_location_from_bm25() {
+  local token file line_number location
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    while IFS= read -r file; do
+      line_number="$(named_symbol_definition_line "$file" "$token" any)"
+      [[ "$line_number" =~ ^[[:digit:]]+$ ]] && ((line_number > 1)) || continue
+      location="$(compact_search_locations "$(printf "File: %s, Lines: %s-%s\n" "$file" "$line_number" "$line_number")" "$token")"
+      if [[ -n "$location" ]]; then
+        printf "%s\n" "$location"
+        return 0
+      fi
+    done < <(candidate_files_from_bm25)
+  done < <(search_distinctive_tokens "${question:-}")
+  return 1
+}
+
+recover_timeout_search_from_candidates() {
+  recover_search_from_candidates || return 1
+  if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
+    output="$(recover_timeout_location_from_bm25 || true)"
+    if [[ -z "$output" ]]; then
+      recovered_from_candidates=false
+      return 1
+    fi
+    search_fallback_locations="$output"
+  fi
+}
+
 search_named_symbol() {
   search_named_symbols "$1" | awk 'NR == 1 { first = $0 } END { print first }'
 }
@@ -735,6 +797,7 @@ case "${1:-}" in
           ;;
       esac
     done
+    question="${search_pattern_parts[*]}"
     if [[ "$search_timeout_set" == false ]]; then
       search_options=(--timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" "${search_options[@]}")
     fi
@@ -807,6 +870,7 @@ case "${1:-}" in
     else
       search_fallback_locations="$(compact_search_locations "$candidates")"
     fi
+    bm25_candidates="$candidates"
     if [[ -n "$symbol" && -z "$search_fallback_locations" ]]; then
       search_fallback_locations="$(recover_named_symbol_definition "$symbol" || true)"
       if [[ -z "$search_fallback_locations" ]]; then
@@ -1027,7 +1091,7 @@ if ((status != 0)); then
     exit "$status"
   fi
   if planner_timeout_or_kill "$status"; then
-    if recover_search_from_candidates; then
+    if recover_timeout_search_from_candidates; then
       :
     else
       printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2

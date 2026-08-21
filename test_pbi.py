@@ -2231,7 +2231,7 @@ class PbiTest(unittest.TestCase):
             repo = directory / "repo"
             repo.mkdir()
             source = repo / "real.py"
-            source.write_text("def unrelated():\n    return True\n")
+            source.write_text("# breaker-open appears in a comment first\nstate = breaker-open\n")
             env, _ = self.fake_environment(directory)
             env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
@@ -2244,15 +2244,73 @@ class PbiTest(unittest.TestCase):
             fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
             fake_chat.chmod(0o755)
             result = self.run_pbi(
-                "search", "find", "the", "real", "implementation",
+                "search", "find", "the", "breaker-open", "implementation",
                 env=env,
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
                 timeout=5,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stdout, "real.py:2\n")
         self.assertEqual(result.stderr, "")
+
+    def test_search_probe_timeout_recovers_issue_number_after_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text("# 927 appears in a comment first\nissue = 927\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-2\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", "find", "issue", "#927", "implementation",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:2\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_probe_timeout_rejects_stamp_only_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "stamp.py"
+            source.write_text("unrelated = True\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 1-1\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", "find", "breaker-open", "receipt", "#927",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
 
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
         # #22: a timed-out search must not turn unrelated BM25 candidates into success.
