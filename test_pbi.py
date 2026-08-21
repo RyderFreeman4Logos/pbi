@@ -509,6 +509,40 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
+    def test_default_query_identifier_free_dotted_file_citation_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env bash\nexit 0\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('dummy query one')\n"
+                "    print('dummy query two')\n"
+                "    print('dummy query three')\n"
+                "    print('dummy query four')\n"
+                "    print('dummy query five')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('main.rs:42')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "404?",
+                env=env,
+                cwd=ROOT,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "main.rs:42\n")
+        self.assertEqual(result.stderr, "")
+
     def test_default_query_identifier_free_mixed_stamps_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

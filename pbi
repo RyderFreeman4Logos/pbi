@@ -216,7 +216,7 @@ has_mixed_stamp_junk() {
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     if [[ "$line" =~ ^[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}T[[:digit:]]{2}:[[:digit:]]{2}(:[[:digit:]]{2})?$ ||
-          "$line" =~ ^([[:alnum:]][[:alnum:].-]*\.[[:alnum:].-]+|localhost):[[:digit:]]+$ ]]; then
+          "$line" =~ ^(([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}|localhost):[[:digit:]]+$ ]]; then
       return 0
     fi
   done <<<"$1"
