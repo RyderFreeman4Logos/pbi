@@ -1208,6 +1208,70 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertNotIn("location stamps", result.stdout)
 
+    def test_search_generic_probe_failure_recovers_candidates(self) -> None:
+        symbol = "recover_search_from_candidates"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text(f"def {symbol}():\n    return True\n")
+            candidate = f"File: {source}, Lines: 1-3"
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env python3\n" + f"print({candidate!r})\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf \"%s\\n\" \"connection reset\" >&2\n"
+                "exit 23\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "find",
+                "the",
+                "candidate",
+                "implementation",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("pbi: probe-chat failed", result.stdout + result.stderr)
+
+    def test_search_generic_probe_failure_without_candidates_stays_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env bash\nexit 0\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf \"%s\\n\" \"connection reset\" >&2\n"
+                "exit 23\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "find",
+                "a",
+                "missing",
+                "source",
+                env=env,
+                cwd=directory,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: probe-chat failed\n")
+        self.assertNotIn("connection reset", result.stdout + result.stderr)
+
     def test_search_api_error_recovers_named_symbol_from_candidates(self) -> None:
         # #22: an API-error payload must not hide an already-retrieved location
         # for a natural-language query; post-chat recovery returns the candidate.
