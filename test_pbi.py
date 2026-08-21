@@ -1455,6 +1455,23 @@ class PbiTest(unittest.TestCase):
     def test_search_prints_only_compact_locations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                f"#!/usr/bin/env bash\n"
+                f"printf '%s\\n' '- /repo ✓' '{PBI}:5' "
+                "'AI SDK Warning: System messages can enable prompt injection.'\n"
+                "printf '%s\\n' 'AI SDK Warning: System messages can enable prompt injection.' >&2\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi("search", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, directory / "probe"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi:5\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_compact_stamp_fallback_fails_closed_without_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
             repo = directory / "repo"
             repo.mkdir()
             sources = {
