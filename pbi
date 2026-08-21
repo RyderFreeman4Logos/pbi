@@ -199,6 +199,10 @@ run_timed_command() {
   return "$status"
 }
 
+is_stamp_location() {
+  [[ "$1" != /* && "$1" =~ ^(([^:/[:space:]]+([ ][^:/[:space:]]+)?/[^:]+|[^:/[:space:]]+[ ][^:/[:space:]]+\.[A-Za-z0-9]+|[^:[:space:]]+):(1|line))$ ]]
+}
+
 is_stamp_dump() {
   # True when every non-empty line is a bare relative `path:1` or `path:line`
   # stamp — the BM25 `File: ...Lines:` echo the model mirrors back instead of
@@ -206,21 +210,32 @@ is_stamp_dump() {
   local line
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    [[ "$line" != /* && "$line" =~ ^(([^:/[:space:]]+([ ][^:/[:space:]]+)?/[^:]+|[^:/[:space:]]+[ ][^:/[:space:]]+\.[A-Za-z0-9]+|[^:[:space:]]+):(1|line))$ ]] || return 1
+    is_stamp_location "$line" || return 1
   done <<<"$1"
   return 0
 }
 
 has_mixed_stamp_junk() {
-  local line
+  local line stamp_file seen has_stamp=false has_junk=false
+  local -a seen_stamp_files=()
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    if [[ "$line" =~ ^[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}T[[:digit:]]{2}:[[:digit:]]{2}(:[[:digit:]]{2})?$ ||
-          "$line" =~ ^(([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}|localhost):[[:digit:]]+$ ]]; then
-      return 0
+    if is_stamp_location "$line"; then
+      has_stamp=true
+      if [[ "${line##*:}" == 1 ]]; then
+        stamp_file="${line%:*}"
+        for seen in "${seen_stamp_files[@]}"; do
+          [[ "$seen" == "$stamp_file" ]] && return 0
+        done
+        seen_stamp_files+=("$stamp_file")
+      fi
+    elif [[ "$line" =~ ^[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}T[[:digit:]]{2}:[[:digit:]]{2}(:[[:digit:]]{2})?$ ||
+            "$line" =~ ^(([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}|localhost):[[:digit:]]+$ ||
+            "$line" =~ ^[[:alnum:]_./-]+:[[:alnum:]_~-]+$ ]]; then
+      has_junk=true
     fi
   done <<<"$1"
-  return 1
+  [[ "$has_stamp" == true && "$has_junk" == true ]]
 }
 
 named_symbol_definition_line() {
@@ -413,7 +428,7 @@ search_distinctive_tokens() {
     [[ "$token" =~ ^[[:digit:]][[:digit:]][[:digit:]]*$ ||
        "$token" =~ ^[[:alnum:]]+-[[:alnum:]-]+$ ]] || continue
     printf "%s\n" "$token"
-  done < <(printf "%s\n" "$1" | tr "[:space:]" "\n")
+  done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }')
   while IFS= read -r token; do
     token="${token#\#}"
     token="${token%%[,:;.!?]*}"
@@ -424,7 +439,7 @@ search_distinctive_tokens() {
     esac
     [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{5,}$ ]] || continue
     printf "%s\n" "$token"
-  done < <(printf "%s\n" "$1" | tr "[:space:]" "\n")
+  done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }')
 }
 
 candidate_files_from_bm25() {
@@ -490,6 +505,37 @@ recover_search_from_candidates() {
   [[ "$search_uses_local_model" == true && -n "$search_fallback_locations" ]] || return 1
   output="$search_fallback_locations"
   recovered_from_candidates=true
+}
+
+run_default_bm25_fast_path() {
+  local candidate_batch
+  search_uses_local_model=true
+  if ! candidate_batch="$("$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
+      --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
+      --reranker bm25 --format plain --dry-run -- "$question" 2>&1)"; then
+    search_uses_local_model=false
+    return 1
+  fi
+  candidate_batch="$(printf '%s\n' "$candidate_batch" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
+  search_fallback_locations="$(compact_search_locations "$candidate_batch")"
+  [[ -n "$search_fallback_locations" ]] || {
+    search_uses_local_model=false
+    return 1
+  }
+  bm25_candidates="$candidate_batch"
+  if recover_timeout_search_from_candidates &&
+      [[ -n "${output:-}" ]] &&
+      ! is_stamp_dump "$output" &&
+      ! has_mixed_stamp_junk "$output"; then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  search_uses_local_model=false
+  search_fallback_locations=""
+  bm25_candidates=""
+  output=""
+  recovered_from_candidates=false
+  return 1
 }
 
 recover_named_symbol_definition() {
@@ -941,6 +987,9 @@ else
   fi
   question="${message_parts[*]}"
   configure_local_routing
+  if run_default_bm25_fast_path; then
+    exit 0
+  fi
   planner_timed_out=false
   run_planner --force-provider openai --model-name "$primary_model" \
       --message "Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: $question" \
@@ -1160,7 +1209,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
 fi
 if [[ "$search_uses_local_model" == true ]]; then
   output="$(compact_search_locations "$output")"
-  if is_stamp_dump "$output"; then
+  if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
     # #17: a local-model answer that only echoes the BM25 candidate set
     # (bare `path:1` stamps) is not a real localization. Recover a real
     # location from the compacted candidate set already in hand instead of
@@ -1244,7 +1293,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
   fi
 fi
 if [[ "${recovered_from_candidates:-false}" != true ]]; then
-  if is_stamp_dump "$output"; then
+  if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi

@@ -239,6 +239,7 @@ class PbiTest(unittest.TestCase):
             [call[-1] for call in probe_calls],
             [
                 "where is the entrypoint",
+                "where is the entrypoint",
                 "entrypoint CLI parsing",
                 "command dispatch match",
                 "clap Subcommand derive",
@@ -334,6 +335,81 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
         self.assertLess(elapsed, 5)
 
+    def test_default_query_ambient_duplicate_stamps_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'candidate.py:1'\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    for query in ('query one', 'query two', 'query three', 'query four', 'query five'):\n"
+                "        print(query)\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('candidate.py:1')\n"
+                "    print('hermes:ambient')\n"
+                "    print('candidate.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "404?",
+                env=env,
+                cwd=directory,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+
+    def test_default_query_bm25_fast_path_skips_slow_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "src" / "fast.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("# fast path\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace:\n"
+                "    trace.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "print('src/fast.py:5')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "while True: time.sleep(0.1)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is compression publication and main route cache key assembly for first post-compress request",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=4,
+            )
+            probe_trace = directory / "probe-trace.json"
+            self.assertTrue(probe_trace.exists(), "BM25 fast path must search before planner")
+            probe_calls = [json.loads(line) for line in probe_trace.read_text().splitlines()]
+            self.assertFalse((directory / "trace.json").exists(), "a fast-path success must not start the planner")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/fast.py:5\n")
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(probe_calls)
+        self.assertEqual(probe_calls[0][-1], "where is compression publication and main route cache key assembly for first post-compress request")
     def test_default_query_timeout_recovers_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -377,7 +453,7 @@ class PbiTest(unittest.TestCase):
                 timeout=4,
             )
             probe_trace = directory / "probe-trace.json"
-            self.assertFalse(probe_trace.exists(), "initial planner timeout must not invoke Probe BM25")
+            self.assertTrue(probe_trace.exists(), "BM25 fast path must run before planner")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "src/api/mcp.rs:2\nsrc/api/mcp.rs:3\n")
         self.assertEqual(result.stderr, "")
@@ -658,8 +734,8 @@ class PbiTest(unittest.TestCase):
             node.chmod(0o755)
             probe = directory / "probe"
             probe.write_text(
-                "#!/usr/bin/env python3\n"
-                f"print('File: {source}, Lines: 1-2')\n"
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'pbi:1'\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -741,10 +817,10 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
-                "import os, time\n"
+                "import os\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
                 "    f.write('invoked')\n"
-                "time.sleep(30)\n"
+                "print('LICENSE:5')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -762,21 +838,16 @@ class PbiTest(unittest.TestCase):
             )
             fake_chat.chmod(0o755)
             started = time.monotonic()
-            try:
-                result = self.run_pbi(
-                    "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
-                )
-            except subprocess.TimeoutExpired as error:
-                self.fail(f"initial planner timeout invoked the probe: {error}")
+            result = self.run_pbi(
+                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
+            )
             elapsed = time.monotonic() - started
-            planner = json.loads(trace.read_text())
-            self.assertFalse((directory / "probe-trace.json").exists())
-        self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((directory / "probe-trace.json").exists())
+            self.assertFalse(trace.exists(), "a fast-path success must not start the planner")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(elapsed, 3)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
-        self.assertNotIn("LICENSE:1", result.stdout + result.stderr)
-        self.assertNotIn("Repository files:", planner["argv"][5])
+        self.assertEqual(result.stdout, "LICENSE:5\n")
+        self.assertEqual(result.stderr, "")
 
     def test_term_resistant_refinement_planner_times_out_to_direct_bm25(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
