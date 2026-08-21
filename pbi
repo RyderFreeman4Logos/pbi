@@ -60,7 +60,7 @@ resolve_node() {
   printf '%s' "$node_path"
 }
 
-probe_reported_error() {
+probe_json_error() {
   local output="$1"
   if printf '%s' "$output" | "$node_command" -e '
 let input = "";
@@ -79,7 +79,12 @@ process.stdin.on("end", () => {
 });'; then
     return 0
   fi
-  grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$output"
+  return 1
+}
+
+probe_reported_error() {
+  probe_json_error "$1" ||
+    grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$1"
 }
 
 probe_api_error_diagnostic() {
@@ -145,8 +150,28 @@ probe_system_message_warning() {
   grep -Eiq '^AI SDK Warning:?[[:space:]]+System messages' <<<"$1"
 }
 
+redact_fallback_debug_line() {
+  sed -E \
+    -e 's#https?://[^[:space:])",]+#[REDACTED_URL]#g' \
+    -e 's#((api[-_ ]?key|authorization|token)[[:space:]]*[:=][[:space:]]*)("[^"]*"|[^[:space:],}]+)#\1[REDACTED]#gI' \
+    -e 's#"((api[-_ ]?key|authorization|token))"[[:space:]]*:[[:space:]]*"[^"]*"#"\1":"[REDACTED]"#gI' \
+    -e 's#FALLBACK_PROVIDERS[[:space:]]*[:=][[:space:]]*.*#FALLBACK_PROVIDERS=[REDACTED]#gI'
+}
+
+emit_fallback_debug() {
+  [[ "${DEBUG:-}" == 1 ]] || return 0
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      '[FallbackManager] Attempting provider:'*|'[FallbackManager] ✅ Success with provider:'*)
+        printf '%s\n' "$line" | redact_fallback_debug_line >&2
+        ;;
+    esac
+  done <<<"$1"
+}
+
 strip_probe_chrome() {
-  grep -Ev '^AI SDK Warning:?[[:space:]]+System messages|^- .+ ✓$' <<<"$1" || true
+  grep -Ev '^AI SDK Warning:?[[:space:]]+System messages|^AI SDK Warning System: To turn off warning logging, set the AI_SDK_LOG_WARNINGS global to false\.$|^- .+ ✓$|^\[FallbackManager\] (Attempting provider:|✅ Success with provider:)' <<<"$1" || true
 }
 
 planner_timeout_or_kill() {
@@ -196,6 +221,7 @@ run_timed_command() {
     status="$?"
   fi
   active_timeout_pid=
+  emit_fallback_debug "$(<"$stdout_file")"$'\n'"$(<"$stderr_file")"
   return "$status"
 }
 
@@ -546,20 +572,41 @@ else
 fi
 config_primary_model=
 config_model=
+config_endpoint_count=0
+config_endpoint_provider=()
+config_endpoint_model=()
+config_endpoint_base_url=()
+config_endpoint_api_key=()
+config_endpoint_reasoning_effort=()
+config_endpoint_reasoning_set=()
 load_config_toml() {
-  local line key value config_valid=true
+  local line key value config_valid=true section endpoint_index
   local parsed_primary_model= parsed_model=
-  local double_quoted single_quoted bare assignment
+  local double_quoted single_quoted bare assignment single_quote
   double_quoted='^"([^"]*)"[[:space:]]*(#.*)?$'
   single_quoted="^'([^']*)'[[:space:]]*(#.*)?$"
   bare='^([A-Za-z0-9._:/@+-]+)[[:space:]]*(#.*)?$'
   assignment='^([A-Za-z_][A-Za-z0-9_.-]*)[[:space:]]*=[[:space:]]*(.*)$'
+  single_quote="'"
+  config_endpoint_count=0
+  config_endpoint_provider=()
+  config_endpoint_model=()
+  config_endpoint_base_url=()
+  config_endpoint_api_key=()
+  config_endpoint_reasoning_effort=()
+  config_endpoint_reasoning_set=()
   [[ -f "$config_file" && -r "$config_file" ]] || return 0
+
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
-    [[ "$line" == \[* ]] && return 0
+    if [[ "$line" == \[* ]]; then
+      if [[ "$line" =~ ^\[\[[A-Za-z0-9_.-]+\]\][[:space:]]*(#.*)?$ || "$line" =~ ^\[[A-Za-z0-9_.-]+\][[:space:]]*(#.*)?$ ]]; then
+        continue
+      fi
+      return 0
+    fi
     if [[ "$line" =~ $assignment ]]; then
       value="${BASH_REMATCH[2]}"
       value="${value#"${value%%[![:space:]]*}"}"
@@ -568,39 +615,81 @@ load_config_toml() {
         continue
       fi
     fi
-    [[ "$line" == *\"\"\"* || "$line" == *"'''"* ]] && return 0 || :
+    [[ "$line" == *\"\"\"* || "$line" == *"${single_quote}${single_quote}${single_quote}"* ]] && return 0 || :
   done <"$config_file" || return 0
+
+  section=root
+  endpoint_index=-1
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
-    [[ -z "$line" ]] && continue
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" =~ ^\[\[([A-Za-z0-9_.-]+)\]\][[:space:]]*(#.*)?$ ]]; then
+      if [[ "${BASH_REMATCH[1]}" == endpoints ]]; then
+        section=endpoints
+        endpoint_index="$config_endpoint_count"
+        config_endpoint_provider[endpoint_index]=
+        config_endpoint_model[endpoint_index]=
+        config_endpoint_base_url[endpoint_index]=
+        config_endpoint_api_key[endpoint_index]=
+        config_endpoint_reasoning_effort[endpoint_index]=
+        config_endpoint_reasoning_set[endpoint_index]=false
+        ((config_endpoint_count += 1))
+      else
+        section=unknown
+        endpoint_index=-1
+      fi
+      continue
+    fi
+    if [[ "$line" =~ ^\[([A-Za-z0-9_.-]+)\][[:space:]]*(#.*)?$ ]]; then
+      section=unknown
+      endpoint_index=-1
+      continue
+    fi
     [[ "$line" =~ $assignment ]] || continue
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
-    case "$key" in
-      primary_model|model) ;;
-      *) continue ;;
-    esac
+    if [[ "$section" == root ]]; then
+      case "$key" in
+        primary_model|model) ;;
+        *) continue ;;
+      esac
+    elif [[ "$section" == endpoints ]]; then
+      case "$key" in
+        provider|model|base_url|api_key|key|reasoning_effort) ;;
+        *) continue ;;
+      esac
+    else
+      continue
+    fi
     if [[ "$value" =~ $double_quoted || "$value" =~ $single_quoted ]]; then
       value="${BASH_REMATCH[1]}"
     elif [[ "$value" =~ $bare ]]; then
       value="${BASH_REMATCH[1]}"
     else
-      config_valid=false
-      break
+      return 0
     fi
-    if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then
-      config_valid=false
-      break
+    if [[ "$section" == root ]]; then
+      [[ -n "$value" && "$value" =~ ^[A-Za-z0-9._:/@+-]+$ ]] || return 0
+      case "$key" in
+        primary_model) parsed_primary_model="$value" ;;
+        model) parsed_model="$value" ;;
+      esac
+    else
+      case "$key" in
+        provider) config_endpoint_provider[endpoint_index]="$value" ;;
+        model) config_endpoint_model[endpoint_index]="$value" ;;
+        base_url) config_endpoint_base_url[endpoint_index]="$value" ;;
+        api_key|key) config_endpoint_api_key[endpoint_index]="$value" ;;
+        reasoning_effort)
+          config_endpoint_reasoning_effort[endpoint_index]="$value"
+          config_endpoint_reasoning_set[endpoint_index]=true
+          ;;
+      esac
     fi
-    case "$key" in
-      primary_model) parsed_primary_model="$value" ;;
-      model) parsed_model="$value" ;;
-    esac
   done <"$config_file" || return 0
-  [[ "$config_valid" == true ]] || return 0
   config_primary_model="$parsed_primary_model"
   config_model="$parsed_model"
 }
@@ -655,6 +744,16 @@ elif [[ -n "$config_model" ]]; then
 else
   primary_model="$DEFAULT_PRIMARY_MODEL"
 fi
+primary_provider="openai"
+if ((config_endpoint_count > 0)); then
+  primary_provider="${config_endpoint_provider[0]}"
+  if [[ -z "${LOCAL_MODEL:-}" && -z "${LLM_MODEL:-}" && -n "${config_endpoint_model[0]}" ]]; then
+    primary_model="${config_endpoint_model[0]}"
+  fi
+  if [[ -z "${CLIPROXY_BASE_URL:-}" && -z "${LOCAL_ROUTER_BASEURL:-}" && -n "${config_endpoint_base_url[0]}" ]]; then
+    base_url="${config_endpoint_base_url[0]}"
+  fi
+fi
 fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
 request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
 operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
@@ -699,29 +798,116 @@ run_planner() {
 }
 
 configure_local_routing() {
-  api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-${LOCAL_ROUTER_API_KEY:-}}}"
-  if [[ -z "$api_key" ]]; then
-    printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment' >&2
-    return 78
-  fi
-  node_command="$(resolve_node)"
-
-  fallback_providers="$(
-    PBI_BASE_URL="$base_url" PBI_API_KEY="$api_key" PBI_PRIMARY_MODEL="$primary_model" \
-      PBI_FALLBACK_MODEL="$fallback_model" "$node_command" -e '
+  local environment_api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-${LOCAL_ROUTER_API_KEY:-}}}"
+  local endpoint_provider endpoint_model endpoint_base_url endpoint_api_key
+  local endpoint_index routing_count=0
+  local -a routing_provider=() routing_model=() routing_base_url=() routing_api_key=()
+  if ((config_endpoint_count > 0)); then
+    for ((endpoint_index = 0; endpoint_index < config_endpoint_count; endpoint_index += 1)); do
+      endpoint_provider="${config_endpoint_provider[endpoint_index]}"
+      endpoint_model="${config_endpoint_model[endpoint_index]}"
+      endpoint_base_url="${config_endpoint_base_url[endpoint_index]}"
+      endpoint_api_key="${config_endpoint_api_key[endpoint_index]}"
+      if ((endpoint_index == 0)); then
+        if [[ -n "${LOCAL_MODEL:-}" ]]; then
+          endpoint_model="$LOCAL_MODEL"
+        elif [[ -n "${LLM_MODEL:-}" ]]; then
+          endpoint_model="$LLM_MODEL"
+        elif [[ -z "$endpoint_model" ]]; then
+          endpoint_model="$primary_model"
+        fi
+        if [[ -n "${CLIPROXY_BASE_URL:-}" ]]; then
+          endpoint_base_url="$CLIPROXY_BASE_URL"
+        elif [[ -n "${LOCAL_ROUTER_BASEURL:-}" ]]; then
+          endpoint_base_url="$LOCAL_ROUTER_BASEURL"
+        elif [[ -z "$endpoint_base_url" ]]; then
+          endpoint_base_url="$base_url"
+        fi
+        if [[ -n "$environment_api_key" ]]; then
+          endpoint_api_key="$environment_api_key"
+        fi
+      fi
+      case "$endpoint_provider" in
+        openai|anthropic|google|bedrock) ;;
+        *) continue ;;
+      esac
+      [[ -n "$endpoint_model" && -n "$endpoint_base_url" && -n "$endpoint_api_key" ]] || continue
+      routing_provider[routing_count]="$endpoint_provider"
+      routing_model[routing_count]="$endpoint_model"
+      routing_base_url[routing_count]="$endpoint_base_url"
+      routing_api_key[routing_count]="$endpoint_api_key"
+      ((routing_count += 1))
+    done
+    if ((routing_count == 0)); then
+      printf '%s\n' 'pbi: no usable endpoint has a provider, model, base_url, and api_key' >&2
+      return 78
+    fi
+    primary_provider="${routing_provider[0]}"
+    primary_model="${routing_model[0]}"
+    base_url="${routing_base_url[0]}"
+    api_key="${routing_api_key[0]}"
+    node_command="$(resolve_node)"
+    fallback_providers="$({
+      export PBI_ENDPOINT_COUNT="$routing_count"
+      for ((endpoint_index = 0; endpoint_index < routing_count; endpoint_index += 1)); do
+        export "PBI_ENDPOINT_${endpoint_index}_PROVIDER=${routing_provider[endpoint_index]}"
+        export "PBI_ENDPOINT_${endpoint_index}_MODEL=${routing_model[endpoint_index]}"
+        export "PBI_ENDPOINT_${endpoint_index}_BASE_URL=${routing_base_url[endpoint_index]}"
+        export "PBI_ENDPOINT_${endpoint_index}_API_KEY=${routing_api_key[endpoint_index]}"
+      done
+      "$node_command" -e '
+const count = Number(process.env.PBI_ENDPOINT_COUNT);
+const providers = [];
+for (let index = 0; index < count; index += 1) {
+  const prefix = `PBI_ENDPOINT_${index}_`;
+  providers.push({
+    provider: process.env[`${prefix}PROVIDER`],
+    apiKey: process.env[`${prefix}API_KEY`],
+    baseURL: process.env[`${prefix}BASE_URL`],
+    model: process.env[`${prefix}MODEL`],
+    maxRetries: index === 0 ? 3 : 0,
+  });
+}
+process.stdout.write(JSON.stringify(providers));'
+    })"
+  else
+    api_key="$environment_api_key"
+    if [[ -z "$api_key" ]]; then
+      printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment' >&2
+      return 78
+    fi
+    node_command="$(resolve_node)"
+    fallback_providers="$(
+      PBI_BASE_URL="$base_url" PBI_API_KEY="$api_key" PBI_PRIMARY_MODEL="$primary_model" \
+        PBI_FALLBACK_MODEL="$fallback_model" "$node_command" -e '
 const {PBI_BASE_URL, PBI_API_KEY, PBI_PRIMARY_MODEL, PBI_FALLBACK_MODEL} = process.env;
 process.stdout.write(JSON.stringify([
   {provider: "openai", apiKey: PBI_API_KEY, baseURL: PBI_BASE_URL, model: PBI_PRIMARY_MODEL, maxRetries: 3},
   {provider: "openai", apiKey: PBI_API_KEY, baseURL: PBI_BASE_URL, model: PBI_FALLBACK_MODEL, maxRetries: 0}
 ]));'
-  )"
+    )"
+  fi
 
   export PROBE_BINARY_PATH="$probe_path"
-  export FORCE_PROVIDER="openai"
+  export FORCE_PROVIDER="$primary_provider"
   export MODEL_NAME="$primary_model"
   export OPENAI_API_KEY="$api_key"
   export OPENAI_API_URL="$base_url"
   export LLM_BASE_URL="$base_url"
+  case "$primary_provider" in
+    anthropic)
+      export ANTHROPIC_API_KEY="$api_key"
+      export ANTHROPIC_API_URL="$base_url"
+      ;;
+    google)
+      export GOOGLE_GENERATIVE_AI_API_KEY="$api_key"
+      export GOOGLE_API_URL="$base_url"
+      ;;
+    bedrock)
+      export AWS_BEDROCK_API_KEY="$api_key"
+      export AWS_BEDROCK_BASE_URL="$base_url"
+      ;;
+  esac
   export REQUEST_TIMEOUT="$request_timeout"
   export MAX_OPERATION_TIMEOUT="$operation_timeout"
   export MAX_RETRIES="$max_retries"
@@ -902,10 +1088,22 @@ rg_ignores=(--glob '!drafts/**' --glob '!docs/plans/**' --glob '!**/__pycache__/
 
 if [[ "${1:-}" == "--debug-config" ]]; then
   printf '%s\n' "probe_binary=$probe_path"
-  printf '%s\n' 'provider=openai'
+  printf '%s\n' "provider=$primary_provider"
   printf '%s\n' "primary_model=$primary_model"
   printf '%s\n' "fallback_model=$fallback_model"
   printf '%s\n' "base_url=$base_url"
+  if ((config_endpoint_count > 0)); then
+    printf '%s\n' "endpoint_count=$config_endpoint_count"
+    for ((endpoint_index = 0; endpoint_index < config_endpoint_count; endpoint_index += 1)); do
+      printf '%s\n' "endpoint_${endpoint_index}_provider=${config_endpoint_provider[endpoint_index]}"
+      printf '%s\n' "endpoint_${endpoint_index}_model=${config_endpoint_model[endpoint_index]}"
+      printf '%s\n' "endpoint_${endpoint_index}_base_url=${config_endpoint_base_url[endpoint_index]}"
+      printf '%s\n' "endpoint_${endpoint_index}_api_key=[REDACTED]"
+      if [[ "${config_endpoint_reasoning_set[endpoint_index]}" == true ]]; then
+        printf '%s\n' "endpoint_${endpoint_index}_reasoning_effort=${config_endpoint_reasoning_effort[endpoint_index]}"
+      fi
+    done
+  fi
   printf '%s\n' "request_timeout_ms=$request_timeout"
   printf '%s\n' "max_operation_timeout_ms=$operation_timeout"
   printf '%s\n' "max_retries=$max_retries"
@@ -916,7 +1114,9 @@ if [[ "${1:-}" == "--debug-config" ]]; then
   exit 0
 fi
 
+message_mode=false
 if [[ "$1" == "--message" ]]; then
+  message_mode=true
   shift
   if (($# == 0)); then
     printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
@@ -963,7 +1163,9 @@ else
     printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
     exit 1
   elif ((planner_status == 0)) || [[ -n "$generated_queries" ]]; then
-    if [[ -z "$generated_queries" ]] || probe_reported_error "$generated_queries"; then
+    if [[ -z "$generated_queries" ]] ||
+        { ((planner_status != 0)) && probe_reported_error "$generated_queries"; } ||
+        { ((planner_status == 0)) && probe_json_error "$generated_queries"; }; then
       if [[ "$planner_had_system_message_warning" == true && -z "$generated_queries" ]]; then
         printf '%s\n' 'pbi: no source locations found' >&2
         exit 1
@@ -1033,7 +1235,9 @@ else
     elif ((planner_status != 0)) && [[ -z "$gap_queries" ]]; then
       break
     fi
-    if [[ -z "$gap_queries" || "$gap_queries" == "NONE" ]] || probe_reported_error "$gap_queries"; then
+    if [[ -z "$gap_queries" || "$gap_queries" == "NONE" ]] ||
+        { ((planner_status != 0)) && probe_reported_error "$gap_queries"; } ||
+        { ((planner_status == 0)) && probe_json_error "$gap_queries"; }; then
       break
     fi
     while IFS= read -r planned_query; do
@@ -1100,7 +1304,7 @@ if ((status != 0)); then
   elif recover_search_from_candidates; then
     :
   else
-    if probe_reported_error "$probe_diagnostic_input"; then
+    if ((status != 0)) && probe_reported_error "$probe_diagnostic_input"; then
       probe_api_error_diagnostic "$probe_diagnostic_input"
     else
       printf '%s\n' 'pbi: probe-chat failed' >&2
@@ -1109,7 +1313,8 @@ if ((status != 0)); then
   fi
 fi
 output="$(strip_probe_chrome "$output")"
-if probe_reported_error "$probe_diagnostic_input"; then
+if { ((status != 0)) && probe_reported_error "$probe_diagnostic_input"; } ||
+    probe_json_error "$probe_diagnostic_input"; then
   if ! recover_search_from_candidates; then
     probe_api_error_diagnostic "$probe_diagnostic_input"
     exit 1
@@ -1135,7 +1340,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
       "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}"; then
     reviewed_output="$(<"$reviewed_output_file")"
     reviewed_output="$(strip_probe_chrome "$reviewed_output")"
-    if [[ -n "$reviewed_output" ]] && ! probe_reported_error "$reviewed_output"; then
+    if [[ -n "$reviewed_output" ]] && ! probe_json_error "$reviewed_output"; then
       output="$reviewed_output"
     fi
   fi
@@ -1152,7 +1357,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
       "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}"; then
     audited_output="$(<"$audited_output_file")"
     audited_output="$(strip_probe_chrome "$audited_output")"
-    if [[ -n "$audited_output" ]] && ! probe_reported_error "$audited_output"; then
+    if [[ -n "$audited_output" ]] && ! probe_json_error "$audited_output"; then
       output="$audited_output"
     fi
   fi
@@ -1184,7 +1389,8 @@ if [[ "$search_uses_local_model" == true ]]; then
     exit 1
   fi
 fi
-if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ]]; then
+if [[ "$message_mode" != true &&
+      ( -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ) ]]; then
   printf '%s\n' 'pbi: no source locations found' >&2
   exit 1
 fi
