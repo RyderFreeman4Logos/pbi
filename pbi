@@ -211,6 +211,18 @@ is_stamp_dump() {
   return 0
 }
 
+has_mixed_stamp_junk() {
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}T[[:digit:]]{2}:[[:digit:]]{2}(:[[:digit:]]{2})?$ ||
+          "$line" =~ ^([[:alnum:]][[:alnum:].-]*\.[[:alnum:].-]+|localhost):[[:digit:]]+$ ]]; then
+      return 0
+    fi
+  done <<<"$1"
+  return 1
+}
+
 named_symbol_definition_line() {
   local file="$1" symbol="$2" mode="${3:-definition}"
   local line_start="${4:-0}" line_end="${5:-0}"
@@ -359,8 +371,17 @@ emit_bm25_locations_or_fail_closed() {
 
 # Code-symbol tokens in a query, longest first. Empty when the query names no distinguishable real symbol.
 search_named_symbols() {
-  printf '%s\n' "$1" | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | awk '
-    ($0 ~ /_/ || substr($0, 2) ~ /[A-Z]/) && ($0 ~ /_/ || $0 ~ /[a-z]/) && !seen[$0]++ { print length($0) "\t" $0 }
+  printf '%s\n' "$1" | awk '
+    {
+      remaining = $0
+      while (match(remaining, /[A-Za-z_][A-Za-z0-9_]*/)) {
+        token = substr(remaining, RSTART, RLENGTH)
+        if ((token ~ /_/ || substr(token, 2) ~ /[A-Z]/) &&
+            (token ~ /_/ || token ~ /[a-z]/) && !seen[token]++)
+          print length(token) "\t" token
+        remaining = substr(remaining, RSTART + RLENGTH)
+      }
+    }
   ' | sort -rn | cut -f2-
 }
 
@@ -1079,10 +1100,14 @@ fi
 if [[ "$explore_uses_local_model" == true ]]; then
   named_symbols="$(search_named_symbols "$question")"
   named_symbol_found=false
+  named_symbol_recovery_required=false
+  if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
+    named_symbol_recovery_required=true
+  fi
   if [[ -n "$named_symbols" ]]; then
     while IFS= read -r candidate_symbol; do
       [[ -n "$candidate_symbol" ]] || continue
-      if search_output_contains_symbol "$output" "$candidate_symbol"; then
+      if [[ "$named_symbol_recovery_required" != true ]] && search_output_contains_symbol "$output" "$candidate_symbol"; then
         named_symbol_found=true
         break
       fi
@@ -1099,8 +1124,24 @@ if [[ "$explore_uses_local_model" == true ]]; then
       done <<<"$named_symbols"
       if [[ -n "$recovered_named_locations" ]]; then
         output="$recovered_named_locations"
+        recovered_from_candidates=true
       else
-        printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
+        symbol_scan_status=1
+        while IFS= read -r candidate_symbol; do
+          [[ -n "$candidate_symbol" ]] || continue
+          candidate_scan_status=0
+          repo_contains_named_symbol "$candidate_symbol" || candidate_scan_status=$?
+          if [[ "$candidate_scan_status" -eq 2 ]]; then
+            symbol_scan_status=2
+          elif [[ "$candidate_scan_status" -eq 0 ]]; then
+            symbol_scan_status=0
+          fi
+        done <<<"$named_symbols"
+        if [[ "$symbol_scan_status" -eq 1 ]]; then
+          printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
+        else
+          printf '%s\n' 'pbi: no source locations found' >&2
+        fi
         exit 1
       fi
     fi

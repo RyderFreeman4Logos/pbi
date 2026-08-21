@@ -431,6 +431,149 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("1970-01-01T00:00", result.stdout)
         self.assertNotIn("127.0.0.1:3080", result.stdout)
 
+    def test_default_query_mixed_stamp_with_cited_symbol_recovers_or_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "pbi"
+            source.write_text("# source header\nconst PBI_VERSION = 'test'\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('PBI_VERSION lookup')\n"
+                "    print('PBI_VERSION definition')\n"
+                "    print('pbi entrypoint')\n"
+                "    print('pbi configuration')\n"
+                "    print('pbi tests')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('pbi:1')\n"
+                "    print('1970-01-01T00:00')\n"
+                "    print('127.0.0.1:3080')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is PBI_VERSION?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pbi:2\n")
+        self.assertNotIn("1970-01-01T00:00", result.stdout)
+        self.assertNotIn("127.0.0.1:3080", result.stdout)
+
+    def test_default_query_without_identifier_tokens_does_not_silent_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('one')\n"
+                "    print('two')\n"
+                "    print('three')\n"
+                "    print('four')\n"
+                "    print('five')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('pbi:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "404?",
+                env=env,
+                cwd=ROOT,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+
+    def test_default_query_mixed_stamp_recovery_does_not_claim_absence_without_rg(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "pbi"
+            source.write_text("# source header\nconst PBI_VERSION = 'test'\n")
+            env, _ = self.fake_environment(directory)
+            tool_path = directory / "tool-path"
+            tool_path.mkdir()
+            for name in (
+                "bash", "python3", "env", "sleep", "timeout", "setsid", "sh", "mktemp", "rm", "realpath",
+                "grep", "awk", "sort", "cut", "sed", "head", "readlink",
+            ):
+                command = shutil.which(name)
+                if command:
+                    (tool_path / name).symlink_to(command)
+            env["PATH"] = os.pathsep.join((str(directory), str(tool_path)))
+            node = directory / "node"
+            node.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "if os.environ.get('PBI_BASE_URL'):\n"
+                "    print('[]')\n"
+                "else:\n"
+                "    sys.stdin.read()\n"
+                "    raise SystemExit(1)\n"
+            )
+            node.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('PBI_VERSION lookup')\n"
+                "    print('PBI_VERSION definition')\n"
+                "    print('pbi entrypoint')\n"
+                "    print('pbi configuration')\n"
+                "    print('pbi tests')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('pbi:1')\n"
+                "    print('1970-01-01T00:00')\n"
+                "    print('127.0.0.1:3080')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is PBI_VERSION?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("pbi: no source location contains the queried symbol", result.stderr)
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+
     def test_default_query_planner_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
