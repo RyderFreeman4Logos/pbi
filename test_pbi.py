@@ -1338,19 +1338,32 @@ class PbiTest(unittest.TestCase):
 
     def test_search_ignores_commented_prefix_definition_before_real_definition(self) -> None:
         query = "daemon_mcp_listen_port HTTP MCP session roots project isolation"
-        for comment_opener in ("/*", "/* documentation"):
-            with self.subTest(comment_opener=comment_opener), tempfile.TemporaryDirectory() as temporary:
+        comment_cases = {
+            "leading block":
+                "/*\nfn daemon_mcp_listen_port_fake_comment() {}\n*/\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "leading documentation block":
+                "/* documentation\nfn daemon_mcp_listen_port_fake_comment() {}\n*/\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "trailing slash comment":
+                "let x = 1; // daemon_mcp_listen_port_fake_comment\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "trailing hash comment":
+                "x = 1 # daemon_mcp_listen_port_fake_comment\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+            "mid-line block comment":
+                "code /* daemon_mcp_listen_port_fake_comment\n"
+                "fn daemon_mcp_listen_port_fake_comment() {}\n*/\n"
+                "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n",
+        }
+        for comment_case, comment_text in comment_cases.items():
+            with self.subTest(comment_case=comment_case), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 repo = directory / "repo"
                 source_dir = repo / "src" / "api"
                 source_dir.mkdir(parents=True)
                 comment_file = repo / "aaa_comment.rs"
-                comment_file.write_text(
-                    f"{comment_opener}\n"
-                    "fn daemon_mcp_listen_port_fake_comment() {}\n"
-                    "*/\n"
-                    "const HTTP_REQUEST_TIMEOUT: u64 = 30;\n"
-                )
+                comment_file.write_text(comment_text)
                 definition = source_dir / "mcp_tests.rs"
                 definition.write_text(
                     "async fn daemon_mcp_listen_port_fails_closed_when_daemon_down() {}\n"
@@ -1382,6 +1395,48 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(result.stderr, "")
             self.assertFalse(trace.exists(), "a commented prefix must not skip Probe Chat")
             self.assertLess(elapsed, 5)
+
+    def test_search_accepts_later_uncommented_symbol_hit_inside_bm25_range(self) -> None:
+        symbol = "search_fallback_locations"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "real.py"
+            source.write_text(
+                "\n".join(
+                    [
+                        f"{symbol} = \"before\"",
+                        "# filler",
+                        "# filler",
+                        "# filler",
+                        f"{symbol} = \"inside\"",
+                    ]
+                )
+                + "\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {source}, Lines: 5-5\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "printf \"%s\\n\" \"{\\\"error\\\": {\\\"code\\\": \\\"invalid_request\\\"}}\"\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:5\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "an in-range hit must skip Probe Chat")
 
     def test_search_recovers_named_symbol_definition_outside_bm25_snippet(self) -> None:
         query = "WriteSpool _replay_operation"
