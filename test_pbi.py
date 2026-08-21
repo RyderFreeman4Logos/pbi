@@ -1446,6 +1446,82 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: no source location contains the queried symbol\n")
         self.assertNotIn("prose.py:1", result.stdout + result.stderr)
 
+    def test_search_does_not_claim_absence_when_rg_is_missing(self) -> None:
+        symbol = "present_named_symbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+            candidate = repo / "candidate.py"
+            candidate.write_text("def unrelated():\n    return True\n")
+            env, _ = self.fake_environment(directory)
+            tool_path = directory / "tool-path"
+            tool_path.mkdir()
+            for name in ("bash", "python3", "env", "sleep", "timeout", "setsid", "sh", "mktemp", "rm", "realpath", "grep", "awk", "sort", "cut", "sed", "head", "readlink"):
+                command = shutil.which(name)
+                if command:
+                    (tool_path / name).symlink_to(command)
+            env["PATH"] = os.pathsep.join((str(directory), str(tool_path)))
+            node = directory / "node"
+            node.write_text("#!/usr/bin/env bash\nprintf '%s\n' '[]'\n")
+            node.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {candidate}, Lines: 1-1\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            started = time.monotonic()
+            result = self.run_pbi(
+                "search", "Locate", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            elapsed = time.monotonic() - started
+        self.assertNotIn("pbi: no source location contains the queried symbol", result.stderr)
+        self.assertIn("pbi: probe-chat timed out answering the question", result.stderr)
+        self.assertLess(elapsed, 5)
+
+    def test_search_does_not_claim_absence_when_rg_fails(self) -> None:
+        symbol = "present_named_symbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+            candidate = repo / "candidate.py"
+            candidate.write_text("def unrelated():\n    return True\n")
+            env, _ = self.fake_environment(directory)
+            rg = directory / "rg"
+            rg.write_text("#!/usr/bin/env bash\nexit 2\n")
+            rg.chmod(0o755)
+            node = directory / "node"
+            node.write_text("#!/usr/bin/env bash\nprintf '%s\n' '[]'\n")
+            node.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {candidate}, Lines: 1-1\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            started = time.monotonic()
+            result = self.run_pbi(
+                "search", "Locate", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            elapsed = time.monotonic() - started
+        self.assertNotIn("pbi: no source location contains the queried symbol", result.stderr)
+        self.assertIn("pbi: probe-chat timed out answering the question", result.stderr)
+        self.assertLess(elapsed, 5)
+
     def test_search_fails_closed_when_named_symbol_is_absent(self) -> None:
         symbol = "definitely_missing_search_symbol"
         with tempfile.TemporaryDirectory() as temporary:

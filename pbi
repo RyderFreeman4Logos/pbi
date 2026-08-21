@@ -344,12 +344,17 @@ recover_named_symbol_definition() {
 }
 
 repo_contains_named_symbol() {
-  local symbol="$1" rg_command
+  local symbol="$1" rg_command status
   rg_command="$(command -v rg || true)"
-  [[ -n "$rg_command" ]] || return 1
+  [[ -n "$rg_command" ]] || return 2
+  status=0
   "$rg_command" -q -F --glob "!drafts/**" --glob "!docs/plans/**" \
     --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
-    -- "$symbol" . 2>/dev/null
+    -- "$symbol" . 2>/dev/null || status=$?
+  case "$status" in
+    0|1) return "$status" ;;
+    *) return 2 ;;
+  esac
 }
 
 case "${1:-}" in
@@ -701,9 +706,13 @@ case "${1:-}" in
     fi
     if [[ -n "$symbol" && -z "$search_fallback_locations" ]]; then
       search_fallback_locations="$(recover_named_symbol_definition "$symbol" || true)"
-      if [[ -z "$search_fallback_locations" ]] && ! repo_contains_named_symbol "$symbol"; then
-        printf "%s\n" "pbi: no source location contains the queried symbol" >&2
-        exit 1
+      if [[ -z "$search_fallback_locations" ]]; then
+        symbol_scan_status=0
+        repo_contains_named_symbol "$symbol" || symbol_scan_status=$?
+        if [[ "$symbol_scan_status" -eq 1 ]]; then
+          printf "%s\n" "pbi: no source location contains the queried symbol" >&2
+          exit 1
+        fi
       fi
     fi
     set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates" \
