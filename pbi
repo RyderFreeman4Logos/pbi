@@ -212,24 +212,23 @@ is_stamp_dump() {
 }
 
 named_symbol_definition_line() {
-  local file="$1" symbol="$2"
-  awk -v symbol="$symbol" '
+  local file="$1" symbol="$2" mode="${3:-definition}"
+  awk -v symbol="$symbol" -v mode="$mode" '
     BEGIN {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
     }
     {
       if (in_block) {
-        if ($0 ~ "^[[:space:]]*[*]/[[:space:]]*$") in_block = 0
+        if ($0 ~ "[*]/") in_block = 0
         next
       }
-      if ($0 ~ "^[[:space:]]*/[*].*[*]/[[:space:]]*$") next
-      if ($0 ~ "^[[:space:]]*/[*][[:space:]]*$") {
-        in_block = 1
+      if ($0 ~ "^[[:space:]]*/[*]") {
+        if ($0 !~ "[*]/") in_block = 1
         next
       }
-      if ($0 ~ "^[[:space:]]*[*]/[[:space:]]*$" || $0 ~ "^[[:space:]]*(//|#)") next
-      if ($0 ~ declaration || $0 ~ assignment) {
+      if ($0 ~ "^[[:space:]]*[*]/" || $0 ~ "^[[:space:]]*(//|#)") next
+      if ($0 ~ declaration || $0 ~ assignment || (mode == "any" && index($0, symbol))) {
         print NR
         exit
       }
@@ -239,7 +238,7 @@ named_symbol_definition_line() {
 
 compact_search_locations() {
   local line file location suffix relative symbol line_start line_end line_number
-  local allow_outside symbol_in_range definition_line first_symbol_line
+  local allow_outside definition_line first_symbol_line
   symbol="${2:-}"
   allow_outside="${3:-false}"
   while IFS= read -r line; do
@@ -258,19 +257,12 @@ compact_search_locations() {
         line_number=1
         if [[ -n "$symbol" ]]; then
           line_number=""
-          symbol_in_range=false
           first_symbol_line=""
-          while IFS=: read -r candidate_line _; do
-            if ((candidate_line >= line_start && (line_end == 0 || candidate_line <= line_end))); then
-              symbol_in_range=true
-              first_symbol_line="$candidate_line"
-              break
-            fi
-          done < <(grep -nF -- "$symbol" "$file" 2>/dev/null || true)
           definition_line="$(named_symbol_definition_line "$file" "$symbol")"
+          first_symbol_line="$(named_symbol_definition_line "$file" "$symbol" any)"
           if [[ -n "$definition_line" ]] && ((definition_line >= line_start && (line_end == 0 || definition_line <= line_end))); then
             line_number="$definition_line"
-          elif [[ "$symbol_in_range" == true ]]; then
+          elif [[ -n "$first_symbol_line" ]] && ((first_symbol_line >= line_start && (line_end == 0 || first_symbol_line <= line_end))); then
             line_number="$first_symbol_line"
           elif [[ "$allow_outside" == true && -n "$definition_line" ]]; then
             line_number="$definition_line"
@@ -335,7 +327,7 @@ search_output_contains_symbol() {
     [[ "$loc" =~ ^(.+):([^:]+)$ ]] || continue
     file="${BASH_REMATCH[1]}"
     [[ "$file" != /* ]] && file="$PWD/$file"
-    if [[ -f "$file" ]] && grep -qF -- "$token" "$file"; then
+    if [[ -f "$file" ]] && [[ -n "$(named_symbol_definition_line "$file" "$token" any)" ]]; then
       return 0
     fi
   done <<<"$output"
