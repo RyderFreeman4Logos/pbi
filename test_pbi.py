@@ -2604,6 +2604,57 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(recorded["env"]["ALLOWED_FOLDERS"], str(codebase))
 
+    def test_successful_endpoint_fallback_strips_debug_chrome(self) -> None:
+        for debug in (False, True):
+            with self.subTest(debug=debug), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                env, _ = self.fake_environment(directory)
+                for name in ("CLIPROXY_API_KEY", "OPENAI_API_KEY", "LOCAL_ROUTER_API_KEY"):
+                    env.pop(name, None)
+                if debug:
+                    env["DEBUG"] = "1"
+                config_path = directory / ".config" / "pbi" / "config.toml"
+                config_path.parent.mkdir(parents=True)
+                config_path.write_text(
+                    '[[endpoints]]\n'
+                    'provider = "openai"\n'
+                    'model = "first-model"\n'
+                    'base_url = "https://first.example/v1"\n'
+                    'api_key = "first-fixture-secret"\n'
+                    '\n'
+                    '[[endpoints]]\n'
+                    'provider = "openai"\n'
+                    'model = "second-model"\n'
+                    'base_url = "https://second.example/v1"\n'
+                    'api_key = "second-fixture-secret"\n'
+                )
+                fake_chat = directory / "probe-chat"
+                fake_chat.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "printf '%s\\n' '[FallbackManager] Attempting provider: first-model "
+                    "(model not found) baseURL=https://first.example/v1 apiKey=first-fixture-secret'\n"
+                    "printf '%s\\n' '[FallbackManager] ✅ Success with provider: second-model "
+                    "baseURL=https://second.example/v1 apiKey=second-fixture-secret'\n"
+                    "printf '%s\\n' 'pong'\n"
+                )
+                fake_chat.chmod(0o755)
+                result = self.run_pbi("--message", "CHAIN_SENTINEL reply with the single word pong", env=env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "pong\n")
+            if debug:
+                self.assertIn("[FallbackManager] Attempting provider:", result.stderr)
+                self.assertIn("[FallbackManager] ✅ Success with provider:", result.stderr)
+                self.assertIn("[REDACTED_URL]", result.stderr)
+                self.assertIn("[REDACTED]", result.stderr)
+            else:
+                self.assertEqual(result.stderr, "")
+            self.assertNotIn("first-fixture-secret", result.stdout + result.stderr)
+            self.assertNotIn("second-fixture-secret", result.stdout + result.stderr)
+            self.assertNotIn("first.example", result.stdout + result.stderr)
+            self.assertNotIn("second.example", result.stdout + result.stderr)
+
+
     def test_fails_closed_when_probe_reports_a_json_api_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

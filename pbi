@@ -60,7 +60,7 @@ resolve_node() {
   printf '%s' "$node_path"
 }
 
-probe_reported_error() {
+probe_json_error() {
   local output="$1"
   if printf '%s' "$output" | "$node_command" -e '
 let input = "";
@@ -79,7 +79,12 @@ process.stdin.on("end", () => {
 });'; then
     return 0
   fi
-  grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$output"
+  return 1
+}
+
+probe_reported_error() {
+  probe_json_error "$1" ||
+    grep -Eiq 'invalid_request|codex[[:space:]-]*fallback|fallback[[:space:]-]*codex|model[_[:space:]-]*(not[_[:space:]-]*found|missing|unavailable)' <<<"$1"
 }
 
 probe_api_error_diagnostic() {
@@ -145,8 +150,28 @@ probe_system_message_warning() {
   grep -Eiq '^AI SDK Warning:?[[:space:]]+System messages' <<<"$1"
 }
 
+redact_fallback_debug_line() {
+  sed -E \
+    -e 's#https?://[^[:space:])",]+#[REDACTED_URL]#g' \
+    -e 's#((api[-_ ]?key|authorization|token)[[:space:]]*[:=][[:space:]]*)("[^"]*"|[^[:space:],}]+)#\1[REDACTED]#gI' \
+    -e 's#"((api[-_ ]?key|authorization|token))"[[:space:]]*:[[:space:]]*"[^"]*"#"\1":"[REDACTED]"#gI' \
+    -e 's#FALLBACK_PROVIDERS[[:space:]]*[:=][[:space:]]*.*#FALLBACK_PROVIDERS=[REDACTED]#gI'
+}
+
+emit_fallback_debug() {
+  [[ "${DEBUG:-}" == 1 ]] || return 0
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      '[FallbackManager] Attempting provider:'*|'[FallbackManager] ✅ Success with provider:'*)
+        printf '%s\n' "$line" | redact_fallback_debug_line >&2
+        ;;
+    esac
+  done <<<"$1"
+}
+
 strip_probe_chrome() {
-  grep -Ev '^AI SDK Warning:?[[:space:]]+System messages|^- .+ ✓$' <<<"$1" || true
+  grep -Ev '^AI SDK Warning:?[[:space:]]+System messages|^- .+ ✓$|^\[FallbackManager\] (Attempting provider:|✅ Success with provider:)' <<<"$1" || true
 }
 
 planner_timeout_or_kill() {
@@ -196,6 +221,7 @@ run_timed_command() {
     status="$?"
   fi
   active_timeout_pid=
+  emit_fallback_debug "$(<"$stdout_file")"$'\n'"$(<"$stderr_file")"
   return "$status"
 }
 
@@ -1088,7 +1114,9 @@ if [[ "${1:-}" == "--debug-config" ]]; then
   exit 0
 fi
 
+message_mode=false
 if [[ "$1" == "--message" ]]; then
+  message_mode=true
   shift
   if (($# == 0)); then
     printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
@@ -1135,7 +1163,9 @@ else
     printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
     exit 1
   elif ((planner_status == 0)) || [[ -n "$generated_queries" ]]; then
-    if [[ -z "$generated_queries" ]] || probe_reported_error "$generated_queries"; then
+    if [[ -z "$generated_queries" ]] ||
+        { ((planner_status != 0)) && probe_reported_error "$generated_queries"; } ||
+        { ((planner_status == 0)) && probe_json_error "$generated_queries"; }; then
       if [[ "$planner_had_system_message_warning" == true && -z "$generated_queries" ]]; then
         printf '%s\n' 'pbi: no source locations found' >&2
         exit 1
@@ -1205,7 +1235,9 @@ else
     elif ((planner_status != 0)) && [[ -z "$gap_queries" ]]; then
       break
     fi
-    if [[ -z "$gap_queries" || "$gap_queries" == "NONE" ]] || probe_reported_error "$gap_queries"; then
+    if [[ -z "$gap_queries" || "$gap_queries" == "NONE" ]] ||
+        { ((planner_status != 0)) && probe_reported_error "$gap_queries"; } ||
+        { ((planner_status == 0)) && probe_json_error "$gap_queries"; }; then
       break
     fi
     while IFS= read -r planned_query; do
@@ -1272,7 +1304,7 @@ if ((status != 0)); then
   elif recover_search_from_candidates; then
     :
   else
-    if probe_reported_error "$probe_diagnostic_input"; then
+    if ((status != 0)) && probe_reported_error "$probe_diagnostic_input"; then
       probe_api_error_diagnostic "$probe_diagnostic_input"
     else
       printf '%s\n' 'pbi: probe-chat failed' >&2
@@ -1281,7 +1313,8 @@ if ((status != 0)); then
   fi
 fi
 output="$(strip_probe_chrome "$output")"
-if probe_reported_error "$probe_diagnostic_input"; then
+if { ((status != 0)) && probe_reported_error "$probe_diagnostic_input"; } ||
+    probe_json_error "$probe_diagnostic_input"; then
   if ! recover_search_from_candidates; then
     probe_api_error_diagnostic "$probe_diagnostic_input"
     exit 1
@@ -1307,7 +1340,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
       "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}"; then
     reviewed_output="$(<"$reviewed_output_file")"
     reviewed_output="$(strip_probe_chrome "$reviewed_output")"
-    if [[ -n "$reviewed_output" ]] && ! probe_reported_error "$reviewed_output"; then
+    if [[ -n "$reviewed_output" ]] && ! probe_json_error "$reviewed_output"; then
       output="$reviewed_output"
     fi
   fi
@@ -1324,7 +1357,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
       "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}"; then
     audited_output="$(<"$audited_output_file")"
     audited_output="$(strip_probe_chrome "$audited_output")"
-    if [[ -n "$audited_output" ]] && ! probe_reported_error "$audited_output"; then
+    if [[ -n "$audited_output" ]] && ! probe_json_error "$audited_output"; then
       output="$audited_output"
     fi
   fi
@@ -1356,7 +1389,8 @@ if [[ "$search_uses_local_model" == true ]]; then
     exit 1
   fi
 fi
-if [[ -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ]]; then
+if [[ "$message_mode" != true &&
+      ( -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ) ]]; then
   printf '%s\n' 'pbi: no source locations found' >&2
   exit 1
 fi
