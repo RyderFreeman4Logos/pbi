@@ -466,7 +466,7 @@ fast_path_token_variants() {
     printf '%s\tfalse\n' "$token"
     if [[ "$token" == *[-_]* ]]; then
       tail="${token##*[-_]}"
-      if [[ "${#tail}" -ge 5 ]]; then
+      if [[ "${#tail}" -ge 6 ]]; then
         printf '%s\tfalse\n' "$tail"
       fi
     fi
@@ -489,7 +489,7 @@ fast_path_match_variants() {
     [[ "$normalized" == "$token" ]] || printf '%s\n' "$normalized"
     if [[ "$token" == *[-_]* ]]; then
       tail="${token##*[-_]}"
-      if [[ "${#tail}" -ge 5 ]]; then
+      if [[ "${#tail}" -ge 6 ]]; then
         printf '%s\n' "$tail"
       fi
     fi
@@ -537,6 +537,55 @@ build_fast_path_queries() {
   fi
 }
 
+fast_path_required_compounds() {
+  local token normalized
+  while IFS= read -r token; do
+    [[ "$token" == *[-_]* ]] || continue
+    normalized="${token//-/_}"
+    printf '%s\n' "$normalized"
+  done < <(search_distinctive_tokens "$1") | awk 'NF && !seen[$0]++'
+}
+
+fast_path_requires_append_audit() {
+  local normalized_question="${1,,}"
+  [[ "$normalized_question" =~ (^|[^[:alnum:]_])append(ing)?([^[:alnum:]_]|$) ]] &&
+    [[ "$normalized_question" =~ (^|[^[:alnum:]_])audit([^[:alnum:]_]|$) ]]
+}
+
+fast_path_line_has_required_compound() {
+  local file="$1" line_number="$2" required_compounds="$3" compound
+  while IFS= read -r compound; do
+    [[ -n "$compound" ]] || continue
+    if [[ -n "$(named_symbol_definition_line "$file" "$compound" any "$line_number" "$line_number")" ]]; then
+      return 0
+    fi
+  done <<<"$required_compounds"
+  return 1
+}
+
+fast_path_line_has_append_audit_identifier() {
+  local file="$1" line_number="$2"
+  awk -v line_number="$line_number" '
+    NR != line_number { next }
+    {
+      code = $0
+      sub(/[[:space:]]*\/\/.*/, "", code)
+      sub(/[[:space:]]*#.*/, "", code)
+      gsub(/\/\*[^*]*\*\//, "", code)
+      while (match(code, /[[:alpha:]_][[:alnum:]_-]*/)) {
+        identifier = substr(code, RSTART, RLENGTH)
+        normalized_identifier = identifier
+        gsub(/[^[:alnum:]]/, "", normalized_identifier)
+        normalized_identifier = tolower(normalized_identifier)
+        if (index(normalized_identifier, "append") && index(normalized_identifier, "audit")) exit 0
+        code = substr(code, RSTART + RLENGTH)
+      }
+      exit 1
+    }
+  ' < "$file" 2>/dev/null
+}
+
+
 candidate_line_score() {
   local file="$1" line_number="$2" token="$3"
   awk -v line_number="$line_number" -v token="$token" '
@@ -575,6 +624,13 @@ candidate_line_score() {
 recover_timeout_location_from_bm25() {
   local candidate token file line_start line_end line_number location score
   local best_score=-1 best_location="" match_token match_line
+  local required_compounds="" append_audit_signal=false
+  if [[ "${1:-false}" == true ]]; then
+    required_compounds="$(fast_path_required_compounds "${question:-}")"
+    if fast_path_requires_append_audit "${question:-}"; then
+      append_audit_signal=true
+    fi
+  fi
   while IFS= read -r candidate; do
     if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
@@ -599,6 +655,14 @@ recover_timeout_location_from_bm25() {
       [[ -n "$match_token" ]] || continue
       match_line="$(named_symbol_definition_line "$file" "$match_token" any "$line_start" "$line_end")"
       [[ "$match_line" =~ ^[[:digit:]]+$ ]] || continue
+      if [[ -n "$required_compounds" ]] &&
+         ! fast_path_line_has_required_compound "$file" "$match_line" "$required_compounds"; then
+        continue
+      fi
+      if [[ "$append_audit_signal" == true ]] &&
+         ! fast_path_line_has_append_audit_identifier "$file" "$match_line"; then
+        continue
+      fi
       score="$(candidate_line_score "$file" "$match_line" "$match_token")"
       [[ "$score" =~ ^[[:digit:]]+$ ]] || continue
       line_number="$match_line"
@@ -703,7 +767,7 @@ run_default_bm25_fast_path() {
     fi
   done
   search_fallback_locations="$(compact_search_locations "$bm25_candidates")"
-  if output="$(recover_timeout_location_from_bm25)" && [[ -n "$output" ]]; then
+  if output="$(recover_timeout_location_from_bm25 true)" && [[ -n "$output" ]]; then
     printf '%s\n' "$output"
     return 0
   fi
