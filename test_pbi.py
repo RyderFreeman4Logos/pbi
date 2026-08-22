@@ -2848,6 +2848,24 @@ class PbiTest(unittest.TestCase):
         self.assertLess(elapsed, 10, "hung search probe-chat must be killed, not hang pbi")
         self.assertIn("pbi: probe-chat timed out answering the question", result.stderr)
 
+    def test_search_probe_hang_emits_diagnostic_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            probe.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "search", "hallucination", "caption", env=env, cwd=ROOT,
+                binary=self.fake_pbi(directory, probe), timeout=20,
+            )
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: probe search timed out\n")
+        self.assertLess(elapsed, 10)
+
     def test_search_probe_timeout_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

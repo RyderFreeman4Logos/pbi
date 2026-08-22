@@ -1420,16 +1420,22 @@ case "${1:-}" in
     search_options+=(--ignore drafts)
     search_uses_local_model=true
     search_status=0
-    if candidates="$("$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}" 2>&1)"; then
+    search_output_file="$(mktemp)"
+    track_temp_file "$search_output_file"
+    active_timeout_diagnostic="pbi: probe search timed out"
+    if run_timed_command "$DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS" "$search_output_file" "$search_output_file" \
+        "$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}"; then
       search_status=0
     else
       search_status=$?
     fi
+    active_timeout_diagnostic=
+    candidates="$(<"$search_output_file")"
     if ((search_status != 0)); then
       if planner_timeout_or_kill "$search_status"; then
-        printf '%s\n' 'pbi: probe search timed out' >&2
+        printf "%s\n" "pbi: probe search timed out" >&2
       else
-        printf '%s\n' "$candidates" >&2
+        printf "%s\n" "$candidates" >&2
       fi
       exit "$search_status"
     fi
