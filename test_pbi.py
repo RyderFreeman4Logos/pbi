@@ -3515,6 +3515,12 @@ class PbiTest(unittest.TestCase):
             source_dir.mkdir(parents=True)
             display_alias = source_dir / "session_display_alias.rs"
             alias_race = source_dir / "session_cmds_tests_tail_wait_resume_wrapper_alias_race.rs"
+            tripwire = repo / "crates/foo/bar.rs"
+            tripwire.parent.mkdir(parents=True)
+            tripwire.write_text("fn late_alias_tripwire() {}\n")
+            for index in range(20):
+                unrelated = repo / f"crates/foo/unrelated_{index}.rs"
+                unrelated.write_text("fn unrelated() {}\n")
             display_alias.write_text("// filler\n" * 25 + "pub(crate) fn alias_for_display_session() {}\n")
             lines = ["// filler"] * 87
             lines.append("fn rebinds_when_alias_appears_after_wait_starts() {}")
@@ -3532,7 +3538,10 @@ class PbiTest(unittest.TestCase):
                 f"    print('File: {display_alias}, Lines: 26-66')\n"
                 "    print('Found 2 search results')\n"
                 "    print('Remaining files not shown:')\n"
+                "    print('  patterns/pr-bot/PATTERN.md <2> <17>')\n"
                 "    print('  src/session_cmds_tests_tail_wait_resume_wrapper_alias_race.rs <2> <7>')\n"
+                f"    print('  {tripwire.relative_to(repo)} <2> <7>')\n"
+                "    for index in range(20): print(f'  crates/foo/unrelated_{index}.rs <1> <1>')\n"
                 "else: print('git-fixtures:1')\n"
             )
             probe.chmod(0o755)

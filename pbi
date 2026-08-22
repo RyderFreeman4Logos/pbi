@@ -642,9 +642,46 @@ fast_path_accepted_match_line() {
   return 1
 }
 
+fast_path_deadline_reached() {
+  [[ "${fast_path_deadline_ns:-}" =~ ^[[:digit:]]+$ ]] || return 1
+  (( $(fast_path_now_ns) >= fast_path_deadline_ns ))
+}
+
+fast_path_footer_tokens() {
+  local token normalized
+  {
+    fast_path_match_variants "$1"
+    fast_path_required_compounds "$1"
+    while IFS= read -r token; do
+      [[ "$token" == *[-_]* ]] || continue
+      printf '%s\n' "${token##*[-_]}"
+    done < <(search_distinctive_tokens "$1")
+    if fast_path_requires_append_audit "$1"; then
+      printf '%s\n' review
+    fi
+  } | while IFS= read -r token; do
+    normalized="${token,,}"
+    normalized="${normalized//[^[:alnum:]]/}"
+    [[ -n "$normalized" ]] && printf '%s\n' "$normalized"
+  done | awk 'NF && !seen[$0]++'
+}
+
+fast_path_footer_path_matches_query() {
+  local path="$1" footer_tokens="$2" normalized_path token
+  normalized_path="${path,,}"
+  normalized_path="${normalized_path//[^[:alnum:]]/}"
+  while IFS= read -r token; do
+    [[ -n "$token" && "$normalized_path" == *"$token"* ]] && return 0
+  done <<<"$footer_tokens"
+  return 1
+}
+
 remaining_file_candidates() {
-  local line path in_footer=false
+  local line path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
+  footer_tokens="$(fast_path_footer_tokens "$query")"
+  fast_path_deadline_reached && return 0
   while IFS= read -r line; do
+    fast_path_deadline_reached && break
     if [[ "$line" =~ ^Remaining[[:space:]]+files[[:space:]]+not[[:space:]]+shown:[[:space:]]*$ ]]; then
       in_footer=true
       continue
@@ -652,32 +689,37 @@ remaining_file_candidates() {
     [[ "$in_footer" == true ]] || continue
     [[ "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]+\<[[:digit:]]+\>[[:space:]]+\<[[:digit:]]+\>[[:space:]]*$ ]] || continue
     path="${BASH_REMATCH[1]}"
-    [[ "$path" != /* ]] && path="$PWD/$path"
     case "$path" in
       */PATTERN.md|*/workflow.toml|*/Cargo.toml|*.md) continue ;;
     esac
+    fast_path_footer_path_matches_query "$path" "$footer_tokens" || continue
+    [[ "$path" != /* ]] && path="$PWD/$path"
     [[ -f "$path" ]] || continue
     printf 'File: %s, Lines: 1-999999999\n' "$path"
+    kept=$((kept + 1))
+    ((kept < 16)) || break
   done <<<"$1"
 }
 
 recover_timeout_location_from_bm25() {
   local candidate token file line_start line_end line_number location score
-  local best_score=-1 best_location="" match_token match_line
+  local best_score=-1 best_location="" first_compound_location="" match_token match_line
   local required_compounds="" append_audit_signal=false
-  local candidates="${bm25_candidates:-}" footer_candidates
-  footer_candidates="$(remaining_file_candidates "$candidates")"
-  if [[ -n "$footer_candidates" ]]; then
-    [[ -z "$candidates" ]] || candidates+=$'\n'
-    candidates+="$footer_candidates"
-  fi
+  local candidates="${bm25_candidates:-}" footer_candidates match_tokens
   if [[ "${1:-false}" == true ]]; then
     required_compounds="$(fast_path_required_compounds "${question:-}")"
     if fast_path_requires_append_audit "${question:-}"; then
       append_audit_signal=true
     fi
   fi
+  footer_candidates="$(remaining_file_candidates "$candidates" "${question:-}")"
+  match_tokens="$(fast_path_match_variants "${question:-}")"
+  if [[ -n "$footer_candidates" ]] && ! fast_path_deadline_reached; then
+    [[ -z "$candidates" ]] || candidates+=$'\n'
+    candidates+="$footer_candidates"
+  fi
   while IFS= read -r candidate; do
+    fast_path_deadline_reached && break
     if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
       if [[ "$file" =~ ^(.+),[[:space:]]Lines:[[:space:]]([[:digit:]]+)(-([[:digit:]]+))?$ ]]; then
@@ -698,6 +740,7 @@ recover_timeout_location_from_bm25() {
     [[ "$file" != /* ]] && file="$PWD/$file"
     [[ -f "$file" ]] || continue
     while IFS= read -r match_token; do
+      fast_path_deadline_reached && break 2
       [[ -n "$match_token" ]] || continue
       match_line="$(fast_path_accepted_match_line "$file" "$match_token" "$line_start" "$line_end" || true)"
       if [[ -z "$match_line" && ( -n "$required_compounds" || "$append_audit_signal" == true ) &&
@@ -714,8 +757,19 @@ recover_timeout_location_from_bm25() {
         best_score="$score"
         best_location="$location"
       fi
-    done < <(fast_path_match_variants "${question:-}")
+      if [[ -n "$required_compounds" || "$append_audit_signal" == true ]]; then
+        if ((score >= 100000000)); then
+          printf '%s\n' "$location"
+          return 0
+        fi
+        [[ -n "$first_compound_location" ]] || first_compound_location="$location"
+      fi
+    done <<<"$match_tokens"
   done <<< "$candidates"
+  if [[ -n "$first_compound_location" ]]; then
+    printf '%s\n' "$first_compound_location"
+    return 0
+  fi
   if [[ -n "$best_location" ]]; then
     printf '%s\n' "$best_location"
     return 0
