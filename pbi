@@ -642,10 +642,35 @@ fast_path_accepted_match_line() {
   return 1
 }
 
+remaining_file_candidates() {
+  local line path in_footer=false
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^Remaining[[:space:]]+files[[:space:]]+not[[:space:]]+shown:[[:space:]]*$ ]]; then
+      in_footer=true
+      continue
+    fi
+    [[ "$in_footer" == true ]] || continue
+    [[ "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]+\<[[:digit:]]+\>[[:space:]]+\<[[:digit:]]+\>[[:space:]]*$ ]] || continue
+    path="${BASH_REMATCH[1]}"
+    [[ "$path" != /* ]] && path="$PWD/$path"
+    case "$path" in
+      */PATTERN.md|*/workflow.toml|*/Cargo.toml|*.md) continue ;;
+    esac
+    [[ -f "$path" ]] || continue
+    printf 'File: %s, Lines: 1-999999999\n' "$path"
+  done <<<"$1"
+}
+
 recover_timeout_location_from_bm25() {
   local candidate token file line_start line_end line_number location score
   local best_score=-1 best_location="" match_token match_line
   local required_compounds="" append_audit_signal=false
+  local candidates="${bm25_candidates:-}" footer_candidates
+  footer_candidates="$(remaining_file_candidates "$candidates")"
+  if [[ -n "$footer_candidates" ]]; then
+    [[ -z "$candidates" ]] || candidates+=$'\n'
+    candidates+="$footer_candidates"
+  fi
   if [[ "${1:-false}" == true ]]; then
     required_compounds="$(fast_path_required_compounds "${question:-}")"
     if fast_path_requires_append_audit "${question:-}"; then
@@ -690,7 +715,7 @@ recover_timeout_location_from_bm25() {
         best_location="$location"
       fi
     done < <(fast_path_match_variants "${question:-}")
-  done <<< "${bm25_candidates:-}"
+  done <<< "$candidates"
   if [[ -n "$best_location" ]]; then
     printf '%s\n' "$best_location"
     return 0

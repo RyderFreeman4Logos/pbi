@@ -3507,6 +3507,84 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("reclaim", probe_queries)
         self.assertNotIn("alias", probe_queries)
 
+    def test_default_query_bm25_fast_path_recovers_remaining_file_footer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            display_alias = source_dir / "session_display_alias.rs"
+            alias_race = source_dir / "session_cmds_tests_tail_wait_resume_wrapper_alias_race.rs"
+            display_alias.write_text("// filler\n" * 25 + "pub(crate) fn alias_for_display_session() {}\n")
+            lines = ["// filler"] * 87
+            lines.append("fn rebinds_when_alias_appears_after_wait_starts() {}")
+            lines.extend(["// filler"] * (195 - len(lines)))
+            lines.append('const LATE_ALIAS_NOTE: &str = "late alias must keep wrapper as an alias and must not get the fix result";')
+            alias_race.write_text("\n".join(lines) + "\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "query = sys.argv[-1]\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
+                f"if query in ('late_alias', 'lock_reclaim'):\n"
+                f"    print('File: {display_alias}, Lines: 26-66')\n"
+                "    print('Found 2 search results')\n"
+                "    print('Remaining files not shown:')\n"
+                "    print('  src/session_cmds_tests_tail_wait_resume_wrapper_alias_race.rs <2> <7>')\n"
+                "else: print('git-fixtures:1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "late-alias", "lock-reclaim", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            probe_queries = [json.loads(line) for line in (directory / "probe-trace.json").read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/session_cmds_tests_tail_wait_resume_wrapper_alias_race.rs:196\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("late_alias", probe_queries)
+        self.assertIn("lock_reclaim", probe_queries)
+        self.assertNotIn("alias", probe_queries)
+        self.assertNotIn("reclaim", probe_queries)
+
+    def test_default_query_bm25_fast_path_recovers_remaining_file_footer_for_append_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            store = source_dir / "store.rs"
+            target = source_dir / "review_cmd_dirty_tree.rs"
+            store.write_text("// filler\n" * 204 + "pub fn append_entry() {}\n")
+            target.write_text("// filler\n" * 124 + "pub(super) fn append_repo_write_audit_finding() {}\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "query = sys.argv[-1]\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
+                "if query == 'appending':\n"
+                f"    print('File: {store}, Lines: 205-207')\n"
+                "    print('Remaining files not shown:')\n"
+                "    print('  src/review_cmd_dirty_tree.rs <1> <1>')\n"
+                "else: print('git-fixtures:1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "appending", "review", "audit", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            probe_queries = [json.loads(line) for line in (directory / "probe-trace.json").read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/review_cmd_dirty_tree.rs:125\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("appending", probe_queries)
+        self.assertNotIn("append", probe_queries)
+        self.assertNotIn("audit", probe_queries)
+
     def test_default_query_bm25_fast_path_requires_post_compress_compound(self) -> None:
         for include_compound in (True, False):
             with self.subTest(include_compound=include_compound), tempfile.TemporaryDirectory() as temporary:
