@@ -487,6 +487,9 @@ fast_path_match_variants() {
         printf '%s\n' "$tail"
       fi
     fi
+    if [[ "$token" == appending ]] && fast_path_requires_append_audit "$1"; then
+      printf '%s\n' append
+    fi
     if [[ "$token" == *ing && "${#token}" -ge 8 ]]; then
       stem="${token:0:${#token}-3}"
       if [[ "${#stem}" -ge 8 ]]; then
@@ -618,6 +621,27 @@ candidate_line_score() {
   ' < "$file" 2>/dev/null || true
 }
 
+fast_path_accepted_match_line() {
+  local file="$1" token="$2" line_start="$3" line_end="$4" match_line
+  while ((line_start <= line_end)); do
+    match_line="$(named_symbol_definition_line "$file" "$token" any "$line_start" "$line_end")"
+    [[ "$match_line" =~ ^[[:digit:]]+$ ]] || return 1
+    if [[ -n "$required_compounds" ]] &&
+       ! fast_path_line_has_required_compound "$file" "$match_line" "$required_compounds"; then
+      line_start=$((match_line + 1))
+      continue
+    fi
+    if [[ "$append_audit_signal" == true ]] &&
+       ! fast_path_line_has_append_audit_identifier "$file" "$match_line"; then
+      line_start=$((match_line + 1))
+      continue
+    fi
+    printf '%s\n' "$match_line"
+    return 0
+  done
+  return 1
+}
+
 recover_timeout_location_from_bm25() {
   local candidate token file line_start line_end line_number location score
   local best_score=-1 best_location="" match_token match_line
@@ -650,16 +674,12 @@ recover_timeout_location_from_bm25() {
     [[ -f "$file" ]] || continue
     while IFS= read -r match_token; do
       [[ -n "$match_token" ]] || continue
-      match_line="$(named_symbol_definition_line "$file" "$match_token" any "$line_start" "$line_end")"
+      match_line="$(fast_path_accepted_match_line "$file" "$match_token" "$line_start" "$line_end" || true)"
+      if [[ -z "$match_line" && ( -n "$required_compounds" || "$append_audit_signal" == true ) &&
+            ( "$line_start" != 1 || "$line_end" != 999999999 ) ]]; then
+        match_line="$(fast_path_accepted_match_line "$file" "$match_token" 1 999999999 || true)"
+      fi
       [[ "$match_line" =~ ^[[:digit:]]+$ ]] || continue
-      if [[ -n "$required_compounds" ]] &&
-         ! fast_path_line_has_required_compound "$file" "$match_line" "$required_compounds"; then
-        continue
-      fi
-      if [[ "$append_audit_signal" == true ]] &&
-         ! fast_path_line_has_append_audit_identifier "$file" "$match_line"; then
-        continue
-      fi
       score="$(candidate_line_score "$file" "$match_line" "$match_token")"
       [[ "$score" =~ ^[[:digit:]]+$ ]] || continue
       line_number="$match_line"
