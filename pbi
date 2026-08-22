@@ -1087,9 +1087,7 @@ run_default_bm25_fast_path() {
     printf '%s\n' "$output"
     return 0
   fi
-  if [[ -n "$search_fallback_locations" || "$fast_path_fallback" == true || "$fast_path_timed_out" == true ]]; then
-    search_fast_path_miss=true
-  fi
+  search_fast_path_miss=true
   search_uses_local_model=false
   output=""
   recovered_from_candidates=false
@@ -1496,13 +1494,11 @@ case "${1:-}" in
     if [[ -z "$symbol" ]]; then
       emit_bm25_locations_or_fail_closed
     fi
-    set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates" \
-      --max-iterations 1
     if [[ -n "$symbol" ]] && search_output_contains_symbol "$search_fallback_locations" "$symbol"; then
       printf '%s\n' "$search_fallback_locations"
       exit 0
     fi
-    configure_local_routing
+    emit_bm25_locations_or_fail_closed
     ;;
 esac
 

@@ -173,7 +173,7 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: probe-chat failed\n")
         self.assertNotIn("mise ERROR", result.stdout + result.stderr)
 
-    def test_positional_question_is_compact_chat_and_preserves_json_request(self) -> None:
+    def test_positional_question_fails_closed_when_fast_path_has_no_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
@@ -231,55 +231,15 @@ class PbiTest(unittest.TestCase):
                 cwd=directory,
                 binary=self.fake_pbi(directory, probe),
             )
-            recorded = [json.loads(line) for line in trace.read_text().splitlines()]
             probe_trace = directory / "probe-trace.json"
             self.assertTrue(probe_trace.exists(), "positional questions must retrieve code first")
             probe_calls = [json.loads(line) for line in probe_trace.read_text().splitlines()]
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "The entrypoint is pbi:1.\n")
-        self.assertEqual(
-            [call[-1] for call in probe_calls],
-            [
-                "entrypoint",
-                "where is the entrypoint",
-                "entrypoint CLI parsing",
-                "command dispatch match",
-                "clap Subcommand derive",
-                "persistence write callers",
-                "result return formatting",
-                "readonly PBI_VERSION",
-                "compact_search_locations",
-                "DEFAULT_SEARCH_TIMEOUT_SECONDS",
-            ],
-        )
-        self.assertTrue(all(call[1:7] == ["--timeout", "540", "--max-results", "4", "--max-tokens", "4000"] for call in probe_calls))
-        self.assertEqual(len(recorded), 6)
-        planner, gap_planner, second_gap_planner, draft, reviewer, citation_auditor = recorded
-        self.assertIn("Convert the code question", planner["argv"][5])
-        self.assertNotIn("Repository files:\n", planner["argv"][5])
-        self.assertEqual(planner["argv"][6:8], ["--max-iterations", "1"])
-        self.assertIn("Identify missing evidence", gap_planner["argv"][5])
-        self.assertNotIn("Repository files:\n", gap_planner["argv"][5])
-        self.assertIn("query=entrypoint CLI parsing", gap_planner["argv"][5])
-        self.assertIn("Identify missing evidence", second_gap_planner["argv"][5])
-        self.assertIn("query=readonly PBI_VERSION", second_gap_planner["argv"][5])
-        self.assertEqual(draft["argv"][:5], ["--force-provider", "openai", "--model-name", PRIMARY, "--message"])
-        self.assertIn("Question: where is the entrypoint", draft["argv"][5])
-        self.assertIn("Code excerpts:\nFile:", draft["argv"][5])
-        self.assertIn("query=DEFAULT_SEARCH_TIMEOUT_SECONDS", draft["argv"][5])
-        self.assertIn("Exact literal matches for readonly PBI_VERSION", draft["argv"][5])
-        self.assertIn("Repository entrypoint landmarks", draft["argv"][5])
-        self.assertIn("main.rs:2", draft["argv"][5])
-        self.assertEqual(draft["argv"][6:8], ["--max-iterations", "1"])
-        self.assertTrue(all("--prompt" not in call["argv"] for call in recorded))
-        self.assertIn("Review and compress the draft answer", reviewer["argv"][5])
-        self.assertIn("Draft answer:\nThe entrypoint is pbi:1.", reviewer["argv"][5])
-        self.assertIn("Evidence:\nFile:", reviewer["argv"][5])
-        self.assertEqual(reviewer["argv"][-1], "--json")
-        self.assertIn("Audit every source citation", citation_auditor["argv"][5])
-        self.assertIn("Answer to audit:\nThe entrypoint is pbi:1.", citation_auditor["argv"][5])
-        self.assertIn("Source evidence:\nFile:", citation_auditor["argv"][5])
-        self.assertEqual(citation_auditor["argv"][-1], "--json")
+            self.assertTrue(probe_calls)
+            self.assertTrue(all(call[1:7] == ["--timeout", "540", "--max-results", "4", "--max-tokens", "4000"] for call in probe_calls))
+            self.assertFalse(trace.exists(), "a completed fast-path miss must skip planner and chat")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_default_query_chat_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -338,7 +298,7 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(list(tmpdir.iterdir()), [])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
         self.assertLess(elapsed, 5)
 
     def test_default_query_ambient_duplicate_stamps_fail_closed(self) -> None:
@@ -757,9 +717,9 @@ class PbiTest(unittest.TestCase):
             )
             probe_trace = directory / "probe-trace.json"
             self.assertTrue(probe_trace.exists(), "BM25 fast path must run before planner")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/api/mcp.rs:2\nsrc/api/mcp.rs:3\n")
-        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_planner_warning_mixed_bm25_stamps_recover_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -801,13 +761,10 @@ class PbiTest(unittest.TestCase):
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
-            chat_calls = trace.read_text().splitlines()
-        self.assertEqual(chat_calls, ["Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: where are reserve_http_session and reap_expired_sessions?"])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
-        self.assertEqual(result.stderr, "")
-        self.assertNotIn("1970-01-01T00:00", result.stdout)
-        self.assertNotIn("127.0.0.1:3080", result.stdout)
+            self.assertFalse(trace.exists(), "planner/chat must not run after a completed fast-path miss")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_default_query_mixed_stamps_recover_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -854,11 +811,9 @@ class PbiTest(unittest.TestCase):
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
-        self.assertEqual(result.stderr, "")
-        self.assertNotIn("1970-01-01T00:00", result.stdout)
-        self.assertNotIn("127.0.0.1:3080", result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_default_query_mixed_stamp_with_cited_symbol_recovers_or_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -968,9 +923,9 @@ class PbiTest(unittest.TestCase):
                 cwd=ROOT,
                 binary=self.fake_pbi(directory, probe),
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "main.rs:42\n")
-        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_default_query_identifier_free_mixed_stamps_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1006,9 +961,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
-        self.assertNotIn("1970-01-01T00:00", result.stdout)
-        self.assertNotIn("127.0.0.1:3080", result.stdout)
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_default_query_mixed_stamp_recovery_does_not_claim_absence_without_rg(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1113,7 +1066,7 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(list(tmpdir.iterdir()), [])
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertLess(elapsed, 5)
 
     def test_term_resistant_initial_planner_times_out_to_direct_bm25(self) -> None:
@@ -1194,15 +1147,12 @@ class PbiTest(unittest.TestCase):
                 "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
             )
             elapsed = time.monotonic() - started
-            planner_messages = [json.loads(line) for line in trace.read_text().splitlines()]
-        self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(trace.exists(), "planner/chat must not run after a completed fast-path miss")
+        self.assertEqual(result.returncode, 1)
         self.assertLess(elapsed, 3)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertNotIn("LICENSE:1", result.stdout + result.stderr)
-        self.assertEqual(len(planner_messages), 2)
-        self.assertTrue(planner_messages[0].startswith("Convert the code question"))
-        self.assertTrue(planner_messages[1].startswith("Identify missing evidence"))
 
     def test_loads_cwd_dotenv_for_local_router_without_leaking_secret(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1320,7 +1270,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertIn("pbi: no source locations found", result.stderr)
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
         self.assertNotIn("SEARCH_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("PLANNER_SENTINEL", result.stdout + result.stderr)
 
@@ -1549,8 +1499,9 @@ class PbiTest(unittest.TestCase):
                     cwd=ROOT,
                     binary=self.fake_pbi(directory, directory / "probe"),
                 )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, f"{answer}\n")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
     def test_no_colon_warning_only_stdout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1577,7 +1528,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertIn("pbi: no source locations found", result.stderr)
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
         self.assertNotIn("AI SDK Warning", result.stdout)
 
     def test_query_planning_system_message_warning_keeps_local_model_answer(self) -> None:
@@ -1616,11 +1567,10 @@ class PbiTest(unittest.TestCase):
             )
             fake_chat.chmod(0o755)
             result = self.run_pbi("where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, directory / "probe"))
-            calls = [json.loads(line) for line in trace.read_text().splitlines()]
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "MODEL_ANSWER pbi:9\n")
-        self.assertNotEqual(result.stdout, "pbi:1\n")
-        self.assertTrue(any(call[call.index("--message") + 1].startswith("Answer the question") for call in calls))
+            self.assertFalse(trace.exists(), "a completed fast-path miss must skip planner and chat")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
     def test_nonzero_query_planning_warning_fails_closed_without_echoing_sentinels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1753,8 +1703,9 @@ class PbiTest(unittest.TestCase):
                 "search", "SessionDB", "FTS5", "session", "search", env=env, binary=self.fake_pbi(directory, probe)
             )
             probe_recorded = json.loads((directory / "probe-trace.json").read_text())
-            chat_recorded = json.loads(trace.read_text())
-        self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertFalse(trace.exists(), "named-symbol search miss must skip chat")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
         self.assertEqual(
             probe_recorded["argv"],
             [
@@ -1775,21 +1726,6 @@ class PbiTest(unittest.TestCase):
             ],
         )
         self.assertNotIn("ms-marco-minilm-l6", probe_recorded["argv"])
-        self.assertEqual(
-            chat_recorded["argv"][:5],
-            ["--force-provider", "openai", "--model-name", PRIMARY, "--message"],
-        )
-        self.assertEqual(chat_recorded["argv"][6:8], ["--max-iterations", "1"])
-        self.assertNotIn("--prompt", chat_recorded["argv"])
-        self.assertEqual(chat_recorded["env"]["FORCE_PROVIDER"], "openai")
-        self.assertEqual(chat_recorded["env"]["MODEL_NAME"], PRIMARY)
-        self.assertEqual(chat_recorded["env"]["OPENAI_API_KEY"], "test-key")
-        self.assertEqual(chat_recorded["env"]["OPENAI_API_URL"], BASE_URL)
-        self.assertEqual(chat_recorded["env"]["MAX_RETRIES"], "3")
-        self.assertEqual(
-            [provider["model"] for provider in json.loads(chat_recorded["env"]["FALLBACK_PROVIDERS"])],
-            [PRIMARY, FALLBACK],
-        )
 
     def test_search_hides_mocked_bert_fallback_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1803,24 +1739,12 @@ class PbiTest(unittest.TestCase):
             )
             probe.chmod(0o755)
             result = self.run_pbi("search", "SessionDB", env=env, binary=self.fake_pbi(directory, probe))
-            recorded = json.loads(trace.read_text())
-        self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertFalse(trace.exists(), "an empty BM25 result must skip chat")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
         self.assertNotIn("BERT reranker", result.stdout)
         self.assertNotIn("Falling back to BM25", result.stdout)
-        self.assertEqual(
-            recorded["argv"],
-            [
-                "--force-provider",
-                "openai",
-                "--model-name",
-                PRIMARY,
-                "--message",
-                "Use Probe BM25 candidates to find SessionDB. Return only the best matching "
-                "path:symbol or path:line locations; no narration.\n\n",
-                "--max-iterations",
-                "1",
-            ],
-        )
 
     def test_named_symbol_candidate_skips_stamp_diagnostic_without_api_key(self) -> None:
         symbol = "soft_delete_drawer"
@@ -2604,7 +2528,7 @@ class PbiTest(unittest.TestCase):
             (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
             candidate = repo / "candidate.py"
             candidate.write_text("def unrelated():\n    return True\n")
-            env, _ = self.fake_environment(directory)
+            env, trace = self.fake_environment(directory)
             tool_path = directory / "tool-path"
             tool_path.mkdir()
             for name in ("bash", "python3", "env", "sleep", "timeout", "setsid", "sh", "mktemp", "rm", "realpath", "grep", "awk", "sort", "cut", "sed", "head", "readlink"):
@@ -2622,7 +2546,7 @@ class PbiTest(unittest.TestCase):
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
-            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\nsleep 30\n")
             fake_chat.chmod(0o755)
             env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
             started = time.monotonic()
@@ -2631,8 +2555,10 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe), timeout=5,
             )
             elapsed = time.monotonic() - started
-        self.assertNotIn("pbi: no source location contains the queried symbol", result.stderr)
-        self.assertIn("pbi: probe-chat timed out answering the question", result.stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertFalse(trace.exists(), "a named-symbol miss must skip Probe Chat")
         self.assertLess(elapsed, 5)
 
     def test_search_does_not_claim_absence_when_rg_fails(self) -> None:
@@ -2644,7 +2570,7 @@ class PbiTest(unittest.TestCase):
             (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
             candidate = repo / "candidate.py"
             candidate.write_text("def unrelated():\n    return True\n")
-            env, _ = self.fake_environment(directory)
+            env, trace = self.fake_environment(directory)
             rg = directory / "rg"
             rg.write_text("#!/usr/bin/env bash\nexit 2\n")
             rg.chmod(0o755)
@@ -2658,7 +2584,7 @@ class PbiTest(unittest.TestCase):
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
-            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\nsleep 30\n")
             fake_chat.chmod(0o755)
             env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
             started = time.monotonic()
@@ -2667,8 +2593,10 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe), timeout=5,
             )
             elapsed = time.monotonic() - started
-        self.assertNotIn("pbi: no source location contains the queried symbol", result.stderr)
-        self.assertIn("pbi: probe-chat timed out answering the question", result.stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertFalse(trace.exists(), "a named-symbol miss must skip Probe Chat")
         self.assertLess(elapsed, 5)
 
     def test_search_fails_closed_when_named_symbol_is_absent(self) -> None:
@@ -2903,7 +2831,7 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
-        # #22: a timed-out search must not turn unrelated BM25 candidates into success.
+        # #22: a named-symbol miss must emit BM25 or fail closed, never chat.
         symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -2917,7 +2845,7 @@ class PbiTest(unittest.TestCase):
                 )
                 + "\n"
             )
-            env, _ = self.fake_environment(directory)
+            env, trace = self.fake_environment(directory)
             env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
             probe.write_text(
@@ -2926,18 +2854,31 @@ class PbiTest(unittest.TestCase):
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
-            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\nsleep 30\n")
             fake_chat.chmod(0o755)
             started = time.time()
             result = self.run_pbi(
                 "search", f"Locate {symbol}", env=env, cwd=repo,
-                binary=self.fake_pbi(directory, probe), timeout=20,
+                binary=self.fake_pbi(directory, probe), timeout=5,
             )
             elapsed = time.time() - started
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertLess(elapsed, 10, "hung search probe-chat must be killed, not hang pbi")
-        self.assertIn("pbi: probe-chat timed out answering the question", result.stderr)
+        self.assertIn(result.returncode, (0, 1))
+        self.assertLess(elapsed, 5, "named-symbol miss must not hang in Probe Chat")
+        self.assertFalse(trace.exists(), "a named-symbol miss must skip Probe Chat")
+        self.assertNotIn("pbi: probe-chat failed", result.stderr)
+        self.assertNotIn("pbi: probe-chat timed out answering the question", result.stderr)
+        if result.returncode == 0:
+            self.assertEqual(result.stdout, "real.py:1\n")
+            self.assertEqual(result.stderr, "")
+        else:
+            self.assertEqual(result.stdout, "")
+            self.assertIn(
+                result.stderr,
+                (
+                    "pbi: model returned only BM25 location stamps; no source answer\n",
+                    "pbi: no source locations found\n",
+                ),
+            )
 
     def test_search_probe_hang_emits_diagnostic_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3076,7 +3017,7 @@ class PbiTest(unittest.TestCase):
     def test_search_combines_unquoted_words_into_one_pattern(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            env, trace = self.fake_environment(directory)
+            env, _ = self.fake_environment(directory)
             probe = directory / "probe"
             self.record_probe_argv(probe)
             result = self.run_pbi(
@@ -3089,7 +3030,8 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
             )
             argv = json.loads((directory / "probe-trace.json").read_text())
-        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
         self.assertEqual(
             argv,
             [
