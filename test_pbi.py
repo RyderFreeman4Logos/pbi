@@ -184,6 +184,8 @@ class PbiTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as f:\n"
                 "    print(json.dumps(sys.argv[1:]), file=f)\n"
+                "if \"--dry-run\" in sys.argv:\n"
+                "    raise SystemExit(0)\n"
                 f"print('File: {directory / 'pbi'}, Lines: 1-40')\n"
                 "print('readonly PBI_VERSION=0.1.0')\n"
                 "print('query=' + sys.argv[-1])\n"
@@ -289,9 +291,13 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env bash\n"
-                + "printf '%s\\n' 'File: "
+                "if [[ \"$*\" == *--dry-run* ]]; then\n"
+                "    printf '%s\\n' 'File: /missing/pbi, Lines: 1-1'\n"
+                "else\n"
+                + "    printf '%s\\n' 'File: "
                 + str(directory / "pbi")
                 + ", Lines: 1-1'\n"
+                "fi\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -453,6 +459,46 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "src/target.py:7\n")
         self.assertEqual(result.stderr, "")
 
+    def test_default_query_bm25_fast_path_ignores_generic_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            first = source_dir / "markers.rs"
+            target = source_dir / "target.rs"
+            first.write_text("// filler\n" * 4 + "let markers = scan_markers(&lines);\n")
+            target.write_text("// filler\n" * 4 + "let provenance = compression;\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{first}:5\")\n"
+                f"print(\"{target}:5\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, signal, time\n"
+                "with open(os.environ[\"PBI_TEST_TRACE\"], \"w\") as trace: trace.write(\"planner\")\n"
+                "signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "while True: time.sleep(0.1)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is the marker oauth provenance compression path?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=4,
+            )
+            planner_trace = directory / "trace.json"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/target.rs:5\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(planner_trace.exists(), "a token-matched fast path must not start the planner")
+
     def test_default_query_bm25_fast_path_rejects_unrelated_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -473,7 +519,8 @@ class PbiTest(unittest.TestCase):
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env python3\n"
-                "import signal, time\n"
+                "import os, signal, time\n"
+                "with open(os.environ[\"PBI_TEST_TRACE\"], \"w\") as trace: trace.write(\"planner\")\n"
                 "signal.signal(signal.SIGTERM, lambda *_: None)\n"
                 "while True: time.sleep(0.1)\n"
             )
@@ -485,9 +532,11 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
                 timeout=4,
             )
+            planner_trace = directory / "trace.json"
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertFalse(planner_trace.exists(), "a BM25 miss must not start the planner")
         self.assertNotIn("unrelated.py:", result.stdout + result.stderr)
 
     def test_default_query_timeout_recovers_named_symbol_definitions(self) -> None:
@@ -552,9 +601,11 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
-                f"print('File: {source_file}, Lines: 1-20')\n"
-                "print('1970-01-01T00:00')\n"
-                "print('127.0.0.1:3080')\n"
+                "import sys\n"
+                "if \"--dry-run\" not in sys.argv:\n"
+                f"    print('File: {source_file}, Lines: 1-20')\n"
+                "    print('1970-01-01T00:00')\n"
+                "    print('127.0.0.1:3080')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -598,7 +649,9 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
-                f"print('File: {source_file}, Lines: 1-20')\n"
+                "import sys\n"
+                "if \"--dry-run\" not in sys.argv:\n"
+                f"    print('File: {source_file}, Lines: 1-20')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -815,7 +868,7 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env bash\n"
-                "printf '%s\\n' 'pbi:1'\n"
+                "if [[ \"$*\" != *--dry-run* ]]; then printf '%s\\n' 'pbi:1'; fi\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -941,8 +994,9 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
-                "import os\n"
-                "print(f'File: {os.getcwd()}/LICENSE, Lines: 1-10')\n"
+                "import os, sys\n"
+                "if \"--dry-run\" not in sys.argv:\n"
+                "    print(f'File: {os.getcwd()}/LICENSE, Lines: 1-10')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -1065,7 +1119,11 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env bash\n"
-                f"printf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+                "if [[ \"$*\" == *--dry-run* ]]; then\n"
+                "    printf '%s\\n' 'File: /missing/pbi, Lines: 1-10'\n"
+                "else\n"
+                f"    printf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+                "fi\n"
                 "printf '%s\\n' 'SEARCH_SENTINEL' >&2\n"
             )
             probe.chmod(0o755)
@@ -1245,7 +1303,12 @@ class PbiTest(unittest.TestCase):
                 directory = Path(temporary)
                 env, _ = self.fake_environment(directory)
                 (directory / "probe").write_text(
-                    f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+                    "#!/usr/bin/env bash\n"
+                    "if [[ \"$*\" == *--dry-run* ]]; then\n"
+                    "    printf '%s\\n' 'File: /missing/pbi, Lines: 1-40'\n"
+                    "else\n"
+                    f"    printf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+                    "fi\n"
                 )
                 (directory / "probe").chmod(0o755)
                 fake_chat = directory / "probe-chat"
@@ -1285,7 +1348,12 @@ class PbiTest(unittest.TestCase):
                 directory = Path(temporary)
                 env, _ = self.fake_environment(directory)
                 (directory / "probe").write_text(
-                    f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+                    "#!/usr/bin/env bash\n"
+                    "if [[ \"$*\" == *--dry-run* ]]; then\n"
+                    "    printf '%s\\n' 'File: /missing/pbi, Lines: 1-40'\n"
+                    "else\n"
+                    f"    printf '%s\\n' 'File: {PBI}, Lines: 1-40'\n"
+                    "fi\n"
                 )
                 (directory / "probe").chmod(0o755)
                 fake_chat = directory / "probe-chat"
@@ -1315,7 +1383,14 @@ class PbiTest(unittest.TestCase):
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
-            probe.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-10'\n")
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$*\" == *--dry-run* ]]; then\n"
+                "    printf '%s\\n' 'File: /missing/pbi, Lines: 1-10'\n"
+                "else\n"
+                f"    printf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+                "fi\n"
+            )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
@@ -1336,7 +1411,12 @@ class PbiTest(unittest.TestCase):
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
             (directory / "probe").write_text(
-                f"#!/usr/bin/env bash\nprintf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$*\" == *--dry-run* ]]; then\n"
+                "    printf '%s\\n' 'File: /missing/pbi, Lines: 1-10'\n"
+                "else\n"
+                f"    printf '%s\\n' 'File: {PBI}, Lines: 1-10'\n"
+                "fi\n"
             )
             (directory / "probe").chmod(0o755)
             fake_chat = directory / "probe-chat"

@@ -420,7 +420,7 @@ search_named_symbols() {
 }
 
 search_distinctive_tokens() {
-  local token
+  local token token_lower
   search_named_symbols "$1"
   while IFS= read -r token; do
     token="${token#\#}"
@@ -432,14 +432,16 @@ search_distinctive_tokens() {
   while IFS= read -r token; do
     token="${token#\#}"
     token="${token%%[,:;.!?]*}"
-    case "$token" in
-      a|an|and|answer|are|code|current|does|find|for|from|how|implementation|is|locate|of|query|return|search|show|source|the|their|this|to|what|where|which|with)
+    token_lower="${token,,}"
+    case "$token_lower" in
+      a|an|and|answer|are|code|current|does|find|for|from|how|implementation|is|locate|of|query|return|search|show|source|the|their|this|to|what|where|which|with|marker|markers|cache|route|line|file|test|tests|cover|when|append|cleared|single|multi|request|first|main|key)
         continue
         ;;
     esac
     [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{5,}$ ]] || continue
-    printf "%s\n" "$token"
-  done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }')
+    printf "%s\t%s\n" "${#token}" "$token"
+  done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }') |
+    sort -rn -k1,1 -k2,2 | cut -f2-
 }
 
 recover_timeout_location_from_bm25() {
@@ -531,16 +533,13 @@ run_default_bm25_fast_path() {
     return 1
   }
   bm25_candidates="$candidate_batch"
-  if [[ -z "$(search_named_symbols "$question")" ]] && recover_search_from_candidates; then
-    output="$(recover_timeout_location_from_bm25 || true)"
-    if [[ -n "$output" ]]; then
-      printf '%s\n' "$output"
-      return 0
-    fi
+  output="$(recover_timeout_location_from_bm25 || true)"
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
+    return 0
   fi
+  search_fast_path_miss=true
   search_uses_local_model=false
-  search_fallback_locations=""
-  bm25_candidates=""
   output=""
   recovered_from_candidates=false
   return 1
@@ -723,6 +722,7 @@ fi
 search_uses_local_model=false
 explore_uses_local_model=false
 search_fallback_locations=""
+search_fast_path_miss=false
 recovered_from_candidates=false
 planner_stdout=""
 planner_stderr=""
@@ -997,6 +997,14 @@ else
   configure_local_routing
   if run_default_bm25_fast_path; then
     exit 0
+  fi
+  if [[ "$search_fast_path_miss" == true ]]; then
+    if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
+      printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+    else
+      printf '%s\n' 'pbi: no source locations found' >&2
+    fi
+    exit 1
   fi
   planner_timed_out=false
   run_planner --force-provider openai --model-name "$primary_model" \
