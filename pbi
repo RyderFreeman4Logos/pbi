@@ -563,6 +563,96 @@ fast_path_requires_cache_key() {
     [[ "$normalized_question" =~ (^|[^[:alnum:]_])key([^[:alnum:]_]|$) ]]
 }
 
+named_query_files() {
+  local token candidate relative
+  while IFS= read -r token; do
+    token="${token#(}"
+    token="${token#\"}"
+    while true; do
+      case "$token" in
+        *','|*':'|*';'|*'.'|*'!'|*'?'|*')') token="${token::-1}" ;;
+        *) break ;;
+      esac
+    done
+    case "${token,,}" in
+      readme)
+        for candidate in README.md README; do
+          [[ -f "$PWD/$candidate" ]] || continue
+          relative="$(realpath --relative-to="$PWD" -- "$PWD/$candidate" 2>/dev/null || true)"
+          [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
+          printf '%s\n' "$relative"
+        done
+        ;;
+      *.md)
+        [[ "$token" != /* ]] || continue
+        candidate="$PWD/$token"
+        [[ -f "$candidate" ]] || continue
+        relative="$(realpath --relative-to="$PWD" -- "$candidate" 2>/dev/null || true)"
+        [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
+        printf '%s\n' "$relative"
+        ;;
+    esac
+  done < <(printf '%s\n' "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }') |
+    awk '
+      !seen[$0]++ {
+        priority = 3
+        if ($0 == "README.md" || $0 == "README") priority = 0
+        else if ($0 == "mvp.md" || $0 ~ /\/mvp\.md$/) priority = 1
+        else if ($0 == "safety-model.md" || $0 ~ /\/safety-model\.md$/) priority = 2
+        print priority "\t" $0
+      }
+    ' | sort -n -k1,1 -k2,2 | cut -f2-
+}
+
+named_file_claim_line() {
+  awk '
+    {
+      line = $0
+      cleaned = ""
+      while (1) {
+        if (html_comment) {
+          comment_end = index(line, "-->")
+          if (!comment_end) {
+            line = ""
+            break
+          }
+          line = substr(line, comment_end + 3)
+          html_comment = 0
+        }
+        open = index(line, "<!--")
+        if (!open) {
+          cleaned = cleaned line
+          break
+        }
+        cleaned = cleaned substr(line, 1, open - 1)
+        line = substr(line, open + 4)
+        html_comment = 1
+      }
+      sub(/[[:space:]]*\/\/.*$/, "", cleaned)
+      sub(/[[:space:]]*\/\*.*$/, "", cleaned)
+      lower = tolower(cleaned)
+      if (lower ~ /(^|[^[:alnum:]_])(caption|ocr|hallucination|evidence|safety)([^[:alnum:]_]|$)/) {
+        print NR
+        exit
+      }
+    }
+  ' < "$1" 2>/dev/null
+}
+
+recover_named_file_claims() {
+  local file line relative
+  for file in "$@"; do
+    fast_path_deadline_reached && return 1
+    line="$(named_file_claim_line "$PWD/$file" || true)"
+    [[ "$line" =~ ^[[:digit:]]+$ ]] || continue
+    relative="$(realpath --relative-to="$PWD" -- "$PWD/$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
+    printf '%s:%s\n' "$relative" "$line"
+    return 0
+  done
+  return 1
+}
+
 fast_path_line_has_required_compound() {
   local file="$1" line_number="$2" required_compounds="$3" compound
   while IFS= read -r compound; do
@@ -921,7 +1011,22 @@ run_default_bm25_fast_path() {
   local fast_path_deadline_ns now_ns remaining_ns remaining_ms per_query_ns timeout_seconds
   local fast_path_query_index=0 remaining_queries
   local fast_path_fallback=false fast_path_timed_out=false
-  local -a fast_path_queries=()
+  local -a fast_path_queries=() named_files=()
+  fast_path_deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
+  mapfile -t named_files < <(named_query_files "${question:-}")
+  if ((${#named_files[@]} > 0)); then
+    search_uses_local_model=true
+    bm25_candidates=""
+    search_fallback_locations=""
+    output=""
+    recovered_from_candidates=false
+    if output="$(recover_named_file_claims "${named_files[@]}")"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    search_fast_path_miss=true
+    return 1
+  fi
   mapfile -t fast_path_queries < <(build_fast_path_queries "${question:-}")
   if ((${#fast_path_queries[@]} == 0)); then
     fast_path_queries=("${question:-}")
@@ -932,7 +1037,6 @@ run_default_bm25_fast_path() {
   search_fallback_locations=""
   output=""
   recovered_from_candidates=false
-  fast_path_deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
   fast_path_output_file="$(mktemp)"
   track_temp_file "$fast_path_output_file"
   for fast_path_query in "${fast_path_queries[@]}"; do

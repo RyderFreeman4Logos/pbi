@@ -448,6 +448,50 @@ class PbiTest(unittest.TestCase):
         self.assertIn("appending", probe_queries)
         self.assertNotIn("append", probe_queries)
 
+    def test_default_query_named_readme_prefers_product_claim_over_caption_test(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            docs = repo / "docs"
+            docs.mkdir(parents=True)
+            readme = repo / "README.md"
+            mvp = docs / "mvp.md"
+            readme_lines = [
+                "# Product claims",
+                "OCR output and vision captions are not citable source Evidence.",
+            ]
+            readme.write_text("\n".join(readme_lines) + "\n")
+            mvp.write_text("# MVP\nGenerated captions are not Evidence.\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "query = sys.argv[-1]\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: "
+                "    trace.write(json.dumps(query) + '\\n')\n"
+                "if query == 'caption': print('src/vision_caption.rs:291')\n"
+                "else: print('src/vision_caption.rs:291')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Locate current safety, hallucination, caption, OCR, and evidence product claims in README and docs/mvp.md; report exact files and headings.",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            probe_trace = directory / "probe-trace.json"
+            probe_queries = [
+                json.loads(line) for line in probe_trace.read_text().splitlines()
+            ] if probe_trace.exists() else []
+            claim_line = readme_lines.index("OCR output and vision captions are not citable source Evidence.") + 1
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"README.md:{claim_line}\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(any(query in {
+            "caption", "hallucination", "headings", "product", "report", "evidence", "safety"
+        } for query in probe_queries))
+
     def test_default_query_bm25_fast_path_skips_slow_planner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
