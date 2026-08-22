@@ -404,6 +404,13 @@ emit_bm25_locations_or_fail_closed() {
     exit 0
   fi
   if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
+    locations="$(recover_timeout_location_from_bm25 || true)"
+    if [[ -n "$locations" ]]; then
+      printf '%s\n' "$locations"
+      exit 0
+    fi
+  fi
+  if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi
@@ -1477,6 +1484,9 @@ case "${1:-}" in
           exit 1
         fi
       fi
+    fi
+    if [[ -z "$symbol" ]]; then
+      emit_bm25_locations_or_fail_closed
     fi
     set -- --message "Use Probe BM25 candidates to find ${search_pattern_parts[*]}. Return only the best matching path:symbol or path:line locations; no narration."$'\n\n'"$candidates" \
       --max-iterations 1

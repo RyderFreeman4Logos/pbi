@@ -2043,7 +2043,7 @@ class PbiTest(unittest.TestCase):
             )
 
             # The natural-language query intentionally has no named symbol, so
-            # this recovery test must invoke the post-chat path.
+            # candidate recovery must finish without invoking Probe Chat.
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
@@ -2065,7 +2065,7 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertNotIn("location stamps", result.stdout)
 
-    def test_search_generic_probe_failure_recovers_candidates(self) -> None:
+    def test_search_generic_probe_failure_recovers_candidates_without_chat(self) -> None:
         symbol = "recover_search_from_candidates"
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -2098,9 +2098,8 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertEqual(result.stderr, "")
-        self.assertNotIn("pbi: probe-chat failed", result.stdout + result.stderr)
 
-    def test_search_generic_probe_failure_without_candidates_stays_failed(self) -> None:
+    def test_search_generic_probe_failure_without_candidates_fails_closed_before_chat(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
@@ -2124,14 +2123,15 @@ class PbiTest(unittest.TestCase):
                 cwd=directory,
                 binary=self.fake_pbi(directory, probe),
             )
-        self.assertEqual(result.returncode, 23)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: probe-chat failed\n")
-        self.assertNotIn("connection reset", result.stdout + result.stderr)
+        self.assertEqual(
+            result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n"
+        )
 
-    def test_search_api_error_recovers_named_symbol_from_candidates(self) -> None:
+    def test_search_api_error_recovers_candidate_without_chat(self) -> None:
         # #22: an API-error payload must not hide an already-retrieved location
-        # for a natural-language query; post-chat recovery returns the candidate.
+        # for a natural-language query; candidate recovery returns it directly.
         symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -2724,6 +2724,45 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertLess(elapsed, 5)
 
+    def test_search_no_named_symbol_skips_hanging_chat_and_emits_bm25_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "README.md"
+            source.write_text("caption OCR\nproduct claim\nEvidence\ndocs/mvp\nclosing\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(f'File: {source}, Lines: 1-5')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "search",
+                "hallucination",
+                "caption",
+                "OCR",
+                "Evidence",
+                "README",
+                "docs/mvp",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+            elapsed = time.monotonic() - started
+            self.assertFalse(trace.exists(), "a no-symbol BM25 answer must skip hanging Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "README.md:3\n")
+        self.assertEqual(result.stderr, "")
+        self.assertLess(elapsed, 5)
+
     def test_search_probe_timeout_recovers_compact_candidates_without_named_symbol(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -2809,7 +2848,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: probe-chat timed out answering the question\n")
+        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
         # #22: a timed-out search must not turn unrelated BM25 candidates into success.
