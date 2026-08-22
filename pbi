@@ -306,7 +306,14 @@ named_symbol_definition_line() {
     {
       code = strip_comments($0)
       if ((line_start && NR < line_start) || (line_end && NR > line_end)) next
-      if (code ~ declaration || code ~ assignment || (mode == "any" && index(code, symbol))) {
+      normalized_code = code
+      normalized_symbol = symbol
+      gsub(/[^[:alnum:]]/, "", normalized_code)
+      gsub(/[^[:alnum:]]/, "", normalized_symbol)
+      compound_match = index(tolower(normalized_code), tolower(normalized_symbol))
+      if (code ~ declaration || code ~ assignment ||
+          (mode == "any" &&
+           (index(code, symbol) || (symbol ~ /[-_]/ && compound_match)))) {
         print NR
         exit
       }
@@ -435,7 +442,7 @@ search_distinctive_tokens() {
     token="${token%%[,:;.!?]*}"
     token_lower="${token,,}"
     case "$token_lower" in
-      a|an|and|answer|are|code|current|does|find|for|from|how|implementation|is|locate|of|query|return|search|show|source|the|their|this|to|what|where|which|with|marker|markers|cache|route|line|file|test|tests|cover|when|append|cleared|single|multi|request|first|main|key)
+      a|an|and|answer|are|cache|code|cmd|current|default|does|file|find|findings|first|for|from|helper|helpers|how|implementation|is|key|line|locate|lock|main|marker|markers|multi|of|output|query|request|return|review|route|search|session|show|single|source|spawn|test|tests|the|their|this|to|wait|what|where|which|with|when|append|cleared|cover|audit)
         continue
         ;;
     esac

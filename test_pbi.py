@@ -374,6 +374,62 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
+    def test_default_query_bm25_fast_path_requires_distinctive_token_on_cited_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            generic = source_dir / "global_tests.rs"
+            target = source_dir / "worktree_reclaim_tests.rs"
+            generic.write_text("fn lookup() {}\nsession: Default::default()\n")
+            target.write_text("fn worktree_write_lock_reclaims_terminal_session_after_holder_crash() {}\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{generic}:2\")\n"
+                f"print(\"{target}:1\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where are late-alias lock-reclaim?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/worktree_reclaim_tests.rs:1\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_default_query_bm25_fast_path_ignores_generic_findings_default_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            generic = source_dir / "review_cmd_output_consistency_helpers.rs"
+            target = source_dir / "repo_write_audit.rs"
+            generic.write_text("write_findings_toml(session_dir, &FindingsFile::default())\n")
+            target.write_text("const FINDINGS_TOML_SYNTHETIC_MARKER: &str = \"synthetic\";\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{generic}:1\")\n"
+                f"print(\"{target}:1\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "find provenance synthetic-marker findings default",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/repo_write_audit.rs:1\n")
+        self.assertEqual(result.stderr, "")
+
     def test_default_query_bm25_fast_path_skips_slow_planner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
