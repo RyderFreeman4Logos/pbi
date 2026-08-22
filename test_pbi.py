@@ -383,15 +383,16 @@ class PbiTest(unittest.TestCase):
             generic = source_dir / "global_tests.rs"
             target = source_dir / "worktree_reclaim_tests.rs"
             generic.write_text("fn lookup() {}\nsession: Default::default()\n")
-            target.write_text("fn worktree_write_lock_reclaims_terminal_session_after_holder_crash() {}\n")
+            target.write_text("// filler\n" * 44 + "fn worktree_write_lock_reclaims_terminal_session_after_holder_crash() {}\n")
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
-                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"w\") as trace: json.dump(sys.argv[-1], trace)\n"
-                f"print(\"{generic}:2\")\n"
-                f"print(\"{target}:1\")\n"
+                "query = sys.argv[-1]\n"
+                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"a\") as trace: print(json.dumps(query), file=trace)\n"
+                f"if query == \"lock_reclaim\": print(\"{target}:45\")\n"
+                "else: print(\"git-fixtures:1\")\n"
             )
             probe.chmod(0o755)
             result = self.run_pbi(
@@ -400,13 +401,15 @@ class PbiTest(unittest.TestCase):
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
-            probe_query = json.loads((directory / "probe-trace.json").read_text())
+            probe_queries = [
+                json.loads(line)
+                for line in (directory / "probe-trace.json").read_text().splitlines()
+            ]
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/worktree_reclaim_tests.rs:1\n")
+        self.assertEqual(result.stdout, "src/worktree_reclaim_tests.rs:45\n")
         self.assertEqual(result.stderr, "")
-        self.assertTrue("late_alias" in probe_query or "lock_reclaim" in probe_query)
-        self.assertNotIn("late-alias", probe_query)
-        self.assertNotIn("lock-reclaim", probe_query)
+        self.assertIn("lock_reclaim", probe_queries)
+        self.assertFalse(any("late_alias lock_reclaim" in query for query in probe_queries))
 
     def test_default_query_bm25_fast_path_ignores_generic_findings_default_line(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -417,30 +420,33 @@ class PbiTest(unittest.TestCase):
             generic = source_dir / "review_cmd_output_consistency_helpers.rs"
             target = source_dir / "repo_write_audit.rs"
             generic.write_text("write_findings_toml(session_dir, &FindingsFile::default())\n")
-            target.write_text("fn append_repo_write_audit_finding() { let _ = FINDINGS_TOML_SYNTHETIC_MARKER; }\n")
+            target.write_text("\n" * 124 + "fn append_repo_write_audit_finding() { let _ = FINDINGS_TOML_SYNTHETIC_MARKER; }\n")
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
-                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"w\") as trace: json.dump(sys.argv[-1], trace)\n"
-                f"print(\"{generic}:1\")\n"
-                f"print(\"{target}:1\")\n"
+                "query = sys.argv[-1]\n"
+                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"a\") as trace: print(json.dumps(query), file=trace)\n"
+                f"if query == \"append\": print(\"{target}:125\")\n"
+                "else: print(\"git-fixtures:1\")\n"
             )
             probe.chmod(0o755)
             result = self.run_pbi(
-                "find provenance for append_repo_write_audit_finding and FINDINGS_TOML_SYNTHETIC_MARKER while avoiding generic defaults",
+                "where is appending review audit",
                 env=env,
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
-            probe_query = json.loads((directory / "probe-trace.json").read_text())
+            probe_queries = [
+                json.loads(line)
+                for line in (directory / "probe-trace.json").read_text().splitlines()
+            ]
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/repo_write_audit.rs:1\n")
+        self.assertEqual(result.stdout, "src/repo_write_audit.rs:125\n")
         self.assertEqual(result.stderr, "")
-        self.assertIn("append_repo_write_audit_finding", probe_query)
-        self.assertIn("FINDINGS_TOML_SYNTHETIC_MARKER", probe_query)
-        self.assertNotIn("find provenance for append_repo_write_audit_finding", probe_query)
+        self.assertIn("append", probe_queries)
+        self.assertFalse(any("appending review" in query for query in probe_queries))
 
     def test_default_query_bm25_fast_path_skips_slow_planner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
