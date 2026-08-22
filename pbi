@@ -9,6 +9,7 @@ readonly DEFAULT_FALLBACK_MODEL="opencode/deepseek-v4-flash"
 readonly DEFAULT_REQUEST_TIMEOUT_MS="1700000"
 readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
+readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"
 readonly DEFAULT_SEARCH_MAX_RESULTS="8"
 readonly DEFAULT_PLANNER_TIMEOUT_SECONDS="45"
 readonly DEFAULT_CHAT_TIMEOUT_SECONDS="30"
@@ -518,11 +519,24 @@ recover_search_from_candidates() {
 }
 
 run_default_bm25_fast_path() {
-  local candidate_batch
+  local candidate_batch fast_path_output_file fast_path_status
   search_uses_local_model=true
-  if ! candidate_batch="$("$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
+  fast_path_output_file="$(mktemp)"
+  track_temp_file "$fast_path_output_file"
+  if run_timed_command "$DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS" "$fast_path_output_file" "$fast_path_output_file" \
+      "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
       --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
-      --reranker bm25 --format plain --dry-run -- "$question" 2>&1)"; then
+      --reranker bm25 --format plain --dry-run -- "$question"; then
+    fast_path_status=0
+  else
+    fast_path_status=$?
+  fi
+  candidate_batch="$(<"$fast_path_output_file")"
+  if ((fast_path_status != 0)); then
+    bm25_candidates="$candidate_batch"
+    if planner_timeout_or_kill "$fast_path_status"; then
+      search_fast_path_miss=true
+    fi
     search_uses_local_model=false
     return 1
   fi
