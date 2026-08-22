@@ -466,9 +466,26 @@ fast_path_token_variants() {
     printf '%s\tfalse\n' "$token"
     if [[ "${#token}" -ge 8 && "$token" == *ing ]]; then
       stem="${token:0:${#token}-3}"
-      if [[ "${#stem}" -ge 5 ]]; then
+      if [[ "${#stem}" -ge 8 ]]; then
         printf '%s\ttrue\n' "$stem"
       fi
+    fi
+  done < <(search_distinctive_tokens "$1")
+}
+
+# Matching may use a short morphological stem, but BM25 queries may not.
+fast_path_match_variants() {
+  local token normalized stem
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    printf '%s\n' "$token"
+    normalized="${token//-/_}"
+    [[ "$normalized" == "$token" ]] || printf '%s\n' "$normalized"
+    if [[ "$token" == *ing && "${#token}" -ge 8 ]]; then
+      stem="${token:0:${#token}-3}"
+      printf '%s\n' "$stem"
+      normalized="${stem//-/_}"
+      [[ "$normalized" == "$stem" ]] || printf '%s\n' "$normalized"
     fi
   done < <(search_distinctive_tokens "$1")
 }
@@ -506,8 +523,44 @@ build_fast_path_queries() {
   fi
 }
 
+candidate_line_score() {
+  local file="$1" line_number="$2" token="$3"
+  awk -v line_number="$line_number" -v token="$token" '
+    NR != line_number { next }
+    {
+      code = $0
+      sub(/[[:space:]]*\/\/.*/, "", code)
+      sub(/[[:space:]]*#.*/, "", code)
+      normalized_token = token
+      gsub(/[^[:alnum:]]/, "", normalized_token)
+      normalized_token = tolower(normalized_token)
+      normalized_code = tolower(code)
+      gsub(/[^[:alnum:]]/, "", normalized_code)
+      if (!index(normalized_code, normalized_token)) exit
+      score = 0
+      if (code ~ /^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub([[:space:]]*\([^)]*\))?|const|unsafe|extern|inline|readonly)[[:space:]]+)*(fn|def|const|class|struct)([[:space:](<{:]|$)/)
+        score += 100000000
+      remaining = code
+      longest = 0
+      while (match(remaining, /[[:alpha:]_][[:alnum:]_-]*/)) {
+        identifier = substr(remaining, RSTART, RLENGTH)
+        identifier_normalized = identifier
+        gsub(/[^[:alnum:]]/, "", identifier_normalized)
+        if (identifier ~ /[_-]/ && index(tolower(identifier_normalized), normalized_token)) {
+          score += 10000000
+          if (length(identifier) > longest) longest = length(identifier)
+        }
+        remaining = substr(remaining, RSTART + RLENGTH)
+      }
+      print score + longest
+      exit
+    }
+  ' < "$file" 2>/dev/null || true
+}
+
 recover_timeout_location_from_bm25() {
-  local candidate token file line_start line_end line_number location
+  local candidate token file line_start line_end line_number location score
+  local best_score=-1 best_location="" match_token match_line
   while IFS= read -r candidate; do
     if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
@@ -528,19 +581,28 @@ recover_timeout_location_from_bm25() {
     fi
     [[ "$file" != /* ]] && file="$PWD/$file"
     [[ -f "$file" ]] || continue
-    while IFS=$'\t' read -r token is_stem; do
-      [[ -n "$token" ]] || continue
-      line_number="$(named_symbol_definition_line "$file" "$token" any "$line_start" "$line_end")"
-      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
-      location="$(compact_search_locations "$(printf "File: %s, Lines: %s-%s\n" "$file" "$line_number" "$line_number")" "$token")"
-      if [[ -n "$location" ]]; then
-        printf "%s\n" "$location"
-        return 0
+    while IFS= read -r match_token; do
+      [[ -n "$match_token" ]] || continue
+      match_line="$(named_symbol_definition_line "$file" "$match_token" any "$line_start" "$line_end")"
+      [[ "$match_line" =~ ^[[:digit:]]+$ ]] || continue
+      score="$(candidate_line_score "$file" "$match_line" "$match_token")"
+      [[ "$score" =~ ^[[:digit:]]+$ ]] || continue
+      line_number="$match_line"
+      location="$(compact_search_locations "$(printf "File: %s, Lines: %s-%s\n" "$file" "$line_number" "$line_number")" "$match_token")"
+      [[ -n "$location" ]] || continue
+      if ((score > best_score)); then
+        best_score="$score"
+        best_location="$location"
       fi
-    done < <(fast_path_token_variants "${question:-}")
+    done < <(fast_path_match_variants "${question:-}")
   done <<< "${bm25_candidates:-}"
+  if [[ -n "$best_location" ]]; then
+    printf '%s\n' "$best_location"
+    return 0
+  fi
   return 1
 }
+
 recover_timeout_search_from_candidates() {
   recover_search_from_candidates || return 1
   if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
@@ -621,17 +683,16 @@ run_default_bm25_fast_path() {
       [[ -z "$bm25_candidates" ]] || bm25_candidates+=$'\n\n'
       bm25_candidates+="$candidate_batch"
       search_fallback_locations="$(compact_search_locations "$bm25_candidates")"
-      output="$(recover_timeout_location_from_bm25 || true)"
-      if [[ -n "$output" ]]; then
-        printf '%s\n' "$output"
-        return 0
-      fi
     fi
     if ((fast_path_status != 0)) && planner_timeout_or_kill "$fast_path_status"; then
       fast_path_timed_out=true
     fi
   done
   search_fallback_locations="$(compact_search_locations "$bm25_candidates")"
+  if output="$(recover_timeout_location_from_bm25)" && [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
+    return 0
+  fi
   if [[ -n "$search_fallback_locations" || "$fast_path_fallback" == true || "$fast_path_timed_out" == true ]]; then
     search_fast_path_miss=true
   fi

@@ -428,7 +428,7 @@ class PbiTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "query = sys.argv[-1]\n"
                 "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"a\") as trace: print(json.dumps(query), file=trace)\n"
-                f"if query == \"append\": print(\"{target}:125\")\n"
+                f"if query == \"appending\": print(\"{target}:125\")\n"
                 "else: print(\"git-fixtures:1\")\n"
             )
             probe.chmod(0o755)
@@ -445,8 +445,8 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "src/repo_write_audit.rs:125\n")
         self.assertEqual(result.stderr, "")
-        self.assertIn("append", probe_queries)
-        self.assertFalse(any("appending review" in query for query in probe_queries))
+        self.assertIn("appending", probe_queries)
+        self.assertNotIn("append", probe_queries)
 
     def test_default_query_bm25_fast_path_skips_slow_planner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3397,6 +3397,71 @@ class PbiTest(unittest.TestCase):
         self.assertIn("126", result.stderr)
         self.assertNotIn("probe-chat reported an API error", result.stderr)
         self.assertNotIn("probe-chat failed", result.stderr)
+
+
+    def test_default_query_bm25_fast_path_does_not_search_short_gerund_stem_and_ranks_long_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            short_definition = source_dir / "store.rs"
+            long_definition = source_dir / "review_cmd_dirty_tree.rs"
+            short_definition.write_text("// filler\n" * 204 + "pub fn append_entry() {}\n")
+            long_definition.write_text("// filler\n" * 124 + "pub(super) fn append_repo_write_audit_finding() {}\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "query = sys.argv[-1]\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
+                f"if query == 'appending':\n    print('{short_definition}:205')\n    print('{long_definition}:125')\n"
+                "else:\n    print('git-fixtures:1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "appending", "review", "audit", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            probe_queries = [json.loads(line) for line in (directory / "probe-trace.json").read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/review_cmd_dirty_tree.rs:125\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("appending", probe_queries)
+        self.assertNotIn("append", probe_queries)
+
+    def test_default_query_bm25_fast_path_ranks_hyphenated_definition_over_generic_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            generic = source_dir / "bug_class.rs"
+            target = source_dir / "worktree_reclaim_tests.rs"
+            generic.write_text("// filler\n" * 433 + '"Prefer synchronization patterns that make ownership explicit."\n')
+            target.write_text("// filler\n" * 44 + "fn worktree_write_lock_reclaims_terminal_session_after_holder_crash() {}\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "query = sys.argv[-1]\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
+                f"if query == 'late_alias': print('{generic}:434')\n"
+                f"elif query == 'lock_reclaim': print('{target}:45')\n"
+                "else: print('git-fixtures:1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "late-alias", "lock-reclaim", "synchronization", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            probe_queries = [json.loads(line) for line in (directory / "probe-trace.json").read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/worktree_reclaim_tests.rs:45\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("lock_reclaim", probe_queries)
 
 
 if __name__ == "__main__":
