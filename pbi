@@ -452,6 +452,43 @@ search_distinctive_tokens() {
     sort -rn -k1,1 -k2,2 | cut -f2-
 }
 
+build_fast_path_query() {
+  local token normalized query="" fallback_query="" count=0 fallback_count=0
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    normalized="${token//-/_}"
+    case " $fallback_query " in
+      *" $normalized "*) ;;
+      *)
+        if ((fallback_count < 8)); then
+          fallback_query+="${fallback_query:+ }$normalized"
+          fallback_count=$((fallback_count + 1))
+        fi
+        ;;
+    esac
+    if [[ "$token" != *_* &&
+          ! "$token" =~ ^[[:upper:]][[:upper:][:digit:]]{5,}$ &&
+          ! "$token" =~ ^[[:alpha:]][[:alnum:]_-]{7,}$ &&
+          ! "$token" =~ ^[[:digit:]][[:digit:]][[:digit:]]*$ &&
+          "$token" != *-* ]]; then
+      continue
+    fi
+    case " $query " in
+      *" $normalized "*) continue ;;
+    esac
+    if ((count < 8)); then
+      query+="${query:+ }$normalized"
+      count=$((count + 1))
+    fi
+  done < <(search_distinctive_tokens "$1")
+  if [[ -n "$query" ]]; then
+    printf "%s" "$query"
+    return 0
+  fi
+  printf "%s" "$fallback_query"
+  return 1
+}
+
 recover_timeout_location_from_bm25() {
   local candidate token file line_start line_end line_number location
   while IFS= read -r candidate; do
@@ -526,14 +563,17 @@ recover_search_from_candidates() {
 }
 
 run_default_bm25_fast_path() {
-  local candidate_batch fast_path_output_file fast_path_status
+  local candidate_batch fast_path_output_file fast_path_status fast_path_query
+  local fast_path_fallback=false
+  fast_path_query="$(build_fast_path_query "${question:-}")" || fast_path_fallback=true
+  [[ -n "$fast_path_query" ]] || fast_path_query="${question:-}"
   search_uses_local_model=true
   fast_path_output_file="$(mktemp)"
   track_temp_file "$fast_path_output_file"
   if run_timed_command "$DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS" "$fast_path_output_file" "$fast_path_output_file" \
       "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
       --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
-      --reranker bm25 --format plain --dry-run -- "$question"; then
+      --reranker bm25 --format plain --dry-run -- "$fast_path_query"; then
     fast_path_status=0
   else
     fast_path_status=$?
@@ -548,12 +588,13 @@ run_default_bm25_fast_path() {
     return 1
   fi
   candidate_batch="$(printf '%s\n' "$candidate_batch" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
+  bm25_candidates="$candidate_batch"
   search_fallback_locations="$(compact_search_locations "$candidate_batch")"
   [[ -n "$search_fallback_locations" ]] || {
     search_uses_local_model=false
+    [[ "$fast_path_fallback" == true ]] && search_fast_path_miss=true
     return 1
   }
-  bm25_candidates="$candidate_batch"
   output="$(recover_timeout_location_from_bm25 || true)"
   if [[ -n "$output" ]]; then
     printf '%s\n' "$output"

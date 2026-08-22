@@ -240,7 +240,7 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(
             [call[-1] for call in probe_calls],
             [
-                "where is the entrypoint",
+                "entrypoint",
                 "where is the entrypoint",
                 "entrypoint CLI parsing",
                 "command dispatch match",
@@ -388,6 +388,8 @@ class PbiTest(unittest.TestCase):
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"w\") as trace: json.dump(sys.argv[-1], trace)\n"
                 f"print(\"{generic}:2\")\n"
                 f"print(\"{target}:1\")\n"
             )
@@ -398,9 +400,13 @@ class PbiTest(unittest.TestCase):
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
+            probe_query = json.loads((directory / "probe-trace.json").read_text())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "src/worktree_reclaim_tests.rs:1\n")
         self.assertEqual(result.stderr, "")
+        self.assertTrue("late_alias" in probe_query or "lock_reclaim" in probe_query)
+        self.assertNotIn("late-alias", probe_query)
+        self.assertNotIn("lock-reclaim", probe_query)
 
     def test_default_query_bm25_fast_path_ignores_generic_findings_default_line(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -411,24 +417,30 @@ class PbiTest(unittest.TestCase):
             generic = source_dir / "review_cmd_output_consistency_helpers.rs"
             target = source_dir / "repo_write_audit.rs"
             generic.write_text("write_findings_toml(session_dir, &FindingsFile::default())\n")
-            target.write_text("const FINDINGS_TOML_SYNTHETIC_MARKER: &str = \"synthetic\";\n")
+            target.write_text("fn append_repo_write_audit_finding() { let _ = FINDINGS_TOML_SYNTHETIC_MARKER; }\n")
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"w\") as trace: json.dump(sys.argv[-1], trace)\n"
                 f"print(\"{generic}:1\")\n"
                 f"print(\"{target}:1\")\n"
             )
             probe.chmod(0o755)
             result = self.run_pbi(
-                "find provenance synthetic-marker findings default",
+                "find provenance for append_repo_write_audit_finding and FINDINGS_TOML_SYNTHETIC_MARKER while avoiding generic defaults",
                 env=env,
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
+            probe_query = json.loads((directory / "probe-trace.json").read_text())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "src/repo_write_audit.rs:1\n")
         self.assertEqual(result.stderr, "")
+        self.assertIn("append_repo_write_audit_finding", probe_query)
+        self.assertIn("FINDINGS_TOML_SYNTHETIC_MARKER", probe_query)
+        self.assertNotIn("find provenance for append_repo_write_audit_finding", probe_query)
 
     def test_default_query_bm25_fast_path_skips_slow_planner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -471,7 +483,35 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "src/fast.py:5\n")
         self.assertEqual(result.stderr, "")
         self.assertTrue(probe_calls)
-        self.assertEqual(probe_calls[0][-1], "where is compression publication and main route cache key assembly for first post-compress request")
+        fast_query = probe_calls[0][-1]
+        self.assertIn("post_compress", fast_query)
+        self.assertNotIn("post-compress", fast_query)
+        self.assertNotIn("where is compression publication", fast_query)
+
+    def test_default_query_without_distinctive_tokens_runs_bm25_without_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"w\") as trace: trace.write(\"searched\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where is the session wait helper",
+                env=env,
+                cwd=directory,
+                binary=self.fake_pbi(directory, probe),
+            )
+            probe_query = (directory / "probe-trace.json").read_text()
+            planner_started = (directory / "trace.json").exists()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertEqual(probe_query, "searched")
+        self.assertFalse(planner_started)
 
     def test_default_query_bm25_fast_path_timeout_fails_closed_without_planner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
