@@ -550,7 +550,7 @@ class PbiTest(unittest.TestCase):
             unrelated = source_dir / "unrelated.py"
             target = source_dir / "target.py"
             unrelated.write_text("# unrelated candidate\n" * 5)
-            target.write_text("# target\n" * 6 + "compression publication cache key\n")
+            target.write_text("# target\n" * 6 + "compression publication cache key assembly audit\n")
             env, _ = self.fake_environment(directory)
             env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
@@ -571,7 +571,7 @@ class PbiTest(unittest.TestCase):
             )
             fake_chat.chmod(0o755)
             result = self.run_pbi(
-                "where is compression publication and cache key assembly?",
+                "where is compression publication and cache key assembly audit?",
                 env=env,
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
@@ -3416,7 +3416,8 @@ class PbiTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "query = sys.argv[-1]\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
-                f"if query == 'appending':\n    print('{short_definition}:205')\n    print('{long_definition}:125')\n"
+                f"if query == 'appending':\n    print('{short_definition}:205')\n"
+                f"elif query == 'audit':\n    print('{long_definition}:125')\n"
                 "else:\n    print('git-fixtures:1')\n"
             )
             probe.chmod(0o755)
@@ -3429,6 +3430,7 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "src/review_cmd_dirty_tree.rs:125\n")
         self.assertEqual(result.stderr, "")
         self.assertIn("appending", probe_queries)
+        self.assertIn("audit", probe_queries)
         self.assertNotIn("append", probe_queries)
 
     def test_default_query_bm25_fast_path_ranks_hyphenated_definition_over_generic_literal(self) -> None:
@@ -3449,7 +3451,8 @@ class PbiTest(unittest.TestCase):
                 "query = sys.argv[-1]\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
                 f"if query == 'late_alias': print('{generic}:434')\n"
-                f"elif query == 'lock_reclaim': print('{target}:45')\n"
+                f"elif query == 'lock_reclaim': print('{generic}:434')\n"
+                f"elif query == 'reclaim': print('{target}:45')\n"
                 "else: print('git-fixtures:1')\n"
             )
             probe.chmod(0o755)
@@ -3462,6 +3465,8 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "src/worktree_reclaim_tests.rs:45\n")
         self.assertEqual(result.stderr, "")
         self.assertIn("lock_reclaim", probe_queries)
+        self.assertIn("reclaim", probe_queries)
+        self.assertNotIn("synchronization", probe_queries)
 
 
 if __name__ == "__main__":

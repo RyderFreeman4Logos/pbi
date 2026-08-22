@@ -442,11 +442,11 @@ search_distinctive_tokens() {
     token="${token%%[,:;.!?]*}"
     token_lower="${token,,}"
     case "$token_lower" in
-      a|an|and|answer|are|cache|code|cmd|current|default|does|file|find|findings|first|for|from|helper|helpers|how|implementation|is|key|line|locate|lock|main|marker|markers|multi|of|output|query|request|return|review|route|search|session|show|single|source|spawn|test|tests|the|their|this|to|wait|what|where|which|with|when|append|cleared|cover|audit)
+      a|an|and|answer|are|cache|code|cmd|current|default|does|file|find|findings|first|for|from|helper|helpers|how|implementation|is|key|line|locate|lock|main|marker|markers|multi|of|output|query|request|return|review|route|search|session|show|single|source|spawn|test|tests|the|their|this|to|wait|what|where|which|with|when|append|cleared|cover|synchronization|readiness|publication|compression|assembly|fixture|daemon)
         continue
         ;;
     esac
-    [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{5,}$ ]] || continue
+    [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{4,}$ ]] || continue
     printf "%s\t%s\n" "${#token}" "$token"
   done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }') |
     sort -rn -k1,1 -k2,2 | cut -f2-
@@ -460,10 +460,16 @@ fast_path_now_ns() {
 }
 
 fast_path_token_variants() {
-  local token stem
+  local token stem tail
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     printf '%s\tfalse\n' "$token"
+    if [[ "$token" == *[-_]* ]]; then
+      tail="${token##*[-_]}"
+      if [[ "${#tail}" -ge 5 ]]; then
+        printf '%s\tfalse\n' "$tail"
+      fi
+    fi
     if [[ "${#token}" -ge 8 && "$token" == *ing ]]; then
       stem="${token:0:${#token}-3}"
       if [[ "${#stem}" -ge 8 ]]; then
@@ -473,19 +479,27 @@ fast_path_token_variants() {
   done < <(search_distinctive_tokens "$1")
 }
 
-# Matching may use a short morphological stem, but BM25 queries may not.
+# Matching may use a morphological stem only when it remains distinctive.
 fast_path_match_variants() {
-  local token normalized stem
+  local token normalized stem tail
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     printf '%s\n' "$token"
     normalized="${token//-/_}"
     [[ "$normalized" == "$token" ]] || printf '%s\n' "$normalized"
+    if [[ "$token" == *[-_]* ]]; then
+      tail="${token##*[-_]}"
+      if [[ "${#tail}" -ge 5 ]]; then
+        printf '%s\n' "$tail"
+      fi
+    fi
     if [[ "$token" == *ing && "${#token}" -ge 8 ]]; then
       stem="${token:0:${#token}-3}"
-      printf '%s\n' "$stem"
-      normalized="${stem//-/_}"
-      [[ "$normalized" == "$stem" ]] || printf '%s\n' "$normalized"
+      if [[ "${#stem}" -ge 8 ]]; then
+        printf '%s\n' "$stem"
+        normalized="${stem//-/_}"
+        [[ "$normalized" == "$stem" ]] || printf '%s\n' "$normalized"
+      fi
     fi
   done < <(search_distinctive_tokens "$1")
 }
@@ -498,7 +512,7 @@ build_fast_path_queries() {
     if [[ "$is_stem" != true &&
           "$token" != *_* &&
           ! "$token" =~ ^[[:upper:]][[:upper:][:digit:]]{5,}$ &&
-          ! "$token" =~ ^[[:alpha:]][[:alnum:]_-]{7,}$ &&
+          ! "$token" =~ ^[[:alpha:]][[:alnum:]_-]{4,}$ &&
           ! "$token" =~ ^[[:digit:]][[:digit:]][[:digit:]]*$ &&
           "$token" != *-* ]]; then
       if ((fallback_count < 8)) && [[ " $fallback_queries " != *" $normalized "* ]]; then
