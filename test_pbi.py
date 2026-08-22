@@ -3418,8 +3418,7 @@ class PbiTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "query = sys.argv[-1]\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
-                f"if query == 'appending': print('{short_definition}:205')\n"
-                f"elif query == 'audit':\n    print('{plan_audit}:45')\n    print('{long_definition}:125')\n"
+                f"if query == 'appending':\n    print('{plan_audit}:45')\n    print('{long_definition}:125')\n"
                 "else: print('git-fixtures:1')\n"
             )
             probe.chmod(0o755)
@@ -3432,7 +3431,7 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "src/review_cmd_dirty_tree.rs:125\n")
         self.assertEqual(result.stderr, "")
         self.assertIn("appending", probe_queries)
-        self.assertIn("audit", probe_queries)
+        self.assertNotIn("audit", probe_queries)
         self.assertNotIn("append", probe_queries)
 
     def test_default_query_bm25_fast_path_requires_full_hyphen_compound_on_cited_line(self) -> None:
@@ -3452,8 +3451,8 @@ class PbiTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "query = sys.argv[-1]\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
-                f"if query in ('late_alias', 'lock_reclaim'): print('{alias_definition}:26')\n"
-                f"elif query == 'reclaim':\n    print('{alias_definition}:26')\n    print('{target}:45')\n"
+                f"if query == 'late_alias': print('{alias_definition}:26')\n"
+                f"elif query == 'lock_reclaim': print('{target}:45')\n"
                 "else: print('git-fixtures:1')\n"
             )
             probe.chmod(0o755)
@@ -3465,8 +3464,9 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "src/worktree_reclaim_tests.rs:45\n")
         self.assertEqual(result.stderr, "")
+        self.assertIn("late_alias", probe_queries)
         self.assertIn("lock_reclaim", probe_queries)
-        self.assertIn("reclaim", probe_queries)
+        self.assertNotIn("reclaim", probe_queries)
         self.assertNotIn("alias", probe_queries)
 
     def test_default_query_bm25_fast_path_requires_post_compress_compound(self) -> None:
@@ -3488,8 +3488,7 @@ class PbiTest(unittest.TestCase):
                     "import json, os, sys\n"
                     "query = sys.argv[-1]\n"
                     "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace: trace.write(json.dumps(query) + '\\n')\n"
-                    f"if query == 'compress': print('{preflight}:332')\n"
-                    f"elif query == 'post_compress':\n    print('{preflight}:332')\n    if os.environ['PBI_TEST_COMPOUND'] == '1': print('{compound}:20')\n"
+                    f"if query == 'post_compress':\n    print('{preflight}:332')\n    if os.environ['PBI_TEST_COMPOUND'] == '1': print('{compound}:20')\n"
                     "else: print('git-fixtures:1')\n"
                 )
                 probe.chmod(0o755)
@@ -3499,7 +3498,7 @@ class PbiTest(unittest.TestCase):
                 )
                 probe_queries = [json.loads(line) for line in (directory / "probe-trace.json").read_text().splitlines()]
             self.assertIn("post_compress", probe_queries)
-            self.assertIn("compress", probe_queries)
+            self.assertNotIn("compress", probe_queries)
             self.assertNotIn("post-compress", probe_queries)
             if include_compound:
                 self.assertEqual(result.returncode, 0, result.stderr)

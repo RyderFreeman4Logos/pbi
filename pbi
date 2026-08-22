@@ -464,12 +464,6 @@ fast_path_token_variants() {
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     printf '%s\tfalse\n' "$token"
-    if [[ "$token" == *[-_]* ]]; then
-      tail="${token##*[-_]}"
-      if [[ "${#tail}" -ge 6 ]]; then
-        printf '%s\tfalse\n' "$tail"
-      fi
-    fi
     if [[ "${#token}" -ge 8 && "$token" == *ing ]]; then
       stem="${token:0:${#token}-3}"
       if [[ "${#stem}" -ge 8 ]]; then
@@ -508,6 +502,9 @@ build_fast_path_queries() {
   local token is_stem normalized fallback_token queries="" fallback_queries="" count=0 fallback_count=0
   while IFS=$'\t' read -r token is_stem; do
     [[ -n "$token" ]] || continue
+    if [[ "$token" == audit ]] && fast_path_requires_append_audit "$1"; then
+      continue
+    fi
     normalized="${token//-/_}"
     if [[ "$is_stem" != true &&
           "$token" != *_* &&
