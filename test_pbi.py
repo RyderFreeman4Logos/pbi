@@ -2730,7 +2730,7 @@ class PbiTest(unittest.TestCase):
             repo = directory / "repo"
             repo.mkdir()
             source = repo / "README.md"
-            source.write_text("caption OCR\nproduct claim\nEvidence\ndocs/mvp\nclosing\n")
+            source.write_text("# README\nproduct claim\nEvidence\ndocs/mvp\nclosing\n")
             env, trace = self.fake_environment(directory)
             env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
@@ -2762,6 +2762,58 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "README.md:3\n")
         self.assertEqual(result.stderr, "")
         self.assertLess(elapsed, 5)
+
+    def test_search_bm25_emit_prefers_named_readme_over_caption_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            readme = repo / "README.md"
+            caption = repo / "crates" / "verbatim-core" / "src" / "vision_caption.rs"
+            caption.parent.mkdir(parents=True)
+            readme.write_text(
+                "# Product claims\n"
+                "This fixture has a source claim.\n"
+                "Product Evidence claims belong in README.\n"
+            )
+            caption.write_text(
+                'pub const VISION_CAPTION_PROMPT_VERSION: &str = "1";\n'
+            )
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "sleep 30\n"
+            )
+            fake_chat.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {caption}, Lines: 1-9')\n"
+            )
+            probe.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "search",
+                "hallucination",
+                "caption",
+                "OCR",
+                "Evidence",
+                "README",
+                "docs/mvp",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=10,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "README.md:3\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named-file recovery must skip Probe Chat")
+        self.assertNotIn("vision_caption.rs", result.stdout)
+        self.assertLess(elapsed, 10)
 
     def test_search_probe_timeout_recovers_compact_candidates_without_named_symbol(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

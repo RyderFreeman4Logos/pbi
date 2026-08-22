@@ -389,6 +389,14 @@ compact_search_locations() {
 
 emit_bm25_locations_or_fail_closed() {
   local locations recovered_named_locations candidate_symbol candidate_locations
+  local -a named_files=()
+  mapfile -t named_files < <(named_query_files "${question:-}")
+  if ((${#named_files[@]} > 0)); then
+    if recovered_named_locations="$(recover_named_file_claims "${named_files[@]}")"; then
+      printf '%s\n' "$recovered_named_locations"
+      exit 0
+    fi
+  fi
   locations="$(compact_search_locations "$bm25_candidates")"
   recovered_named_locations=""
   while IFS= read -r candidate_symbol; do
