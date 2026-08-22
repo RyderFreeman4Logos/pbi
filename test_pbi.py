@@ -452,9 +452,11 @@ class PbiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
-            source = repo / "src" / "fast.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("# filler\n" * 4 + "def _content_cache_key(): pass\n")
+            ts_source = repo / "src" / "ipc.ts"
+            py_source = repo / "src" / "codex.py"
+            ts_source.parent.mkdir(parents=True)
+            ts_source.write_text("// filler\n" * 66 + "const key = `${desktopFsCacheKey()}:x`\n" + "// filler\n" * 10)
+            py_source.write_text("def _bounded_prompt_cache_key(): pass\n" "def _content_cache_key(): pass\n")
             env, _ = self.fake_environment(directory)
             env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
@@ -463,7 +465,9 @@ class PbiTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as trace:\n"
                 "    trace.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                "print('src/fast.py:5')\n"
+                "print('File: src/ipc.ts, Lines: 66-76')\n"
+                "print('Remaining files not shown:')\n"
+                "print(' src/codex.py <3> <46>')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -486,7 +490,7 @@ class PbiTest(unittest.TestCase):
             probe_calls = [json.loads(line) for line in probe_trace.read_text().splitlines()]
             self.assertFalse((directory / "trace.json").exists(), "a fast-path success must not start the planner")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/fast.py:5\n")
+        self.assertEqual(result.stdout, "src/codex.py:2\n")
         self.assertEqual(result.stderr, "")
         self.assertTrue(probe_calls)
         fast_query = probe_calls[0][-1]

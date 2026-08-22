@@ -583,16 +583,19 @@ fast_path_line_has_cache_key_identifier() {
       sub(/[[:space:]]*\/\/.*$/, "", code)
       sub(/[[:space:]]*#.*/, "", code)
       gsub(/\/\*[^*]*\*\//, "", code)
-      while (match(code, /[[:alpha:]_][[:alnum:]_-]*/)) {
-        identifier = substr(code, RSTART, RLENGTH)
-        normalized_identifier = identifier
-        gsub(/[^[:alnum:]]/, "", normalized_identifier)
-        normalized_identifier = tolower(normalized_identifier)
-        if (index(normalized_identifier, "cache") && index(normalized_identifier, "key") &&
-            !index(normalized_identifier, "bound") &&
-            !index(normalized_identifier, "should") &&
-            !index(normalized_identifier, "preflight")) exit 0
-        code = substr(code, RSTART + RLENGTH)
+      if (match(code, /(^|[[:space:]])(fn|def|function)[[:space:]]+/)) {
+        definition = substr(code, RSTART + RLENGTH)
+        if (match(definition, /^[[:alpha:]_][[:alnum:]_-]*/)) {
+          identifier = substr(definition, RSTART, RLENGTH)
+          normalized_identifier = identifier
+          gsub(/[^[:alnum:]]/, "", normalized_identifier)
+          normalized_identifier = tolower(normalized_identifier)
+          if (index(normalized_identifier, "cache") && index(normalized_identifier, "key") &&
+              (index(normalized_identifier, "prompt") || index(normalized_identifier, "content")) &&
+              !index(normalized_identifier, "bound") &&
+              !index(normalized_identifier, "should") &&
+              !index(normalized_identifier, "preflight")) exit 0
+        }
       }
       exit 1
     }
@@ -833,6 +836,9 @@ recover_timeout_location_from_bm25() {
       continue
     fi
     [[ "$file" != /* ]] && file="$PWD/$file"
+    if [[ "$cache_key_signal" == true && "$file" != *.py && "$file" != *.rs ]]; then
+      continue
+    fi
     [[ -f "$file" ]] || continue
     while IFS= read -r match_token; do
       fast_path_deadline_reached && break 2
