@@ -374,7 +374,7 @@ class PbiTest(unittest.TestCase):
             repo = directory / "repo"
             source = repo / "src" / "fast.py"
             source.parent.mkdir(parents=True)
-            source.write_text("# fast path\n")
+            source.write_text("# filler\n" * 4 + "compression publication cache key\n")
             env, _ = self.fake_environment(directory)
             env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
@@ -410,6 +410,86 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertTrue(probe_calls)
         self.assertEqual(probe_calls[0][-1], "where is compression publication and main route cache key assembly for first post-compress request")
+    def test_default_query_bm25_fast_path_skips_unrelated_first_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            unrelated = source_dir / "unrelated.py"
+            target = source_dir / "target.py"
+            unrelated.write_text("# unrelated candidate\n" * 5)
+            target.write_text("# target\n" * 6 + "compression publication cache key\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "with open(os.environ[\"PBI_TEST_PROBE_TRACE\"], \"a\") as trace: trace.write(sys.argv[-1] + \"\\n\")\n"
+                f"print(\"{unrelated}:5\")\n"
+                f"print(\"{target}:7\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "while True: time.sleep(0.1)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is compression publication and cache key assembly?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=4,
+            )
+            probe_trace = directory / "probe-trace.json"
+            self.assertTrue(probe_trace.exists(), "BM25 fast path must search before planner")
+            self.assertFalse((directory / "trace.json").exists(), "a token-matched fast path must not start the planner")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/target.py:7\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_default_query_bm25_fast_path_rejects_unrelated_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            unrelated = source_dir / "unrelated.py"
+            unrelated.write_text("# unrelated candidate\n" * 7)
+            env, _ = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{unrelated}:5\")\n"
+                f"print(\"{unrelated}:7\")\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "while True: time.sleep(0.1)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is compression publication and cache key assembly?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=4,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: planner timed out before producing a source answer\n")
+        self.assertNotIn("unrelated.py:", result.stdout + result.stderr)
+
     def test_default_query_timeout_recovers_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -812,6 +892,10 @@ class PbiTest(unittest.TestCase):
     def test_term_resistant_initial_planner_times_out_to_direct_bm25(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "entrypoint.py"
+            repo.mkdir()
+            source.write_text("# filler\n" * 4 + "entrypoint\n")
             env, trace = self.fake_environment(directory)
             env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
@@ -820,7 +904,7 @@ class PbiTest(unittest.TestCase):
                 "import os\n"
                 "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
                 "    f.write('invoked')\n"
-                "print('LICENSE:5')\n"
+                "print('entrypoint.py:5')\n"
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
@@ -839,14 +923,14 @@ class PbiTest(unittest.TestCase):
             fake_chat.chmod(0o755)
             started = time.monotonic()
             result = self.run_pbi(
-                "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe), timeout=4
+                "where is the entrypoint", env=env, cwd=repo, binary=self.fake_pbi(directory, probe), timeout=4
             )
             elapsed = time.monotonic() - started
             self.assertTrue((directory / "probe-trace.json").exists())
             self.assertFalse(trace.exists(), "a fast-path success must not start the planner")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(elapsed, 3)
-        self.assertEqual(result.stdout, "LICENSE:5\n")
+        self.assertEqual(result.stdout, "entrypoint.py:5\n")
         self.assertEqual(result.stderr, "")
 
     def test_term_resistant_refinement_planner_times_out_to_direct_bm25(self) -> None:

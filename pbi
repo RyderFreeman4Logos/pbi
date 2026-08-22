@@ -442,33 +442,41 @@ search_distinctive_tokens() {
   done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }')
 }
 
-candidate_files_from_bm25() {
-  local line file
-  while IFS= read -r line; do
-    [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]] || continue
-    file="${BASH_REMATCH[1]}"
-    file="${file%%, Lines:*}"
-    [[ -f "$file" ]] && printf "%s\n" "$file"
-  done <<< "${bm25_candidates:-}"
-}
-
 recover_timeout_location_from_bm25() {
-  local token file line_number location
-  while IFS= read -r token; do
-    [[ -n "$token" ]] || continue
-    while IFS= read -r file; do
-      line_number="$(named_symbol_definition_line "$file" "$token" any)"
+  local candidate token file line_start line_end line_number location
+  while IFS= read -r candidate; do
+    if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
+      file="${BASH_REMATCH[1]}"
+      if [[ "$file" =~ ^(.+),[[:space:]]Lines:[[:space:]]([[:digit:]]+)(-([[:digit:]]+))?$ ]]; then
+        file="${BASH_REMATCH[1]}"
+        line_start="${BASH_REMATCH[2]}"
+        line_end="${BASH_REMATCH[4]:-$line_start}"
+      else
+        line_start=1
+        line_end=999999999
+      fi
+    elif [[ "$candidate" =~ ^(.+):([[:digit:]]+)$ ]]; then
+      file="${BASH_REMATCH[1]}"
+      line_start="${BASH_REMATCH[2]}"
+      line_end="$line_start"
+    else
+      continue
+    fi
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    [[ -f "$file" ]] || continue
+    while IFS= read -r token; do
+      [[ -n "$token" ]] || continue
+      line_number="$(named_symbol_definition_line "$file" "$token" any "$line_start" "$line_end")"
       [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
       location="$(compact_search_locations "$(printf "File: %s, Lines: %s-%s\n" "$file" "$line_number" "$line_number")" "$token")"
       if [[ -n "$location" ]]; then
         printf "%s\n" "$location"
         return 0
       fi
-    done < <(candidate_files_from_bm25)
-  done < <(search_distinctive_tokens "${question:-}")
+    done < <(search_distinctive_tokens "${question:-}")
+  done <<< "${bm25_candidates:-}"
   return 1
 }
-
 recover_timeout_search_from_candidates() {
   recover_search_from_candidates || return 1
   if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
@@ -523,12 +531,12 @@ run_default_bm25_fast_path() {
     return 1
   }
   bm25_candidates="$candidate_batch"
-  if recover_timeout_search_from_candidates &&
-      [[ -n "${output:-}" ]] &&
-      ! is_stamp_dump "$output" &&
-      ! has_mixed_stamp_junk "$output"; then
-    printf '%s\n' "$output"
-    return 0
+  if [[ -z "$(search_named_symbols "$question")" ]] && recover_search_from_candidates; then
+    output="$(recover_timeout_location_from_bm25 || true)"
+    if [[ -n "$output" ]]; then
+      printf '%s\n' "$output"
+      return 0
+    fi
   fi
   search_uses_local_model=false
   search_fallback_locations=""
