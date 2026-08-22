@@ -656,9 +656,6 @@ fast_path_footer_tokens() {
       [[ "$token" == *[-_]* ]] || continue
       printf '%s\n' "${token##*[-_]}"
     done < <(search_distinctive_tokens "$1")
-    if fast_path_requires_append_audit "$1"; then
-      printf '%s\n' review
-    fi
   } | while IFS= read -r token; do
     normalized="${token,,}"
     normalized="${normalized//[^[:alnum:]]/}"
@@ -677,9 +674,12 @@ fast_path_footer_path_matches_query() {
 }
 
 remaining_file_candidates() {
-  local line path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
+  local line path resolved_path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
+  local append_audit_matches rg_command remaining_ns remaining_ms timeout_seconds
+  local -a footer_source_paths=() footer_path_matches=()
   footer_tokens="$(fast_path_footer_tokens "$query")"
   fast_path_deadline_reached && return 0
+  append_audit_matches=""
   while IFS= read -r line; do
     fast_path_deadline_reached && break
     if [[ "$line" =~ ^Remaining[[:space:]]+files[[:space:]]+not[[:space:]]+shown:[[:space:]]*$ ]]; then
@@ -692,13 +692,53 @@ remaining_file_candidates() {
     case "$path" in
       */PATTERN.md|*/workflow.toml|*/Cargo.toml|*.md) continue ;;
     esac
-    fast_path_footer_path_matches_query "$path" "$footer_tokens" || continue
-    [[ "$path" != /* ]] && path="$PWD/$path"
-    [[ -f "$path" ]] || continue
+    resolved_path="$path"
+    [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
+    [[ -f "$resolved_path" ]] || continue
+    [[ "$path" == *.rs || "$path" == *.py ]] && footer_source_paths+=("$path")
+    if fast_path_footer_path_matches_query "$path" "$footer_tokens"; then
+      footer_path_matches+=("$path")
+    fi
+  done <<<"$1"
+  if fast_path_requires_append_audit "$query" && ! fast_path_deadline_reached &&
+     ((${#footer_source_paths[@]} > 0)); then
+    rg_command="$(command -v rg || true)"
+    if [[ -n "$rg_command" ]]; then
+      remaining_ns=$((fast_path_deadline_ns - $(fast_path_now_ns)))
+      if ((remaining_ns > 0)); then
+        remaining_ms=$(( (remaining_ns + 999999) / 1000000 ))
+        printf -v timeout_seconds '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
+        append_audit_matches="$(timeout --kill-after=1s "$timeout_seconds" "$rg_command" \
+          -l --no-messages -i \
+          -e 'append[[:alnum:]_-]*audit|audit[[:alnum:]_-]*append' \
+          -- "${footer_source_paths[@]}" || true)"
+      fi
+    fi
+  fi
+  declare -A emitted_footer_paths=()
+  while IFS= read -r path; do
+    fast_path_deadline_reached && break
+    [[ -n "$path" && -z "${emitted_footer_paths[$path]+seen}" ]] || continue
+    resolved_path="$path"
+    [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
+    [[ -f "$resolved_path" ]] || continue
+    emitted_footer_paths["$path"]=1
     printf 'File: %s, Lines: 1-999999999\n' "$path"
     kept=$((kept + 1))
     ((kept < 16)) || break
-  done <<<"$1"
+  done <<< "$append_audit_matches"
+  ((kept < 16)) || return 0
+  for path in "${footer_path_matches[@]}"; do
+    fast_path_deadline_reached && break
+    [[ -n "$path" && -z "${emitted_footer_paths[$path]+seen}" ]] || continue
+    resolved_path="$path"
+    [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
+    [[ -f "$resolved_path" ]] || continue
+    emitted_footer_paths["$path"]=1
+    printf 'File: %s, Lines: 1-999999999\n' "$path"
+    kept=$((kept + 1))
+    ((kept < 16)) || break
+  done
 }
 
 recover_timeout_location_from_bm25() {

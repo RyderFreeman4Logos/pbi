@@ -3568,6 +3568,8 @@ class PbiTest(unittest.TestCase):
             target = source_dir / "review_cmd_dirty_tree.rs"
             store.write_text("// filler\n" * 204 + "pub fn append_entry() {}\n")
             target.write_text("// filler\n" * 124 + "pub(super) fn append_repo_write_audit_finding() {}\n")
+            for index in range(20):
+                (source_dir / f"review_cmd_foo_{index}.rs").write_text("fn unrelated_review() {}\n")
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
@@ -3578,6 +3580,7 @@ class PbiTest(unittest.TestCase):
                 "if query == 'appending':\n"
                 f"    print('File: {store}, Lines: 205-207')\n"
                 "    print('Remaining files not shown:')\n"
+                "    for index in range(20): print(f'  src/review_cmd_foo_{index}.rs <1> <1>')\n"
                 "    print('  src/review_cmd_dirty_tree.rs <1> <1>')\n"
                 "else: print('git-fixtures:1')\n"
             )
