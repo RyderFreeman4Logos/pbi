@@ -503,6 +503,10 @@ fast_path_match_variants() {
 
 build_fast_path_queries() {
   local token is_stem normalized fallback_token queries="" fallback_queries="" count=0 fallback_count=0
+  if fast_path_requires_cache_key "$1"; then
+    printf '%s\n' cache_key
+    return 0
+  fi
   while IFS=$'\t' read -r token is_stem; do
     [[ -n "$token" ]] || continue
     if [[ "$token" == audit ]] && fast_path_requires_append_audit "$1"; then
@@ -539,6 +543,7 @@ build_fast_path_queries() {
 
 fast_path_required_compounds() {
   local token normalized
+  fast_path_requires_cache_key "$1" && return 0
   while IFS= read -r token; do
     [[ "$token" == *[-_]* ]] || continue
     normalized="${token//-/_}"
@@ -552,6 +557,12 @@ fast_path_requires_append_audit() {
     [[ "$normalized_question" =~ (^|[^[:alnum:]_])audit([^[:alnum:]_]|$) ]]
 }
 
+fast_path_requires_cache_key() {
+  local normalized_question="${1,,}"
+  [[ "$normalized_question" =~ (^|[^[:alnum:]_])cache([^[:alnum:]_]|$) ]] &&
+    [[ "$normalized_question" =~ (^|[^[:alnum:]_])key([^[:alnum:]_]|$) ]]
+}
+
 fast_path_line_has_required_compound() {
   local file="$1" line_number="$2" required_compounds="$3" compound
   while IFS= read -r compound; do
@@ -561,6 +572,31 @@ fast_path_line_has_required_compound() {
     fi
   done <<<"$required_compounds"
   return 1
+}
+
+fast_path_line_has_cache_key_identifier() {
+  local file="$1" line_number="$2"
+  awk -v line_number="$line_number" '
+    NR != line_number { next }
+    {
+      code = $0
+      sub(/[[:space:]]*\/\/.*$/, "", code)
+      sub(/[[:space:]]*#.*/, "", code)
+      gsub(/\/\*[^*]*\*\//, "", code)
+      while (match(code, /[[:alpha:]_][[:alnum:]_-]*/)) {
+        identifier = substr(code, RSTART, RLENGTH)
+        normalized_identifier = identifier
+        gsub(/[^[:alnum:]]/, "", normalized_identifier)
+        normalized_identifier = tolower(normalized_identifier)
+        if (index(normalized_identifier, "cache") && index(normalized_identifier, "key") &&
+            !index(normalized_identifier, "bound") &&
+            !index(normalized_identifier, "should") &&
+            !index(normalized_identifier, "preflight")) exit 0
+        code = substr(code, RSTART + RLENGTH)
+      }
+      exit 1
+    }
+  ' < "$file" 2>/dev/null
 }
 
 fast_path_line_has_append_audit_identifier() {
@@ -636,6 +672,11 @@ fast_path_accepted_match_line() {
       line_start=$((match_line + 1))
       continue
     fi
+    if [[ "$cache_key_signal" == true ]] &&
+       ! fast_path_line_has_cache_key_identifier "$file" "$match_line"; then
+      line_start=$((match_line + 1))
+      continue
+    fi
     printf '%s\n' "$match_line"
     return 0
   done
@@ -675,11 +716,17 @@ fast_path_footer_path_matches_query() {
 
 remaining_file_candidates() {
   local line path resolved_path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
-  local append_audit_matches rg_command remaining_ns remaining_ms timeout_seconds
+  local footer_rg_matches rg_command footer_rg_pattern remaining_ns remaining_ms timeout_seconds
   local -a footer_source_paths=() footer_path_matches=()
   footer_tokens="$(fast_path_footer_tokens "$query")"
   fast_path_deadline_reached && return 0
-  append_audit_matches=""
+  footer_rg_matches=""
+  footer_rg_pattern=""
+  if fast_path_requires_cache_key "$query"; then
+    footer_rg_pattern='cache[_-]?key'
+  elif fast_path_requires_append_audit "$query"; then
+    footer_rg_pattern='append[[:alnum:]_-]*audit|audit[[:alnum:]_-]*append'
+  fi
   while IFS= read -r line; do
     fast_path_deadline_reached && break
     if [[ "$line" =~ ^Remaining[[:space:]]+files[[:space:]]+not[[:space:]]+shown:[[:space:]]*$ ]]; then
@@ -696,11 +743,12 @@ remaining_file_candidates() {
     [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
     [[ -f "$resolved_path" ]] || continue
     [[ "$path" == *.rs || "$path" == *.py ]] && footer_source_paths+=("$path")
-    if fast_path_footer_path_matches_query "$path" "$footer_tokens"; then
+    if ! fast_path_requires_cache_key "$query" &&
+       fast_path_footer_path_matches_query "$path" "$footer_tokens"; then
       footer_path_matches+=("$path")
     fi
   done <<<"$1"
-  if fast_path_requires_append_audit "$query" && ! fast_path_deadline_reached &&
+  if [[ -n "$footer_rg_pattern" ]] && ! fast_path_deadline_reached &&
      ((${#footer_source_paths[@]} > 0)); then
     rg_command="$(command -v rg || true)"
     if [[ -n "$rg_command" ]]; then
@@ -708,9 +756,9 @@ remaining_file_candidates() {
       if ((remaining_ns > 0)); then
         remaining_ms=$(( (remaining_ns + 999999) / 1000000 ))
         printf -v timeout_seconds '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
-        append_audit_matches="$(timeout --kill-after=1s "$timeout_seconds" "$rg_command" \
+        footer_rg_matches="$(timeout --kill-after=1s "$timeout_seconds" "$rg_command" \
           -l --no-messages -i \
-          -e 'append[[:alnum:]_-]*audit|audit[[:alnum:]_-]*append' \
+          -e "$footer_rg_pattern" \
           -- "${footer_source_paths[@]}" || true)"
       fi
     fi
@@ -726,7 +774,7 @@ remaining_file_candidates() {
     printf 'File: %s, Lines: 1-999999999\n' "$path"
     kept=$((kept + 1))
     ((kept < 16)) || break
-  done <<< "$append_audit_matches"
+  done <<< "$footer_rg_matches"
   ((kept < 16)) || return 0
   for path in "${footer_path_matches[@]}"; do
     fast_path_deadline_reached && break
@@ -744,16 +792,23 @@ remaining_file_candidates() {
 recover_timeout_location_from_bm25() {
   local candidate token file line_start line_end line_number location score
   local best_score=-1 best_location="" first_compound_location="" match_token match_line
-  local required_compounds="" append_audit_signal=false
+  local required_compounds="" append_audit_signal=false cache_key_signal=false
   local candidates="${bm25_candidates:-}" footer_candidates match_tokens
   if [[ "${1:-false}" == true ]]; then
     required_compounds="$(fast_path_required_compounds "${question:-}")"
     if fast_path_requires_append_audit "${question:-}"; then
       append_audit_signal=true
     fi
+    if fast_path_requires_cache_key "${question:-}"; then
+      cache_key_signal=true
+    fi
   fi
   footer_candidates="$(remaining_file_candidates "$candidates" "${question:-}")"
-  match_tokens="$(fast_path_match_variants "${question:-}")"
+  if [[ "$cache_key_signal" == true ]]; then
+    match_tokens='cache_key'
+  else
+    match_tokens="$(fast_path_match_variants "${question:-}")"
+  fi
   if [[ -n "$footer_candidates" ]] && ! fast_path_deadline_reached; then
     [[ -z "$candidates" ]] || candidates+=$'\n'
     candidates+="$footer_candidates"
@@ -783,7 +838,7 @@ recover_timeout_location_from_bm25() {
       fast_path_deadline_reached && break 2
       [[ -n "$match_token" ]] || continue
       match_line="$(fast_path_accepted_match_line "$file" "$match_token" "$line_start" "$line_end" || true)"
-      if [[ -z "$match_line" && ( -n "$required_compounds" || "$append_audit_signal" == true ) &&
+      if [[ -z "$match_line" && ( -n "$required_compounds" || "$append_audit_signal" == true || "$cache_key_signal" == true ) &&
             ( "$line_start" != 1 || "$line_end" != 999999999 ) ]]; then
         match_line="$(fast_path_accepted_match_line "$file" "$match_token" 1 999999999 || true)"
       fi
@@ -797,7 +852,7 @@ recover_timeout_location_from_bm25() {
         best_score="$score"
         best_location="$location"
       fi
-      if [[ -n "$required_compounds" || "$append_audit_signal" == true ]]; then
+      if [[ -n "$required_compounds" || "$append_audit_signal" == true || "$cache_key_signal" == true ]]; then
         if ((score >= 100000000)); then
           printf '%s\n' "$location"
           return 0
