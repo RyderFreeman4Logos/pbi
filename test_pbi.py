@@ -2661,6 +2661,40 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
         self.assertLess(elapsed, 5)
 
+    def test_named_symbol_variant_definition_beats_mention(self) -> None:
+        symbol = "DatabaseBusy"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "mention.rs").write_text(
+                "fn is_not_git_repository_stderr() {\n"
+                f"    let message = \"{symbol}\";\n"
+                "}\n"
+            )
+            (repo / "project.rs").write_text("enum X {\n    DatabaseBusy,\n}\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            rg = directory / "rg"
+            rg.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"-l\" ]]; then\n"
+                "    printf \"%s\\n\" \"./mention.rs\" \"./project.rs\"\n"
+                "    exit 0\n"
+                "fi\n"
+                "exec /usr/bin/rg \"$@\"\n"
+            )
+            rg.chmod(0o755)
+            for args in (("search", symbol), ("where", "is", symbol)):
+                result = self.run_pbi(
+                    *args, env=env, cwd=repo,
+                    binary=self.fake_pbi(directory, directory / "probe"), timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "project.rs:2\n")
+                self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "enum-variant recovery must skip Probe Chat")
+
     def test_default_positional_recovers_named_symbol_definition(self) -> None:
         symbol = "TargetSymbol"
         with tempfile.TemporaryDirectory() as temporary:

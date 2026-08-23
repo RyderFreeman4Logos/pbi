@@ -246,6 +246,8 @@ named_symbol_definition_line() {
     BEGIN {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
+      # ponytail: enum-variant / Type::Variant match; upgrade if it starts ranking every mention of a camelCase word.
+      variant = "^[[:space:]]*([[:alnum:]_]+::)*" symbol "([[:space:](<{,;}]|$)"
     }
     function hash_comment_pos(line,    i, previous, leading, include_boundary) {
       for (i = 1; i <= length(line); i++) {
@@ -312,6 +314,7 @@ named_symbol_definition_line() {
       gsub(/[^[:alnum:]]/, "", normalized_symbol)
       compound_match = index(tolower(normalized_code), tolower(normalized_symbol))
       if (code ~ declaration || code ~ assignment ||
+          (mode == "definition" && code ~ variant) ||
           (mode == "any" &&
            (index(code, symbol) || (symbol ~ /[-_]/ && compound_match)))) {
         print NR
