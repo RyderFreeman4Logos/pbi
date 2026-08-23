@@ -2661,6 +2661,42 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
         self.assertLess(elapsed, 5)
 
+    def test_search_prefers_named_symbol_definition_over_multiline_import_mention(self) -> None:
+        symbol = "TargetSymbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "mention.py").write_text(
+                "from pkg import (\n"
+                f"    {symbol},\n"
+                ")\n"
+            )
+            (repo / "pkg.py").write_text(f"class {symbol}:\n    pass\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            rg = directory / "rg"
+            rg.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"-l\" ]]; then\n"
+                "    printf '%s\n' './mention.py' './pkg.py'\n"
+                "    exit 0\n"
+                "fi\n"
+                "exec /usr/bin/rg \"$@\"\n"
+            )
+            rg.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env bash\nexit 0\n")
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pkg.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
+
     def test_named_symbol_variant_definition_beats_mention(self) -> None:
         symbol = "DatabaseBusy"
         with tempfile.TemporaryDirectory() as temporary:
@@ -2694,6 +2730,35 @@ class PbiTest(unittest.TestCase):
                 self.assertEqual(result.stdout, "project.rs:2\n")
                 self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "enum-variant recovery must skip Probe Chat")
+
+    def test_default_positional_recovers_enum_variant_before_bm25_stamp(self) -> None:
+        symbol = "DatabaseBusy"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            retry_source = repo / "sqlite_retry.rs"
+            retry_source.write_text("\n".join(["// filler"] * 22 + [f"    return {symbol};", ""]))
+            variant_source = repo / "project.rs"
+            variant_source.write_text("enum X {\n    DatabaseBusy,\n}\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if '--dry-run' in sys.argv:\n"
+                f"    print('File: {retry_source}, Lines: 23-23')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where", "is", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "project.rs:2\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
 
     def test_default_positional_recovers_named_symbol_definition(self) -> None:
         symbol = "TargetSymbol"

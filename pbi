@@ -247,7 +247,9 @@ named_symbol_definition_line() {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
       # ponytail: enum-variant / Type::Variant match; upgrade if it starts ranking every mention of a camelCase word.
-      variant = "^[[:space:]]*([[:alnum:]_]+::)*" symbol "([[:space:](<{,;}]|$)"
+      variant_qualified = "^[[:space:]]*([[:alnum:]_]+::)+" symbol "([[:space:](<{,;}]|$)"
+      variant_lone = "^[[:space:]]*" symbol "([[:space:](<{,;}]|$)"
+      seen_enum = 0
     }
     function hash_comment_pos(line,    i, previous, leading, include_boundary) {
       for (i = 1; i <= length(line); i++) {
@@ -313,8 +315,10 @@ named_symbol_definition_line() {
       gsub(/[^[:alnum:]]/, "", normalized_code)
       gsub(/[^[:alnum:]]/, "", normalized_symbol)
       compound_match = index(tolower(normalized_code), tolower(normalized_symbol))
+      if (code ~ /(^|[[:space:]])enum([[:space:]]|$)/) seen_enum = 1
       if (code ~ declaration || code ~ assignment ||
-          (mode == "definition" && code ~ variant) ||
+          (mode == "definition" &&
+           (code ~ variant_qualified || (seen_enum && code ~ variant_lone))) ||
           (mode == "any" &&
            (index(code, symbol) || (symbol ~ /[-_]/ && compound_match)))) {
         print NR
@@ -1087,10 +1091,6 @@ run_default_bm25_fast_path() {
     fi
   done
   search_fallback_locations="$(compact_search_locations "$bm25_candidates")"
-  if output="$(recover_timeout_location_from_bm25 true)" && [[ -n "$output" ]]; then
-    printf '%s\n' "$output"
-    return 0
-  fi
   recovered_named_locations=""
   while IFS= read -r candidate_symbol; do
     [[ -n "$candidate_symbol" ]] || continue
@@ -1102,6 +1102,10 @@ run_default_bm25_fast_path() {
   done < <(search_named_symbols "${question:-}")
   if [[ -n "$recovered_named_locations" ]]; then
     printf '%s\n' "$recovered_named_locations"
+    return 0
+  fi
+  if output="$(recover_timeout_location_from_bm25 true)" && [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
     return 0
   fi
   search_fast_path_miss=true
