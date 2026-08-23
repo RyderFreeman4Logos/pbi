@@ -201,9 +201,9 @@ run_timed_command() {
 }
 
 fast_path_remaining_timeout() {
-  local deadline_ns="$1" remaining_ns
+  local deadline_ns="$1" reserve_ns="${2:-0}" remaining_ns
   [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] || return 1
-  remaining_ns=$((deadline_ns - $(fast_path_now_ns)))
+  remaining_ns=$((deadline_ns - $(fast_path_now_ns) - reserve_ns))
   ((remaining_ns > 0)) || return 1
   printf '%d.%09d\n' "$((remaining_ns / 1000000000))" "$((remaining_ns % 1000000000))"
 }
@@ -212,8 +212,8 @@ run_awk_with_deadline() {
   local deadline_ns="$1" timeout_seconds
   shift
   if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
-    timeout_seconds="$(fast_path_remaining_timeout "$deadline_ns")" || return 124
-    timeout --kill-after=0s "$timeout_seconds" awk "$@"
+    timeout_seconds="$(fast_path_remaining_timeout "$deadline_ns" 100000000)" || return 124
+    timeout --kill-after=0.1s "$timeout_seconds" awk "$@"
   else
     awk "$@"
   fi
@@ -225,8 +225,8 @@ run_rg_with_deadline() {
   command="$1"
   shift
   if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
-    timeout_seconds="$(fast_path_remaining_timeout "$deadline_ns")" || return 124
-    timeout --kill-after=0s "$timeout_seconds" "$command" "$@"
+    timeout_seconds="$(fast_path_remaining_timeout "$deadline_ns" 100000000)" || return 124
+    timeout --kill-after=0.1s "$timeout_seconds" "$command" "$@"
   else
     "$command" "$@"
   fi
@@ -343,12 +343,20 @@ named_symbol_definition_line() {
         return substr(remaining, 1, comment_pos - 1)
       }
     }
-    function brace_delta(line,    i, character, delta) {
-      gsub(/"([^"\\]|\\.)*"/, "", line)
+    function brace_delta(line,    i, character, delta, quote, escaped) {
       delta = 0
+      quote = ""
+      escaped = 0
       for (i = 1; i <= length(line); i++) {
         character = substr(line, i, 1)
-        if (character == "{") delta++
+        if (quote != "") {
+          if (escaped) escaped = 0
+          else if (character == "\\") escaped = 1
+          else if (character == quote) quote = ""
+          continue
+        }
+        if (character == "\"" || character == sprintf("%c", 39)) quote = character
+        else if (character == "{") delta++
         else if (character == "}") delta--
       }
       return delta
@@ -1211,7 +1219,8 @@ run_default_bm25_fast_path() {
 }
 
 recover_named_symbol_definition() {
-  local symbol="$1" deadline_ns="${2:-}" file locations line_number rg_command matching_files rg_status
+  local symbol="$1" deadline_ns="${2:-}" mode="${3:-definition}"
+  local file locations line_number rg_command matching_files rg_status
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
   if matching_files="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -l -F \
@@ -1230,10 +1239,14 @@ recover_named_symbol_definition() {
   if [[ -n "$matching_files" ]]; then
     while IFS= read -r file; do
       fast_path_deadline_reached "$deadline_ns" && return 1
-      line_number="$(named_symbol_definition_line "$file" "$symbol" definition 0 0 "$deadline_ns")"
-      fast_path_deadline_reached "$deadline_ns" && return 1
-      [[ -n "$line_number" ]] || continue
-      locations="$(compact_search_locations "File: $file, Lines: $line_number-$line_number" "$symbol" false "$deadline_ns")"
+      if [[ "$mode" == occurrence ]]; then
+        locations="$(compact_search_locations "File: $file, Lines: 1-1" "$symbol" true "$deadline_ns")"
+      else
+        line_number="$(named_symbol_definition_line "$file" "$symbol" definition 0 0 "$deadline_ns")"
+        fast_path_deadline_reached "$deadline_ns" && return 1
+        [[ -n "$line_number" ]] || continue
+        locations="$(compact_search_locations "File: $file, Lines: $line_number-$line_number" "$symbol" false "$deadline_ns")"
+      fi
       fast_path_deadline_reached "$deadline_ns" && return 1
       if [[ -n "$locations" ]]; then
         printf "%s\n" "$locations"
@@ -1616,6 +1629,9 @@ case "${1:-}" in
     bm25_candidates="$candidates"
     if [[ -n "$symbol" && -z "$search_fallback_locations" ]]; then
       search_fallback_locations="$(recover_named_symbol_definition "$symbol" || true)"
+      if [[ -z "$search_fallback_locations" && -n "${candidates//[[:space:]]/}" ]]; then
+        search_fallback_locations="$(recover_named_symbol_definition "$symbol" "" occurrence || true)"
+      fi
       if [[ -z "$search_fallback_locations" ]]; then
         symbol_scan_status=0
         repo_contains_named_symbol "$symbol" || symbol_scan_status=$?
