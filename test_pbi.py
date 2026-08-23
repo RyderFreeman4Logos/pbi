@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent
 PBI = ROOT / "pbi"
+INSTALLER = ROOT / "install.sh"
 PRIMARY = "qwen3.6-27b-decensor-by-aeon"
 FALLBACK = "opencode/deepseek-v4-flash"
 BASE_URL = "http://localhost:8317/v1"
@@ -30,13 +32,16 @@ class PbiTest(unittest.TestCase):
         binary: Path = PBI,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        effective_cwd = cwd
+        if effective_cwd is None and env is not None and env.get("HOME"):
+            effective_cwd = Path(env["HOME"])
         return subprocess.run(
             [str(binary), *args],
             text=True,
             capture_output=True,
             check=False,
             env=env,
-            cwd=cwd,
+            cwd=effective_cwd,
             timeout=timeout,
         )
 
@@ -527,6 +532,82 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertEqual(probe_query, "searched")
         self.assertFalse(planner_started)
+
+    def test_default_query_post_bm25_recovery_stays_inside_absolute_deadline(self) -> None:
+        symbol = "TargetSymbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "target.py"
+            source.write_text(f"class {symbol}: pass\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "if '--dry-run' in sys.argv:\n"
+                "    time.sleep(0.75)\n"
+                f"    print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            slow_rg = directory / "rg"
+            slow_rg.write_text("#!/usr/bin/env bash\nsleep 2\nprintf '%s\\n' './target.py'\n")
+            slow_rg.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(
+                binary.read_text().replace(
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="1"',
+                )
+            )
+            binary.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where", "is", symbol, env=env, cwd=repo, binary=binary, timeout=4
+            )
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("no source", result.stderr)
+        self.assertFalse(trace.exists(), "deadline expiry must not invoke planner/chat")
+        self.assertLess(elapsed, 1.8)
+
+    def test_default_query_named_recovery_succeeds_before_absolute_deadline(self) -> None:
+        symbol = "TargetSymbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "target.py"
+            source.write_text(f"class {symbol}: pass\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                f"if '--dry-run' in sys.argv: print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fast_rg = directory / "rg"
+            fast_rg.write_text("#!/usr/bin/env bash\nprintf '%s\\n' './target.py'\n")
+            fast_rg.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(
+                binary.read_text().replace(
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="1"',
+                )
+            )
+            binary.chmod(0o755)
+            result = self.run_pbi(
+                "where", "is", symbol, env=env, cwd=repo, binary=binary, timeout=4
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "target.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "successful recovery must skip planner/chat")
 
     def test_default_query_bm25_fast_path_timeout_fails_closed_without_planner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1731,6 +1812,7 @@ class PbiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
+            (directory / "reference.py").write_text("print(SessionDB)\n")
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env bash\n"
@@ -1937,6 +2019,7 @@ class PbiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
+            (directory / "reference.py").write_text("use(HERMES_TUI_RPC_TIMEOUT_MS)\n")
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 "#!/usr/bin/env bash\n"
@@ -2696,6 +2779,51 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "pkg.py:1\n")
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
+
+    def test_named_symbol_qualified_variant_is_valid_outside_enum(self) -> None:
+        symbol = "Variant"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "project.rs"
+            source.write_text("fn use_variant() { Type::Variant; }\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(f"#!/usr/bin/env python3\nprint('File: {source}, Lines: 1-1')\n")
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "project.rs:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists())
+
+    def test_named_symbol_lone_use_after_enum_is_not_a_definition(self) -> None:
+        symbol = "Ghost"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "project.rs"
+            source.write_text("enum Real {\n    Actual,\n}\nfn use_it() {\n    Ghost => 1;\n}\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                f"if '--dry-run' in sys.argv: print('File: {source}, Lines: 5-5')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where", "is", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("project.rs:5", result.stdout + result.stderr)
+        self.assertFalse(trace.exists(), "an unrelated lone symbol must not start planner/chat")
 
     def test_named_symbol_variant_definition_beats_mention(self) -> None:
         symbol = "DatabaseBusy"
@@ -3946,6 +4074,99 @@ class PbiTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+
+    def make_install_source(self, directory: Path) -> tuple[Path, str]:
+        checkout = directory / "source-checkout"
+        checkout.mkdir()
+        source = checkout / "pbi"
+        shutil.copy2(PBI, source)
+        source.chmod(0o755)
+        subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+        git_env = os.environ.copy()
+        git_env.update(
+            GIT_AUTHOR_NAME="installer-test",
+            GIT_AUTHOR_EMAIL="installer-test@example.invalid",
+            GIT_COMMITTER_NAME="installer-test",
+            GIT_COMMITTER_EMAIL="installer-test@example.invalid",
+        )
+        subprocess.run(["git", "add", "pbi"], cwd=checkout, check=True, env=git_env)
+        subprocess.run(
+            ["git", "commit", "-qm", "installer fixture"],
+            cwd=checkout,
+            check=True,
+            env=git_env,
+        )
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+        ).strip()
+        return source, commit
+
+    def test_installer_is_durable_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source, commit = self.make_install_source(directory)
+            target = directory / "usr" / "local" / "bin" / "pbi"
+            home = directory / "home"
+            command = [
+                str(INSTALLER),
+                "--source",
+                str(source),
+                "--target",
+                str(target),
+                "--home",
+                str(home),
+            ]
+            env = os.environ.copy()
+            env["CLIPROXY_API_KEY"] = "installer-secret-must-not-leak"
+            first = subprocess.run(command, text=True, capture_output=True, env=env)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            source_bytes = source.read_bytes()
+            expected_sha = hashlib.sha256(source_bytes).hexdigest()
+            provenance = target.with_name("pbi.provenance")
+            self.assertTrue(target.is_file())
+            self.assertFalse(target.is_symlink())
+            self.assertTrue(os.access(target, os.X_OK))
+            self.assertEqual(target.read_bytes(), source_bytes)
+            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), expected_sha)
+            self.assertTrue(provenance.is_file())
+            provenance_text = provenance.read_text()
+            self.assertEqual(
+                provenance_text,
+                f"source_commit={commit}\nsha256={expected_sha}\ntarget={target}\n",
+            )
+            link = home / ".local" / "bin" / "pbi"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), target.resolve())
+
+            second = subprocess.run(command, text=True, capture_output=True, env=env)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(target.read_bytes(), source_bytes)
+            self.assertEqual(link.resolve(), target.resolve())
+
+            previous_target = target.read_bytes()
+            failing_bin = directory / "failing-bin"
+            failing_bin.mkdir()
+            failing_install = failing_bin / "install"
+            failing_install.write_text(
+                "#!/bin/sh\n"
+                "for destination in \"$@\"; do :; done\n"
+                "printf partial >\"$destination\"\n"
+                "printf '%s\\n' 'copy failed' >&2\n"
+                "exit 1\n"
+            )
+            failing_install.chmod(0o755)
+            failure_env = env | {"PATH": f"{failing_bin}:{env['PATH']}"}
+            failed = subprocess.run(command, text=True, capture_output=True, env=failure_env)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(target.read_bytes(), previous_target)
+            self.assertEqual(link.resolve(), target.resolve())
+            self.assertFalse(list(target.parent.glob(".pbi.*tmp.*")))
+            self.assertIn("copy failed", failed.stderr)
+
+            shutil.rmtree(source.parent)
+            version = subprocess.run([str(target), "--version"], text=True, capture_output=True)
+            self.assertEqual(version.returncode, 0, version.stderr)
+            self.assertIn("pbi", version.stdout)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

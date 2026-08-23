@@ -200,6 +200,38 @@ run_timed_command() {
   return "$status"
 }
 
+fast_path_remaining_timeout() {
+  local deadline_ns="$1" remaining_ns
+  [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] || return 1
+  remaining_ns=$((deadline_ns - $(fast_path_now_ns)))
+  ((remaining_ns > 0)) || return 1
+  printf '%d.%09d\n' "$((remaining_ns / 1000000000))" "$((remaining_ns % 1000000000))"
+}
+
+run_awk_with_deadline() {
+  local deadline_ns="$1" timeout_seconds
+  shift
+  if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
+    timeout_seconds="$(fast_path_remaining_timeout "$deadline_ns")" || return 124
+    timeout --kill-after=0s "$timeout_seconds" awk "$@"
+  else
+    awk "$@"
+  fi
+}
+
+run_rg_with_deadline() {
+  local deadline_ns="$1" timeout_seconds command
+  shift
+  command="$1"
+  shift
+  if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
+    timeout_seconds="$(fast_path_remaining_timeout "$deadline_ns")" || return 124
+    timeout --kill-after=0s "$timeout_seconds" "$command" "$@"
+  else
+    "$command" "$@"
+  fi
+}
+
 is_stamp_location() {
   [[ "$1" != /* && "$1" =~ ^(([^:/[:space:]]+([ ][^:/[:space:]]+)?/[^:]+|[^:/[:space:]]+[ ][^:/[:space:]]+\.[A-Za-z0-9]+|[^:[:space:]]+):(1|line))$ ]]
 }
@@ -242,13 +274,17 @@ has_mixed_stamp_junk() {
 named_symbol_definition_line() {
   local file="$1" symbol="$2" mode="${3:-definition}"
   local line_start="${4:-0}" line_end="${5:-0}"
-  awk -v symbol="$symbol" -v mode="$mode" -v line_start="$line_start" -v line_end="$line_end" '
+  local deadline_ns="${6:-}"
+  run_awk_with_deadline "$deadline_ns" -v symbol="$symbol" -v mode="$mode" -v line_start="$line_start" -v line_end="$line_end" '
     BEGIN {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
       # ponytail: enum-variant / Type::Variant match; upgrade if it starts ranking every mention of a camelCase word.
       variant_qualified = "^[[:space:]]*([[:alnum:]_]+::)+" symbol "([[:space:](<{,;}]|$)"
       variant_lone = "^[[:space:]]*" symbol "([[:space:](<{,;}]|$)"
+      brace_depth = 0
+      enum_body_depth = 0
+      pending_enum = 0
       seen_enum = 0
     }
     function hash_comment_pos(line,    i, previous, leading, include_boundary) {
@@ -307,30 +343,59 @@ named_symbol_definition_line() {
         return substr(remaining, 1, comment_pos - 1)
       }
     }
+    function brace_delta(line,    i, character, delta) {
+      gsub(/"([^"\\]|\\.)*"/, "", line)
+      delta = 0
+      for (i = 1; i <= length(line); i++) {
+        character = substr(line, i, 1)
+        if (character == "{") delta++
+        else if (character == "}") delta--
+      }
+      return delta
+    }
     {
       code = strip_comments($0)
-      if ((line_start && NR < line_start) || (line_end && NR > line_end)) next
+      in_range = !((line_start && NR < line_start) || (line_end && NR > line_end))
+      enum_declaration = code ~ /(^|[[:space:]])enum[[:space:]]+[[:alnum:]_]+/
+      enum_body_open = (enum_body_depth > 0 && brace_depth >= enum_body_depth) ||
+                       (pending_enum && code ~ /\{/)
+      delta = brace_delta(code)
       normalized_code = code
       normalized_symbol = symbol
       gsub(/[^[:alnum:]]/, "", normalized_code)
       gsub(/[^[:alnum:]]/, "", normalized_symbol)
       compound_match = index(tolower(normalized_code), tolower(normalized_symbol))
-      if (code ~ /(^|[[:space:]])enum([[:space:]]|$)/) seen_enum = 1
-      if (code ~ declaration || code ~ assignment ||
+      if (in_range && (code ~ declaration || code ~ assignment ||
           (mode == "definition" &&
-           (code ~ variant_qualified || (seen_enum && code ~ variant_lone))) ||
+           (code ~ variant_qualified || (enum_body_open && code ~ variant_lone))) ||
           (mode == "any" &&
-           (index(code, symbol) || (symbol ~ /[-_]/ && compound_match)))) {
+           ((index(code, symbol) || (symbol ~ /[-_]/ && compound_match)) &&
+            !(seen_enum && code ~ variant_lone && code !~ variant_qualified && !enum_body_open))))) {
         print NR
         exit
       }
+      if (enum_declaration) {
+        seen_enum = 1
+        if (code ~ /\{/) enum_body_depth = brace_depth + 1
+        else pending_enum = 1
+      } else if (pending_enum) {
+        if (code ~ /\{/) {
+          enum_body_depth = brace_depth + 1
+          pending_enum = 0
+        } else if (code ~ /;/ ||
+                   code ~ /(^|[[:space:]])(class|def|fn|func|function|interface|struct|type)[[:space:]]+[[:alnum:]_]+/) {
+          pending_enum = 0
+        }
+      }
+      brace_depth += delta
+      if (enum_body_depth > 0 && brace_depth < enum_body_depth) enum_body_depth = 0
     }
   ' < "$file" 2>/dev/null || true
 }
 
 compact_search_locations() {
   local line file location suffix relative symbol line_start line_end line_number
-  local allow_outside definition_line first_symbol_line
+  local allow_outside definition_line first_symbol_line deadline_ns="${4:-}"
   symbol="${2:-}"
   allow_outside="${3:-false}"
   while IFS= read -r line; do
@@ -346,12 +411,15 @@ compact_search_locations() {
         file="${file%%, Lines:*}"
       fi
       if [[ -f "$file" ]]; then
+        fast_path_deadline_reached "$deadline_ns" && return 1
         line_number=1
         if [[ -n "$symbol" ]]; then
           line_number=""
           first_symbol_line=""
-          definition_line="$(named_symbol_definition_line "$file" "$symbol")"
-          first_symbol_line="$(named_symbol_definition_line "$file" "$symbol" any "$line_start" "$line_end")"
+          definition_line="$(named_symbol_definition_line "$file" "$symbol" definition 0 0 "$deadline_ns")"
+          fast_path_deadline_reached "$deadline_ns" && return 1
+          first_symbol_line="$(named_symbol_definition_line "$file" "$symbol" any "$line_start" "$line_end" "$deadline_ns")"
+          fast_path_deadline_reached "$deadline_ns" && return 1
           if [[ -n "$definition_line" ]] && ((definition_line >= line_start && (line_end == 0 || definition_line <= line_end))); then
             line_number="$definition_line"
           elif [[ -n "$first_symbol_line" ]] && ((first_symbol_line >= line_start && (line_end == 0 || first_symbol_line <= line_end))); then
@@ -359,7 +427,7 @@ compact_search_locations() {
           elif [[ "$allow_outside" == true && -n "$definition_line" ]]; then
             line_number="$definition_line"
           elif [[ "$allow_outside" == true && ( -n "${candidates:-}" || -n "${bm25_candidates:-}" ) ]]; then
-            line_number="$(named_symbol_definition_line "$file" "$symbol" any)"
+            line_number="$(named_symbol_definition_line "$file" "$symbol" any 0 0 "$deadline_ns")"
           fi
           [[ -n "$line_number" ]] || continue
         fi
@@ -399,7 +467,7 @@ emit_bm25_locations_or_fail_closed() {
   local -a named_files=()
   mapfile -t named_files < <(named_query_files "${question:-}")
   if ((${#named_files[@]} > 0)); then
-    if recovered_named_locations="$(recover_named_file_claims "${named_files[@]}")"; then
+    if recovered_named_locations="$(recover_named_file_claims "" "${named_files[@]}")"; then
       printf '%s\n' "$recovered_named_locations"
       exit 0
     fi
@@ -627,7 +695,8 @@ named_query_files() {
 }
 
 named_file_claim_line() {
-  awk '
+  local file="$1" deadline_ns="${2:-}"
+  run_awk_with_deadline "$deadline_ns" '
     {
       line = $0
       cleaned = ""
@@ -662,10 +731,12 @@ named_file_claim_line() {
 }
 
 recover_named_file_claims() {
-  local file line relative
+  local deadline_ns="$1" file line relative
+  shift
   for file in "$@"; do
-    fast_path_deadline_reached && return 1
-    line="$(named_file_claim_line "$PWD/$file" || true)"
+    fast_path_deadline_reached "$deadline_ns" && return 1
+    line="$(named_file_claim_line "$PWD/$file" "$deadline_ns" || true)"
+    fast_path_deadline_reached "$deadline_ns" && return 1
     [[ "$line" =~ ^[[:digit:]]+$ ]] || continue
     relative="$(realpath --relative-to="$PWD" -- "$PWD/$file" 2>/dev/null || true)"
     [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
@@ -676,10 +747,12 @@ recover_named_file_claims() {
 }
 
 fast_path_line_has_required_compound() {
-  local file="$1" line_number="$2" required_compounds="$3" compound
+  local file="$1" line_number="$2" required_compounds="$3" compound deadline_ns="${4:-}"
   while IFS= read -r compound; do
+    fast_path_deadline_reached "$deadline_ns" && return 1
     [[ -n "$compound" ]] || continue
-    if [[ -n "$(named_symbol_definition_line "$file" "$compound" any "$line_number" "$line_number")" ]]; then
+    if [[ -n "$(named_symbol_definition_line "$file" "$compound" any "$line_number" "$line_number" "$deadline_ns")" ]]; then
+      fast_path_deadline_reached "$deadline_ns" && return 1
       return 0
     fi
   done <<<"$required_compounds"
@@ -687,8 +760,8 @@ fast_path_line_has_required_compound() {
 }
 
 fast_path_line_has_cache_key_identifier() {
-  local file="$1" line_number="$2"
-  awk -v line_number="$line_number" '
+  local file="$1" line_number="$2" deadline_ns="${3:-}"
+  run_awk_with_deadline "$deadline_ns" -v line_number="$line_number" '
     NR != line_number { next }
     {
       code = $0
@@ -715,8 +788,8 @@ fast_path_line_has_cache_key_identifier() {
 }
 
 fast_path_line_has_append_audit_identifier() {
-  local file="$1" line_number="$2"
-  awk -v line_number="$line_number" '
+  local file="$1" line_number="$2" deadline_ns="${3:-}"
+  run_awk_with_deadline "$deadline_ns" -v line_number="$line_number" '
     NR != line_number { next }
     {
       code = $0
@@ -738,8 +811,8 @@ fast_path_line_has_append_audit_identifier() {
 
 
 candidate_line_score() {
-  local file="$1" line_number="$2" token="$3"
-  awk -v line_number="$line_number" -v token="$token" '
+  local file="$1" line_number="$2" token="$3" deadline_ns="${4:-}"
+  run_awk_with_deadline "$deadline_ns" -v line_number="$line_number" -v token="$token" '
     NR != line_number { next }
     {
       code = $0
@@ -773,22 +846,24 @@ candidate_line_score() {
 }
 
 fast_path_accepted_match_line() {
-  local file="$1" token="$2" line_start="$3" line_end="$4" match_line
+  local file="$1" token="$2" line_start="$3" line_end="$4" match_line deadline_ns="${5:-}"
   while ((line_start <= line_end)); do
-    match_line="$(named_symbol_definition_line "$file" "$token" any "$line_start" "$line_end")"
+    fast_path_deadline_reached "$deadline_ns" && return 1
+    match_line="$(named_symbol_definition_line "$file" "$token" any "$line_start" "$line_end" "$deadline_ns")"
+    fast_path_deadline_reached "$deadline_ns" && return 1
     [[ "$match_line" =~ ^[[:digit:]]+$ ]] || return 1
     if [[ -n "$required_compounds" ]] &&
-       ! fast_path_line_has_required_compound "$file" "$match_line" "$required_compounds"; then
+       ! fast_path_line_has_required_compound "$file" "$match_line" "$required_compounds" "$deadline_ns"; then
       line_start=$((match_line + 1))
       continue
     fi
     if [[ "$append_audit_signal" == true ]] &&
-       ! fast_path_line_has_append_audit_identifier "$file" "$match_line"; then
+       ! fast_path_line_has_append_audit_identifier "$file" "$match_line" "$deadline_ns"; then
       line_start=$((match_line + 1))
       continue
     fi
     if [[ "$cache_key_signal" == true ]] &&
-       ! fast_path_line_has_cache_key_identifier "$file" "$match_line"; then
+       ! fast_path_line_has_cache_key_identifier "$file" "$match_line" "$deadline_ns"; then
       line_start=$((match_line + 1))
       continue
     fi
@@ -799,8 +874,9 @@ fast_path_accepted_match_line() {
 }
 
 fast_path_deadline_reached() {
-  [[ "${fast_path_deadline_ns:-}" =~ ^[[:digit:]]+$ ]] || return 1
-  (( $(fast_path_now_ns) >= fast_path_deadline_ns ))
+  local deadline_ns="${1:-}"
+  [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] || return 1
+  (( $(fast_path_now_ns) >= deadline_ns ))
 }
 
 fast_path_footer_tokens() {
@@ -831,10 +907,10 @@ fast_path_footer_path_matches_query() {
 
 remaining_file_candidates() {
   local line path resolved_path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
-  local footer_rg_matches rg_command footer_rg_pattern remaining_ns remaining_ms timeout_seconds
+  local footer_rg_matches rg_command footer_rg_pattern footer_rg_status deadline_ns="${3:-}"
   local -a footer_source_paths=() footer_path_matches=()
   footer_tokens="$(fast_path_footer_tokens "$query")"
-  fast_path_deadline_reached && return 0
+  fast_path_deadline_reached "$deadline_ns" && return 1
   footer_rg_matches=""
   footer_rg_pattern=""
   if fast_path_requires_cache_key "$query"; then
@@ -843,7 +919,7 @@ remaining_file_candidates() {
     footer_rg_pattern='append[[:alnum:]_-]*audit|audit[[:alnum:]_-]*append'
   fi
   while IFS= read -r line; do
-    fast_path_deadline_reached && break
+    fast_path_deadline_reached "$deadline_ns" && break
     if [[ "$line" =~ ^Remaining[[:space:]]+files[[:space:]]+not[[:space:]]+shown:[[:space:]]*$ ]]; then
       in_footer=true
       continue
@@ -863,24 +939,28 @@ remaining_file_candidates() {
       footer_path_matches+=("$path")
     fi
   done <<<"$1"
-  if [[ -n "$footer_rg_pattern" ]] && ! fast_path_deadline_reached &&
+  if [[ -n "$footer_rg_pattern" ]] && ! fast_path_deadline_reached "$deadline_ns" &&
      ((${#footer_source_paths[@]} > 0)); then
     rg_command="$(command -v rg || true)"
     if [[ -n "$rg_command" ]]; then
-      remaining_ns=$((fast_path_deadline_ns - $(fast_path_now_ns)))
-      if ((remaining_ns > 0)); then
-        remaining_ms=$(( (remaining_ns + 999999) / 1000000 ))
-        printf -v timeout_seconds '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
-        footer_rg_matches="$(timeout --kill-after=1s "$timeout_seconds" "$rg_command" \
+      if footer_rg_matches="$(run_rg_with_deadline "${deadline_ns:-}" "$rg_command" \
           -l --no-messages -i \
           -e "$footer_rg_pattern" \
-          -- "${footer_source_paths[@]}" || true)"
+          -- "${footer_source_paths[@]}")"; then
+        footer_rg_status=0
+      else
+        footer_rg_status=$?
       fi
+      case "$footer_rg_status" in
+        0|1) ;;
+        *) return 1 ;;
+      esac
+      fast_path_deadline_reached "$deadline_ns" && return 1
     fi
   fi
   declare -A emitted_footer_paths=()
   while IFS= read -r path; do
-    fast_path_deadline_reached && break
+    fast_path_deadline_reached "$deadline_ns" && break
     [[ -n "$path" && -z "${emitted_footer_paths[$path]+seen}" ]] || continue
     resolved_path="$path"
     [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
@@ -892,7 +972,7 @@ remaining_file_candidates() {
   done <<< "$footer_rg_matches"
   ((kept < 16)) || return 0
   for path in "${footer_path_matches[@]}"; do
-    fast_path_deadline_reached && break
+    fast_path_deadline_reached "$deadline_ns" && break
     [[ -n "$path" && -z "${emitted_footer_paths[$path]+seen}" ]] || continue
     resolved_path="$path"
     [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
@@ -908,7 +988,7 @@ recover_timeout_location_from_bm25() {
   local candidate token file line_start line_end line_number location score
   local best_score=-1 best_location="" first_compound_location="" match_token match_line
   local required_compounds="" append_audit_signal=false cache_key_signal=false
-  local candidates="${bm25_candidates:-}" footer_candidates match_tokens
+  local candidates="${bm25_candidates:-}" footer_candidates match_tokens deadline_ns="${2:-}"
   if [[ "${1:-false}" == true ]]; then
     required_compounds="$(fast_path_required_compounds "${question:-}")"
     if fast_path_requires_append_audit "${question:-}"; then
@@ -918,18 +998,19 @@ recover_timeout_location_from_bm25() {
       cache_key_signal=true
     fi
   fi
-  footer_candidates="$(remaining_file_candidates "$candidates" "${question:-}")"
+  footer_candidates="$(remaining_file_candidates "$candidates" "${question:-}" "$deadline_ns")"
+  fast_path_deadline_reached "$deadline_ns" && return 1
   if [[ "$cache_key_signal" == true ]]; then
     match_tokens='cache_key'
   else
     match_tokens="$(fast_path_match_variants "${question:-}")"
   fi
-  if [[ -n "$footer_candidates" ]] && ! fast_path_deadline_reached; then
+  if [[ -n "$footer_candidates" ]] && ! fast_path_deadline_reached "$deadline_ns"; then
     [[ -z "$candidates" ]] || candidates+=$'\n'
     candidates+="$footer_candidates"
   fi
   while IFS= read -r candidate; do
-    fast_path_deadline_reached && break
+    fast_path_deadline_reached "$deadline_ns" && break
     if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
       if [[ "$file" =~ ^(.+),[[:space:]]Lines:[[:space:]]([[:digit:]]+)(-([[:digit:]]+))?$ ]]; then
@@ -953,18 +1034,21 @@ recover_timeout_location_from_bm25() {
     fi
     [[ -f "$file" ]] || continue
     while IFS= read -r match_token; do
-      fast_path_deadline_reached && break 2
+      fast_path_deadline_reached "$deadline_ns" && break 2
       [[ -n "$match_token" ]] || continue
-      match_line="$(fast_path_accepted_match_line "$file" "$match_token" "$line_start" "$line_end" || true)"
+      match_line="$(fast_path_accepted_match_line "$file" "$match_token" "$line_start" "$line_end" "$deadline_ns" || true)"
+      fast_path_deadline_reached "$deadline_ns" && return 1
       if [[ -z "$match_line" && ( -n "$required_compounds" || "$append_audit_signal" == true || "$cache_key_signal" == true ) &&
             ( "$line_start" != 1 || "$line_end" != 999999999 ) ]]; then
-        match_line="$(fast_path_accepted_match_line "$file" "$match_token" 1 999999999 || true)"
+        match_line="$(fast_path_accepted_match_line "$file" "$match_token" 1 999999999 "$deadline_ns" || true)"
+        fast_path_deadline_reached "$deadline_ns" && return 1
       fi
       [[ "$match_line" =~ ^[[:digit:]]+$ ]] || continue
-      score="$(candidate_line_score "$file" "$match_line" "$match_token")"
+      score="$(candidate_line_score "$file" "$match_line" "$match_token" "$deadline_ns")"
+      fast_path_deadline_reached "$deadline_ns" && return 1
       [[ "$score" =~ ^[[:digit:]]+$ ]] || continue
       line_number="$match_line"
-      location="$(compact_search_locations "$(printf "File: %s, Lines: %s-%s\n" "$file" "$line_number" "$line_number")" "$match_token")"
+      location="$(compact_search_locations "$(printf "File: %s, Lines: %s-%s\n" "$file" "$line_number" "$line_number")" "$match_token" false "$deadline_ns")"
       [[ -n "$location" ]] || continue
       if ((score > best_score)); then
         best_score="$score"
@@ -1028,14 +1112,22 @@ recover_search_from_candidates() {
   recovered_from_candidates=true
 }
 
+fast_path_fail_closed() {
+  search_fast_path_miss=true
+  search_uses_local_model=false
+  output=""
+  recovered_from_candidates=false
+  return 1
+}
+
 run_default_bm25_fast_path() {
   local candidate_batch fast_path_output_file fast_path_status fast_path_query
-  local candidate_symbol candidate_locations recovered_named_locations
-  local fast_path_deadline_ns now_ns remaining_ns remaining_ms per_query_ns timeout_seconds
+  local candidate_symbol candidate_locations recovered_named_locations candidate_symbols
+  local deadline_ns now_ns remaining_ns remaining_ms per_query_ns timeout_seconds
   local fast_path_query_index=0 remaining_queries
   local fast_path_fallback=false fast_path_timed_out=false
   local -a fast_path_queries=() named_files=()
-  fast_path_deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
+  deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
   mapfile -t named_files < <(named_query_files "${question:-}")
   if ((${#named_files[@]} > 0)); then
     search_uses_local_model=true
@@ -1043,11 +1135,12 @@ run_default_bm25_fast_path() {
     search_fallback_locations=""
     output=""
     recovered_from_candidates=false
-    if output="$(recover_named_file_claims "${named_files[@]}")"; then
+    if output="$(recover_named_file_claims "$deadline_ns" "${named_files[@]}")"; then
+      fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
       printf '%s\n' "$output"
       return 0
     fi
-    search_fast_path_miss=true
+    fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
     return 1
   fi
   mapfile -t fast_path_queries < <(build_fast_path_queries "${question:-}")
@@ -1066,7 +1159,7 @@ run_default_bm25_fast_path() {
     fast_path_query_index=$((fast_path_query_index + 1))
     remaining_queries=$(( ${#fast_path_queries[@]} - fast_path_query_index + 1 ))
     now_ns="$(fast_path_now_ns)"
-    remaining_ns=$((fast_path_deadline_ns - now_ns))
+    remaining_ns=$((deadline_ns - now_ns))
     ((remaining_ns > 0)) || break
     per_query_ns=$((remaining_ns / remaining_queries))
     remaining_ms=$(( (per_query_ns + 999999) / 1000000 ))
@@ -1084,61 +1177,70 @@ run_default_bm25_fast_path() {
     if [[ -n "$candidate_batch" ]]; then
       [[ -z "$bm25_candidates" ]] || bm25_candidates+=$'\n\n'
       bm25_candidates+="$candidate_batch"
-      search_fallback_locations="$(compact_search_locations "$bm25_candidates")"
+      search_fallback_locations="$(compact_search_locations "$bm25_candidates" "" false "$deadline_ns")"
     fi
     if ((fast_path_status != 0)) && planner_timeout_or_kill "$fast_path_status"; then
       fast_path_timed_out=true
     fi
   done
-  search_fallback_locations="$(compact_search_locations "$bm25_candidates")"
+  fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
+  search_fallback_locations="$(compact_search_locations "$bm25_candidates" "" false "$deadline_ns")"
+  fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
   recovered_named_locations=""
+  candidate_symbols="$(search_named_symbols "${question:-}")"
+  fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
   while IFS= read -r candidate_symbol; do
+    fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
     [[ -n "$candidate_symbol" ]] || continue
-    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" || true)"
+    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" "$deadline_ns" || true)"
     if [[ -n "$candidate_locations" ]]; then
       [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
       recovered_named_locations+="$candidate_locations"
     fi
-  done < <(search_named_symbols "${question:-}")
+  done <<<"$candidate_symbols"
   if [[ -n "$recovered_named_locations" ]]; then
     printf '%s\n' "$recovered_named_locations"
     return 0
   fi
-  if output="$(recover_timeout_location_from_bm25 true)" && [[ -n "$output" ]]; then
+  if output="$(recover_timeout_location_from_bm25 true "$deadline_ns")" && [[ -n "$output" ]]; then
+    fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
     printf '%s\n' "$output"
     return 0
   fi
-  search_fast_path_miss=true
-  search_uses_local_model=false
-  output=""
-  recovered_from_candidates=false
-  return 1
+  fast_path_fail_closed
 }
 
 recover_named_symbol_definition() {
-  local symbol="$1" file locations line_number rg_command
+  local symbol="$1" deadline_ns="${2:-}" file locations line_number rg_command matching_files rg_status
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
-  while IFS= read -r file; do
-    line_number="$(named_symbol_definition_line "$file" "$symbol")"
-    [[ -n "$line_number" ]] || continue
-    locations="$(compact_search_locations "File: $file, Lines: $line_number-$line_number" "$symbol")"
-    if [[ -n "$locations" ]]; then
-      printf "%s\n" "$locations"
-      return 0
-    fi
-  done < <("$rg_command" -l -F --glob "!drafts/**" --glob "!docs/plans/**" \
-    --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
-    -- "$symbol" . 2>/dev/null || true)
-  while IFS= read -r file; do
-    locations="$(compact_search_locations "File: $file, Lines: 1-1" "$symbol" true)"
-    if [[ -n "$locations" ]]; then
-      printf "%s\n" "$locations"
-      return 0
-    fi
-  done < <("$rg_command" -l -F --glob "!drafts/**" --glob "!docs/plans/**" \
-    --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
-    -- "$symbol" . 2>/dev/null || true)
+  if matching_files="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -l -F \
+      --glob "!drafts/**" --glob "!docs/plans/**" \
+      --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
+      -- "$symbol" . 2>/dev/null)"; then
+    rg_status=0
+  else
+    rg_status=$?
+  fi
+  case "$rg_status" in
+    0|1) ;;
+    *) return 1 ;;
+  esac
+  fast_path_deadline_reached "$deadline_ns" && return 1
+  if [[ -n "$matching_files" ]]; then
+    while IFS= read -r file; do
+      fast_path_deadline_reached "$deadline_ns" && return 1
+      line_number="$(named_symbol_definition_line "$file" "$symbol" definition 0 0 "$deadline_ns")"
+      fast_path_deadline_reached "$deadline_ns" && return 1
+      [[ -n "$line_number" ]] || continue
+      locations="$(compact_search_locations "File: $file, Lines: $line_number-$line_number" "$symbol" false "$deadline_ns")"
+      fast_path_deadline_reached "$deadline_ns" && return 1
+      if [[ -n "$locations" ]]; then
+        printf "%s\n" "$locations"
+        return 0
+      fi
+    done <<<"$matching_files"
+  fi
   return 1
 }
 
