@@ -576,16 +576,24 @@ class PbiTest(unittest.TestCase):
         self.assertLess(elapsed, 1.8)
 
     def test_default_query_term_ignoring_rg_is_killed_inside_deadline(self) -> None:
+        def current_start_time(pid: int) -> str | None:
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            except (FileNotFoundError, IndexError, ProcessLookupError):
+                return None
+
         symbol = "TargetSymbol"
+        identities: dict[str, dict[str, int | str]] = {}
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
             repo.mkdir()
             (repo / "unrelated.py").write_text("pass\n")
             env, trace = self.fake_environment(directory)
-            pid_file = directory / "rg.pid"
-            pid = -1
-            env["PBI_TEST_RG_PID"] = str(pid_file)
+            identity_file = directory / "rg-identities.json"
+            child_identity_file = directory / "rg-child.json"
+            env["PBI_TEST_RG_IDENTITIES"] = str(identity_file)
+            env["PBI_TEST_RG_CHILD_IDENTITY"] = str(child_identity_file)
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
@@ -593,12 +601,27 @@ class PbiTest(unittest.TestCase):
                 "if '--dry-run' in sys.argv: print('File: unrelated.py, Lines: 1-1')\n"
             )
             probe.chmod(0o755)
+            child_code = (
+                "import json, os, pathlib, signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "start = pathlib.Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid': os.getpid(), 'start_time': start, 'pgid': os.getpgrp()}))\n"
+                "while True: time.sleep(.1)\n"
+            )
             rg = directory / "rg"
             rg.write_text(
                 "#!/usr/bin/env python3\n"
-                "import os, signal, time\n"
+                "import json, os, pathlib, signal, subprocess, sys, time\n"
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                "open(os.environ['PBI_TEST_RG_PID'], 'w').write(str(os.getpid()))\n"
+                f"child_code = {child_code!r}\n"
+                "child_path = pathlib.Path(os.environ['PBI_TEST_RG_CHILD_IDENTITY'])\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code, str(child_path)])\n"
+                "deadline = time.monotonic() + .5\n"
+                "while not child_path.exists() and time.monotonic() < deadline: time.sleep(.005)\n"
+                "child_identity = json.loads(child_path.read_text())\n"
+                "start = pathlib.Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
+                "identities = {'parent': {'pid': os.getpid(), 'start_time': start, 'pgid': os.getpgrp()}, 'child': child_identity}\n"
+                "pathlib.Path(os.environ['PBI_TEST_RG_IDENTITIES']).write_text(json.dumps(identities))\n"
                 "while True: time.sleep(.1)\n"
             )
             rg.chmod(0o755)
@@ -612,16 +635,34 @@ class PbiTest(unittest.TestCase):
                 started = time.monotonic()
                 result = self.run_pbi("where", "is", symbol, env=env, cwd=repo, binary=binary, timeout=3)
                 elapsed = time.monotonic() - started
+                identities = json.loads(identity_file.read_text())
+                self.assertEqual(identities["parent"]["pgid"], identities["child"]["pgid"])
+                survivors = {
+                    name: identity
+                    for name, identity in identities.items()
+                    if current_start_time(int(identity["pid"])) == identity["start_time"]
+                }
+                self.assertFalse(survivors, f"deadline cleanup left matching process identities: {survivors}")
             finally:
-                if pid_file.exists():
-                    pid = int(pid_file.read_text())
+                for identity in identities.values():
+                    pid = int(identity["pid"])
                     try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                        pidfd = os.pidfd_open(pid)
+                    except (AttributeError, ProcessLookupError):
+                        continue
+                    try:
+                        if current_start_time(pid) == identity["start_time"]:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    finally:
+                        os.close(pidfd)
+                cleanup_deadline = time.monotonic() + .5
+                while time.monotonic() < cleanup_deadline and any(
+                    current_start_time(int(identity["pid"])) == identity["start_time"]
+                    for identity in identities.values()
+                ):
+                    time.sleep(.01)
         self.assertNotEqual(result.returncode, 0)
         self.assertLess(elapsed, 1.8)
-        self.assertFalse(Path(f"/proc/{pid}").exists(), "deadline cleanup must reap rg")
         self.assertFalse(trace.exists())
 
     def test_default_query_named_recovery_succeeds_before_absolute_deadline(self) -> None:
@@ -2915,6 +2956,52 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("project.rs:3", result.stdout + result.stderr)
         self.assertFalse(trace.exists())
 
+    def test_default_query_rust_lifetimes_preserve_enum_structure(self) -> None:
+        expected = {
+            "DatabaseBusy": (2, ("where", "is", "DatabaseBusy")),
+            "RealLoneVariant": (6, ("where", "is", "RealLoneVariant")),
+            "QualifiedVariant": (9, ("where", "is", "QualifiedVariant")),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "project.rs"
+            source.write_text(
+                "enum X<'a> {\n"
+                "    DatabaseBusy(&'a str),\n"
+                r"    Quote = '\'' as u8," "\n"
+                r"    Backslash = '\\' as u8," "\n"
+                "    Brace = '{' as u8,\n"
+                "    RealLoneVariant,\n"
+                "}\n"
+                "fn use_it<'a>(input: &'a str) {\n"
+                "    Type::QualifiedVariant;\n"
+                "    'label: loop { break 'label; }\n"
+                "    Ghost => 1;\n"
+                "}\n"
+            )
+            unrelated = repo / "unrelated.rs"
+            unrelated.write_text("fn unrelated() {}\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                f"if '--dry-run' in sys.argv: print('File: {unrelated}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            for symbol, (line, query) in expected.items():
+                with self.subTest(symbol=symbol):
+                    result = self.run_pbi(*query, env=env, cwd=repo, binary=binary, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, f"project.rs:{line}\n")
+                    self.assertEqual(result.stderr, "")
+            ghost = self.run_pbi("where", "is", "Ghost", env=env, cwd=repo, binary=binary, timeout=5)
+            self.assertFalse(trace.exists(), "definition recovery must not start planner/chat")
+        self.assertNotEqual(ghost.returncode, 0)
+        self.assertNotIn("project.rs:11", ghost.stdout + ghost.stderr)
+
     def test_named_symbol_variant_definition_beats_mention(self) -> None:
         symbol = "DatabaseBusy"
         with tempfile.TemporaryDirectory() as temporary:
@@ -4256,6 +4343,125 @@ class PbiTest(unittest.TestCase):
                 self.assertEqual(os.readlink(link), old_link)
                 self.assertFalse(list(target.parent.glob(".pbi.*")))
                 self.assertFalse(list(link.parent.glob(".pbi.*")))
+
+    def test_installer_copy_failure_before_transaction_preserves_prior_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source, _ = self.make_install_source(directory)
+            target = directory / "bin" / "pbi"
+            provenance = target.with_name("pbi.provenance")
+            home = directory / "home"
+            link = home / ".local" / "bin" / "pbi"
+            command = [str(INSTALLER), "--source", str(source), "--target", str(target), "--home", str(home)]
+            installed = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            prior = {
+                "target": (target.read_bytes(), (target.stat().st_dev, target.stat().st_ino)),
+                "provenance": (provenance.read_bytes(), (provenance.stat().st_dev, provenance.stat().st_ino)),
+                "link": (os.readlink(link), (link.lstat().st_dev, link.lstat().st_ino)),
+            }
+            fake_bin = directory / "copy-failure-bin"
+            fake_bin.mkdir()
+            failing_install = fake_bin / "install"
+            failing_install.write_text(
+                "#!/bin/sh\n"
+                "for destination in \"$@\"; do :; done\n"
+                "printf partial >\"$destination\"\n"
+                "exit 1\n"
+            )
+            failing_install.chmod(0o755)
+            failed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                env=os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(target.read_bytes(), prior["target"][0])
+            self.assertEqual(provenance.read_bytes(), prior["provenance"][0])
+            self.assertEqual(os.readlink(link), prior["link"][0])
+            self.assertEqual((target.stat().st_dev, target.stat().st_ino), prior["target"][1])
+            self.assertEqual((provenance.stat().st_dev, provenance.stat().st_ino), prior["provenance"][1])
+            self.assertEqual((link.lstat().st_dev, link.lstat().st_ino), prior["link"][1])
+            self.assertFalse(list(target.parent.glob(".pbi.*")))
+            self.assertFalse(list(link.parent.glob(".pbi.*")))
+
+    def test_installer_signals_restore_exact_prior_or_absent_state(self) -> None:
+        seams = (
+            ("target backup", "target_backup", True),
+            ("target publish", "target_publish", False),
+            ("provenance backup", "provenance_backup", True),
+            ("provenance publish", "provenance_publish", False),
+            ("link backup", "link_backup", True),
+            ("link publish", "link_publish", False),
+        )
+        for initially_existing in (False, True):
+            for seam, signal_kind, existing_only in seams:
+                if existing_only and not initially_existing:
+                    continue
+                with self.subTest(initially_existing=initially_existing, seam=seam), tempfile.TemporaryDirectory() as temporary:
+                    directory = Path(temporary)
+                    source, _ = self.make_install_source(directory)
+                    target = directory / "bin" / "pbi"
+                    provenance = target.with_name("pbi.provenance")
+                    home = directory / "home"
+                    link = home / ".local" / "bin" / "pbi"
+                    command = [str(INSTALLER), "--source", str(source), "--target", str(target), "--home", str(home)]
+                    prior: dict[str, tuple[bytes | str, tuple[int, int]]] = {}
+                    if initially_existing:
+                        installed = subprocess.run(command, text=True, capture_output=True)
+                        self.assertEqual(installed.returncode, 0, installed.stderr)
+                        prior = {
+                            "target": (target.read_bytes(), (target.stat().st_dev, target.stat().st_ino)),
+                            "provenance": (provenance.read_bytes(), (provenance.stat().st_dev, provenance.stat().st_ino)),
+                            "link": (os.readlink(link), (link.lstat().st_dev, link.lstat().st_ino)),
+                        }
+                        source.write_bytes(source.read_bytes() + b"# signal-upgrade\n")
+                        source.chmod(0o755)
+
+                    fake_bin = directory / "signal-bin"
+                    fake_bin.mkdir()
+                    hit = directory / "signal-hit"
+                    fake_mv = fake_bin / "mv"
+                    fake_mv.write_text(
+                        "#!/usr/bin/env python3\n"
+                        "import os, signal, subprocess, sys, time\n"
+                        "result = subprocess.run(['/usr/bin/mv', *sys.argv[1:]])\n"
+                        "source, destination = sys.argv[-2:]\n"
+                        "public = {'target': os.environ['PBI_SIGNAL_TARGET'], 'provenance': os.environ['PBI_SIGNAL_PROVENANCE'], 'link': os.environ['PBI_SIGNAL_LINK']}\n"
+                        "name, operation = os.environ['PBI_SIGNAL_KIND'].split('_')\n"
+                        "matches = (source == public[name] and destination != public[name]) if operation == 'backup' else (source != public[name] and destination == public[name])\n"
+                        "if result.returncode == 0 and matches and not os.path.exists(os.environ['PBI_SIGNAL_HIT']):\n"
+                        "    open(os.environ['PBI_SIGNAL_HIT'], 'w').write(source + '\\n' + destination + '\\n')\n"
+                        "    os.kill(os.getppid(), signal.SIGTERM)\n"
+                        "    time.sleep(.05)\n"
+                        "raise SystemExit(result.returncode)\n"
+                    )
+                    fake_mv.chmod(0o755)
+                    env = os.environ | {
+                        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                        "PBI_SIGNAL_KIND": signal_kind,
+                        "PBI_SIGNAL_TARGET": str(target),
+                        "PBI_SIGNAL_PROVENANCE": str(provenance),
+                        "PBI_SIGNAL_LINK": str(link),
+                        "PBI_SIGNAL_HIT": str(hit),
+                    }
+                    interrupted = subprocess.run(command, text=True, capture_output=True, env=env)
+                    self.assertTrue(hit.exists(), "the requested post-rename signal seam must be reached")
+                    self.assertNotEqual(interrupted.returncode, 0, "a signal must never report installer success")
+                    if initially_existing:
+                        self.assertEqual(target.read_bytes(), prior["target"][0])
+                        self.assertEqual(provenance.read_bytes(), prior["provenance"][0])
+                        self.assertEqual(os.readlink(link), prior["link"][0])
+                        self.assertEqual((target.stat().st_dev, target.stat().st_ino), prior["target"][1])
+                        self.assertEqual((provenance.stat().st_dev, provenance.stat().st_ino), prior["provenance"][1])
+                        self.assertEqual((link.lstat().st_dev, link.lstat().st_ino), prior["link"][1])
+                    else:
+                        self.assertFalse(os.path.lexists(target))
+                        self.assertFalse(os.path.lexists(provenance))
+                        self.assertFalse(os.path.lexists(link))
+                    self.assertFalse(list(target.parent.glob(".pbi.*")))
+                    self.assertFalse(list(link.parent.glob(".pbi.*")))
 
     def test_installer_is_durable_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -343,7 +343,32 @@ named_symbol_definition_line() {
         return substr(remaining, 1, comment_pos - 1)
       }
     }
-    function brace_delta(line,    i, character, delta, quote, escaped) {
+    function rust_char_literal_length(line, start,    apostrophe, character, escape, i, digits) {
+      apostrophe = sprintf("%c", 39)
+      character = substr(line, start + 1, 1)
+      if (character != "" && character != "\\" && character != apostrophe &&
+          substr(line, start + 2, 1) == apostrophe) return 3
+      if (character != "\\") return 0
+      escape = substr(line, start + 2, 1)
+      if (escape ~ /^[\\\"nrt0]$/ || escape == apostrophe)
+        return substr(line, start + 3, 1) == apostrophe ? 4 : 0
+      if (escape == "x" && substr(line, start + 3, 2) ~ /^[[:xdigit:]]{2}$/ &&
+          substr(line, start + 5, 1) == apostrophe) return 6
+      if (escape != "u" || substr(line, start + 3, 1) != "{") return 0
+      digits = 0
+      for (i = start + 4; i <= length(line) && i <= start + 11; i++) {
+        character = substr(line, i, 1)
+        if (character ~ /^[[:xdigit:]]$/) {
+          if (++digits > 6) return 0
+        } else if (character == "_" && digits > 0) {
+          continue
+        } else if (character == "}" && digits > 0 && substr(line, i + 1, 1) == apostrophe) {
+          return i - start + 2
+        } else return 0
+      }
+      return 0
+    }
+    function brace_delta(line,    i, character, delta, quote, escaped, literal_length) {
       delta = 0
       quote = ""
       escaped = 0
@@ -355,8 +380,11 @@ named_symbol_definition_line() {
           else if (character == quote) quote = ""
           continue
         }
-        if (character == "\"" || character == sprintf("%c", 39)) quote = character
-        else if (character == "{") delta++
+        if (character == "\"") quote = character
+        else if (character == sprintf("%c", 39)) {
+          literal_length = rust_char_literal_length(line, i)
+          if (literal_length) i += literal_length - 1
+        } else if (character == "{") delta++
         else if (character == "}") delta--
       }
       return delta
