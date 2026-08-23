@@ -717,9 +717,9 @@ class PbiTest(unittest.TestCase):
             )
             probe_trace = directory / "probe-trace.json"
             self.assertTrue(probe_trace.exists(), "BM25 fast path must run before planner")
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp.rs:2\nsrc/api/mcp.rs:3\n")
+        self.assertEqual(result.stderr, "")
 
     def test_planner_warning_mixed_bm25_stamps_recover_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -762,9 +762,9 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
             )
             self.assertFalse(trace.exists(), "planner/chat must not run after a completed fast-path miss")
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertEqual(result.stderr, "")
 
     def test_default_query_mixed_stamps_recover_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -811,9 +811,9 @@ class PbiTest(unittest.TestCase):
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertEqual(result.stderr, "")
 
     def test_default_query_mixed_stamp_with_cited_symbol_recovers_or_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2621,6 +2621,72 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: no source location contains the queried symbol\n")
         self.assertFalse(trace.exists(), "an absent named symbol must not invoke Probe Chat")
+        self.assertLess(elapsed, 5)
+
+    def test_search_prefers_named_symbol_definition_over_import_mention(self) -> None:
+        symbol = "TargetSymbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "mention.py").write_text(f"from pkg import {symbol}\n")
+            (repo / "pkg.py").write_text(f"class {symbol}:\n    pass\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            rg = directory / "rg"
+            rg.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"-l\" ]]; then\n"
+                "    printf '%s\n' './mention.py' './pkg.py'\n"
+                "    exit 0\n"
+                "fi\n"
+                "exec /usr/bin/rg \"$@\"\n"
+            )
+            rg.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env bash\nexit 0\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pkg.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
+        self.assertLess(elapsed, 5)
+
+    def test_default_positional_recovers_named_symbol_definition(self) -> None:
+        symbol = "TargetSymbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "mention.py").write_text(f"from pkg import {symbol}\n")
+            (repo / "pkg.py").write_text(f"class {symbol}:\n    pass\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env bash\nexit 0\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where", "is", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pkg.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named-symbol recovery must skip planner and chat")
         self.assertLess(elapsed, 5)
 
     def test_search_skips_hanging_chat_when_candidates_contain_named_symbol(self) -> None:

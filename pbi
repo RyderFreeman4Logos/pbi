@@ -1023,6 +1023,7 @@ recover_search_from_candidates() {
 
 run_default_bm25_fast_path() {
   local candidate_batch fast_path_output_file fast_path_status fast_path_query
+  local candidate_symbol candidate_locations recovered_named_locations
   local fast_path_deadline_ns now_ns remaining_ns remaining_ms per_query_ns timeout_seconds
   local fast_path_query_index=0 remaining_queries
   local fast_path_fallback=false fast_path_timed_out=false
@@ -1087,6 +1088,19 @@ run_default_bm25_fast_path() {
     printf '%s\n' "$output"
     return 0
   fi
+  recovered_named_locations=""
+  while IFS= read -r candidate_symbol; do
+    [[ -n "$candidate_symbol" ]] || continue
+    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" || true)"
+    if [[ -n "$candidate_locations" ]]; then
+      [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
+      recovered_named_locations+="$candidate_locations"
+    fi
+  done < <(search_named_symbols "${question:-}")
+  if [[ -n "$recovered_named_locations" ]]; then
+    printf '%s\n' "$recovered_named_locations"
+    return 0
+  fi
   search_fast_path_miss=true
   search_uses_local_model=false
   output=""
@@ -1095,9 +1109,20 @@ run_default_bm25_fast_path() {
 }
 
 recover_named_symbol_definition() {
-  local symbol="$1" file locations rg_command
+  local symbol="$1" file locations line_number rg_command
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
+  while IFS= read -r file; do
+    line_number="$(named_symbol_definition_line "$file" "$symbol")"
+    [[ -n "$line_number" ]] || continue
+    locations="$(compact_search_locations "File: $file, Lines: $line_number-$line_number" "$symbol")"
+    if [[ -n "$locations" ]]; then
+      printf "%s\n" "$locations"
+      return 0
+    fi
+  done < <("$rg_command" -l -F --glob "!drafts/**" --glob "!docs/plans/**" \
+    --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
+    -- "$symbol" . 2>/dev/null || true)
   while IFS= read -r file; do
     locations="$(compact_search_locations "File: $file, Lines: 1-1" "$symbol" true)"
     if [[ -n "$locations" ]]; then
