@@ -111,6 +111,15 @@ trap 'cleanup 131' 3
 trap 'cleanup 143' 15
 
 mkdir -p "$target_dir" "$link_dir"
+# Reject a compatibility-link path that aliases the target (lexical equality
+# or a symlinked-parent alias) before any mutation: the stable target must
+# stay a regular executable, never replaced by a self-referential link.
+target_real_dir=$(cd -- "$target_dir" && pwd -P)
+link_real_dir=$(cd -- "$link_dir" && pwd -P)
+if [ "$target_real_dir" = "$link_real_dir" ] && [ "$(basename -- "$target")" = "$(basename -- "$link")" ]; then
+  printf 'install.sh: target and compatibility path are the same file: %s\n' "$target" >&2
+  exit 1
+fi
 if { [ -e "$link" ] || [ -L "$link" ]; } && [ ! -L "$link" ]; then
   printf 'install.sh: compatibility path is not a replaceable symlink: %s\n' "$link" >&2
   exit 1
@@ -141,7 +150,12 @@ printf 'source_commit=%s\nsha256=%s\ntarget=%s\n' \
 ln -s "$target" "$link_tmp"
 
 transaction_started=true
-if [ -e "$target" ]; then mv -fT -- "$target" "$target_backup"; fi
+if [ -e "$target" ]; then
+  # Preserve prior bytes in same-directory backup storage WITHOUT renaming
+  # the live leaf away; the public target stays visible (old bytes) until the
+  # atomic same-directory rename swaps in the fully staged executable.
+  ln -- "$target" "$target_backup"
+fi
 mv -fT -- "$target_tmp" "$target"
 [ -f "$target" ] && [ ! -L "$target" ] && [ -x "$target" ] || {
   printf 'install.sh: published target is not a regular executable: %s\n' "$target" >&2
@@ -151,7 +165,9 @@ if [ -e "$provenance" ]; then mv -fT -- "$provenance" "$provenance_backup"; fi
 mv -fT -- "$provenance_tmp" "$provenance"
 if [ -L "$link" ]; then mv -fT -- "$link" "$link_backup"; fi
 mv -fT -- "$link_tmp" "$link"
-[ -f "$provenance" ] && [ ! -L "$provenance" ] && [ -L "$link" ] || {
+[ -f "$target" ] && [ ! -L "$target" ] && [ -x "$target" ] && \
+  [ -f "$provenance" ] && [ ! -L "$provenance" ] && \
+  [ -L "$link" ] && [ "$(readlink -- "$link")" = "$target" ] || {
   printf '%s\n' 'install.sh: publication validation failed' >&2
   exit 1
 }

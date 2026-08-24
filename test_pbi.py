@@ -4790,6 +4790,25 @@ class PbiTest(unittest.TestCase):
                         "raise SystemExit(result.returncode)\n"
                     )
                     fake_mv.chmod(0o755)
+                    # The target's prior bytes are now preserved by a hard
+                    # link, not a rename; inject the same TERM at that seam.
+                    fake_ln = fake_bin / "ln"
+                    fake_ln.write_text(
+                        "#!/usr/bin/env python3\n"
+                        "import os, signal, subprocess, sys, time\n"
+                        "result = subprocess.run(['/usr/bin/ln', *sys.argv[1:]])\n"
+                        "name, operation = os.environ['PBI_SIGNAL_KIND'].split('_')\n"
+                        "if operation == 'backup' and name == 'target':\n"
+                        "    public = os.environ['PBI_SIGNAL_TARGET']\n"
+                        "    source, destination = sys.argv[-2:]\n"
+                        "    matches = (source == public and destination != public)\n"
+                        "    if result.returncode == 0 and matches and not os.path.exists(os.environ['PBI_SIGNAL_HIT']):\n"
+                        "        open(os.environ['PBI_SIGNAL_HIT'], 'w').write(source + '\\n' + destination + '\\n')\n"
+                        "        os.kill(os.getppid(), signal.SIGTERM)\n"
+                        "        time.sleep(.05)\n"
+                        "raise SystemExit(result.returncode)\n"
+                    )
+                    fake_ln.chmod(0o755)
                     env = os.environ | {
                         "PATH": f"{fake_bin}:{os.environ['PATH']}",
                         "PBI_SIGNAL_KIND": signal_kind,
