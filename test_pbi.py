@@ -71,7 +71,25 @@ class PbiTest(unittest.TestCase):
         for command in (directory / "mise", directory / "probe-chat", directory / "npx"):
             command.chmod(0o755)
         env = os.environ.copy()
-        for name in ("LOCAL_MODEL", "LLM_MODEL", "FALLBACK_MODEL", "XDG_CONFIG_HOME", "PBI_CONFIG_FILE"):
+        # Clear exactly the finite set of product-consumed host routing,
+        # credential, and deadline variables so host knobs cannot change a
+        # test's route or timing; each test then sets the values it requires.
+        for name in (
+            "CLIPROXY_API_KEY",
+            "OPENAI_API_KEY",
+            "LOCAL_ROUTER_API_KEY",
+            "CLIPROXY_BASE_URL",
+            "LOCAL_ROUTER_BASEURL",
+            "LOCAL_MODEL",
+            "LLM_MODEL",
+            "FALLBACK_MODEL",
+            "PBI_CONFIG_FILE",
+            "XDG_CONFIG_HOME",
+            "PBI_PLANNER_TIMEOUT_SECONDS",
+            "PBI_CHAT_TIMEOUT_SECONDS",
+            "REQUEST_TIMEOUT_MS",
+            "MAX_OPERATION_TIMEOUT_MS",
+        ):
             env.pop(name, None)
         env["PATH"] = f"{directory}:{env['PATH']}"
         env["PBI_TEST_TRACE"] = str(trace)
@@ -121,6 +139,11 @@ class PbiTest(unittest.TestCase):
         self.assertIn("pbi", version_result.stdout)
         self.assertIn("Usage: pbi <question...>", help_result.stdout)
         self.assertIn("pbi search [--bm25] <query>", help_result.stdout)
+        self.assertIn(
+            "Search prints compact verified BM25 locations and never starts chat",
+            help_result.stdout,
+        )
+        self.assertIn("--bm25 prints raw no-LLM Probe output", help_result.stdout)
         self.assertEqual(no_args_result.returncode, 2)
         self.assertIn("question is required", no_args_result.stderr)
 
@@ -574,6 +597,124 @@ class PbiTest(unittest.TestCase):
         self.assertIn("no source", result.stderr)
         self.assertFalse(trace.exists(), "deadline expiry must not invoke planner/chat")
         self.assertLess(elapsed, 1.8)
+
+    def test_default_query_term_resistant_initial_probe_fits_absolute_deadline(self) -> None:
+        # #118 absolute deadline: the initial BM25 probe search plus its
+        # same-group TERM-ignoring child must be TERM/KILL/reaped inside the
+        # configured budget, leave zero matching identities before emergency
+        # cleanup, and fail closed without planner/chat.
+        def current_start_time(pid: int) -> str | None:
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            except (FileNotFoundError, IndexError, ProcessLookupError):
+                return None
+
+        symbol = "TargetSymbol"
+        identities: dict[str, dict[str, int | str]] = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "unrelated.py").write_text("pass\n")
+            env, trace = self.fake_environment(directory)
+            identity_file = directory / "probe-identities.json"
+            child_identity_file = directory / "probe-child.json"
+            env["PBI_TEST_PROBE_IDENTITIES"] = str(identity_file)
+            env["PBI_TEST_PROBE_CHILD_IDENTITY"] = str(child_identity_file)
+            probe = directory / "probe"
+            child_code = (
+                "import json, os, pathlib, signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "start = pathlib.Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid': os.getpid(), 'start_time': start, 'pgid': os.getpgrp()}))\n"
+                "while True: time.sleep(.1)\n"
+            )
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, signal, subprocess, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"child_code = {child_code!r}\n"
+                "child_path = pathlib.Path(os.environ['PBI_TEST_PROBE_CHILD_IDENTITY'])\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code, str(child_path)])\n"
+                "deadline = time.monotonic() + .5\n"
+                "while not child_path.exists() and time.monotonic() < deadline: time.sleep(.005)\n"
+                "child_identity = json.loads(child_path.read_text())\n"
+                "start = pathlib.Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
+                "identities = {'parent': {'pid': os.getpid(), 'start_time': start, 'pgid': os.getpgrp()}, 'child': child_identity}\n"
+                "pathlib.Path(os.environ['PBI_TEST_PROBE_IDENTITIES']).write_text(json.dumps(identities))\n"
+                "while True: time.sleep(.1)\n"
+            )
+            probe.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(binary.read_text().replace(
+                'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="3"',
+            ))
+            binary.chmod(0o755)
+            try:
+                started = time.monotonic()
+                result = self.run_pbi("where", "is", symbol, env=env, cwd=repo, binary=binary, timeout=6)
+                elapsed = time.monotonic() - started
+                identities = json.loads(identity_file.read_text())
+                self.assertEqual(identities["parent"]["pgid"], identities["child"]["pgid"])
+                survivors = {
+                    name: identity
+                    for name, identity in identities.items()
+                    if current_start_time(int(identity["pid"])) == identity["start_time"]
+                }
+                self.assertFalse(
+                    survivors,
+                    f"TERM/KILL/reap must complete inside the deadline; matching identities: {survivors}",
+                )
+            finally:
+                for identity in identities.values():
+                    pid = int(identity["pid"])
+                    try:
+                        pidfd = os.pidfd_open(pid)
+                    except (AttributeError, ProcessLookupError):
+                        continue
+                    try:
+                        if current_start_time(pid) == identity["start_time"]:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    finally:
+                        os.close(pidfd)
+                cleanup_deadline = time.monotonic() + .5
+                while time.monotonic() < cleanup_deadline and any(
+                    current_start_time(int(identity["pid"])) == identity["start_time"]
+                    for identity in identities.values()
+                ):
+                    time.sleep(.01)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertLess(elapsed, 3.2, "the initial probe TERM/KILL/reap must fit the absolute budget")
+        self.assertFalse(trace.exists(), "a deadline miss must not start planner/chat")
+
+    def test_default_query_named_readme_without_claim_fails_closed(self) -> None:
+        # #118: a completed named-file fast-path miss (README with no
+        # recognized claim) must fail closed without ever starting
+        # planner/chat or invoking the probe.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "README.md").write_text("# README\nSome product notes.\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            self.record_probe_argv(probe)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where", "is", "README", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            probe_invoked = (directory / "probe-trace.json").exists()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertFalse(probe_invoked, "a README miss must not invoke the probe")
+        self.assertFalse(trace.exists(), "a README miss must never start planner/chat")
 
     def test_default_query_term_ignoring_rg_is_killed_inside_deadline(self) -> None:
         def current_start_time(pid: int) -> str | None:
@@ -1975,6 +2116,77 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "pbi:5\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_compact_fixture_records_probe_input_and_zero_chat(self) -> None:
+        # #118: the default explicit search is a compact verified BM25
+        # localization; the fixture proves the exact one Probe search input,
+        # zero chat invocations, and the exact compact output.
+        symbol = "rest_response_prefers_created_ids_when_both_fields_exist"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text(f"def {symbol}():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe_trace = directory / "probe-trace.json"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\nimport json, os, sys\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as f:\n"
+                "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                f"print(f'File: {repo}/real.py, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", f"Locate {symbol}", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            probe_invocations = [json.loads(line) for line in probe_trace.read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "no chat invocation is allowed for default search")
+        self.assertEqual(
+            probe_invocations,
+            [
+                [
+                    "search", "--timeout", "540", "--max-results", "8", "--ignore", "drafts",
+                    "--reranker", "bm25", "--format", "plain", "--dry-run", "--",
+                    f"Locate {symbol}",
+                ]
+            ],
+        )
+
+    def test_search_bm25_fixture_records_raw_probe_output_and_zero_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "real.py").write_text("def TargetSymbol():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe_trace = directory / "probe-trace.json"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\nimport json, os, sys\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'a') as f:\n"
+                "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "print('File: real.py, Lines: 1-1')\n"
+                "print('raw probe line 2')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "--bm25", "TargetSymbol", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+            probe_invocations = [json.loads(line) for line in probe_trace.read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(trace.exists(), "raw --bm25 output must not invoke chat")
+        self.assertEqual(result.stdout, "File: real.py, Lines: 1-1\nraw probe line 2\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            probe_invocations,
+            [["search", "--reranker", "bm25", "--timeout", "540", "--max-results", "8", "--", "TargetSymbol"]],
+        )
+
     def test_search_compact_stamp_fallback_fails_closed_without_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -2956,6 +3168,46 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("project.rs:3", result.stdout + result.stderr)
         self.assertFalse(trace.exists())
 
+    def test_named_symbol_ts_single_quoted_enum_value_does_not_extend_enum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "project.ts"
+            source.write_text("enum Real { Actual = 'value{' }\nfn use_it() {\n    Ghost => 1;\n}\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                f"if '--dry-run' in sys.argv: print('File: {source}, Lines: 3-3')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi("where", "is", "Ghost", env=env, cwd=repo,
+                                  binary=self.fake_pbi(directory, probe), timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("project.ts:3", result.stdout + result.stderr)
+        self.assertFalse(trace.exists())
+
+    def test_named_symbol_double_quoted_url_enum_value_keeps_string_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "project.ts"
+            source.write_text('enum Real { Actual = "http://x" }\nfn use_it() {\n    Ghost => 1;\n}\n')
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                f"if '--dry-run' in sys.argv: print('File: {source}, Lines: 3-3')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi("where", "is", "Ghost", env=env, cwd=repo,
+                                  binary=self.fake_pbi(directory, probe), timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("project.ts:3", result.stdout + result.stderr)
+        self.assertFalse(trace.exists())
+
     def test_default_query_rust_lifetimes_preserve_enum_structure(self) -> None:
         expected = {
             "DatabaseBusy": (2, ("where", "is", "DatabaseBusy")),
@@ -3301,7 +3553,8 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
 
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
-        # #22: a named-symbol miss must emit BM25 or fail closed, never chat.
+        # #22: a named-symbol miss must fail closed with one exact outcome and
+        # never chat; the controlled rg makes the outcome deterministic.
         symbol = "ingest_receipt_accepts_cleanup_ids_from_legacy_wire_shape"
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -3323,6 +3576,9 @@ class PbiTest(unittest.TestCase):
                 f"print(f'File: {repo}/real.py, Lines: 1-10')\n"
             )
             probe.chmod(0o755)
+            rg = directory / "rg"
+            rg.write_text("#!/usr/bin/env bash\nexit 1\n")
+            rg.chmod(0o755)
             fake_chat = directory / "probe-chat"
             fake_chat.write_text("#!/usr/bin/env bash\ntouch \"$PBI_TEST_TRACE\"\nsleep 30\n")
             fake_chat.chmod(0o755)
@@ -3332,23 +3588,13 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe), timeout=5,
             )
             elapsed = time.time() - started
-        self.assertIn(result.returncode, (0, 1))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source location contains the queried symbol\n")
         self.assertLess(elapsed, 5, "named-symbol miss must not hang in Probe Chat")
         self.assertFalse(trace.exists(), "a named-symbol miss must skip Probe Chat")
         self.assertNotIn("pbi: probe-chat failed", result.stderr)
         self.assertNotIn("pbi: probe-chat timed out answering the question", result.stderr)
-        if result.returncode == 0:
-            self.assertEqual(result.stdout, "real.py:1\n")
-            self.assertEqual(result.stderr, "")
-        else:
-            self.assertEqual(result.stdout, "")
-            self.assertIn(
-                result.stderr,
-                (
-                    "pbi: model returned only BM25 location stamps; no source answer\n",
-                    "pbi: no source locations found\n",
-                ),
-            )
 
     def test_search_probe_hang_emits_diagnostic_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3672,8 +3918,8 @@ class PbiTest(unittest.TestCase):
         self.assertIn(f"base_url={BASE_URL}", result.stdout)
         self.assertIn("max_retries=3", result.stdout)
         self.assertIn("search_timeout_seconds=540", result.stdout)
-        self.assertIn("search_default=local_model", result.stdout)
-        self.assertIn("search_bm25_opt_in=--bm25", result.stdout)
+        self.assertIn("search_default=compact_verified_bm25_no_chat", result.stdout)
+        self.assertIn("search_bm25_opt_in=--bm25_raw_no_llm_probe", result.stdout)
         self.assertIn("api_key=[REDACTED]", result.stdout)
 
 
@@ -4291,7 +4537,10 @@ class PbiTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(target.is_dir())
-            self.assertFalse(list(target.rglob(".pbi.*")))
+            # Residue must be sought beside the obstruction (owning parents),
+            # never inside the obstructing directory itself.
+            self.assertFalse(list(target.parent.glob(".pbi.*")))
+            self.assertFalse(list((home / ".local" / "bin").glob(".pbi.*")))
             self.assertFalse(target.with_name("pbi.provenance").exists())
             self.assertFalse((home / ".local" / "bin" / "pbi").exists())
 
@@ -4385,6 +4634,109 @@ class PbiTest(unittest.TestCase):
             self.assertEqual((link.lstat().st_dev, link.lstat().st_ino), prior["link"][1])
             self.assertFalse(list(target.parent.glob(".pbi.*")))
             self.assertFalse(list(link.parent.glob(".pbi.*")))
+
+    def test_installer_rejects_target_link_alias_before_mutation(self) -> None:
+        # #117: a target that aliases the compatibility path (lexically equal or
+        # via a symlinked parent) must be rejected before any mutation with an
+        # exact diagnostic and zero residue; it must never publish a
+        # self-referential link over the stable executable.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source, _ = self.make_install_source(directory)
+            home = directory / "home"
+            lexical_target = home / ".local" / "bin" / "pbi"
+            same_dir = directory / "same"
+            alias_home = directory / "alias-home"
+            (alias_home / ".local").mkdir(parents=True)
+            (same_dir).mkdir()
+            (alias_home / ".local" / "bin").symlink_to(same_dir)
+            symlink_alias_target = same_dir / "pbi"
+            command = [str(INSTALLER), "--source", str(source), "--target", "TARGET", "--home", "HOME"]
+            for label, target in (
+                ("lexical equality", lexical_target),
+                ("symlinked-parent alias", symlink_alias_target),
+            ):
+                with self.subTest(alias=label):
+                    result = subprocess.run(
+                        [c.replace("TARGET", str(target)).replace("HOME", str(home)) for c in command]
+                        if label == "lexical equality" else
+                        [c.replace("TARGET", str(target)).replace("HOME", str(alias_home)) for c in command],
+                        text=True, capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        result.stderr,
+                        f"install.sh: target and compatibility path are the same file: {target}\n",
+                    )
+                    self.assertFalse(os.path.lexists(target), "aliased target must stay absent")
+                    self.assertFalse(os.path.lexists(target.with_name("pbi.provenance")))
+                    self.assertFalse(list(target.parent.glob(".pbi.*")))
+        self.assertFalse(list((home / ".local" / "bin").glob(".pbi.*")))
+
+    def test_installer_upgrade_rename_never_hides_the_target(self) -> None:
+        # #117: an upgrading install must preserve the live target bytes
+        # (same-directory backup, no rename-away) and atomically rename the
+        # staged executable over the leaf; an observer at every public rename
+        # must always see a regular executable that is wholly old or new.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source, _ = self.make_install_source(directory)
+            target = directory / "bin" / "pbi"
+            home = directory / "home"
+            command = [str(INSTALLER), "--source", str(source), "--target", str(target), "--home", str(home)]
+            first = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            old_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+            source.write_bytes(source.read_bytes() + b"# v2\n")
+            source.chmod(0o755)
+            fake_bin = directory / "observer-bin"
+            fake_bin.mkdir()
+            log = directory / "mv-observations.log"
+            fake_mv = fake_bin / "mv"
+            fake_mv.write_text(
+                "#!/usr/bin/env python3\n"
+                "import hashlib, os, pathlib, subprocess, sys\n"
+                "target = os.environ['PBI_OBSERVER_TARGET']\n"
+                "log = os.environ['PBI_OBSERVER_LOG']\n"
+                "def describe(path):\n"
+                "    try:\n"
+                "        os.lstat(path)\n"
+                "    except FileNotFoundError:\n"
+                "        return 'absent'\n"
+                "    if os.path.islink(path):\n"
+                "        return 'symlink:' + os.readlink(path)\n"
+                "    if not os.path.isfile(path):\n"
+                "        return 'other'\n"
+                "    return 'regular:' + hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()\n"
+                "destination = sys.argv[-1]\n"
+                "if os.path.abspath(destination) == os.path.abspath(target):\n"
+                "    with open(log, 'a') as f:\n"
+                "        f.write('pre ' + describe(destination) + '\\n')\n"
+                "result = subprocess.run(['/usr/bin/mv', *sys.argv[1:]])\n"
+                "if os.path.abspath(destination) == os.path.abspath(target):\n"
+                "    with open(log, 'a') as f:\n"
+                "        f.write('post ' + describe(destination) + '\\n')\n"
+                "raise SystemExit(result.returncode)\n"
+            )
+            fake_mv.chmod(0o755)
+            env = os.environ | {
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "PBI_OBSERVER_TARGET": str(target),
+                "PBI_OBSERVER_LOG": str(log),
+            }
+            upgraded = subprocess.run(command, text=True, capture_output=True, env=env)
+            self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+            new_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+            observations = log.read_text().splitlines()
+            self.assertTrue(observations, "the public target rename must be observed")
+            for line in observations:
+                kind, state = line.split(" ", 1)
+                self.assertIn(kind, ("pre", "post"))
+                self.assertTrue(
+                    state == f"regular:{old_sha}" or state == f"regular:{new_sha}",
+                    f"public target must always be wholly old or new bytes, got: {state!r}",
+                )
+            self.assertEqual(new_sha, hashlib.sha256(source.read_bytes()).hexdigest())
 
     def test_installer_signals_restore_exact_prior_or_absent_state(self) -> None:
         seams = (

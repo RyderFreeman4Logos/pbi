@@ -20,7 +20,7 @@ usage() {
   printf '%s\n' "       pbi search [--bm25] <query>"
   printf '%s\n' "       pbi --message <question> [probe-chat options]"
   printf '%s\n' "       pbi --debug-config"
-  printf '%s\n' "Search defaults to local-model ranking; use --bm25 for no-LLM Probe output."
+  printf '%s\n' "Search prints compact verified BM25 locations and never starts chat; --bm25 prints raw no-LLM Probe output."
 }
 
 resolve_command() {
@@ -156,6 +156,9 @@ planner_timeout_or_kill() {
 
 active_timeout_pid=
 active_timeout_diagnostic=
+# Default TERM grace for run_timed_command; the fast path shortens it so the
+# KILL/reap fits inside its absolute deadline.
+fast_path_kill_after="1s"
 active_temp_files=()
 
 track_temp_file() {
@@ -184,19 +187,29 @@ trap cleanup_temp_files EXIT
 
 run_timed_command() {
   local timeout_seconds="$1" stdout_file="$2" stderr_file="$3" status
+  local kill_after_seconds="${fast_path_kill_after:-1s}" timed_pid
   shift 3
   if [[ "$stdout_file" == "$stderr_file" ]]; then
-    setsid sh -c 'timeout --kill-after=1s "$@"' sh "$timeout_seconds" "$@" >"$stdout_file" 2>&1 &
+    PBI_TIMEOUT_KILL_AFTER="$kill_after_seconds" setsid sh -c 'timeout --kill-after="$PBI_TIMEOUT_KILL_AFTER" "$@"' sh "$timeout_seconds" "$@" >"$stdout_file" 2>&1 &
   else
-    setsid sh -c 'timeout --kill-after=1s "$@"' sh "$timeout_seconds" "$@" >"$stdout_file" 2>"$stderr_file" &
+    PBI_TIMEOUT_KILL_AFTER="$kill_after_seconds" setsid sh -c 'timeout --kill-after="$PBI_TIMEOUT_KILL_AFTER" "$@"' sh "$timeout_seconds" "$@" >"$stdout_file" 2>"$stderr_file" &
   fi
   active_timeout_pid="$!"
+  timed_pid="$active_timeout_pid"
   if wait "$active_timeout_pid"; then
     status=0
   else
-    status="$?"
+    status=$?
   fi
   active_timeout_pid=
+  if planner_timeout_or_kill "$status"; then
+    # GNU timeout under setsid signals only its direct child; a
+    # TERM-ignoring same-group descendant survives the KILL. Escalate to a
+    # group KILL and reap inside the reserved deadline allowance so no owned
+    # descendant keeps caller-visible pipes open past the budget.
+    kill -KILL -- "-$timed_pid" 2>/dev/null || kill -KILL "$timed_pid" 2>/dev/null || true
+    wait "$timed_pid" 2>/dev/null || true
+  fi
   return "$status"
 }
 
@@ -287,61 +300,99 @@ named_symbol_definition_line() {
       pending_enum = 0
       seen_enum = 0
     }
-    function hash_comment_pos(line,    i, previous, leading, include_boundary) {
-      for (i = 1; i <= length(line); i++) {
-        if (substr(line, i, 1) != "#") continue
-        previous = (i == 1 ? "" : substr(line, i - 1, 1))
-        leading = (substr(line, 1, i - 1) ~ /^[[:space:]]*$/)
-        include_boundary = substr(line, i + 8, 1)
-        if ((i == 1 || previous ~ /[[:space:]]/) &&
-            !(leading &&
-              ((substr(line, i, 8) == "#include" && include_boundary !~ /[[:alnum:]_]/) ||
-               substr(line, i, 2) == "#[" || substr(line, i, 3) == "#![")))
-          return i
+    function has_closing_quote(line, start, q,    i, character, escaped) {
+      escaped = 0
+      for (i = start; i <= length(line); i++) {
+        character = substr(line, i, 1)
+        if (escaped) escaped = 0
+        else if (character == "\\") escaped = 1
+        else if (character == q) return 1
       }
       return 0
     }
-    function strip_comments(line,    remaining, block_pos, slash_pos, hash_pos, comment_pos, comment_kind, close_pos, prefix) {
-      remaining = line
-      while (1) {
+    # One bounded lexical pass over a line: comments are recognized only
+    # outside quotes; braces are ignored inside supported single/double
+    # strings and Rust char literals; Rust lifetime/label apostrophes stay
+    # code. Returns comment-stripped code (strings kept) and sets
+    # lex_brace_delta to the code brace delta.
+    function lex_clean(line,    out, i, character, quote, escaped, literal_length, close_at, hash_at) {
+      out = ""
+      lex_brace_delta = 0
+      quote = ""
+      escaped = 0
+      i = 1
+      while (i <= length(line)) {
         if (in_block) {
-          close_pos = index(remaining, "*/")
-          if (!close_pos) return ""
-          remaining = " " substr(remaining, close_pos + 2)
+          hash_at = index(substr(line, i), "*/")
+          if (!hash_at) break
+          out = out " "
+          i += hash_at + 1
           in_block = 0
           continue
         }
-        block_pos = index(remaining, "/*")
-        slash_pos = index(remaining, "//")
-        hash_pos = hash_comment_pos(remaining)
-        comment_pos = 0
-        comment_kind = ""
-        if (block_pos && (!comment_pos || block_pos < comment_pos)) {
-          comment_pos = block_pos
-          comment_kind = "block"
-        }
-        if (slash_pos && (!comment_pos || slash_pos < comment_pos)) {
-          comment_pos = slash_pos
-          comment_kind = "line"
-        }
-        if (hash_pos && (!comment_pos || hash_pos < comment_pos)) {
-          comment_pos = hash_pos
-          comment_kind = "line"
-        }
-        if (!comment_pos) return remaining
-        if (comment_kind == "block") {
-          prefix = substr(remaining, 1, comment_pos - 1)
-          remaining = substr(remaining, comment_pos + 2)
-          close_pos = index(remaining, "*/")
-          if (!close_pos) {
-            in_block = 1
-            return prefix
-          }
-          remaining = prefix " " substr(remaining, close_pos + 2)
+        character = substr(line, i, 1)
+        if (quote != "") {
+          out = out character
+          i++
+          if (escaped) escaped = 0
+          else if (character == "\\") escaped = 1
+          else if (character == quote) quote = ""
           continue
         }
-        return substr(remaining, 1, comment_pos - 1)
+        if (character == "\"") {
+          quote = character
+          out = out character
+          i++
+          continue
+        }
+        if (character == sprintf("%c", 39)) {
+          literal_length = rust_char_literal_length(line, i)
+          if (literal_length) {
+            out = out substr(line, i, literal_length)
+            i += literal_length
+            continue
+          }
+          if (has_closing_quote(line, i + 1, character)) {
+            # TypeScript-style single-quoted string: keep verbatim.
+            quote = character
+            out = out character
+            i++
+            continue
+          }
+          # Rust lifetime or label apostrophe: code, keep scanning.
+          out = out character
+          i++
+          continue
+        }
+        if (character == "/" && substr(line, i + 1, 1) == "/") break
+        if (character == "/" && substr(line, i + 1, 1) == "*") {
+          hash_at = index(substr(line, i + 2), "*/")
+          if (!hash_at) {
+            in_block = 1
+            break
+          }
+          out = out " "
+          i += hash_at + 3
+          continue
+        }
+        if (character == "#") {
+          leading = (substr(line, 1, i - 1) ~ /^[[:space:]]*$/)
+          if ((i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/) &&
+              !(leading &&
+                ((substr(line, i, 8) == "#include" && substr(line, i + 8, 1) !~ /[[:alnum:]_]/) ||
+                 substr(line, i, 2) == "#[" || substr(line, i, 3) == "#!["))) {
+            break
+          }
+          out = out character
+          i++
+          continue
+        }
+        if (character == "{") lex_brace_delta++
+        else if (character == "}") lex_brace_delta--
+        out = out character
+        i++
       }
+      return out
     }
     function rust_char_literal_length(line, start,    apostrophe, character, escape, i, digits) {
       apostrophe = sprintf("%c", 39)
@@ -368,34 +419,13 @@ named_symbol_definition_line() {
       }
       return 0
     }
-    function brace_delta(line,    i, character, delta, quote, escaped, literal_length) {
-      delta = 0
-      quote = ""
-      escaped = 0
-      for (i = 1; i <= length(line); i++) {
-        character = substr(line, i, 1)
-        if (quote != "") {
-          if (escaped) escaped = 0
-          else if (character == "\\") escaped = 1
-          else if (character == quote) quote = ""
-          continue
-        }
-        if (character == "\"") quote = character
-        else if (character == sprintf("%c", 39)) {
-          literal_length = rust_char_literal_length(line, i)
-          if (literal_length) i += literal_length - 1
-        } else if (character == "{") delta++
-        else if (character == "}") delta--
-      }
-      return delta
-    }
     {
-      code = strip_comments($0)
+      code = lex_clean($0)
+      delta = lex_brace_delta
       in_range = !((line_start && NR < line_start) || (line_end && NR > line_end))
       enum_declaration = code ~ /(^|[[:space:]])enum[[:space:]]+[[:alnum:]_]+/
       enum_body_open = (enum_body_depth > 0 && brace_depth >= enum_body_depth) ||
                        (pending_enum && code ~ /\{/)
-      delta = brace_delta(code)
       normalized_code = code
       normalized_symbol = symbol
       gsub(/[^[:alnum:]]/, "", normalized_code)
@@ -1177,6 +1207,7 @@ run_default_bm25_fast_path() {
       return 0
     fi
     fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
+    fast_path_fail_closed
     return 1
   fi
   mapfile -t fast_path_queries < <(build_fast_path_queries "${question:-}")
@@ -1197,9 +1228,19 @@ run_default_bm25_fast_path() {
     now_ns="$(fast_path_now_ns)"
     remaining_ns=$((deadline_ns - now_ns))
     ((remaining_ns > 0)) || break
-    per_query_ns=$((remaining_ns / remaining_queries))
+    # Reserve the TERM/KILL/reap allowance inside the absolute budget: a
+    # TERM-ignoring initial probe must be killed and reaped before the
+    # deadline, never about a second after it. Escalation is capped at 1.1s
+    # and halves when little budget remains so the command still gets a
+    # bounded slice in tight tests.
+    escalation_ns=$((remaining_ns / 2))
+    ((escalation_ns > 1100000000)) && escalation_ns=1100000000
+    per_query_ns=$(( (remaining_ns - escalation_ns) / remaining_queries ))
+    ((per_query_ns > 0)) || { fast_path_timed_out=true; break; }
     remaining_ms=$(( (per_query_ns + 999999) / 1000000 ))
     printf -v timeout_seconds '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
+    printf -v kill_after_seconds '%d.%03d' "$(((escalation_ns - 100000000) / 1000000000))" "$(((escalation_ns - 100000000) % 1000000000 / 1000000))"
+    fast_path_kill_after="$kill_after_seconds"
     if run_timed_command "$timeout_seconds" "$fast_path_output_file" "$fast_path_output_file" \
         "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
         --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
@@ -1209,7 +1250,9 @@ run_default_bm25_fast_path() {
       fast_path_status=$?
     fi
     candidate_batch="$(<"$fast_path_output_file")"
-    candidate_batch="$(printf '%s\n' "$candidate_batch" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
+    # The timed wrapper's shell can journal "Killed" into the shared capture
+    # file when the escalation KILL fires; it is chrome, never candidate data.
+    candidate_batch="$(printf '%s\n' "$candidate_batch" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$|^Killed$" || true)"
     if [[ -n "$candidate_batch" ]]; then
       [[ -z "$bm25_candidates" ]] || bm25_candidates+=$'\n\n'
       bm25_candidates+="$candidate_batch"
@@ -1627,7 +1670,7 @@ case "${1:-}" in
       fi
       exit "$search_status"
     fi
-    candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$" || true)"
+    candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$|^Killed$" || true)"
     symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
     search_fallback_locations=""
     if [[ -n "$symbol" ]]; then
@@ -1698,8 +1741,8 @@ if [[ "${1:-}" == "--debug-config" ]]; then
   printf '%s\n' "max_operation_timeout_ms=$operation_timeout"
   printf '%s\n' "max_retries=$max_retries"
   printf '%s\n' "search_timeout_seconds=$DEFAULT_SEARCH_TIMEOUT_SECONDS"
-  printf '%s\n' 'search_default=local_model'
-  printf '%s\n' 'search_bm25_opt_in=--bm25'
+  printf '%s\n' 'search_default=compact_verified_bm25_no_chat'
+  printf '%s\n' 'search_bm25_opt_in=--bm25_raw_no_llm_probe'
   printf '%s\n' 'api_key=[REDACTED]'
   exit 0
 fi
