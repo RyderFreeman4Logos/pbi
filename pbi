@@ -657,10 +657,17 @@ fast_path_match_variants() {
   done < <(search_distinctive_tokens "$1")
 }
 
+question_is_multi_target_where() {
+  local q="${1,,}" thes
+  [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]] || return 1
+  thes="$(printf '%s\n' "$q" | grep -oE '(^|[[:space:]])the[[:space:]]' | wc -l)"
+  (( thes >= 2 )) && { [[ "$q" == *","* ]] || [[ "$q" == *" and "* ]]; }
+}
+
 question_needs_synthesized_answer() {
   local q="${1,,}"
   [[ "$q" =~ (^|[[:space:]])(why|how|explain)([[:space:]]|$) ]] ||
-    [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]]
+    question_is_multi_target_where "$1"
 }
 
 build_fast_path_queries() {
@@ -1349,32 +1356,97 @@ recover_named_symbol_definition() {
   return 1
 }
 
-recover_distinctive_source_locations() {
-  local deadline_ns="${1:-}" token location recovered="" seen=$'\n' count=0
+is_synthesis_junk_path() {
+  local file="$1" base="${1##*/}"
+  case "$base" in
+    LICENSE|NOTICE|COPYING|Cargo.toml|Cargo.lock) return 0 ;;
+  esac
+  [[ "$file" == *.md ]]
+}
+
+is_synthesis_junk_line() {
+  [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]]
+}
+
+token_overlap_score() {
+  local haystack="$1" tokens="$2" token score=0
+  haystack="${haystack,,}"
+  haystack="${haystack//_/-}"
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
+    token="${token,,}"
+    token="${token//_/-}"
+    [[ -n "$token" && "$haystack" == *"$token"* ]] && score=$((score + 1))
+  done <<< "$tokens"
+  printf '%s\n' "$score"
+}
+
+recover_distinctive_source_locations() {
+  local deadline_ns="${1:-}" token variant rg_command hit file rest line_number text
+  local relative location score tokens="" score_tokens="" seen_tokens=$'\n' count=0 ranked=""
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    [[ "$seen_tokens" == *$'\n'"$token"$'\n'* ]] && continue
+    seen_tokens+="$token"$'\n'
+    score_tokens+="$token"$'\n'
+    tokens+="$token"$'\n'
+    variant="${token//-/_}"
+    [[ "$variant" == "$token" ]] || tokens+="$variant"$'\n'
     count=$((count + 1))
-    ((count <= 8)) || break
-    fast_path_deadline_reached "$deadline_ns" && break
-    location="$(recover_named_symbol_definition "$token" "$deadline_ns" any || true)"
-    [[ -n "$location" ]] || continue
-    [[ "$seen" == *$'\n'"$location"$'\n'* ]] && continue
-    seen+="$location"$'\n'
-    recovered+="${recovered:+$'\n'}$location"
+    ((count < 8)) || break
   done < <(search_distinctive_tokens "${question:-}")
-  [[ -n "$recovered" ]] || return 1
-  printf '%s\n' "$recovered"
+  [[ -n "$tokens" ]] || return 1
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    fast_path_deadline_reached "$deadline_ns" && break
+    while IFS= read -r hit; do
+      [[ "$hit" == *:*:* ]] || continue
+      file="${hit%%:*}"
+      rest="${hit#*:}"
+      line_number="${rest%%:*}"
+      text="${rest#*:}"
+      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
+      [[ -f "$file" ]] || continue
+      is_synthesis_junk_path "$file" && continue
+      is_synthesis_junk_line "$text" && continue
+      relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+      if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
+        relative="$(basename -- "$file")"
+      fi
+      score="$(token_overlap_score "$relative $text" "$score_tokens")"
+      [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) || continue
+      ranked+="$score"$'\t'"$relative:$line_number"$'\n'
+    done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
+        --glob "!drafts/**" --glob "!docs/plans/**" \
+        --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
+        -- "$token" . 2>/dev/null || true)
+  done <<< "$tokens"
+  [[ -n "$ranked" ]] || return 1
+  printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
 }
 
 format_located_answer() {
-  local locations="$1" line joined=""
+  local locations="$1" line file line_number text joined=""
   [[ -n "${locations//[[:space:]]/}" ]] || return 1
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    joined+="${joined:+, }$line"
+    file="${line%:*}"
+    line_number="${line##*:}"
+    [[ "$line_number" =~ ^[[:digit:]]+$ && -f "$file" ]] || continue
+    is_synthesis_junk_path "$file" && continue
+    text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
+    text="${text#"${text%%[![:space:]]*}"}"
+    [[ -n "$text" ]] || continue
+    is_synthesis_junk_line "$text" && continue
+    if ((${#text} > 200)); then
+      text="${text:0:200}..."
+    fi
+    joined+="${joined:+ }The source shows ${text} (${line})."
   done <<< "$locations"
   [[ -n "$joined" ]] || return 1
-  printf 'Located in %s.\n' "$joined"
+  printf '%s\n' "$joined"
 }
 
 emit_synthesized_source_answer() {

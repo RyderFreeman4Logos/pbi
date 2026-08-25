@@ -322,10 +322,12 @@ class PbiTest(unittest.TestCase):
             repo = directory / "repo"
             repo.mkdir()
             (repo / "distractor.py").write_text("def unrelated():\n    return True\n")
+            (repo / "LICENSE").write_text("Apache process changed terms\n" * 40)
+            (repo / "Cargo.toml").write_text("[workspace]\nmembers = [\"guardian\"]\n")
             source = repo / "cutover-guardian.sh"
             source.write_text(
                 "#!/bin/sh\n"
-                "attestation_error=\"integrated guardian main process changed\"\n"
+                'attestation_error="integrated guardian main process changed"\n'
             )
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
@@ -359,8 +361,21 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            result.stdout.startswith("Located in "),
+            result.stdout,
+        )
+        self.assertNotRegex(
+            result.stdout,
+            r"^Located in [^:]+:\d+(, [^:]+:\d+)*\.\n?\Z",
+            result.stdout,
+        )
         self.assertIn("cutover-guardian.sh", result.stdout)
         self.assertRegex(result.stdout, r"cutover-guardian\.sh:\d+")
+        self.assertIn("attestation_error", result.stdout)
+        self.assertIn("integrated guardian main process changed", result.stdout)
+        self.assertNotIn("LICENSE:", result.stdout)
+        self.assertNotIn("Cargo.toml:", result.stdout)
         self.assertEqual(result.stderr, "")
         self.assertNotIn("no source locations found", result.stderr)
         self.assertNotIn("timed out", result.stderr)
@@ -400,12 +415,25 @@ class PbiTest(unittest.TestCase):
             )
             elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            result.stdout.startswith("Located in "),
+            result.stdout,
+        )
+        self.assertNotRegex(
+            result.stdout,
+            r"^Located in [^:]+:\d+(, [^:]+:\d+)*\.\n?\Z",
+            result.stdout,
+        )
         self.assertTrue(
             "quality-gate-receipt-tests.sh" in result.stdout
             or "quality-gate-isolation-tests.sh" in result.stdout,
             result.stdout,
         )
         self.assertRegex(result.stdout, r"quality-gate-[^:]+\.sh:\d+")
+        self.assertTrue(
+            "run_exact_reuse" in result.stdout or "isolate_ambient_inputs" in result.stdout,
+            result.stdout,
+        )
         self.assertEqual(result.stderr, "")
         self.assertNotIn("timed out", result.stderr)
         self.assertNotIn("no source locations found", result.stderr)
