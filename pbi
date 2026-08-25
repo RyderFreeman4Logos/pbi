@@ -583,6 +583,59 @@ search_named_symbols() {
   ' | sort -rn | cut -f2-
 }
 
+is_search_stopword() {
+  case "${1,,}" in
+    a|an|and|answer|are|cache|code|cmd|current|default|does|file|find|findings|first|for|from|helper|helpers|how|implementation|is|key|line|locate|lock|main|marker|markers|multi|of|output|query|request|return|review|route|search|session|show|single|source|spawn|test|tests|the|their|this|to|wait|what|where|which|with|when|append|cleared|cover|synchronization|readiness|publication|compression|assembly|fixture|daemon)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+singularize_overlap_token() {
+  local word="${1,,}"
+  if [[ "$word" == *ies && ${#word} -ge 5 ]]; then
+    printf '%s\n' "${word%ies}y"
+  elif [[ "$word" == *xes || "$word" == *ses || "$word" == *ches || "$word" == *shes ]]; then
+    printf '%s\n' "${word%es}"
+  elif [[ "$word" == *s && "$word" != *ss && ${#word} -ge 4 ]]; then
+    printf '%s\n' "${word%s}"
+  fi
+}
+
+question_phrase_tokens() {
+  local prev="" word word_lower stem count=0
+  while IFS= read -r word; do
+    word="${word#\#}"
+    word="${word%%[,:;.!?]*}"
+    word_lower="${word,,}"
+    [[ "$word_lower" =~ ^[[:alpha:]][[:alnum:]_-]{2,}$ ]] || { prev=""; continue; }
+    if [[ -n "$prev" ]] && ! is_search_stopword "$word_lower"; then
+      case "$prev" in
+        request)
+          [[ "$word_lower" == prefix || "$word_lower" == prefixes ]] || { prev="$word_lower"; continue; }
+          ;;
+        cache)
+          [[ "$word_lower" == identity || "$word_lower" == key || "$word_lower" == keys ]] || { prev="$word_lower"; continue; }
+          ;;
+        key) ;;
+        *)
+          prev="$word_lower"
+          continue
+          ;;
+      esac
+      printf '%s-%s\n' "$prev" "$word_lower"
+      stem="$(singularize_overlap_token "$word_lower")"
+      if [[ -n "$stem" && "$stem" != "$word_lower" ]]; then
+        printf '%s-%s\n' "$prev" "$stem"
+      fi
+      count=$((count + 1))
+      ((count < 8)) || break
+    fi
+    prev="$word_lower"
+  done < <(printf '%s\n' "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }')
+}
+
 search_distinctive_tokens() {
   local token token_lower
   search_named_symbols "$1"
@@ -597,11 +650,7 @@ search_distinctive_tokens() {
     token="${token#\#}"
     token="${token%%[,:;.!?]*}"
     token_lower="${token,,}"
-    case "$token_lower" in
-      a|an|and|answer|are|cache|code|cmd|current|default|does|file|find|findings|first|for|from|helper|helpers|how|implementation|is|key|line|locate|lock|main|marker|markers|multi|of|output|query|request|return|review|route|search|session|show|single|source|spawn|test|tests|the|their|this|to|wait|what|where|which|with|when|append|cleared|cover|synchronization|readiness|publication|compression|assembly|fixture|daemon)
-        continue
-        ;;
-    esac
+    is_search_stopword "$token_lower" && continue
     [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{4,}$ ]] || continue
     printf "%s\t%s\n" "${#token}" "$token"
   done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }') |
@@ -1378,27 +1427,61 @@ is_synthesis_junk_line() {
 }
 
 token_overlap_score() {
-  local haystack="$1" tokens="$2" token score=0
+  local haystack="$1" tokens="$2" token score=0 spaced pat
   haystack="${haystack,,}"
   haystack="${haystack//_/-}"
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     token="${token,,}"
     token="${token//_/-}"
-    [[ -n "$token" && "$haystack" == *"$token"* ]] && score=$((score + 1))
+    token="${token// /-}"
+    [[ -n "$token" ]] || continue
+    if [[ "$token" == *-* ]]; then
+      spaced="${token//-/ }"
+      if [[ "$haystack" == *"$token"* || "$haystack" == *"$spaced"* ]]; then
+        score=$((score + 1))
+      fi
+    else
+      # ponytail: hyphen is a word char so leftover "identity" does not match azure-identity
+      pat='(^|[^[:alnum:]-])'"$token"'([^[:alnum:]-]|$)'
+      [[ "$haystack" =~ $pat ]] && score=$((score + 1))
+    fi
   done <<< "$tokens"
   printf '%s\n' "$score"
 }
 
+overlap_accepts_candidate() {
+  local haystack="$1" distinctive="$2" phrases="$3"
+  local phrase_score=0 distinctive_score=0 token
+  if [[ -n "${phrases//[[:space:]]/}" ]]; then
+    phrase_score="$(token_overlap_score "$haystack" "$phrases")"
+    [[ "$phrase_score" =~ ^[[:digit:]]+$ ]] && ((phrase_score > 0)) && return 0
+  fi
+  while IFS= read -r token; do
+    [[ -n "$token" && "$token" == *-* ]] || continue
+    distinctive_score="$(token_overlap_score "$haystack" "$token")"
+    [[ "$distinctive_score" =~ ^[[:digit:]]+$ ]] && ((distinctive_score > 0)) && return 0
+  done <<< "$distinctive"
+  distinctive_score="$(token_overlap_score "$haystack" "$distinctive")"
+  [[ "$distinctive_score" =~ ^[[:digit:]]+$ ]] || return 1
+  [[ -z "${phrases//[[:space:]]/}" ]] && ((distinctive_score > 0))
+}
+
 recover_distinctive_source_locations() {
   local deadline_ns="${1:-}" token variant rg_command hit file rest line_number text
-  local relative location score tokens="" score_tokens="" seen_tokens=$'\n' count=0 ranked=""
+  local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked=""
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
+    phrase_tokens+="$token"$'\n'
+    score_tokens+="$token"$'\n'
+  done < <(question_phrase_tokens "${question:-}")
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
     [[ "$seen_tokens" == *$'\n'"$token"$'\n'* ]] && continue
     seen_tokens+="$token"$'\n'
+    distinctive_tokens+="$token"$'\n'
     score_tokens+="$token"$'\n'
     tokens+="$token"$'\n'
     variant="${token//-/_}"
@@ -1406,6 +1489,18 @@ recover_distinctive_source_locations() {
     count=$((count + 1))
     ((count < 8)) || break
   done < <(search_distinctive_tokens "${question:-}")
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    [[ "$seen_tokens" == *$'\n'"$token"$'\n'* ]] && continue
+    seen_tokens+="$token"$'\n'
+    tokens+="$token"$'\n'
+    variant="${token//-/_}"
+    [[ "$variant" == "$token" ]] || tokens+="$variant"$'\n'
+    variant="${token//-/ }"
+    [[ "$variant" == "$token" ]] || tokens+="$variant"$'\n'
+    extra=$((extra + 1))
+    ((extra < 4)) || break
+  done <<< "$phrase_tokens"
   [[ -n "$tokens" ]] || return 1
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
@@ -1424,8 +1519,8 @@ recover_distinctive_source_locations() {
       if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
         relative="$(basename -- "$file")"
       fi
+      overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || continue
       score="$(token_overlap_score "$relative $text" "$score_tokens")"
-      [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) || continue
       ranked+="$score"$'\t'"$relative:$line_number"$'\n'
     done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
         --glob "!drafts/**" --glob "!docs/plans/**" \
@@ -1459,15 +1554,20 @@ format_located_answer() {
 }
 
 recover_bm25_source_locations() {
-  local require_overlap="${1:-false}"
-  local candidate file line_start text relative score score_tokens="" count=0
+  local candidate file line_start text relative score score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
   local candidates="${bm25_candidates:-}"
   [[ -n "${candidates//[[:space:]]/}" ]] || return 1
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
+    phrase_tokens+="$token"$'\n'
+    score_tokens+="$token"$'\n'
+  done < <(question_phrase_tokens "${question:-}")
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    distinctive_tokens+="$token"$'\n'
     score_tokens+="$token"$'\n'
   done < <(search_distinctive_tokens "${question:-}")
-  if [[ "$require_overlap" == true && -z "${score_tokens//[[:space:]]/}" ]]; then
+  if [[ -z "${score_tokens//[[:space:]]/}" ]]; then
     return 1
   fi
   while IFS= read -r candidate; do
@@ -1498,26 +1598,19 @@ recover_bm25_source_locations() {
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
       relative="$(basename -- "$file")"
     fi
-    if [[ "$require_overlap" == true ]]; then
-      score="$(token_overlap_score "$relative $text" "$score_tokens")"
-      [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) || continue
-    fi
-    printf '%s:%s\n' "$relative" "$line_start"
-    count=$((count + 1))
-    ((count < 4)) || break
+    overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || continue
+    score="$(token_overlap_score "$relative $text" "$score_tokens")"
+    ranked+="$score"$'\t'"$relative:$line_start"$'\n'
   done <<< "$candidates"
-  ((count > 0))
+  [[ -n "$ranked" ]] || return 1
+  printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
 }
 
 emit_synthesized_source_answer() {
-  local recovered q="${question,,}"
-  recovered="$(recover_bm25_source_locations true)" || recovered=""
+  local recovered
+  recovered="$(recover_bm25_source_locations)" || recovered=""
   if [[ -z "${recovered//[[:space:]]/}" ]]; then
     recovered="$(recover_distinctive_source_locations "${1:-}")" || recovered=""
-  fi
-  if [[ -z "${recovered//[[:space:]]/}" &&
-        "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]]; then
-    recovered="$(recover_bm25_source_locations false)" || return 1
   fi
   format_located_answer "$recovered"
 }
@@ -2302,7 +2395,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
   if [[ "${named_symbol_recovery_required:-false}" == true &&
         "${recovered_from_candidates:-false}" != true ]]; then
     if question_needs_synthesized_answer "${question:-}" &&
-        output="$(recover_bm25_source_locations false)" &&
+        output="$(recover_bm25_source_locations)" &&
         output="$(format_located_answer "$output")"; then
       printf '%s' "$output"
       exit 0
@@ -2314,7 +2407,7 @@ fi
 if [[ "${recovered_from_candidates:-false}" != true ]]; then
   if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
     if question_needs_synthesized_answer "${question:-}" &&
-        output="$(recover_bm25_source_locations false)" &&
+        output="$(recover_bm25_source_locations)" &&
         output="$(format_located_answer "$output")"; then
       printf '%s' "$output"
       exit 0

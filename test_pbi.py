@@ -515,6 +515,49 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("location stamps", result.stderr)
         self.assertNotIn("no source locations found", result.stderr)
 
+    def test_where_are_question_rejects_unrelated_bm25_provider_hit(self) -> None:
+        # #123: leftover stopword survivors like provider/identity must not
+        # turn an unrelated BM25 hit into a source answer.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            unrelated = repo / "batch_runner.py"
+            unrelated.write_text(
+                "# bearer provider returned by agent.azure_identity_adapter\n"
+                "# token provider in the worker process (azure-identity caches\n"
+                "# Fail closed if a job's stored provider/base_url pair would leak\n"
+                "# provider's stored key is never paired with an off-host base_url\n"
+            )
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 1-4')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('batch_runner.py:1')\n"
+                "print('batch_runner.py:1')\n"
+                "print('batch_runner.py:1')\n"
+                "print('batch_runner.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where are provider request prefixes or API request bodies stored for cache identity",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("batch_runner.py", result.stdout)
+        self.assertNotIn("azure-identity", result.stdout)
+        self.assertNotIn("azure_identity", result.stdout)
+        self.assertIn("location stamps", result.stderr)
+
     def test_default_query_chat_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
