@@ -1068,6 +1068,8 @@ recover_timeout_location_from_bm25() {
   local best_score=-1 best_location="" first_compound_location="" match_token match_line
   local required_compounds="" append_audit_signal=false cache_key_signal=false
   local candidates="${bm25_candidates:-}" footer_candidates match_tokens deadline_ns="${2:-}"
+  # Synthesis-class questions need a quoted non-junk line, not a compact stamp.
+  question_needs_synthesized_answer "${question:-}" && return 1
   if [[ "${1:-false}" == true ]]; then
     required_compounds="$(fast_path_required_compounds "${question:-}")"
     if fast_path_requires_append_audit "${question:-}"; then
@@ -2073,7 +2075,14 @@ if ((status != 0)); then
     exit "$status"
   fi
   if planner_timeout_or_kill "$status"; then
-    if recover_timeout_search_from_candidates; then
+    if question_needs_synthesized_answer "${question:-}"; then
+      if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+        :
+      else
+        printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
+        exit "$status"
+      fi
+    elif recover_timeout_search_from_candidates; then
       :
     elif output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
       :

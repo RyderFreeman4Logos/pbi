@@ -380,6 +380,33 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("no source locations found", result.stderr)
         self.assertNotIn("timed out", result.stderr)
 
+    def test_why_question_fails_closed_when_only_junk_stamps_remain(self) -> None:
+        # Synthesis-class why/how questions must not succeed with leftover
+        # compact BM25 stamps after junk (LICENSE/Cargo.toml/*.md) is filtered.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            license_path = repo / "LICENSE"
+            license_path.write_text("Apache process changed terms\n" * 40)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {license_path}, Lines: 1-40')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Why can the hermetic guardian cutover readiness test report that the integrated guardian main process changed?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("LICENSE:1", result.stdout)
+        self.assertNotIn("Located in", result.stdout)
+
     def test_where_are_question_answers_from_source_when_chat_times_out(self) -> None:
         # #121: hyphenated source terms exist, but synthesis cannot finish
         # inside the existing chat budget. Timeout is not an answer.
