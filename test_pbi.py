@@ -270,6 +270,202 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
+    def test_default_question_synthesizes_source_answer_instead_of_bm25_stamps(self) -> None:
+        answer = "The check is implemented by exact_reuse_receipt in receipt.py:1."
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "receipt.py"
+            source.write_text("def exact_reuse_receipt():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('guardian cutover readiness')\n"
+                "    print('integrated guardian process')\n"
+                "    print('hermetic readiness report')\n"
+                "    print('deploy config isolation')\n"
+                "    print('exact reuse receipt')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                f"    print({answer!r})\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "Why can the hermetic guardian cutover readiness test report that the integrated guardian main process changed?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            self.assertTrue(trace.exists(), "a default question must synthesize after BM25-only stamps")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{answer}\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_why_question_answers_from_source_when_chat_omits_locations(self) -> None:
+        # #120: BM25 hits exist, but chat returns location-less prose. A
+        # fail-closed diagnostic is not a source-grounded answer.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "distractor.py").write_text("def unrelated():\n    return True\n")
+            (repo / "LICENSE").write_text("Apache process changed terms\n" * 40)
+            (repo / "Cargo.toml").write_text("[workspace]\nmembers = [\"guardian\"]\n")
+            source = repo / "cutover-guardian.sh"
+            source.write_text(
+                "#!/bin/sh\n"
+                'attestation_error="integrated guardian main process changed"\n'
+            )
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            distractor = repo / "distractor.py"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {distractor}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('guardian process')\n"
+                "    print('cutover readiness')\n"
+                "    print('deploy config')\n"
+                "    print('hermetic report')\n"
+                "    print('isolate tests')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('The guardian process changed because pids differ.')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "Why can the hermetic guardian cutover readiness test report that the integrated guardian main process changed?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            result.stdout.startswith("Located in "),
+            result.stdout,
+        )
+        self.assertNotRegex(
+            result.stdout,
+            r"^Located in [^:]+:\d+(, [^:]+:\d+)*\.\n?\Z",
+            result.stdout,
+        )
+        self.assertIn("cutover-guardian.sh", result.stdout)
+        self.assertRegex(result.stdout, r"cutover-guardian\.sh:\d+")
+        self.assertIn("attestation_error", result.stdout)
+        self.assertIn("integrated guardian main process changed", result.stdout)
+        self.assertNotIn("LICENSE:", result.stdout)
+        self.assertNotIn("Cargo.toml:", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("no source locations found", result.stderr)
+        self.assertNotIn("timed out", result.stderr)
+
+    def test_why_question_fails_closed_when_only_junk_stamps_remain(self) -> None:
+        # Synthesis-class why/how questions must not succeed with leftover
+        # compact BM25 stamps after junk (LICENSE/Cargo.toml/*.md) is filtered.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            license_path = repo / "LICENSE"
+            license_path.write_text("Apache process changed terms\n" * 40)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {license_path}, Lines: 1-40')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Why can the hermetic guardian cutover readiness test report that the integrated guardian main process changed?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("LICENSE:1", result.stdout)
+        self.assertNotIn("Located in", result.stdout)
+
+    def test_where_are_question_answers_from_source_when_chat_times_out(self) -> None:
+        # #121: hyphenated source terms exist, but synthesis cannot finish
+        # inside the existing chat budget. Timeout is not an answer.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            tests = repo / "tests"
+            tests.mkdir(parents=True)
+            (repo / "distractor.py").write_text("def unrelated():\n    return True\n")
+            receipt = tests / "quality-gate-receipt-tests.sh"
+            receipt.write_text("run_exact_reuse() {\n  echo exact-reuse\n}\n")
+            isolation = tests / "quality-gate-isolation-tests.sh"
+            isolation.write_text("ambient-inputs)\n  isolate_ambient_inputs\n")
+            env, _ = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            distractor = repo / "distractor.py"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {distractor}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "Where are the quality-gate exact-reuse receipt contract test, the shared receipt helper it exercises, and the ambient-inputs isolation implementation?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            result.stdout.startswith("Located in "),
+            result.stdout,
+        )
+        self.assertNotRegex(
+            result.stdout,
+            r"^Located in [^:]+:\d+(, [^:]+:\d+)*\.\n?\Z",
+            result.stdout,
+        )
+        self.assertTrue(
+            "quality-gate-receipt-tests.sh" in result.stdout
+            or "quality-gate-isolation-tests.sh" in result.stdout,
+            result.stdout,
+        )
+        self.assertRegex(result.stdout, r"quality-gate-[^:]+\.sh:\d+")
+        self.assertTrue(
+            "run_exact_reuse" in result.stdout or "isolate_ambient_inputs" in result.stdout,
+            result.stdout,
+        )
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("timed out", result.stderr)
+        self.assertNotIn("no source locations found", result.stderr)
+        self.assertLess(elapsed, 6)
+
     def test_default_query_chat_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
