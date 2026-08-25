@@ -245,6 +245,17 @@ run_rg_with_deadline() {
   fi
 }
 
+run_sed_with_deadline() {
+  local deadline_ns="$1" timeout_seconds
+  shift
+  if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
+    timeout_seconds="$(fast_path_remaining_timeout "$deadline_ns" 100000000)" || return 124
+    timeout --kill-after=0.1s "$timeout_seconds" sed "$@"
+  else
+    sed "$@"
+  fi
+}
+
 is_stamp_location() {
   [[ "$1" != /* && "$1" =~ ^(([^:/[:space:]]+([ ][^:/[:space:]]+)?/[^:]+|[^:/[:space:]]+[ ][^:/[:space:]]+\.[A-Za-z0-9]+|[^:[:space:]]+):(1|line))$ ]]
 }
@@ -1356,8 +1367,14 @@ run_default_bm25_fast_path() {
   if question_needs_synthesized_answer "${question:-}"; then
     if output="$(emit_synthesized_source_answer "$deadline_ns")" &&
         [[ -n "${output//[[:space:]]/}" ]]; then
+      fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
       printf '%s' "$output"
       return 0
+    fi
+    fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
+    if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] &&
+        ! fast_path_remaining_timeout "$deadline_ns" 100000000 >/dev/null; then
+      fast_path_fail_closed
     fi
   fi
   if output="$(recover_timeout_location_from_bm25 true "$deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
@@ -1519,8 +1536,8 @@ recover_distinctive_source_locations() {
       if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
         relative="$(basename -- "$file")"
       fi
-      overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || continue
-      score="$(token_overlap_score "$relative $text" "$score_tokens")"
+      overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+      score="$(token_overlap_score "$text" "$score_tokens")"
       ranked+="$score"$'\t'"$relative:$line_number"$'\n'
     done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
         --glob "!drafts/**" --glob "!docs/plans/**" \
@@ -1532,15 +1549,18 @@ recover_distinctive_source_locations() {
 }
 
 format_located_answer() {
-  local locations="$1" line file line_number text joined=""
+  local locations="$1" deadline_ns="${2:-}" line file line_number text joined=""
   [[ -n "${locations//[[:space:]]/}" ]] || return 1
+  fast_path_deadline_reached "$deadline_ns" && return 1
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
+    fast_path_deadline_reached "$deadline_ns" && return 1
     file="${line%:*}"
     line_number="${line##*:}"
     [[ "$line_number" =~ ^[[:digit:]]+$ && -f "$file" ]] || continue
     is_synthesis_junk_path "$file" && continue
-    text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
+    text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null || true)"
+    fast_path_deadline_reached "$deadline_ns" && return 1
     text="${text#"${text%%[![:space:]]*}"}"
     [[ -n "$text" ]] || continue
     is_synthesis_junk_line "$text" && continue
@@ -1549,14 +1569,16 @@ format_located_answer() {
     fi
     joined+="${joined:+ }The source shows ${text} (${line})."
   done <<< "$locations"
+  fast_path_deadline_reached "$deadline_ns" && return 1
   [[ -n "$joined" ]] || return 1
   printf '%s\n' "$joined"
 }
 
 recover_bm25_source_locations() {
-  local candidate file line_start text relative score score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
+  local deadline_ns="${1:-}" candidate file line_start text relative score score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
   local candidates="${bm25_candidates:-}"
   [[ -n "${candidates//[[:space:]]/}" ]] || return 1
+  fast_path_deadline_reached "$deadline_ns" && return 1
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     phrase_tokens+="$token"$'\n'
@@ -1571,6 +1593,7 @@ recover_bm25_source_locations() {
     return 1
   fi
   while IFS= read -r candidate; do
+    fast_path_deadline_reached "$deadline_ns" && return 1
     if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
       if [[ "$file" =~ ^(.+),[[:space:]]Lines:[[:space:]]+([[:digit:]]+)(-([[:digit:]]+))?$ ]]; then
@@ -1590,7 +1613,11 @@ recover_bm25_source_locations() {
     [[ -f "$file" ]] || continue
     is_synthesis_junk_path "$file" && continue
     [[ "$line_start" =~ ^[[:digit:]]+$ ]] || continue
-    text="$(sed -n "${line_start}p" "$file" 2>/dev/null || true)"
+    if ! text="$(run_sed_with_deadline "$deadline_ns" -n "${line_start}p" "$file" 2>/dev/null)"; then
+      [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] && return 1
+      text=""
+    fi
+    fast_path_deadline_reached "$deadline_ns" && return 1
     text="${text#"${text%%[![:space:]]*}"}"
     [[ -n "$text" ]] || continue
     is_synthesis_junk_line "$text" && continue
@@ -1598,21 +1625,28 @@ recover_bm25_source_locations() {
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
       relative="$(basename -- "$file")"
     fi
-    overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || continue
-    score="$(token_overlap_score "$relative $text" "$score_tokens")"
+    overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+    score="$(token_overlap_score "$text" "$score_tokens")"
     ranked+="$score"$'\t'"$relative:$line_start"$'\n'
   done <<< "$candidates"
+  fast_path_deadline_reached "$deadline_ns" && return 1
   [[ -n "$ranked" ]] || return 1
   printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
 }
 
 emit_synthesized_source_answer() {
-  local recovered
-  recovered="$(recover_bm25_source_locations)" || recovered=""
+  local deadline_ns="${1:-}" recovered
+  fast_path_deadline_reached "$deadline_ns" && return 1
+  recovered="$(recover_bm25_source_locations "$deadline_ns")" || recovered=""
+  fast_path_deadline_reached "$deadline_ns" && return 1
   if [[ -z "${recovered//[[:space:]]/}" ]]; then
-    recovered="$(recover_distinctive_source_locations "${1:-}")" || recovered=""
+    if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] && ! fast_path_remaining_timeout "$deadline_ns" 100000000 >/dev/null; then
+      return 1
+    fi
+    recovered="$(recover_distinctive_source_locations "$deadline_ns")" || recovered=""
   fi
-  format_located_answer "$recovered"
+  fast_path_deadline_reached "$deadline_ns" && return 1
+  format_located_answer "$recovered" "$deadline_ns"
 }
 
 repo_contains_named_symbol() {

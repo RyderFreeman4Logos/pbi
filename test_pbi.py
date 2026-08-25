@@ -558,6 +558,95 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("azure_identity", result.stdout)
         self.assertIn("location stamps", result.stderr)
 
+    def test_where_are_question_rejects_path_only_overlap_on_unrelated_line(self) -> None:
+        # #123: a filename matching the query phrase must not validate an
+        # unrelated quoted line (shebang / comment).
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "src" / "cache_identity.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("#!/usr/bin/env bash\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('src/cache_identity.py:1')\n"
+                "print('src/cache_identity.py:1')\n"
+                "print('src/cache_identity.py:1')\n"
+                "print('src/cache_identity.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where are provider request prefixes or API request bodies stored for cache identity",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("cache_identity.py", result.stdout)
+        self.assertNotIn("#!/usr/bin/env bash", result.stdout)
+        self.assertIn("location stamps", result.stderr)
+
+    def test_where_are_question_late_bm25_recovery_fails_closed_after_deadline(self) -> None:
+        # #123: BM25 synthesis must honor the absolute fast-path deadline.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "request_cache.py"
+            source.write_text(
+                "def store_request_prefix(payload):\n"
+                "    return hash((prefix, payload))\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            real_sed = shutil.which("sed")
+            self.assertIsNotNone(real_sed)
+            fake_sed = directory / "sed"
+            fake_sed.write_text(
+                "#!/usr/bin/env bash\n"
+                "sleep 2\n"
+                f"exec {real_sed} \"$@\"\n"
+            )
+            fake_sed.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(
+                binary.read_text().replace(
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="1"',
+                )
+            )
+            binary.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where are provider request prefixes or API request bodies stored for cache identity",
+                env=env,
+                cwd=repo,
+                binary=binary,
+                timeout=4,
+            )
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("store_request_prefix", result.stdout)
+        self.assertNotIn("request_cache.py", result.stdout)
+        self.assertIn("location stamps", result.stderr)
+        self.assertFalse(trace.exists(), "deadline expiry must not invoke planner/chat")
+        self.assertLess(elapsed, 2.4)
+
     def test_default_query_chat_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
