@@ -665,9 +665,16 @@ question_is_multi_target_where() {
 }
 
 question_needs_synthesized_answer() {
-  local q="${1,,}"
-  [[ "$q" =~ (^|[[:space:]])(why|how|explain)([[:space:]]|$) ]] ||
-    question_is_multi_target_where "$1"
+  local q="${1,,}" token
+  [[ "$q" =~ (^|[[:space:]])(why|how|explain)([[:space:]]|$) ]] && return 0
+  question_is_multi_target_where "$1" && return 0
+  [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]] || return 1
+  # Identifier-style where-are lookups stay compact path:line.
+  [[ -n "$(search_named_symbols "$1")" ]] && return 1
+  while IFS= read -r token; do
+    [[ "$token" == *-* ]] && return 1
+  done < <(search_distinctive_tokens "$1")
+  return 0
 }
 
 build_fast_path_queries() {
@@ -1451,9 +1458,67 @@ format_located_answer() {
   printf '%s\n' "$joined"
 }
 
+recover_bm25_source_locations() {
+  local require_overlap="${1:-false}"
+  local candidate file line_start text relative score score_tokens="" count=0
+  local candidates="${bm25_candidates:-}"
+  [[ -n "${candidates//[[:space:]]/}" ]] || return 1
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    score_tokens+="$token"$'\n'
+  done < <(search_distinctive_tokens "${question:-}")
+  if [[ "$require_overlap" == true && -z "${score_tokens//[[:space:]]/}" ]]; then
+    return 1
+  fi
+  while IFS= read -r candidate; do
+    if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
+      file="${BASH_REMATCH[1]}"
+      if [[ "$file" =~ ^(.+),[[:space:]]Lines:[[:space:]]+([[:digit:]]+)(-([[:digit:]]+))?$ ]]; then
+        file="${BASH_REMATCH[1]}"
+        line_start="${BASH_REMATCH[2]}"
+      else
+        file="${file%%, Lines:*}"
+        line_start=1
+      fi
+    elif [[ "$candidate" =~ ^(.+):([[:digit:]]+)$ ]]; then
+      file="${BASH_REMATCH[1]}"
+      line_start="${BASH_REMATCH[2]}"
+    else
+      continue
+    fi
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    [[ -f "$file" ]] || continue
+    is_synthesis_junk_path "$file" && continue
+    [[ "$line_start" =~ ^[[:digit:]]+$ ]] || continue
+    text="$(sed -n "${line_start}p" "$file" 2>/dev/null || true)"
+    text="${text#"${text%%[![:space:]]*}"}"
+    [[ -n "$text" ]] || continue
+    is_synthesis_junk_line "$text" && continue
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
+      relative="$(basename -- "$file")"
+    fi
+    if [[ "$require_overlap" == true ]]; then
+      score="$(token_overlap_score "$relative $text" "$score_tokens")"
+      [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) || continue
+    fi
+    printf '%s:%s\n' "$relative" "$line_start"
+    count=$((count + 1))
+    ((count < 4)) || break
+  done <<< "$candidates"
+  ((count > 0))
+}
+
 emit_synthesized_source_answer() {
-  local recovered
-  recovered="$(recover_distinctive_source_locations "${1:-}")" || return 1
+  local recovered q="${question,,}"
+  recovered="$(recover_bm25_source_locations true)" || recovered=""
+  if [[ -z "${recovered//[[:space:]]/}" ]]; then
+    recovered="$(recover_distinctive_source_locations "${1:-}")" || recovered=""
+  fi
+  if [[ -z "${recovered//[[:space:]]/}" &&
+        "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]]; then
+    recovered="$(recover_bm25_source_locations false)" || return 1
+  fi
   format_located_answer "$recovered"
 }
 
@@ -2236,12 +2301,24 @@ if [[ "$explore_uses_local_model" == true ]]; then
   fi
   if [[ "${named_symbol_recovery_required:-false}" == true &&
         "${recovered_from_candidates:-false}" != true ]]; then
+    if question_needs_synthesized_answer "${question:-}" &&
+        output="$(recover_bm25_source_locations false)" &&
+        output="$(format_located_answer "$output")"; then
+      printf '%s' "$output"
+      exit 0
+    fi
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi
 fi
 if [[ "${recovered_from_candidates:-false}" != true ]]; then
   if is_stamp_dump "$output" || has_mixed_stamp_junk "$output"; then
+    if question_needs_synthesized_answer "${question:-}" &&
+        output="$(recover_bm25_source_locations false)" &&
+        output="$(format_located_answer "$output")"; then
+      printf '%s' "$output"
+      exit 0
+    fi
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi

@@ -466,6 +466,55 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("no source locations found", result.stderr)
         self.assertLess(elapsed, 6)
 
+    def test_where_are_question_quotes_bm25_source_instead_of_stamps(self) -> None:
+        # #123: a natural-language where-are question whose BM25 hits include
+        # real source must quote a cited line. Stamp-only fail-closed is not
+        # an answer, even when distinctive-token rg cannot see the hit.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "request_cache.py"
+            source.write_text(
+                "def store_request_prefix(payload):\n"
+                "    return hash((prefix, payload))\n"
+            )
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('request_cache.py:1')\n"
+                "print('request_cache.py:1')\n"
+                "print('request_cache.py:1')\n"
+                "print('request_cache.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where are provider request prefixes or API request bodies stored for cache identity",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(result.stdout.startswith("Located in "), result.stdout)
+        self.assertNotRegex(
+            result.stdout,
+            r"^Located in [^:]+:\d+(, [^:]+:\d+)*\.\n?\Z",
+            result.stdout,
+        )
+        self.assertIn("request_cache.py", result.stdout)
+        self.assertRegex(result.stdout, r"request_cache\.py:\d+")
+        self.assertIn("store_request_prefix", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("location stamps", result.stderr)
+        self.assertNotIn("no source locations found", result.stderr)
+
     def test_default_query_chat_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
