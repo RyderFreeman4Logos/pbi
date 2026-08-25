@@ -657,6 +657,12 @@ fast_path_match_variants() {
   done < <(search_distinctive_tokens "$1")
 }
 
+question_needs_synthesized_answer() {
+  local q="${1,,}"
+  [[ "$q" =~ (^|[[:space:]])(why|how|explain)([[:space:]]|$) ]] ||
+    [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]]
+}
+
 build_fast_path_queries() {
   local token is_stem normalized fallback_token queries="" fallback_queries="" count=0 fallback_count=0
   if fast_path_requires_cache_key "$1"; then
@@ -1201,7 +1207,8 @@ run_default_bm25_fast_path() {
     search_fallback_locations=""
     output=""
     recovered_from_candidates=false
-    if output="$(recover_named_file_claims "$deadline_ns" "${named_files[@]}")"; then
+    if output="$(recover_named_file_claims "$deadline_ns" "${named_files[@]}")" &&
+        [[ -n "${output//[[:space:]]/}" ]]; then
       fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
       printf '%s\n' "$output"
       return 0
@@ -1277,16 +1284,23 @@ run_default_bm25_fast_path() {
       recovered_named_locations+="$candidate_locations"
     fi
   done <<<"$candidate_symbols"
-  if [[ -n "$recovered_named_locations" ]]; then
+  if [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
     printf '%s\n' "$recovered_named_locations"
     return 0
   fi
-  if output="$(recover_timeout_location_from_bm25 true "$deadline_ns")" && [[ -n "$output" ]]; then
+  if output="$(recover_timeout_location_from_bm25 true "$deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
     fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
     printf '%s\n' "$output"
     return 0
   fi
-  fast_path_fail_closed
+  if [[ -z "${bm25_candidates//[[:space:]]/}" ]] || ! question_needs_synthesized_answer "${question:-}"; then
+    fast_path_fail_closed
+    return 1
+  fi
+  search_uses_local_model=false
+  output=""
+  recovered_from_candidates=false
+  return 1
 }
 
 recover_named_symbol_definition() {
@@ -1784,6 +1798,9 @@ else
     exit 1
   fi
   planner_timed_out=false
+  if question_needs_synthesized_answer "$question"; then
+    planned_queries="$question"
+  else
   run_planner --force-provider openai --model-name "$primary_model" \
       --message "Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: $question" \
       --max-iterations 1
@@ -1822,6 +1839,7 @@ else
   else
       printf '%s\n' 'pbi: local query planning failed' >&2
       exit 1
+  fi
   fi
   candidates=""
   while IFS= read -r planned_query; do
@@ -1864,6 +1882,7 @@ else
     exit 1
   fi
   attempted_queries="$planned_queries"
+  if ! question_needs_synthesized_answer "$question"; then
   for gap_round in 1 2; do
     run_planner --force-provider openai --model-name "$primary_model" \
         --message "Identify missing evidence needed to answer the question completely from source. This is refinement round $gap_round of 2. Return up to five new exact identifiers or short literal source phrases, one plain line each, targeting missing callers, callees, transformations, persistence, or result paths. Prefer distinctive symbols such as fn main, Cli::parse, or insert_record over generic words. Do not repeat an attempted query. Return NONE only when the excerpts directly establish the complete answer."$'\n\n'"Question: $question"$'\n\nSearches already tried:\n'"$attempted_queries"$'\n\nExisting excerpts:\n'"$candidates" \
@@ -1901,6 +1920,7 @@ else
       exit 1
     fi
     emit_bm25_locations_or_fail_closed
+  fi
   fi
   explore_uses_local_model=true
   chat_args=(

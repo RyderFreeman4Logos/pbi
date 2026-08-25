@@ -270,6 +270,50 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
+    def test_default_question_synthesizes_source_answer_instead_of_bm25_stamps(self) -> None:
+        answer = "The check is implemented by exact_reuse_receipt in receipt.py:1."
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "receipt.py"
+            source.write_text("def exact_reuse_receipt():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('guardian cutover readiness')\n"
+                "    print('integrated guardian process')\n"
+                "    print('hermetic readiness report')\n"
+                "    print('deploy config isolation')\n"
+                "    print('exact reuse receipt')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                f"    print({answer!r})\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "Why can the hermetic guardian cutover readiness test report that the integrated guardian main process changed?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            self.assertTrue(trace.exists(), "a default question must synthesize after BM25-only stamps")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{answer}\n")
+        self.assertEqual(result.stderr, "")
+
     def test_default_query_chat_signal_emits_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
