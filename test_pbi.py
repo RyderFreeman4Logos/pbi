@@ -595,8 +595,10 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("#!/usr/bin/env bash", result.stdout)
         self.assertIn("location stamps", result.stderr)
 
-    def test_where_are_question_late_bm25_recovery_fails_closed_after_deadline(self) -> None:
-        # #123: BM25 synthesis must honor the absolute fast-path deadline.
+    def test_where_are_question_late_bm25_recovery_emits_or_falls_through(self) -> None:
+        # #123: 8s bounds BM25 recovery reads. A relevant recovered line is
+        # still emitted, or planner/chat may still run. Stamp-only whole-command
+        # abort is the over-fix.
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
@@ -615,11 +617,17 @@ class PbiTest(unittest.TestCase):
             probe.chmod(0o755)
             real_sed = shutil.which("sed")
             self.assertIsNotNone(real_sed)
+            sed_count = directory / "sed-count"
             fake_sed = directory / "sed"
             fake_sed.write_text(
                 "#!/usr/bin/env bash\n"
-                "sleep 2\n"
-                f"exec {real_sed} \"$@\"\n"
+                f"count_file={sed_count}\n"
+                "n=0\n"
+                '[[ -f "$count_file" ]] && n=$(<"$count_file")\n'
+                "n=$((n + 1))\n"
+                'printf "%s\\n" "$n" > "$count_file"\n'
+                '[[ "$n" -eq 1 ]] && sleep 2\n'
+                f'exec {real_sed} "$@"\n'
             )
             fake_sed.chmod(0o755)
             binary = self.fake_pbi(directory, probe)
@@ -639,12 +647,16 @@ class PbiTest(unittest.TestCase):
                 timeout=4,
             )
             elapsed = time.monotonic() - started
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(result.stdout, "")
-        self.assertNotIn("store_request_prefix", result.stdout)
-        self.assertNotIn("request_cache.py", result.stdout)
-        self.assertIn("location stamps", result.stderr)
-        self.assertFalse(trace.exists(), "deadline expiry must not invoke planner/chat")
+        recovered = (
+            result.returncode == 0
+            and "store_request_prefix" in result.stdout
+            and "request_cache.py" in result.stdout
+        )
+        self.assertTrue(
+            recovered or trace.exists(),
+            f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+        self.assertNotIn("location stamps", result.stderr)
         self.assertLess(elapsed, 2.4)
 
     def test_default_query_chat_signal_emits_diagnostic(self) -> None:
