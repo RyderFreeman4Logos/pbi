@@ -595,6 +595,213 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("#!/usr/bin/env bash", result.stdout)
         self.assertIn("location stamps", result.stderr)
 
+    def test_where_does_question_emits_from_relevant_bm25_hits(self) -> None:
+        # #126: relevant quoted-line BM25 hits must become a source answer.
+        # Falling through to planner/chat just to time out empty is the fail.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "review_bypass.py"
+            source.write_text(
+                "def accept_native_review_bypass_evidence(payload):\n"
+                "    return payload\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where does native review bypass evidence get accepted",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("review_bypass.py", result.stdout)
+        self.assertIn("accept_native_review_bypass_evidence", result.stdout)
+        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "in-hand quoted-line hits must not start planner")
+        self.assertNotIn("timed out", result.stderr)
+        self.assertLess(elapsed, 6)
+
+    def test_where_does_question_emits_hyphenated_identifier_overlap(self) -> None:
+        # #126 live: "native review bypass" must match native_bypass_reason /
+        # native-review-bypass.sh. A line without the leftover word "evidence"
+        # is still a relevant quoted hit.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "workflow.toml"
+            source.write_text(
+                'if native_bypass_reason="$(bash native-review-bypass.sh)"; then\n'
+                "    return 0\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "where does pr-bot Step 10b accept native review bypass evidence",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("workflow.toml", result.stdout)
+        self.assertIn("native-review-bypass.sh", result.stdout)
+        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "in-hand quoted-line hits must not start planner")
+        self.assertLess(elapsed, 6)
+
+    def test_which_question_rejects_type_name_only_import_list(self) -> None:
+        # #130: a type-name-only / import-list hit is not a relevant answer
+        # for a which-test-module question.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "migration_framework.rs"
+            source.write_text("\n" * 138 + "    WorkflowRun,\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 139-139')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Which test module covers WorkflowRun wire serialization",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertNotIn("WorkflowRun,", result.stdout)
+        self.assertNotIn("migration_framework.rs:139", result.stdout)
+        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
+        if result.returncode == 0:
+            self.assertNotIn("The source shows WorkflowRun,", result.stdout)
+            self.assertEqual(result.stderr, "")
+        else:
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(trace.exists() and "timed out" in result.stderr)
+
+    def test_find_question_emits_from_named_path_quoted_line(self) -> None:
+        # #129: a Find/path question with a relevant quoted line in the named
+        # file must emit that line, not fall through to a planner timeout.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            named = repo / "patterns" / "pr-bot" / "scripts" / "csa"
+            named.mkdir(parents=True)
+            source = named / "session-wait-until-done.sh"
+            source.write_text(
+                "#!/usr/bin/env bash\n"
+                'echo "usage: session-wait-until-done.sh <session-id>" >&2\n'
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                "Find patterns/pr-bot/scripts/csa/session-wait-until-done.sh, all direct callers, and its regression tests.",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("session-wait-until-done.sh", result.stdout)
+        self.assertIn("usage:", result.stdout)
+        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "in-hand quoted-line hits must not start planner")
+        self.assertLess(elapsed, 6)
+
+    def test_where_does_question_late_bm25_recovery_falls_through(self) -> None:
+        # #126: 8s bounds BM25 recovery reads only. A late recovery on a
+        # non-synthesis question must fall through to planner/chat instead of
+        # aborting the whole command with the stamp diagnostic.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "review_bypass.py"
+            source.write_text(
+                "def accept_native_review_bypass_evidence(payload):\n"
+                "    return payload\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            real_sed = shutil.which("sed")
+            self.assertIsNotNone(real_sed)
+            sed_count = directory / "sed-count"
+            fake_sed = directory / "sed"
+            fake_sed.write_text(
+                "#!/usr/bin/env bash\n"
+                f"count_file={sed_count}\n"
+                "n=0\n"
+                '[[ -f "$count_file" ]] && n=$(<"$count_file")\n'
+                "n=$((n + 1))\n"
+                'printf "%s\\n" "$n" > "$count_file"\n'
+                '[[ "$n" -eq 1 ]] && sleep 2\n'
+                f'exec {real_sed} "$@"\n'
+            )
+            fake_sed.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(
+                binary.read_text().replace(
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="1"',
+                )
+            )
+            binary.chmod(0o755)
+            result = self.run_pbi(
+                "where does native review bypass evidence get accepted",
+                env=env,
+                cwd=repo,
+                binary=binary,
+                timeout=4,
+            )
+            planner_started = trace.exists()
+        recovered = (
+            result.returncode == 0
+            and "accept_native_review_bypass_evidence" in result.stdout
+            and "review_bypass.py" in result.stdout
+        )
+        self.assertTrue(
+            recovered or planner_started,
+            f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+        self.assertNotIn("location stamps", result.stderr)
+        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
+
     def test_where_are_question_late_bm25_recovery_emits_or_falls_through(self) -> None:
         # #123: 8s bounds BM25 recovery reads. A relevant recovered line is
         # still emitted, or planner/chat may still run. Stamp-only whole-command
@@ -946,23 +1153,23 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(probe_query, "searched")
         self.assertFalse(planner_started)
 
-    def test_default_query_post_bm25_recovery_stays_inside_absolute_deadline(self) -> None:
+    def test_default_query_post_bm25_recovery_falls_through_after_deadline(self) -> None:
+        # #126: 8s bounds BM25 recovery reads only. A late named-symbol rg
+        # that cannot recover from the BM25 hit must fall through.
         symbol = "TargetSymbol"
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
             repo.mkdir()
-            source = repo / "target.py"
-            source.write_text(f"class {symbol}: pass\n")
+            (repo / "unrelated.py").write_text("pass\n")
             env, trace = self.fake_environment(directory)
             env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
-                "import sys, time\n"
+                "import sys\n"
                 "if '--dry-run' in sys.argv:\n"
-                "    time.sleep(0.75)\n"
-                f"    print('File: {source}, Lines: 1-1')\n"
+                "    print('File: unrelated.py, Lines: 1-1')\n"
             )
             probe.chmod(0o755)
             slow_rg = directory / "rg"
@@ -976,16 +1183,12 @@ class PbiTest(unittest.TestCase):
                 )
             )
             binary.chmod(0o755)
-            started = time.monotonic()
             result = self.run_pbi(
                 "where", "is", symbol, env=env, cwd=repo, binary=binary, timeout=4
             )
-            elapsed = time.monotonic() - started
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("no source", result.stderr)
-        self.assertFalse(trace.exists(), "deadline expiry must not invoke planner/chat")
-        self.assertLess(elapsed, 1.8)
+            planner_started = trace.exists()
+        self.assertTrue(planner_started, "late BM25 recovery must fall through to planner/chat")
+        self.assertNotIn("location stamps", result.stderr)
 
     def test_default_query_term_resistant_initial_probe_fits_absolute_deadline(self) -> None:
         # #118 absolute deadline: the initial BM25 probe search plus its
@@ -1193,7 +1396,7 @@ class PbiTest(unittest.TestCase):
                     time.sleep(.01)
         self.assertNotEqual(result.returncode, 0)
         self.assertLess(elapsed, 1.8)
-        self.assertFalse(trace.exists())
+        self.assertNotIn("location stamps", result.stderr)
 
     def test_default_query_named_recovery_succeeds_before_absolute_deadline(self) -> None:
         symbol = "TargetSymbol"
@@ -1368,11 +1571,11 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
                 timeout=4,
             )
-            planner_trace = directory / "trace.json"
+            planner_started = (directory / "trace.json").exists()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
-        self.assertFalse(planner_trace.exists(), "a BM25 miss must not start the planner")
+        self.assertNotIn("location stamps", result.stderr)
+        self.assertTrue(planner_started, "unrelated BM25 leftovers must fall through")
         self.assertNotIn("unrelated.py:", result.stdout + result.stderr)
 
     def test_default_query_timeout_recovers_named_symbol_definitions(self) -> None:
@@ -1976,6 +2179,64 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("SEARCH_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("PLANNER_SENTINEL", result.stdout + result.stderr)
 
+    def test_default_query_lone_non_one_stamp_is_not_success(self) -> None:
+        # #126/#130: a lone path:line stamp, including non-1 lines, is never
+        # rc=0 stdout. Quote a relevant line or fail closed.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "run.py"
+            source.write_text("\n" * 129 + "class WorkflowRun: pass\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 130-130')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Which test module covers WorkflowRun wire serialization",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.stdout.strip(), "run.py:130")
+        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
+        if result.returncode == 0:
+            self.assertIn("run.py", result.stdout)
+            self.assertIn("WorkflowRun", result.stdout)
+            self.assertIn("class WorkflowRun", result.stdout)
+            self.assertEqual(result.stderr, "")
+        else:
+            self.assertEqual(result.stdout, "")
+            self.assertIn("location stamps", result.stderr)
+
+    def test_find_question_lone_stamp_is_not_success(self) -> None:
+        # #126/#129: a Find/path question must not succeed with a lone
+        # file:line stamp. Quote a relevant line or fail closed / fall through.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            unrelated = repo / "review_cmd_prose_findings.rs"
+            unrelated.write_text("\n" * 249 + "fn session_wait_until_done() {}\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 250-250')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Find patterns/pr-bot/scripts/csa/session-wait-until-done.sh, all direct callers, and its regression tests.",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertNotEqual(result.stdout.strip(), "review_cmd_prose_findings.rs:250")
+        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
+
     def test_question_stamp_only_model_answer_fails_closed(self) -> None:
         # #12: a local-model "answer" that is only raw BM25 `path:1` stamps
         # (the model mirroring the candidate echo) must not count as success.
@@ -2201,9 +2462,9 @@ class PbiTest(unittest.TestCase):
                     cwd=ROOT,
                     binary=self.fake_pbi(directory, directory / "probe"),
                 )
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(result.stdout, "")
-            self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(answer, result.stdout)
+            self.assertEqual(result.stderr, "")
 
     def test_no_colon_warning_only_stdout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4885,7 +5146,7 @@ class PbiTest(unittest.TestCase):
             else:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
-                self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+                self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
 
     def make_install_source(self, directory: Path) -> tuple[Path, str]:
         checkout = directory / "source-checkout"

@@ -260,6 +260,16 @@ is_stamp_location() {
   [[ "$1" != /* && "$1" =~ ^(([^:/[:space:]]+([ ][^:/[:space:]]+)?/[^:]+|[^:/[:space:]]+[ ][^:/[:space:]]+\.[A-Za-z0-9]+|[^:[:space:]]+):(1|line))$ ]]
 }
 
+is_lone_path_line_stamp() {
+  local line saw=false
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != /* && "$line" =~ ^[^:[:space:]]+:[[:digit:]]+$ ]] || return 1
+    saw=true
+  done <<< "$1"
+  [[ "$saw" == true ]]
+}
+
 is_stamp_dump() {
   # True when every non-empty line is a bare relative `path:1` or `path:line`
   # stamp — the BM25 `File: ...Lines:` echo the model mirrors back instead of
@@ -620,19 +630,20 @@ question_phrase_tokens() {
     word="${word#\#}"
     word="${word%%[,:;.!?]*}"
     word_lower="${word,,}"
-    [[ "$word_lower" =~ ^[[:alpha:]][[:alnum:]_-]{2,}$ ]] || { prev=""; continue; }
-    if [[ -n "$prev" ]] && ! is_search_stopword "$word_lower"; then
+    [[ "$word_lower" =~ ^[[:alpha:]][[:alnum:]_-]{2,}$ ]] || continue
+    if is_search_stopword "$word_lower"; then
+      case "$word_lower" in
+        request|cache|key) prev="$word_lower" ;;
+      esac
+      continue
+    fi
+    if [[ -n "$prev" ]]; then
       case "$prev" in
         request)
           [[ "$word_lower" == prefix || "$word_lower" == prefixes ]] || { prev="$word_lower"; continue; }
           ;;
         cache)
           [[ "$word_lower" == identity || "$word_lower" == key || "$word_lower" == keys ]] || { prev="$word_lower"; continue; }
-          ;;
-        key) ;;
-        *)
-          prev="$word_lower"
-          continue
           ;;
       esac
       printf '%s-%s\n' "$prev" "$word_lower"
@@ -648,11 +659,22 @@ question_phrase_tokens() {
 }
 
 search_distinctive_tokens() {
-  local token token_lower
+  local token token_lower _path_rest _seg _stem
   search_named_symbols "$1"
   while IFS= read -r token; do
     token="${token#\#}"
     token="${token%%[,:;.!?]*}"
+    if [[ "$token" == */* ]]; then
+      _path_rest="$token"
+      while [[ "$_path_rest" == */* ]]; do
+        _seg="${_path_rest%%/*}"
+        _stem="${_seg%.*}"
+        [[ "$_stem" =~ ^[[:alnum:]]+-[[:alnum:]-]+$ ]] && printf '%s\n' "$_stem"
+        _path_rest="${_path_rest#*/}"
+      done
+      token="$_path_rest"
+    fi
+    [[ "$token" == *.* ]] && token="${token%.*}"
     [[ "$token" =~ ^[[:digit:]][[:digit:]][[:digit:]]*$ ||
        "$token" =~ ^[[:alnum:]]+-[[:alnum:]-]+$ ]] || continue
     printf "%s\n" "$token"
@@ -734,6 +756,15 @@ question_needs_synthesized_answer() {
   while IFS= read -r token; do
     [[ "$token" == *-* ]] && return 1
   done < <(search_distinctive_tokens "$1")
+  return 0
+}
+
+question_allows_compact_stamp() {
+  local q="${1,,}"
+  # Identifier / where-is lookups stay compact path:line. Synthesis and
+  # which/find/where-does questions must quote a line or fail closed.
+  question_needs_synthesized_answer "$1" && return 1
+  [[ "$q" =~ (^|[[:space:]])(which|find|where[[:space:]]+does)([[:space:]]|$) ]] && return 1
   return 0
 }
 
@@ -1285,11 +1316,9 @@ run_default_bm25_fast_path() {
     recovered_from_candidates=false
     if output="$(recover_named_file_claims "$deadline_ns" "${named_files[@]}")" &&
         [[ -n "${output//[[:space:]]/}" ]]; then
-      fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
       printf '%s\n' "$output"
       return 0
     fi
-    fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
     fast_path_fail_closed
     return 1
   fi
@@ -1345,24 +1374,13 @@ run_default_bm25_fast_path() {
       fast_path_timed_out=true
     fi
   done
-  # 8s bounds BM25 search/recovery reads, not the whole pbi command.
-  # Synthesis questions emit an in-hand answer or fall through to planner/chat.
-  fast_path_deadline_reached "$deadline_ns" &&
-    ! question_needs_synthesized_answer "${question:-}" &&
-    fast_path_fail_closed
+  # 8s bounds BM25 recovery reads only. In-hand answers emit; otherwise
+  # fall through to planner/chat instead of aborting the whole command.
   search_fallback_locations="$(compact_search_locations "$bm25_candidates" "" false "$deadline_ns")"
-  fast_path_deadline_reached "$deadline_ns" &&
-    ! question_needs_synthesized_answer "${question:-}" &&
-    fast_path_fail_closed
   recovered_named_locations=""
   candidate_symbols="$(search_named_symbols "${question:-}")"
-  fast_path_deadline_reached "$deadline_ns" &&
-    ! question_needs_synthesized_answer "${question:-}" &&
-    fast_path_fail_closed
   while IFS= read -r candidate_symbol; do
-    fast_path_deadline_reached "$deadline_ns" &&
-      ! question_needs_synthesized_answer "${question:-}" &&
-      fast_path_fail_closed
+    fast_path_deadline_reached "$deadline_ns" && break
     [[ -n "$candidate_symbol" ]] || continue
     candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" "$deadline_ns" || true)"
     if [[ -n "$candidate_locations" ]]; then
@@ -1371,10 +1389,17 @@ run_default_bm25_fast_path() {
     fi
   done <<<"$candidate_symbols"
   if [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
-    printf '%s\n' "$recovered_named_locations"
-    return 0
+    if question_allows_compact_stamp "${question:-}"; then
+      printf '%s\n' "$recovered_named_locations"
+      return 0
+    fi
+    if output="$(format_located_answer "$recovered_named_locations" "$deadline_ns")" &&
+        [[ -n "${output//[[:space:]]/}" ]]; then
+      printf '%s' "$output"
+      return 0
+    fi
   fi
-  if question_needs_synthesized_answer "${question:-}"; then
+  if ! question_allows_compact_stamp "${question:-}"; then
     if output="$(emit_synthesized_source_answer "$deadline_ns")" &&
         [[ -n "${output//[[:space:]]/}" ]]; then
       printf '%s' "$output"
@@ -1382,14 +1407,22 @@ run_default_bm25_fast_path() {
     fi
   fi
   if output="$(recover_timeout_location_from_bm25 true "$deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
-    fast_path_deadline_reached "$deadline_ns" && fast_path_fail_closed
-    printf '%s\n' "$output"
-    return 0
+    if question_allows_compact_stamp "${question:-}"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    if formatted="$(format_located_answer "$output" "$deadline_ns")" &&
+        [[ -n "${formatted//[[:space:]]/}" ]]; then
+      printf '%s' "$formatted"
+      return 0
+    fi
   fi
-  if [[ -z "${bm25_candidates//[[:space:]]/}" ]] || ! question_needs_synthesized_answer "${question:-}"; then
+  if [[ -z "${bm25_candidates//[[:space:]]/}" ]]; then
     fast_path_fail_closed
     return 1
   fi
+  # 8s bounds recovery reads only. Candidates without an in-hand answer
+  # fall through to planner/chat instead of aborting the command.
   search_uses_local_model=false
   output=""
   recovered_from_candidates=false
@@ -1444,7 +1477,9 @@ is_synthesis_junk_path() {
 }
 
 is_synthesis_junk_line() {
-  [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]]
+  [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]] && return 0
+  # Type-name-only / import-list item is not a behavior or test-module answer.
+  [[ "$1" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*,[[:space:]]*$ ]]
 }
 
 token_overlap_score() {
@@ -1579,7 +1614,7 @@ format_located_answer() {
 }
 
 recover_bm25_source_locations() {
-  local deadline_ns="${1:-}" candidate file line_start text relative score score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
+  local deadline_ns="${1:-}" candidate file line_start line_end line_scan_end line_number text relative score score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
   local candidates="${bm25_candidates:-}"
   [[ -n "${candidates//[[:space:]]/}" ]] || return 1
   fast_path_deadline_reached "$deadline_ns" && return 1
@@ -1606,37 +1641,46 @@ recover_bm25_source_locations() {
       if [[ "$file" =~ ^(.+),[[:space:]]Lines:[[:space:]]+([[:digit:]]+)(-([[:digit:]]+))?$ ]]; then
         file="${BASH_REMATCH[1]}"
         line_start="${BASH_REMATCH[2]}"
+        line_end="${BASH_REMATCH[4]:-$line_start}"
       else
         file="${file%%, Lines:*}"
         line_start=1
+        line_end=1
       fi
     elif [[ "$candidate" =~ ^(.+):([[:digit:]]+)$ ]]; then
       file="${BASH_REMATCH[1]}"
       line_start="${BASH_REMATCH[2]}"
+      line_end="$line_start"
     else
       continue
     fi
     [[ "$file" != /* ]] && file="$PWD/$file"
     [[ -f "$file" ]] || continue
     is_synthesis_junk_path "$file" && continue
-    [[ "$line_start" =~ ^[[:digit:]]+$ ]] || continue
-    if ! text="$(run_sed_with_deadline "$deadline_ns" -n "${line_start}p" "$file" 2>/dev/null)"; then
-      if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
-        [[ -n "$ranked" ]] && break
-        return 1
-      fi
-      text=""
-    fi
-    text="${text#"${text%%[![:space:]]*}"}"
-    [[ -n "$text" ]] || continue
-    is_synthesis_junk_line "$text" && continue
+    [[ "$line_start" =~ ^[[:digit:]]+$ && "$line_end" =~ ^[[:digit:]]+$ ]] || continue
+    # ponytail: scan at most 8 quoted lines from a BM25 range
+    line_scan_end="$line_end"
+    ((line_scan_end > line_start + 7)) && line_scan_end=$((line_start + 7))
     relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
       relative="$(basename -- "$file")"
     fi
-    overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
-    score="$(token_overlap_score "$text" "$score_tokens")"
-    ranked+="$score"$'\t'"$relative:$line_start"$'\n'
+    for ((line_number = line_start; line_number <= line_scan_end; line_number++)); do
+      if ! text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null)"; then
+        if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
+          [[ -n "$ranked" ]] && break 2
+          return 1
+        fi
+        text=""
+      fi
+      text="${text#"${text%%[![:space:]]*}"}"
+      [[ -n "$text" ]] || continue
+      is_synthesis_junk_line "$text" && continue
+      overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+      score="$(token_overlap_score "$text" "$score_tokens")"
+      ranked+="$score"$'\t'"$relative:$line_number"$'\n'
+      break
+    done
   done <<< "$candidates"
   [[ -n "$ranked" ]] || return 1
   printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
@@ -2110,6 +2154,12 @@ else
     fi
     exit 1
   fi
+  if ! question_allows_compact_stamp "$question"; then
+    if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+      printf '%s' "$output"
+      exit 0
+    fi
+  fi
   planner_timed_out=false
   if question_needs_synthesized_answer "$question"; then
     planned_queries="$(search_distinctive_tokens "$question")"
@@ -2130,8 +2180,15 @@ else
       fi
     done < <(search_named_symbols "$question")
     if [[ -n "$recovered_named_locations" ]]; then
-      printf '%s\n' "$recovered_named_locations"
-      exit 0
+      if question_allows_compact_stamp "$question"; then
+        printf '%s\n' "$recovered_named_locations"
+        exit 0
+      fi
+      if output="$(format_located_answer "$recovered_named_locations")" &&
+          [[ -n "${output//[[:space:]]/}" ]]; then
+        printf '%s' "$output"
+        exit 0
+      fi
     fi
     printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
     exit 1
@@ -2460,6 +2517,15 @@ if [[ "$search_uses_local_model" == true ]]; then
   symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
   if [[ -n "$symbol" ]] && ! search_output_contains_symbol "$output" "$symbol"; then
     printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
+    exit 1
+  fi
+fi
+if [[ -n "${question:-}" ]] && is_lone_path_line_stamp "$output" &&
+    ! question_allows_compact_stamp "${question:-}"; then
+  if formatted="$(format_located_answer "$output")" && [[ -n "${formatted//[[:space:]]/}" ]]; then
+    output="$formatted"
+  else
+    printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi
 fi
