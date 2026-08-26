@@ -2718,7 +2718,7 @@ class PbiTest(unittest.TestCase):
             probe_recorded = json.loads((directory / "probe-trace.json").read_text())
             self.assertFalse(trace.exists(), "named-symbol search miss must skip chat")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertEqual(
             probe_recorded["argv"],
             [
@@ -2756,7 +2756,7 @@ class PbiTest(unittest.TestCase):
             self.assertFalse(trace.exists(), "an empty BM25 result must skip chat")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertNotIn("BERT reranker", result.stdout)
         self.assertNotIn("Falling back to BM25", result.stdout)
 
@@ -4250,7 +4250,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
         # #22: a named-symbol miss must fail closed with one exact outcome and
@@ -4296,7 +4296,7 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("pbi: probe-chat failed", result.stderr)
         self.assertNotIn("pbi: probe-chat timed out answering the question", result.stderr)
 
-    def test_search_probe_hang_emits_diagnostic_and_fails_closed(self) -> None:
+    def test_search_probe_hang_fails_closed_without_locations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
@@ -4309,27 +4309,35 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe), timeout=20,
             )
             elapsed = time.monotonic() - started
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: probe search timed out\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertLess(elapsed, 10)
 
-    def test_search_probe_timeout_emits_diagnostic(self) -> None:
+    def test_search_probe_timeout_recovers_partial_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "breaker.py"
+            source.write_text("breaker_open = True\n")
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
-            probe.write_text("#!/usr/bin/env bash\ntimeout --kill-after=1s 0.1s sleep 30\n")
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                f"printf 'File: {source}, Lines: 1-1\\n'\n"
+                "timeout --kill-after=1s 0.1s sleep 30\n"
+            )
             probe.chmod(0o755)
             started = time.monotonic()
             result = self.run_pbi(
-                "search", "breaker_open", env=env, cwd=ROOT,
+                "search", "find", "the", "breaker-open", "implementation", env=env, cwd=repo,
                 binary=self.fake_pbi(directory, probe), timeout=5,
             )
             elapsed = time.monotonic() - started
-        self.assertEqual(result.returncode, 124)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: probe search timed out\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "breaker.py:1\n")
+        self.assertEqual(result.stderr, "")
         self.assertLess(elapsed, 3)
 
     def test_bm25_search_probe_timeout_emits_diagnostic(self) -> None:
@@ -4447,7 +4455,7 @@ class PbiTest(unittest.TestCase):
             )
             argv = json.loads((directory / "probe-trace.json").read_text())
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertEqual(
             argv,
             [

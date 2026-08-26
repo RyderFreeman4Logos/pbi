@@ -581,6 +581,10 @@ emit_bm25_locations_or_fail_closed() {
     fi
   fi
   if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
+    if [[ "${search_fail_closed_no_locations:-false}" == true && -z "${locations//[[:space:]]/}" ]]; then
+      printf '%s\n' 'pbi: no source locations found' >&2
+      exit 1
+    fi
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi
@@ -2056,6 +2060,7 @@ case "${1:-}" in
     fi
     search_options+=(--ignore drafts)
     search_uses_local_model=true
+    search_fail_closed_no_locations=true
     search_status=0
     search_output_file="$(mktemp)"
     track_temp_file "$search_output_file"
@@ -2068,15 +2073,20 @@ case "${1:-}" in
     fi
     active_timeout_diagnostic=
     candidates="$(<"$search_output_file")"
+    candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$|^Killed$" || true)"
+    bm25_candidates="$candidates"
     if ((search_status != 0)); then
       if planner_timeout_or_kill "$search_status"; then
-        printf "%s\n" "pbi: probe search timed out" >&2
+        if [[ -z "${candidates//[[:space:]]/}" ]]; then
+          printf '%s\n' 'pbi: no source locations found' >&2
+          exit 1
+        fi
+        emit_bm25_locations_or_fail_closed
       else
         printf "%s\n" "$candidates" >&2
+        exit "$search_status"
       fi
-      exit "$search_status"
     fi
-    candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$|^Killed$" || true)"
     symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
     search_fallback_locations=""
     if [[ -n "$symbol" ]]; then
@@ -2103,7 +2113,6 @@ case "${1:-}" in
     else
       search_fallback_locations="$(compact_search_locations "$candidates")"
     fi
-    bm25_candidates="$candidates"
     if [[ -n "$symbol" && -z "$search_fallback_locations" ]]; then
       search_fallback_locations="$(recover_named_symbol_definition "$symbol" || true)"
       if [[ -z "$search_fallback_locations" && -n "${candidates//[[:space:]]/}" ]]; then
