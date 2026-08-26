@@ -669,20 +669,51 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "in-hand quoted-line hits must not start planner")
         self.assertLess(elapsed, 6)
 
-    def test_which_question_rejects_type_name_only_import_list(self) -> None:
-        # #130: a type-name-only / import-list hit is not a relevant answer
-        # for a which-test-module question.
+    def test_which_test_module_rejects_type_declarations_and_import_lists(self) -> None:
+        # #130: declarations, imports, and non-test source do not answer coverage questions.
+        for path, line in (
+            ("migration_framework.rs", "pub struct WorkflowRun {"),
+            ("migration_framework.rs", "pub type WorkflowRun = u64;"),
+            ("migration_framework.rs", "    WorkflowRun,"),
+            ("sdk/workflow_run.rs", "WorkflowRun workflow envelope identity does not match the payload"),
+        ):
+            with self.subTest(path=path, line=line), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repo = directory / "repo"
+                repo.mkdir()
+                source = repo / path
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("\n" * 138 + f"{line}\n")
+                env, trace = self.fake_environment(directory)
+                probe = directory / "probe"
+                probe.write_text(
+                    "#!/usr/bin/env python3\n"
+                    f"print('File: {source}, Lines: 139-139')\n"
+                )
+                probe.chmod(0o755)
+                result = self.run_pbi(
+                    "Which test module covers WorkflowRun wire serialization",
+                    env=env,
+                    cwd=repo,
+                    binary=self.fake_pbi(directory, probe),
+                    timeout=8,
+                )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(trace.exists() and "timed out" in result.stderr)
+
+    def test_which_test_module_emits_test_module_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
-            repo.mkdir()
-            source = repo / "migration_framework.rs"
-            source.write_text("\n" * 138 + "    WorkflowRun,\n")
+            source = repo / "sdk_tests" / "workflow_wire.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("fn live_workflow_wire_valid_envelope_round_trips() {\n")
             env, trace = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
-                f"print('File: {source}, Lines: 139-139')\n"
+                f"print('File: {source}, Lines: 1-1')\n"
             )
             probe.chmod(0o755)
             result = self.run_pbi(
@@ -692,15 +723,34 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
                 timeout=8,
             )
-        self.assertNotIn("WorkflowRun,", result.stdout)
-        self.assertNotIn("migration_framework.rs:139", result.stdout)
-        self.assertNotRegex(result.stdout, r"^[^:\n]+:\d+\n?\Z")
-        if result.returncode == 0:
-            self.assertNotIn("The source shows WorkflowRun,", result.stdout)
-            self.assertEqual(result.stderr, "")
-        else:
-            self.assertEqual(result.stdout, "")
-            self.assertFalse(trace.exists() and "timed out" in result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sdk_tests/workflow_wire.rs", result.stdout)
+        self.assertIn("live_workflow_wire_valid_envelope_round_trips", result.stdout)
+        self.assertFalse(trace.exists())
+
+    def test_classify_question_rejects_lone_type_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "run.rs"
+            source.write_text("\n" * 129 + "pub struct WorkflowRun {\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 130-130')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Classify every WorkflowRun occurrence by construction, publication, validation, or taxonomy",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_find_question_emits_from_named_path_quoted_line(self) -> None:
         # #129: a Find/path question with a relevant quoted line in the named

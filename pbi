@@ -749,6 +749,7 @@ question_is_multi_target_where() {
 question_needs_synthesized_answer() {
   local q="${1,,}" token
   [[ "$q" =~ (^|[[:space:]])(why|how|explain)([[:space:]]|$) ]] && return 0
+  [[ "$q" =~ (^|[[:space:]])classify([[:space:]]|$) ]] && return 0
   question_is_multi_target_where "$1" && return 0
   [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]] || return 1
   # Identifier-style where-are lookups stay compact path:line.
@@ -772,6 +773,10 @@ build_fast_path_queries() {
   local token is_stem normalized fallback_token queries="" fallback_queries="" count=0 fallback_count=0
   if fast_path_requires_cache_key "$1"; then
     printf '%s\n' cache_key
+    return 0
+  fi
+  if question_is_test_coverage "$1"; then
+    printf '%s\n' "$1"
     return 0
   fi
   while IFS=$'\t' read -r token is_stem; do
@@ -1421,6 +1426,10 @@ run_default_bm25_fast_path() {
     fast_path_fail_closed
     return 1
   fi
+  question_is_test_coverage "${question:-}" && {
+    fast_path_fail_closed
+    return 1
+  }
   # 8s bounds recovery reads only. Candidates without an in-hand answer
   # fall through to planner/chat instead of aborting the command.
   search_uses_local_model=false
@@ -1476,10 +1485,30 @@ is_synthesis_junk_path() {
   [[ "$file" == *.md ]]
 }
 
+question_is_test_coverage() {
+  local q="${1,,}"
+  [[ "$q" =~ (^|[[:space:]])which[[:space:]]+test[[:space:]]+module([[:space:]]|$) ]] ||
+    [[ "$q" =~ (^|[[:space:]])test-?coverage([[:space:]]|$) ]]
+}
+
+question_rejects_lone_type_declaration() {
+  question_is_test_coverage "$1" || [[ "${1,,}" =~ (^|[[:space:]])classify([[:space:]]|$) ]]
+}
+
+is_test_coverage_evidence() {
+  local file="$1" text="$2"
+  [[ "$file" == */test/* || "$file" == */tests/* || "$file" =~ (^|/)[^/]*_tests?(/|$) ]] && return 0
+  [[ "$text" =~ ^[[:space:]]*\#\[[^]]*test ]] ||
+    [[ "$text" =~ (^|[[:space:]])mod[[:space:]]+tests?([[:space:]]|\{) ]]
+}
+
 is_synthesis_junk_line() {
   [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]] && return 0
   # Type-name-only / import-list item is not a behavior or test-module answer.
-  [[ "$1" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*,[[:space:]]*$ ]]
+  [[ "$1" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*,[[:space:]]*$ ]] && return 0
+  question_rejects_lone_type_declaration "${question:-}" || return 1
+  [[ "$1" =~ ^[[:space:]]*(pub[[:space:]]+)?struct[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{ ]] && return 0
+  [[ "$1" =~ ^[[:space:]]*(pub[[:space:]]+)?type[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*= ]]
 }
 
 token_overlap_score() {
@@ -1571,6 +1600,7 @@ recover_distinctive_source_locations() {
       [[ -f "$file" ]] || continue
       is_synthesis_junk_path "$file" && continue
       is_synthesis_junk_line "$text" && continue
+      question_is_test_coverage "${question:-}" && ! is_test_coverage_evidence "$file" "$text" && continue
       relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
       if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
         relative="$(basename -- "$file")"
@@ -1604,6 +1634,7 @@ format_located_answer() {
     text="${text#"${text%%[![:space:]]*}"}"
     [[ -n "$text" ]] || continue
     is_synthesis_junk_line "$text" && continue
+    question_is_test_coverage "${question:-}" && ! is_test_coverage_evidence "$file" "$text" && continue
     if ((${#text} > 200)); then
       text="${text:0:200}..."
     fi
@@ -1676,7 +1707,11 @@ recover_bm25_source_locations() {
       text="${text#"${text%%[![:space:]]*}"}"
       [[ -n "$text" ]] || continue
       is_synthesis_junk_line "$text" && continue
-      overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+      if question_is_test_coverage "${question:-}"; then
+        is_test_coverage_evidence "$file" "$text" || continue
+      else
+        overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+      fi
       score="$(token_overlap_score "$text" "$score_tokens")"
       ranked+="$score"$'\t'"$relative:$line_number"$'\n'
       break
