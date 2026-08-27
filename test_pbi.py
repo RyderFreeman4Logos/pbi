@@ -4194,6 +4194,34 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:2\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_quotes_usable_bm25_source_before_failing_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "heartbeat.py"
+            source.write_text('logger.info("managed work uses a heartbeat for automation")\n')
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\nimport time\ntime.sleep(9)\n"
+                f"print(\"File: {source}, Lines: 20-20\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "managed", "heartbeat", "invisible", "user", "automation",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=12,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            'The source shows logger.info("managed work uses a heartbeat for automation") (heartbeat.py:1).\n',
+        )
+        self.assertEqual(result.stderr, "")
+
     def test_search_probe_timeout_recovers_issue_number_after_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -4301,18 +4329,18 @@ class PbiTest(unittest.TestCase):
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
-            probe.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            probe.write_text("#!/usr/bin/env bash\ntimeout --kill-after=1s 1s sleep 30\n")
             probe.chmod(0o755)
             started = time.monotonic()
             result = self.run_pbi(
-                "search", "hallucination", "caption", env=env, cwd=ROOT,
+                "search", "--timeout", "1", "hallucination", "caption", env=env, cwd=ROOT,
                 binary=self.fake_pbi(directory, probe), timeout=20,
             )
             elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
-        self.assertLess(elapsed, 10)
+        self.assertLess(elapsed, 5)
 
     def test_search_probe_timeout_recovers_partial_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

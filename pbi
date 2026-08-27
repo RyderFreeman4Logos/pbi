@@ -550,7 +550,7 @@ compact_search_locations() {
 }
 
 emit_bm25_locations_or_fail_closed() {
-  local locations recovered_named_locations candidate_symbol candidate_locations
+  local locations recovered_named_locations candidate_symbol candidate_locations source_answer
   local -a named_files=()
   mapfile -t named_files < <(named_query_files "${question:-}")
   if ((${#named_files[@]} > 0)); then
@@ -558,6 +558,14 @@ emit_bm25_locations_or_fail_closed() {
       printf '%s\n' "$recovered_named_locations"
       exit 0
     fi
+  fi
+  if [[ "${search_fail_closed_no_locations:-false}" == true &&
+      "${question:-}" =~ ^[a-z0-9[:space:]-]+$ &&
+      -z "$(search_named_symbol "${question:-}")" &&
+      ! "${question,,}" =~ (^|[[:space:]])(find|locate|which|where)[[:space:]] ]] &&
+      source_answer="$(emit_synthesized_source_answer)" && [[ -n "${source_answer//[[:space:]]/}" ]]; then
+    printf '%s\n' "$source_answer"
+    exit 0
   fi
   locations="$(compact_search_locations "$bm25_candidates")"
   recovered_named_locations=""
@@ -1649,7 +1657,7 @@ format_located_answer() {
 }
 
 recover_bm25_source_locations() {
-  local deadline_ns="${1:-}" candidate file line_start line_end line_scan_end line_number text relative score score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
+  local deadline_ns="${1:-}" candidate file line_start line_end line_scan_end line_number text relative score scan_start candidate_ranked header_scan score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
   local candidates="${bm25_candidates:-}"
   [[ -n "${candidates//[[:space:]]/}" ]] || return 1
   fast_path_deadline_reached "$deadline_ns" && return 1
@@ -1693,14 +1701,19 @@ recover_bm25_source_locations() {
     [[ -f "$file" ]] || continue
     is_synthesis_junk_path "$file" && continue
     [[ "$line_start" =~ ^[[:digit:]]+$ && "$line_end" =~ ^[[:digit:]]+$ ]] || continue
-    # ponytail: scan at most 8 quoted lines from a BM25 range
-    line_scan_end="$line_end"
-    ((line_scan_end > line_start + 7)) && line_scan_end=$((line_start + 7))
     relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
       relative="$(basename -- "$file")"
     fi
-    for ((line_number = line_start; line_number <= line_scan_end; line_number++)); do
+    candidate_ranked=false
+    for scan_start in "$line_start" 1; do
+      # ponytail: scan at most 8 quoted lines from the BM25 range, then its file header.
+      line_scan_end="$line_end"
+      [[ "$scan_start" == 1 ]] && line_scan_end=8
+      ((line_scan_end > scan_start + 7)) && line_scan_end=$((scan_start + 7))
+      header_scan=false
+      [[ "$scan_start" == 1 && "$line_start" != 1 ]] && header_scan=true
+    for ((line_number = scan_start; line_number <= line_scan_end; line_number++)); do
       if ! text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null)"; then
         if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]]; then
           [[ -n "$ranked" ]] && break 2
@@ -1713,12 +1726,16 @@ recover_bm25_source_locations() {
       is_synthesis_junk_line "$text" && continue
       if question_is_test_coverage "${question:-}"; then
         is_test_coverage_evidence "$file" "$text" || continue
-      else
+      elif [[ "$header_scan" != true ]]; then
         overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
       fi
       score="$(token_overlap_score "$text" "$score_tokens")"
+      [[ "$header_scan" != true || "$score" != 0 ]] || continue
       ranked+="$score"$'\t'"$relative:$line_number"$'\n'
+      candidate_ranked=true
       break
+    done
+      [[ "$candidate_ranked" == true ]] && break
     done
   done <<< "$candidates"
   [[ -n "$ranked" ]] || return 1
@@ -2064,14 +2081,12 @@ case "${1:-}" in
     search_status=0
     search_output_file="$(mktemp)"
     track_temp_file "$search_output_file"
-    active_timeout_diagnostic="pbi: probe search timed out"
-    if run_timed_command "$DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS" "$search_output_file" "$search_output_file" \
-        "$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run -- "${search_pattern_parts[*]}"; then
+    if "$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run \
+        -- "${search_pattern_parts[*]}" >"$search_output_file" 2>&1; then
       search_status=0
     else
       search_status=$?
     fi
-    active_timeout_diagnostic=
     candidates="$(<"$search_output_file")"
     candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$|^Killed$" || true)"
     bm25_candidates="$candidates"
