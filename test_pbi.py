@@ -5637,5 +5637,40 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(version.returncode, 0, version.stderr)
             self.assertIn("pbi", version.stdout)
 
+    def test_planner_timeout_recovers_existing_bm25_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "audit.py"
+            source.write_text("def audit_results():\n    return 'append audit'\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys, time\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as trace:\n"
+                "    trace.write('planner-timeout\\n')\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    time.sleep(30)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where", "is", "append", "audit", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=8,
+            )
+            self.assertTrue(trace.exists(), "planner timeout must be exercised")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "audit.py:1\n")
+        self.assertEqual(result.stderr, "")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
