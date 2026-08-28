@@ -2249,6 +2249,23 @@ else
         exit 0
       fi
     fi
+    if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
+      if output="$(recover_timeout_location_from_bm25)" &&
+          [[ -n "${output//[[:space:]]/}" ]]; then
+        printf '%s\n' "$output"
+        exit 0
+      fi
+      if ! question_allows_compact_stamp "$question" &&
+          output="$(emit_synthesized_source_answer)" &&
+          [[ -n "${output//[[:space:]]/}" ]]; then
+        printf '%s' "$output"
+        exit 0
+      fi
+      if is_stamp_dump "$(compact_search_locations "$bm25_candidates")" ||
+          has_mixed_stamp_junk "$(compact_search_locations "$bm25_candidates")"; then
+        emit_bm25_locations_or_fail_closed
+      fi
+    fi
     printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
     exit 1
   elif ((planner_status == 0)) || [[ -n "$generated_queries" ]]; then
@@ -2346,6 +2363,23 @@ else
   done
   if [[ "$planner_timed_out" == true ]]; then
     if planner_timeout_or_kill "$planner_status"; then
+      if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
+        if output="$(recover_timeout_location_from_bm25)" &&
+            [[ -n "${output//[[:space:]]/}" ]]; then
+          printf '%s\n' "$output"
+          exit 0
+        fi
+        if ! question_allows_compact_stamp "$question" &&
+            output="$(emit_synthesized_source_answer)" &&
+            [[ -n "${output//[[:space:]]/}" ]]; then
+          printf '%s' "$output"
+          exit 0
+        fi
+        if is_stamp_dump "$(compact_search_locations "$bm25_candidates")" ||
+            has_mixed_stamp_junk "$(compact_search_locations "$bm25_candidates")"; then
+          emit_bm25_locations_or_fail_closed
+        fi
+      fi
       printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
       exit 1
     fi
