@@ -4516,6 +4516,58 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(recorded["env"]["ALLOWED_FOLDERS"], str(codebase))
 
+    def test_successful_endpoint_fallback_strips_debug_chrome(self) -> None:
+        for debug in (False, True):
+            with self.subTest(debug=debug), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                env, _ = self.fake_environment(directory)
+                for name in ("CLIPROXY_API_KEY", "OPENAI_API_KEY", "LOCAL_ROUTER_API_KEY"):
+                    env.pop(name, None)
+                if debug:
+                    env["DEBUG"] = "1"
+                config_path = directory / ".config" / "pbi" / "config.toml"
+                config_path.parent.mkdir(parents=True)
+                config_path.write_text(
+                    '[[endpoints]]\n'
+                    'provider = "openai"\n'
+                    'model = "first-model"\n'
+                    'base_url = "https://first.example/v1"\n'
+                    'api_key = "first-fixture-secret"\n'
+                    '\n'
+                    '[[endpoints]]\n'
+                    'provider = "openai"\n'
+                    'model = "second-model"\n'
+                    'base_url = "https://second.example/v1"\n'
+                    'api_key = "second-fixture-secret"\n'
+                )
+                fake_chat = directory / "probe-chat"
+                fake_chat.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "printf '%s\\n' '[FallbackManager] Attempting provider: first-model "
+                    "(model not found) baseURL=https://first.example/v1 apiKey=first-fixture-secret'\n"
+                    "printf '%s\\n' '[FallbackManager] ✅ Success with provider: second-model "
+                    "baseURL=https://second.example/v1 apiKey=second-fixture-secret'\n"
+                    "printf '%s\\n' 'AI SDK Warning System: To turn off warning logging, set the AI_SDK_LOG_WARNINGS global to false.'\n"
+                    "printf '%s\\n' 'pong'\n"
+                )
+                fake_chat.chmod(0o755)
+                result = self.run_pbi("--message", "CHAIN_SENTINEL reply with the single word pong", env=env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "pong\n")
+            if debug:
+                self.assertIn("[FallbackManager] Attempting provider:", result.stderr)
+                self.assertIn("[FallbackManager] ✅ Success with provider:", result.stderr)
+                self.assertIn("[REDACTED_URL]", result.stderr)
+                self.assertIn("[REDACTED]", result.stderr)
+            else:
+                self.assertEqual(result.stderr, "")
+            self.assertNotIn("first-fixture-secret", result.stdout + result.stderr)
+            self.assertNotIn("second-fixture-secret", result.stdout + result.stderr)
+            self.assertNotIn("first.example", result.stdout + result.stderr)
+            self.assertNotIn("second.example", result.stdout + result.stderr)
+
+
     def test_fails_closed_when_probe_reports_a_json_api_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -4748,16 +4800,131 @@ class PbiTest(unittest.TestCase):
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
 
 
-    def test_config_toml_ordinary_tables_are_ignored(self) -> None:
+    def test_config_toml_endpoints_are_loaded_in_file_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                'primary_model = "ignored-by-endpoint-primary"\n'
+                '[[endpoints]]\n'
+                'provider = "openai"\n'
+                'model = "endpoint-primary"\n'
+                'base_url = "http://primary.invalid/v1"\n'
+                'api_key = "endpoint-primary-secret"\n'
+                'reasoning_effort = "medium"\n'
+                '\n'
+                '[[endpoints]]\n'
+                'provider = "openai"\n'
+                'model = "endpoint-fallback"\n'
+                'base_url = "http://fallback.invalid/v1"\n'
+                'api_key = "endpoint-fallback-secret"\n'
+                'reasoning_effort = false\n'
+            )
+            result = self.run_pbi("--debug-config", env=env)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("primary_model=endpoint-primary", result.stdout)
+        self.assertIn("endpoint_0_model=endpoint-primary", result.stdout)
+        self.assertIn("endpoint_0_base_url=http://primary.invalid/v1", result.stdout)
+        self.assertIn("endpoint_1_model=endpoint-fallback", result.stdout)
+        self.assertIn("endpoint_1_base_url=http://fallback.invalid/v1", result.stdout)
+
+
+    def test_config_toml_endpoint_chain_forwards_distinct_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            for name in ("CLIPROXY_API_KEY", "OPENAI_API_KEY", "LOCAL_ROUTER_API_KEY"):
+                env.pop(name, None)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                '[[endpoints]]\n'
+                'provider = "openai"\n'
+                'model = "endpoint-primary"\n'
+                'base_url = "http://primary.invalid/v1"\n'
+                'api_key = "endpoint-primary-secret"\n'
+                'reasoning_effort = "medium"\n'
+                '\n'
+                '[[endpoints]]\n'
+                'provider = "openai"\n'
+                'model = "endpoint-fallback"\n'
+                'base_url = "http://fallback.invalid/v1"\n'
+                'api_key = "endpoint-fallback-secret"\n'
+                'reasoning_effort = "low"\n'
+            )
+            result = self.run_pbi("--message", "hello", env=env)
+            self.assertTrue(trace.exists(), result.stderr)
+            recorded = json.loads(trace.read_text())
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertNotIn("endpoint-primary-secret", result.stdout + result.stderr)
+        self.assertNotIn("endpoint-fallback-secret", result.stdout + result.stderr)
+        configured = recorded["env"]
+        self.assertEqual(configured["FORCE_PROVIDER"], "openai")
+        self.assertEqual(configured["MODEL_NAME"], "endpoint-primary")
+        self.assertEqual(configured["OPENAI_API_KEY"], "endpoint-primary-secret")
+        self.assertEqual(configured["OPENAI_API_URL"], "http://primary.invalid/v1")
+        self.assertEqual(
+            json.loads(configured["FALLBACK_PROVIDERS"]),
+            [
+                {
+                    "provider": "openai",
+                    "apiKey": "endpoint-primary-secret",
+                    "baseURL": "http://primary.invalid/v1",
+                    "model": "endpoint-primary",
+                    "maxRetries": 3,
+                },
+                {
+                    "provider": "openai",
+                    "apiKey": "endpoint-fallback-secret",
+                    "baseURL": "http://fallback.invalid/v1",
+                    "model": "endpoint-fallback",
+                    "maxRetries": 0,
+                },
+            ],
+        )
+
+
+    def test_config_toml_endpoint_debug_output_redacts_every_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, trace = self.fake_environment(directory)
+            config_path = directory / ".config" / "pbi" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                '[[endpoints]]\n'
+                'provider = "openai"\n'
+                'model = "endpoint-primary"\n'
+                'base_url = "http://primary.invalid/v1"\n'
+                'api_key = "endpoint-primary-secret"\n'
+                '\n'
+                '[[endpoints]]\n'
+                'provider = "openai"\n'
+                'model = "endpoint-fallback"\n'
+                'base_url = "http://fallback.invalid/v1"\n'
+                'api_key = "endpoint-fallback-secret"\n'
+            )
+            result = self.run_pbi("--debug-config", env=env)
+            self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("endpoint-primary-secret", result.stdout + result.stderr)
+        self.assertNotIn("endpoint-fallback-secret", result.stdout + result.stderr)
+        self.assertIn("endpoint_0_api_key=[REDACTED]", result.stdout)
+        self.assertIn("endpoint_1_api_key=[REDACTED]", result.stdout)
+
+
+    def test_config_toml_ordinary_tables_are_ignored_without_wiping_root(self) -> None:
         cases = (
             (
                 'primary_model = "spark"\n'
-                '[provider]\n'
+                '[other]\n'
                 'primary_model = "shadow"\n'
             ),
             (
                 'model = "spark"\n'
-                '[provider]\n'
+                '[other]\n'
                 'model = "shadow"\n'
             ),
         )
@@ -4771,12 +4938,12 @@ class PbiTest(unittest.TestCase):
                     config_path.write_text(config_text)
                     result = self.run_pbi("--debug-config", env=env)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn(f"primary_model={PRIMARY}", result.stdout)
+                    self.assertIn("primary_model=spark", result.stdout)
                     self.assertNotIn("primary_model=shadow", result.stdout)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
 
 
-    def test_config_toml_unsafe_multiline_and_array_tables_are_ignored(self) -> None:
+    def test_config_toml_unsafe_multiline_is_ignored_and_unknown_array_tables_are_skipped(self) -> None:
         cases = (
             (
                 'primary_model = "spark"\n'
@@ -4831,7 +4998,8 @@ class PbiTest(unittest.TestCase):
                     config_path.write_text(config_text)
                     result = self.run_pbi("--debug-config", env=env)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn(f"primary_model={PRIMARY}", result.stdout)
+                    expected_model = "spark" if "[[providers]]" in config_text else PRIMARY
+                    self.assertIn(f"primary_model={expected_model}", result.stdout)
                     self.assertNotIn("primary_model=shadow", result.stdout)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
 
