@@ -407,8 +407,8 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("LICENSE:1", result.stdout)
         self.assertNotIn("Located in", result.stdout)
 
-    def test_multi_target_where_fails_closed_when_chat_times_out(self) -> None:
-        # A multi-target answer must not succeed from a singleton source location.
+    def test_multi_target_where_recovers_bm25_candidates_after_chat_timeout(self) -> None:
+        # A multi-target answer must not turn one unrelated BM25 hit into success.
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
@@ -419,7 +419,7 @@ class PbiTest(unittest.TestCase):
             receipt.write_text("run_exact_reuse() {\n  echo exact-reuse\n}\n")
             isolation = tests / "quality-gate-isolation-tests.sh"
             isolation.write_text("ambient-inputs)\n  isolate_ambient_inputs\n")
-            env, _ = self.fake_environment(directory)
+            env, trace = self.fake_environment(directory)
             env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
             probe = directory / "probe"
             distractor = repo / "distractor.py"
@@ -429,7 +429,11 @@ class PbiTest(unittest.TestCase):
             )
             probe.chmod(0o755)
             fake_chat = directory / "probe-chat"
-            fake_chat.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "sleep 30\n"
+            )
             fake_chat.chmod(0o755)
             started = time.monotonic()
             result = self.run_pbi(
@@ -440,9 +444,17 @@ class PbiTest(unittest.TestCase):
                 timeout=8,
             )
             elapsed = time.monotonic() - started
-        self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertTrue(trace.exists(), "Probe Chat must start before timing out")
+        self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
         self.assertEqual(result.stdout, "")
-        self.assertIn("timed out", result.stderr)
+        self.assertIn(
+            result.stderr,
+            {
+                "pbi: source answer lacks requested semantic evidence\n",
+                "pbi: model returned only BM25 location stamps; no source answer\n",
+                "pbi: no source locations found\n",
+            },
+        )
         self.assertLess(elapsed, 6)
 
     def test_where_are_question_quotes_bm25_source_instead_of_stamps(self) -> None:

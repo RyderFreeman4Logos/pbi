@@ -2767,6 +2767,8 @@ if ((status != 0)); then
     if question_needs_synthesized_answer "${question:-}"; then
       if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
         :
+      elif [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
+        emit_bm25_locations_or_fail_closed
       else
         printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
         exit "$status"
