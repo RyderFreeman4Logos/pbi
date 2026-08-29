@@ -842,10 +842,9 @@ fast_path_match_variants() {
 }
 
 question_is_multi_target_where() {
-  local q="${1,,}" thes
+  local q="${1,,}"
   [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]] || return 1
-  thes="$(printf '%s\n' "$q" | grep -oE '(^|[[:space:]])the[[:space:]]' | wc -l)"
-  (( thes >= 2 )) && { [[ "$q" == *","* ]] || [[ "$q" == *" and "* ]]; }
+  [[ "$q" == *,* || "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
 }
 
 question_needs_synthesized_answer() {
@@ -1612,13 +1611,16 @@ question_requests_semantic_evidence() {
 
 question_has_multiple_semantic_targets() {
   local q="${1,,}"
-  question_requests_semantic_evidence "$1" &&
-    [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
+  question_is_multi_target_where "$1" || {
+    question_requests_semantic_evidence "$1" &&
+      [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
+  }
 }
 
 source_answer_has_semantic_evidence() {
   local answer="$1" deadline_ns="${2:-}" locations file line_number text symbol named_symbols q location_count requires_named_test_evidence=false
-  question_requests_semantic_evidence "${question:-}" || return 0
+  question_requests_semantic_evidence "${question:-}" ||
+    question_is_multi_target_where "${question:-}" || return 0
   q="${question,,}"
   locations="$(compact_search_locations "$answer" "" false "$deadline_ns")"
   [[ -n "${locations//[[:space:]]/}" ]] || return 1
@@ -1654,7 +1656,8 @@ source_answer_has_semantic_evidence() {
 
 emit_source_locations() {
   local locations="$1" answer
-  if question_requests_semantic_evidence "${question:-}"; then
+  if question_requests_semantic_evidence "${question:-}" ||
+      question_is_multi_target_where "${question:-}"; then
     answer="$(format_located_answer "$locations")" || return 1
     [[ -n "${answer//[[:space:]]/}" ]] || return 1
     printf '%s' "$answer"
