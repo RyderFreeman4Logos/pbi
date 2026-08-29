@@ -634,8 +634,8 @@ emit_bm25_locations_or_fail_closed() {
   local -a named_files=()
   mapfile -t named_files < <(named_query_files "${question:-}")
   if ((${#named_files[@]} > 0)); then
-    if recovered_named_locations="$(recover_named_file_claims "" "${named_files[@]}")"; then
-      printf '%s\n' "$recovered_named_locations"
+    if recovered_named_locations="$(recover_named_file_claims "" "${named_files[@]}")" &&
+        emit_source_locations "$recovered_named_locations"; then
       exit 0
     fi
   fi
@@ -657,14 +657,12 @@ emit_bm25_locations_or_fail_closed() {
       recovered_named_locations+="$candidate_locations"
     fi
   done < <(search_named_symbols "${question:-}")
-  if [[ -n "$recovered_named_locations" ]]; then
-    printf '%s\n' "$recovered_named_locations"
+  if [[ -n "$recovered_named_locations" ]] && emit_source_locations "$recovered_named_locations"; then
     exit 0
   fi
   if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
     locations="$(recover_timeout_location_from_bm25 || true)"
-    if [[ -n "$locations" ]]; then
-      printf '%s\n' "$locations"
+    if [[ -n "$locations" ]] && emit_source_locations "$locations"; then
       exit 0
     fi
   fi
@@ -674,6 +672,13 @@ emit_bm25_locations_or_fail_closed() {
       exit 1
     fi
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+    exit 1
+  fi
+  if question_requests_semantic_evidence "${question:-}"; then
+    if emit_source_locations "$locations"; then
+      exit 0
+    fi
+    printf '%s\n' 'pbi: source answer lacks requested semantic evidence' >&2
     exit 1
   fi
   printf '%s\n' "$locations"
@@ -857,6 +862,7 @@ question_allows_compact_stamp() {
   # Identifier / where-is lookups stay compact path:line. Synthesis and
   # which/find/where-does questions must quote a line or fail closed.
   question_needs_synthesized_answer "$1" && return 1
+  question_requests_semantic_evidence "$1" && return 1
   [[ "$q" =~ (^|[[:space:]])(which|find|where[[:space:]]+does)([[:space:]]|$) ]] && return 1
   return 0
 }
@@ -1412,8 +1418,7 @@ run_default_bm25_fast_path() {
     output=""
     recovered_from_candidates=false
     if output="$(recover_named_file_claims "$deadline_ns" "${named_files[@]}")" &&
-        [[ -n "${output//[[:space:]]/}" ]]; then
-      printf '%s\n' "$output"
+        [[ -n "${output//[[:space:]]/}" ]] && emit_source_locations "$output"; then
       return 0
     fi
     fast_path_fail_closed
@@ -1514,7 +1519,7 @@ run_default_bm25_fast_path() {
       return 0
     fi
   fi
-  if [[ -z "${bm25_candidates//[[:space:]]/}" ]]; then
+  if [[ -z "${search_fallback_locations//[[:space:]]/}" ]]; then
     fast_path_fail_closed
     return 1
   fi
@@ -1594,7 +1599,67 @@ is_test_coverage_evidence() {
     [[ "$text" =~ (^|[[:space:]])mod[[:space:]]+tests?([[:space:]]|\{) ]]
 }
 
+question_requests_semantic_evidence() {
+  local q="${1,,}"
+  [[ "$q" =~ (^|[^[:alnum:]])(api|symbol|symbols|test|tests|caller|callers|calling|called|invocation|invocations|coverage)([^[:alnum:]]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]])(where|which|find|locate|show|does|are|is|cover|how|trace)([^[:alnum:]]|$) ]]
+}
+
+question_has_multiple_semantic_targets() {
+  local q="${1,,}"
+  [[ "$q" == *,* ]] && [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
+}
+
+source_answer_has_semantic_evidence() {
+  local answer="$1" deadline_ns="${2:-}" locations file line_number text symbol named_symbols q location_count requires_named_test_evidence=false
+  question_requests_semantic_evidence "${question:-}" || return 0
+  q="${question,,}"
+  locations="$(compact_search_locations "$answer" "" false "$deadline_ns")"
+  [[ -n "${locations//[[:space:]]/}" ]] || return 1
+  if question_has_multiple_semantic_targets "${question:-}"; then
+    location_count="$(printf '%s\n' "$locations" | awk 'NF { count += 1 } END { print count + 0 }')"
+    (( location_count >= 2 )) || return 1
+  fi
+  named_symbols="$(search_named_symbols "${question:-}")"
+  [[ -z "${named_symbols//[[:space:]]/}" || ! "$q" =~ (^|[^[:alnum:]])tests?([^[:alnum:]]|$) ]] || requires_named_test_evidence=true
+  while IFS= read -r location; do
+    [[ "$location" =~ ^(.+):([[:digit:]]+)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+    line_number="${BASH_REMATCH[2]}"
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    [[ -f "$file" ]] || continue
+    text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null || true)"
+    [[ -n "$text" ]] || continue
+    is_synthesis_junk_line "$text" && continue
+    [[ "$requires_named_test_evidence" == true ]] && ! is_test_coverage_evidence "$file" "$text" && continue
+    if [[ -z "${named_symbols//[[:space:]]/}" ||
+        ! "$q" =~ (^|[^[:alnum:]])(api|symbol|symbols|caller|callers|calling|called|invocation|invocations)([^[:alnum:]]|$) ]]; then
+      return 0
+    fi
+    while IFS= read -r symbol; do
+      [[ -n "$symbol" ]] || continue
+      if [[ -n "$(named_symbol_definition_line "$file" "$symbol" any "$line_number" "$line_number" "$deadline_ns")" ]]; then
+        return 0
+      fi
+    done <<< "$named_symbols"
+  done <<< "$locations"
+  return 1
+}
+
+emit_source_locations() {
+  local locations="$1" answer
+  if question_requests_semantic_evidence "${question:-}"; then
+    answer="$(format_located_answer "$locations")" || return 1
+    [[ -n "${answer//[[:space:]]/}" ]] || return 1
+    printf '%s' "$answer"
+  else
+    printf '%s\n' "$locations"
+  fi
+}
+
 is_synthesis_junk_line() {
+  question_requests_semantic_evidence "${question:-}" &&
+    [[ "$1" =~ ^[[:space:]]*(//!|///|/\*|\*|\"\"\"|\'\'\') ]] && return 0
   [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]] && return 0
   # Type-name-only / import-list item is not a behavior or test-module answer.
   [[ "$1" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*,[[:space:]]*$ ]] && return 0
@@ -1733,6 +1798,7 @@ format_located_answer() {
     joined+="${joined:+ }The source shows ${text} (${line})."
   done <<< "$locations"
   [[ -n "$joined" ]] || return 1
+  source_answer_has_semantic_evidence "$joined" "$deadline_ns" || return 1
   printf '%s\n' "$joined"
 }
 
@@ -2508,8 +2574,7 @@ else
     fi
     if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
       if output="$(recover_timeout_location_from_bm25)" &&
-          [[ -n "${output//[[:space:]]/}" ]]; then
-        printf '%s\n' "$output"
+          [[ -n "${output//[[:space:]]/}" ]] && emit_source_locations "$output"; then
         exit 0
       fi
       if ! question_allows_compact_stamp "$question" &&
@@ -2626,8 +2691,7 @@ else
     if planner_timeout_or_kill "$planner_status"; then
       if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
         if output="$(recover_timeout_location_from_bm25)" &&
-            [[ -n "${output//[[:space:]]/}" ]]; then
-          printf '%s\n' "$output"
+            [[ -n "${output//[[:space:]]/}" ]] && emit_source_locations "$output"; then
           exit 0
         fi
         if ! question_allows_compact_stamp "$question" &&
@@ -2887,5 +2951,9 @@ if [[ -n "${question:-}" ]] && is_lone_path_line_stamp "$output" &&
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi
+fi
+if [[ -n "${question:-}" ]] && ! source_answer_has_semantic_evidence "$output"; then
+  printf '%s\n' 'pbi: source answer lacks requested semantic evidence' >&2
+  exit 1
 fi
 printf '%s\n' "$output"

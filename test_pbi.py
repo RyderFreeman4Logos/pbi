@@ -5842,6 +5842,58 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(version.returncode, 0, version.stderr)
             self.assertIn("pbi", version.stdout)
 
+    def test_explicit_symbol_relationship_query_rejects_singleton_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "source.rs"
+            source.write_text("const STATE_001: &str = \"unrelated state key\";\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text("#!/usr/bin/env python3\nprint('missing.rs:1')\n")
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'source.rs:1'\\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "Where does the NodeOutput API symbol get called, and which tests cover its callers?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertNotEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr)
+
+    def test_explicit_symbol_relationship_query_rejects_unrelated_citation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "source.rs"
+            source.write_text(
+                "//! API symbol caller tests module documentation.\n"
+            )
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Where does the NodeOutput API symbol get called, and which tests cover its callers?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr)
+
     def test_planner_timeout_recovers_existing_bm25_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
