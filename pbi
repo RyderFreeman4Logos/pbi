@@ -843,8 +843,13 @@ fast_path_match_variants() {
 
 question_is_multi_target_where() {
   local q="${1,,}"
-  [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]] || return 1
-  [[ "$q" == *,* || "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
+  if [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]]; then
+    [[ "$q" == *,* || "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
+    return
+  fi
+  [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how)([[:space:]]|$) ]] && return 0
+  [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
 }
 
 question_needs_synthesized_answer() {
@@ -1510,6 +1515,12 @@ run_default_bm25_fast_path() {
         [[ -n "${output//[[:space:]]/}" ]]; then
       printf '%s' "$output"
       return 0
+    fi
+    # Multi-target synthesis must not defer incomplete BM25 evidence to chat.
+    if [[ "${question,,}" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] &&
+        question_is_multi_target_where "${question:-}"; then
+      fast_path_fail_closed
+      return 1
     fi
   fi
   if output="$(recover_timeout_location_from_bm25 true "$deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then

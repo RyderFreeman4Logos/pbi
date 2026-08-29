@@ -5928,6 +5928,95 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertTrue(result.stderr)
 
+    def test_where_is_conjunction_synthesizes_bm25_evidence_without_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "src" / "module.rs"
+            test = repo / "tests" / "module.rs"
+            source.parent.mkdir(parents=True)
+            test.parent.mkdir(parents=True)
+            source.write_text(
+                'const MODULE_LOCATION: &str = "module path validation and non-regular module test";\n'
+            )
+            test.write_text(
+                'const MODULE_TEST: &str = "module path validation and non-regular module test";\n'
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+                f"print('File: {test}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "sleep 30\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is module path validation and the non-regular module test?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=15,
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("source answer", result.stderr)
+        self.assertFalse(trace.exists(), "bounded synthesis must not need Probe Chat")
+
+    def test_where_is_cross_question_is_stable_without_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "src" / "commit.rs"
+            recipe = repo / "justfile"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                'const COMMIT_MARKER: &str = "commit marker derived and build recipe creates an exact-head candidate";\n'
+            )
+            recipe.write_text(
+                'commit-marker-derived-build-recipe-creates-an-exact-head-candidate:\n'
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+                f"print('File: {recipe}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, pathlib\n"
+                "trace = pathlib.Path(os.environ['PBI_TEST_TRACE'])\n"
+                "count = int(trace.read_text() or '0') + 1 if trace.exists() else 1\n"
+                "trace.write_text(str(count))\n"
+                "raise SystemExit(126) if count == 1 else print('src/commit.rs:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            command = (
+                "where is commit marker derived, and what build recipe creates an exact-head candidate?"
+            )
+            first = self.run_pbi(
+                command, env=env, cwd=repo, binary=self.fake_pbi(directory, probe), timeout=15
+            )
+            second = self.run_pbi(
+                command, env=env, cwd=repo, binary=self.fake_pbi(directory, probe), timeout=15
+            )
+        self.assertEqual(first.returncode, 1, first.stderr)
+        self.assertEqual(second.returncode, 1, second.stderr)
+        self.assertEqual(first.stdout, "")
+        self.assertEqual(second.stdout, "")
+        self.assertEqual(first.stderr, second.stderr)
+        self.assertIn("source answer", first.stderr)
+        self.assertFalse(trace.exists(), "cross-question synthesis must not need Probe Chat")
+
     def test_explicit_symbol_relationship_query_rejects_singleton_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
