@@ -233,6 +233,11 @@ emit_probe_launch_diagnostic() {
   printf '%s\n' "pbi: probe-chat found on PATH but failed to launch; category=$category helper=$agent_command $status_detail recovery=$recovery"
 }
 
+emit_probe_runtime_exit_diagnostic() {
+  local status="$1"
+  printf '%s\n' "pbi: probe-chat exited after launch; category=runtime-exit helper=$agent_command exit=$status recovery=inspect probe-chat, then retry once"
+}
+
 active_timeout_pid=
 active_timeout_diagnostic=
 # Default TERM grace for run_timed_command; the fast path shortens it so the
@@ -1601,13 +1606,14 @@ is_test_coverage_evidence() {
 
 question_requests_semantic_evidence() {
   local q="${1,,}"
-  [[ "$q" =~ (^|[^[:alnum:]])(api|symbol|symbols|test|tests|caller|callers|calling|called|invocation|invocations|coverage)([^[:alnum:]]|$) ]] || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])(where|which|find|locate|show|does|are|is|cover|how|trace)([^[:alnum:]]|$) ]]
+  [[ "$q" =~ (^|[^[:alnum:]])(api|symbol|symbols|test|tests|caller|callers|calling|called|invocation|invocations|coverage|owner|owners|owns|ownership|production[[:space:]_-]+path|integration[[:space:]_-]+tests?)([^[:alnum:]]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]])(what|where|which|find|locate|show|does|are|is|cover|how|trace)([^[:alnum:]]|$) ]]
 }
 
 question_has_multiple_semantic_targets() {
   local q="${1,,}"
-  [[ "$q" == *,* ]] && [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
+  question_requests_semantic_evidence "$1" &&
+    [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
 }
 
 source_answer_has_semantic_evidence() {
@@ -2747,6 +2753,10 @@ if ((status != 0)); then
     launch_category="$(probe_launch_category "$status" "$probe_diagnostic_input")"
     if [[ "$launch_category" != exit ]]; then
       emit_probe_launch_diagnostic "$status" "$probe_diagnostic_input" >&2
+      exit "$status"
+    fi
+    if [[ "$status" == 126 ]]; then
+      emit_probe_runtime_exit_diagnostic "$status" >&2
       exit "$status"
     fi
   fi

@@ -5155,6 +5155,38 @@ class PbiTest(unittest.TestCase):
                     self.assertNotIn("probe-chat reported an API error", result.stderr)
                     self.assertNotIn("probe-chat failed", result.stderr)
 
+    def test_fails_closed_with_classified_probe_chat_runtime_exit_126(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            env, _ = self.fake_environment(directory)
+            helper = directory / "probe-chat"
+            helper.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'runtime-output-should-not-leak'\n"
+                "printf '%s\\n' 'runtime-error-should-not-leak' >&2\n"
+                "exit 126\n"
+            )
+            helper.chmod(0o755)
+            result = self.run_pbi(
+                "--message",
+                "hello",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, directory / "probe"),
+            )
+        self.assertEqual(result.returncode, 126, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("category=runtime-exit", result.stderr)
+        self.assertIn(f"helper={helper}", result.stderr)
+        self.assertIn("exit=126", result.stderr)
+        self.assertIn("recovery=inspect probe-chat, then retry once", result.stderr)
+        self.assertNotIn("failed to launch", result.stderr)
+        self.assertNotIn("runtime-output-should-not-leak", result.stdout + result.stderr)
+        self.assertNotIn("runtime-error-should-not-leak", result.stdout + result.stderr)
+        self.assertNotIn("test-key", result.stdout + result.stderr)
+
 
     def test_default_query_bm25_fast_path_requires_append_audit_co_signal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5858,6 +5890,34 @@ class PbiTest(unittest.TestCase):
             fake_chat.chmod(0o755)
             result = self.run_pbi(
                 "Where does the NodeOutput API symbol get called, and which tests cover its callers?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertNotEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr)
+
+    def test_production_ownership_and_integration_tests_query_rejects_singleton_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "production_profile.rs"
+            source.write_text("fn production_path_owns_retry_budget_and_publication_in_integration_tests() {}\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'production_profile.rs:1'\n")
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "What production path owns retry budget and publication in integration tests?",
                 env=env,
                 cwd=repo,
                 binary=self.fake_pbi(directory, probe),
