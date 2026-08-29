@@ -5118,6 +5118,43 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("probe-chat reported an API error", result.stderr)
         self.assertNotIn("probe-chat failed", result.stderr)
 
+    def test_fails_closed_with_classified_probe_chat_launch_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "delegated-sandbox"
+            repo.mkdir()
+            env, _ = self.fake_environment(directory)
+            # Keep only the PATH fixture's helper ahead of node and core utilities.
+            node_bin = os.path.dirname(shutil.which("node") or "/usr/bin/node")
+            env["PATH"] = f"{directory}:{node_bin}:/usr/bin:/bin"
+            helper = directory / "probe-chat"
+            cases = (
+                ("not-executable", "#! /usr/bin/env bash\necho should-not-run\n", 0o644, 126),
+                ("interpreter-loader", "#!/definitely/missing/interpreter\n", 0o755, 127),
+            )
+            for category, source, mode, expected_status in cases:
+                with self.subTest(category=category):
+                    helper.write_text(source)
+                    helper.chmod(mode)
+                    result = self.run_pbi(
+                        "--message",
+                        "hello",
+                        env=env,
+                        cwd=repo,
+                        binary=self.fake_pbi(directory, directory / "probe"),
+                    )
+                    self.assertEqual(result.returncode, expected_status, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("failed to launch", result.stderr)
+                    self.assertIn(f"category={category}", result.stderr)
+                    self.assertIn(f"helper={helper}", result.stderr)
+                    self.assertIn("recovery=", result.stderr)
+                    self.assertIn("retry once", result.stderr)
+                    self.assertNotIn("CLIPROXY_API_KEY", result.stdout + result.stderr)
+                    self.assertNotIn("test-key", result.stdout + result.stderr)
+                    self.assertNotIn("probe-chat reported an API error", result.stderr)
+                    self.assertNotIn("probe-chat failed", result.stderr)
+
 
     def test_default_query_bm25_fast_path_requires_append_audit_co_signal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

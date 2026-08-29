@@ -21,6 +21,7 @@ usage() {
   printf '%s\n' "       pbi --message <question> [probe-chat options]"
   printf '%s\n' "       pbi --debug-config"
   printf '%s\n' "Search prints compact verified BM25 locations and never starts chat; --bm25 prints raw no-LLM Probe output."
+  printf '%s\n' 'Launch diagnostics use category=not-executable|interpreter-loader|exit|signal|os-error.'
 }
 
 resolve_command() {
@@ -177,6 +178,59 @@ strip_probe_chrome() {
 
 planner_timeout_or_kill() {
   [[ "$1" == 124 || "$1" == 137 ]]
+}
+
+probe_launch_category() {
+  local status="$1" diagnostic="$2"
+  if [[ ! -x "$agent_command" ]]; then
+    printf '%s' 'not-executable'
+  elif [[ "$status" == 127 ]] &&
+      grep -Eiq 'failed to run command|bad interpreter|cannot execute|No such file or directory|not found' <<<"$diagnostic"; then
+    printf '%s' 'interpreter-loader'
+  elif [[ "$status" == 126 ]] &&
+      grep -Eiq 'failed to run command|bad interpreter|cannot execute|Permission denied' <<<"$diagnostic"; then
+    printf '%s' 'os-error'
+  elif [[ "$status" == 125 ]] && grep -Eiq '^timeout:' <<<"$diagnostic"; then
+    printf '%s' 'os-error'
+  elif ((status >= 128)); then
+    printf '%s' 'signal'
+  else
+    printf '%s' 'exit'
+  fi
+}
+
+probe_launch_recovery() {
+  case "$1" in
+    not-executable)
+      printf '%s' 'fix permissions or reinstall probe-chat, then retry once'
+      ;;
+    interpreter-loader)
+      printf '%s' 'repair the shebang/interpreter or reinstall probe-chat, then retry once'
+      ;;
+    signal)
+      printf '%s' 'retry once; if repeated, inspect the helper and local signal source'
+      ;;
+    os-error)
+      printf '%s' 'check local helper/OS availability, then retry once'
+      ;;
+    *)
+      printf '%s' 'inspect probe-chat, then retry once'
+      ;;
+  esac
+}
+
+emit_probe_launch_diagnostic() {
+  local status="$1" diagnostic="$2" category status_detail recovery
+  category="$(probe_launch_category "$status" "$diagnostic")"
+  recovery="$(probe_launch_recovery "$category")"
+  if ((status >= 128)); then
+    status_detail="signal=$((status - 128))"
+  elif [[ "$category" == os-error && "$status" == 125 ]]; then
+    status_detail='os=timeout'
+  else
+    status_detail="exit=$status"
+  fi
+  printf '%s\n' "pbi: probe-chat found on PATH but failed to launch; category=$category helper=$agent_command $status_detail recovery=$recovery"
 }
 
 active_timeout_pid=
@@ -2340,6 +2394,9 @@ case "${1:-}" in
 esac
 
 agent_command="$(command -v probe-chat || true)"
+if [[ -n "$agent_command" && "$agent_command" != /* ]]; then
+  agent_command="$PWD/$agent_command"
+fi
 if [[ "${1:-}" != "--debug-config" && -z "$agent_command" ]]; then
   printf '%s\n' 'pbi: probe-chat is unavailable on PATH' >&2
   exit 127
@@ -2622,9 +2679,12 @@ output="$(<"$probe_stdout_file")"
 probe_stderr="$(<"$probe_stderr_file")"
 probe_diagnostic_input="$output"$'\n'"$probe_stderr"
 if ((status != 0)); then
-  if ((status == 126)); then
-    printf '%s\n' 'pbi: probe-chat found on PATH but failed to launch (exit 126: not executable or bad interpreter)' >&2
-    exit "$status"
+  if ! planner_timeout_or_kill "$status"; then
+    launch_category="$(probe_launch_category "$status" "$probe_diagnostic_input")"
+    if [[ "$launch_category" != exit ]]; then
+      emit_probe_launch_diagnostic "$status" "$probe_diagnostic_input" >&2
+      exit "$status"
+    fi
   fi
   if planner_timeout_or_kill "$status"; then
     if question_needs_synthesized_answer "${question:-}"; then
