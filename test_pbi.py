@@ -2878,6 +2878,76 @@ class PbiTest(unittest.TestCase):
             [["search", "--reranker", "bm25", "--timeout", "540", "--max-results", "8", "--", "TargetSymbol"]],
         )
 
+    def test_search_rejects_single_unrelated_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            weak = repo / "weak.py"
+            weak.write_text("\n" * 41 + "shared helper tests\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{weak}:42\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "alpha", "beta", "gamma", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+
+    def test_search_rejects_generic_overlap_from_unrelated_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            weak = repo / "weak.py"
+            weak.write_text("\n" * 41 + "shared helper recipes\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{weak}:42\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "distinctive", "recipes", "boundary", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+
+    def test_search_skips_unrelated_top_candidate_for_relevant_lower_candidate(self) -> None:
+        for query in (("DISTINCTIVE", "SIGNAL"), ("SIGNAL", "DISTINCTIVE")):
+            with self.subTest(query=query), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repo = directory / "repo"
+                repo.mkdir()
+                unrelated = repo / "unrelated.py"
+                unrelated.write_text("\n" * 41 + "shared helper tests\n")
+                relevant = repo / "relevant.py"
+                relevant.write_text("\n" * 41 + "distinctive signal boundary\n")
+                env, _ = self.fake_environment(directory)
+                probe = directory / "probe"
+                probe.write_text(
+                    "#!/usr/bin/env python3\n"
+                    f"print(\"{unrelated}:42\")\n"
+                    f"print(\"{relevant}:42\")\n"
+                )
+                probe.chmod(0o755)
+                result = self.run_pbi(
+                    "search", *query, env=env, cwd=repo,
+                    binary=self.fake_pbi(directory, probe), timeout=5,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "relevant.py:42\n")
+            self.assertEqual(result.stderr, "")
+
     def test_search_compact_stamp_fallback_fails_closed_without_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

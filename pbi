@@ -665,6 +665,9 @@ emit_bm25_locations_or_fail_closed() {
   if [[ -n "$recovered_named_locations" ]] && emit_source_locations "$recovered_named_locations"; then
     exit 0
   fi
+  if [[ "${search_final_selection:-false}" == true ]]; then
+    emit_search_final_selection_or_fail_closed "$locations"
+  fi
   if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
     locations="$(recover_timeout_location_from_bm25 || true)"
     if [[ -n "$locations" ]] && emit_source_locations "$locations"; then
@@ -688,6 +691,40 @@ emit_bm25_locations_or_fail_closed() {
   fi
   printf '%s\n' "$locations"
   exit 0
+}
+
+emit_search_locations_or_fail_closed() {
+  search_final_selection=true
+  emit_bm25_locations_or_fail_closed
+}
+
+emit_search_final_selection_or_fail_closed() {
+  local locations="$1" recovered_locations location_count
+  [[ -n "$(search_distinctive_tokens "${question:-}")" ]] || return 0
+  if [[ "${question,,}" =~ (^|[[:space:]])(find|locate|where|which|show)[[:space:]] ]] &&
+      recovered_locations="$(recover_timeout_location_from_bm25 || true)" &&
+      [[ -n "$recovered_locations" ]] && emit_source_locations "$recovered_locations"; then
+    exit 0
+  fi
+  if recovered_locations="$(recover_bm25_source_locations "" true)" &&
+      emit_source_locations "$recovered_locations"; then
+    exit 0
+  fi
+  if [[ "${question:-}" =~ [[:alnum:]]+[-_][[:alnum:]]+ ]] &&
+      [[ ! "${question,,}" =~ (^|[[:space:]])(find|locate|where|which|show)[[:space:]] ]]; then
+    printf '%s\n' 'pbi: no source locations found' >&2
+    exit 1
+  fi
+  location_count="$(printf '%s\n' "$locations" | awk 'NF { count += 1 } END { print count + 0 }')"
+  if [[ -z "${locations//[[:space:]]/}" && -n "${symbol:-}" ]] ||
+      [[ -z "${locations//[[:space:]]/}" && -z "${symbol:-}" &&
+         ! ( "${question,,}" =~ (^|[[:space:]])(find|locate|where|which|show)[[:space:]] ) ]] ||
+      [[ "$location_count" -gt 0 && "$location_count" -le 1 && -z "${symbol:-}" ]]; then
+    printf '%s\n' 'pbi: no source locations found' >&2
+    exit 1
+  fi
+  printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
+  exit 1
 }
 
 # Code-symbol tokens in a query, longest first. Empty when the query names no distinguishable real symbol.
@@ -1729,6 +1766,27 @@ overlap_accepts_candidate() {
   [[ -z "${phrases//[[:space:]]/}" ]] && ((distinctive_score > 0))
 }
 
+search_overlap_accepts_candidate() {
+  local haystack="$1" distinctive="$2" phrases="$3"
+  local phrase_score=0 distinctive_score=0 token plain_overlap=0 plain_tokens=0 strong_overlap=0
+  if [[ -n "${phrases//[[:space:]]/}" ]]; then
+    phrase_score="$(token_overlap_score "$haystack" "$phrases")"
+    [[ "$phrase_score" =~ ^[[:digit:]]+$ ]] && ((phrase_score > 0)) && return 0
+  fi
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    distinctive_score="$(token_overlap_score "$haystack" "$token")"
+    [[ "$distinctive_score" =~ ^[[:digit:]]+$ ]] || continue
+    if [[ "$token" =~ [-_[:digit:]] ]]; then
+      ((distinctive_score > 0)) && strong_overlap=$((strong_overlap + 1))
+    else
+      plain_tokens=$((plain_tokens + 1))
+      ((distinctive_score > 0)) && plain_overlap=$((plain_overlap + 1))
+    fi
+  done <<< "$distinctive"
+  ((strong_overlap > 0 || plain_overlap > 0 && plain_tokens == 1 || plain_overlap >= 2))
+}
+
 recover_distinctive_source_locations() {
   local deadline_ns="${1:-}" token variant rg_command hit file rest line_number text
   local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked=""
@@ -1823,7 +1881,7 @@ format_located_answer() {
 }
 
 recover_bm25_source_locations() {
-  local deadline_ns="${1:-}" candidate file line_start line_end line_scan_end line_number text relative score scan_start candidate_ranked header_scan score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
+  local deadline_ns="${1:-}" strict_relevance="${2:-false}" candidate file line_start line_end line_scan_end line_number text relative score scan_start candidate_ranked header_scan score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
   local candidates="${bm25_candidates:-}"
   [[ -n "${candidates//[[:space:]]/}" ]] || return 1
   fast_path_deadline_reached "$deadline_ns" && return 1
@@ -1892,8 +1950,12 @@ recover_bm25_source_locations() {
       is_synthesis_junk_line "$text" && continue
       if question_is_test_coverage "${question:-}"; then
         is_test_coverage_evidence "$file" "$text" || continue
-      elif [[ "$header_scan" != true ]]; then
-        overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+      elif [[ "$header_scan" != true || "$strict_relevance" == true ]]; then
+        if [[ "$strict_relevance" == true ]]; then
+          search_overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+        else
+          overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+        fi
       fi
       score="$(token_overlap_score "$text" "$score_tokens")"
       [[ "$header_scan" != true || "$score" != 0 ]] || continue
@@ -2422,7 +2484,7 @@ case "${1:-}" in
           printf '%s\n' 'pbi: no source locations found' >&2
           exit 1
         fi
-        emit_bm25_locations_or_fail_closed
+        emit_search_locations_or_fail_closed
       else
         printf "%s\n" "$candidates" >&2
         exit "$search_status"
@@ -2469,13 +2531,13 @@ case "${1:-}" in
       fi
     fi
     if [[ -z "$symbol" ]]; then
-      emit_bm25_locations_or_fail_closed
+      emit_search_locations_or_fail_closed
     fi
     if [[ -n "$symbol" ]] && search_output_contains_symbol "$search_fallback_locations" "$symbol"; then
       printf '%s\n' "$search_fallback_locations"
       exit 0
     fi
-    emit_bm25_locations_or_fail_closed
+    emit_search_locations_or_fail_closed
     ;;
 esac
 
