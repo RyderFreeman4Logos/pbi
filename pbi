@@ -2124,9 +2124,31 @@ semantic_trace_line_links_evidence() {
   return 1
 }
 
+is_semantic_trace_metadata_line() {
+  [[ "$2" =~ ^[[:space:]]*(issue|rationale|provenance|revision|source[_-]?commit|commit|range)[[:space:]]*[:=] ]]
+}
+
+semantic_trace_accepts_candidate() {
+  is_semantic_trace_metadata_line "$1" "$2" && return 1
+  search_overlap_accepts_candidate "$1 $2" "$3" "$4" ||
+    semantic_trace_line_links_evidence "$1 $2" "$5"
+}
+
+semantic_trace_candidate_priority() {
+  local score phrase_score compound_score=0 token token_score
+  score="$(token_overlap_score "$1 $2" "$3")"
+  phrase_score="$(token_overlap_score "$1 $2" "$4")"
+  while IFS= read -r token; do
+    [[ "$token" == *-* ]] || continue
+    token_score="$(token_overlap_score "$1 $2" "$token")"
+    [[ "$token_score" =~ ^[[:digit:]]+$ ]] && ((token_score > 0)) && compound_score=$((compound_score + 4))
+  done < <(printf '%s\n%s\n' "$3" "$4" | awk 'NF && !seen[$0]++')
+  printf '%s\n' "$((score + phrase_score + compound_score))"
+}
+
 recover_semantic_trace_locations() {
-  local candidate file line_start line_end line_number line_scan_end text relative location emitted=0
-  local distinctive_tokens phrase_tokens accepted_haystack=""
+  local candidate file line_start line_end line_number line_scan_end text relative location score
+  local distinctive_tokens phrase_tokens accepted_haystack="" ranked=""
   local -A seen=()
   [[ -n "${bm25_candidates//[[:space:]]/}" ]] || return 1
   distinctive_tokens="$(search_distinctive_tokens "${question:-}")"
@@ -2161,18 +2183,17 @@ recover_semantic_trace_locations() {
       text="${text#"${text%%[![:space:]]*}"}"
       [[ -n "$text" ]] || continue
       is_synthesis_junk_line "$text" && continue
-      search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" ||
-        semantic_trace_line_links_evidence "$relative $text" "$accepted_haystack" || continue
+      semantic_trace_accepts_candidate "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack" || continue
       location="$relative:$line_number"
       [[ -z "${seen[$location]+seen}" ]] || continue
       seen["$location"]=1
       accepted_haystack+="${accepted_haystack:+ }$relative $text"
-      printf '%s\n' "$location"
-      emitted=$((emitted + 1))
-      ((emitted < 16)) || return 0
+      score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens")"
+      ranked+="$score"$'\t'"$location"$'\n'
     done
   done <<< "$bm25_candidates"
-  ((emitted > 0))
+  [[ -n "$ranked" ]] || return 1
+  printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 16'
 }
 
 filter_semantic_trace_locations() {
@@ -2189,8 +2210,7 @@ filter_semantic_trace_locations() {
     relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
     [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
-    search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" ||
-      semantic_trace_line_links_evidence "$relative $text" "$accepted_haystack" || continue
+    semantic_trace_accepts_candidate "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack" || continue
     accepted_haystack+="${accepted_haystack:+ }$relative $text"
     printf '%s:%s\n' "$relative" "$line_number"
     emitted=$((emitted + 1))

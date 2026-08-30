@@ -6468,6 +6468,48 @@ class PbiTest(unittest.TestCase):
             self.assertNotIn(path, result.stderr)
         self.assertFalse(trace.exists(), "bounded local retrieval must not require chat")
 
+    def test_default_semantic_trace_prefers_implementation_over_metadata_and_generic_db_tests(self) -> None:
+        question = (
+            "Trace durable raw-payload persistence, SQLite retry to filesystem spool, "
+            "spool retention/deletion, rejected LLM payload cleanup, and test isolation "
+            "changes in main...HEAD."
+        )
+        metadata = {
+            "scripts/monolith/baseline.toml": (
+                "issue = 123\n"
+                "rationale = 'raw-payload persistence filesystem spool retention deletion "
+                "rejected LLM payload cleanup test isolation'\n"
+                "range = 'main...HEAD'\n"
+            ),
+            "tests/test_sqlite_vec.py": "def test_sqlite_vec_delete_busy_retry(): pass\n",
+            "tests/test_delete_retry.py": "def test_delete_busy_retry(): pass\n",
+        }
+        implementation = {
+            "src/raw_payload_store.py": (
+                "persist_raw_payload(payload)  # durable raw-payload persistence after SQLite retry\n"
+            ),
+            "src/filesystem_spool.py": (
+                "delete_expired_spool(filesystem_spool)  # spool retention/deletion\n"
+            ),
+            "tests/test_rejected_payload_cleanup.py": (
+                "assert cleanup_rejected_llm_payload()  # rejected LLM payload cleanup\n"
+            ),
+            "tests/test_payload_isolation.py": "assert isolate_test_payloads()  # test isolation changes\n",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), question, metadata | implementation
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in implementation:
+            self.assertIn(path, result.stdout)
+        self.assertNotIn("scripts/monolith/baseline.toml", result.stdout + result.stderr)
+        generic_position = result.stdout.find("tests/test_sqlite_vec.py")
+        self.assertGreater(generic_position, result.stdout.find("src/raw_payload_store.py"))
+        self.assertGreater(generic_position, result.stdout.find("src/filesystem_spool.py"))
+        self.assertNotIn("Missing:", result.stdout + result.stderr)
+        self.assertFalse(trace.exists(), "verified local evidence must not require chat")
+
     def test_default_semantic_trace_generic_candidates_fail_opaque(self) -> None:
         generic = {
             "spikes/framework/src/lib.rs": "#[cfg(test)]\npub mod fixtures;\n",
