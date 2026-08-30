@@ -2922,6 +2922,125 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
+    def test_search_requires_structured_anchor_beyond_generic_framework_term(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            generic = repo / "generic.py"
+            generic.write_text("\n" * 41 + "ADK-Rust framework adapters\n")
+            relevant = repo / "relevant.py"
+            relevant.write_text("\n" * 41 + "r7_04 no create 3_2_1 ADK-Rust\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{generic}:42\")\n"
+                f"print(\"{relevant}:42\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "R7-04", "no-create", "3.2.1", "ADK-Rust",
+                env=env, cwd=repo, binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "relevant.py:42\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_structured_anchor_matches_normalized_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "r7_04.py"
+            source.write_text("\n" * 41 + "framework adapters\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{source}:42\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "R7-04", "framework", "adapters", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "r7_04.py:42\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_no_anchor_candidate_with_two_concepts_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            generic = repo / "crates" / "workflow-adk" / "src" / "lib.rs"
+            generic.parent.mkdir(parents=True)
+            generic.write_text("\n" * 41 + "ADK-Rust framework adapters\n")
+            relevant = repo / "scripts" / "test-local-gates.sh"
+            relevant.parent.mkdir(parents=True)
+            relevant.write_text("#!/usr/bin/env bash\nset -euo pipefail\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"File: {generic}, Lines: 42-42\")\n"
+                "print(\"Remaining files not shown:\")\n"
+                "print(\"  scripts/test-local-gates.sh <5> <1>\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "M2-02", "recipes", "consumer", "local", "gates", "quality", "gate", "adk-rust",
+                env=env, cwd=repo, binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "scripts/test-local-gates.sh:1\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_compound_components_count_as_one_concept(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "workflow-adk-rust.py"
+            source.write_text("\n" * 41 + "adk_rust framework\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{source}:42\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "M2-02", "adk-rust", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+
+    def test_search_without_structured_anchor_keeps_ordinary_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "ordinary.py"
+            source.write_text("\n" * 41 + "ordinary bridge\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print(\"{source}:42\")\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search", "ordinary", "bridge", env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "The source shows ordinary bridge (ordinary.py:42).\n")
+        self.assertEqual(result.stderr, "")
+
     def test_search_skips_unrelated_top_candidate_for_relevant_lower_candidate(self) -> None:
         for query in (("DISTINCTIVE", "SIGNAL"), ("SIGNAL", "DISTINCTIVE")):
             with self.subTest(query=query), tempfile.TemporaryDirectory() as temporary:

@@ -1766,10 +1766,64 @@ overlap_accepts_candidate() {
   [[ -z "${phrases//[[:space:]]/}" ]] && ((distinctive_score > 0))
 }
 
+search_structured_query_anchors() {
+  local token normalized
+  while IFS= read -r token; do
+    token="${token#\#}"
+    token="${token%%[,:;!?]*}"
+    token="${token%.}"
+    if [[ "$token" =~ ^[[:alnum:]]+([._-][[:alnum:]]+)+$ && "$token" =~ [[:digit:]] ]] ||
+       [[ "$token" =~ ^no-[[:alnum:]][[:alnum:]-]*$ ]]; then
+      normalized="${token,,}"
+      normalized="${normalized//_/-}"
+      normalized="${normalized//./-}"
+      printf '%s\n' "$normalized"
+    fi
+  done < <(printf '%s\n' "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }') |
+    awk 'NF && !seen[$0]++'
+}
+
+search_structured_anchors_match() {
+  local haystack="$1" anchors="$2" anchor pattern
+  haystack="${haystack,,}"
+  haystack="${haystack//_/-}"
+  haystack="${haystack//./-}"
+  while IFS= read -r anchor; do
+    [[ -n "$anchor" ]] || continue
+    pattern='(^|[^[:alnum:]])'"$anchor"'([^[:alnum:]]|$)'
+    [[ "$haystack" =~ $pattern ]] && return 0
+  done <<< "$anchors"
+  return 1
+}
+
+search_independent_concept_score() {
+  printf '%s' "$2" | awk -v haystack="$1" '
+    BEGIN { haystack = tolower(haystack); gsub(/[^[:alnum:]]+/, " ", haystack); haystack = " " haystack " " }
+    {
+      token = tolower($0); gsub(/_/, "-", token)
+      if (token ~ /-/) {
+        compounds[token] = 1
+        count = split(token, parts, "-")
+        for (i = 1; i <= count; i++) components[parts[i]] = 1
+      } else if (token != "") plain[token] = 1
+    }
+    END {
+      score = 0
+      for (token in compounds) { words = token; gsub(/-/, " ", words); if (index(haystack, " " words " ")) score++ }
+      for (token in plain) if (!(token in components) && index(haystack, " " token " ")) score++
+      print score
+    }
+  '
+}
+
 search_overlap_accepts_candidate() {
-  local haystack="$1" distinctive="$2" phrases="$3"
+  local haystack="$1" distinctive="$2" phrases="$3" anchors concept_score anchor_match=false
   local phrase_score=0 distinctive_score=0 token plain_overlap=0 plain_tokens=0 strong_overlap=0
-  if [[ -n "${phrases//[[:space:]]/}" ]]; then
+  anchors="$(search_structured_query_anchors "${question:-}")"
+  if [[ -z "${anchors//[[:space:]]/}" ]] || search_structured_anchors_match "$haystack" "$anchors"; then
+    anchor_match=true
+  fi
+  if [[ "$anchor_match" == true && -n "${phrases//[[:space:]]/}" ]]; then
     phrase_score="$(token_overlap_score "$haystack" "$phrases")"
     [[ "$phrase_score" =~ ^[[:digit:]]+$ ]] && ((phrase_score > 0)) && return 0
   fi
@@ -1784,7 +1838,12 @@ search_overlap_accepts_candidate() {
       ((distinctive_score > 0)) && plain_overlap=$((plain_overlap + 1))
     fi
   done <<< "$distinctive"
-  ((strong_overlap > 0 || plain_overlap > 0 && plain_tokens == 1 || plain_overlap >= 2))
+  if [[ "$anchor_match" == true ]] &&
+     ((strong_overlap > 0 || plain_overlap > 0 && plain_tokens == 1 || plain_overlap >= 2)); then
+    return 0
+  fi
+  concept_score="$(search_independent_concept_score "$haystack" "$distinctive")"
+  [[ "$concept_score" =~ ^[[:digit:]]+$ ]] && ((concept_score >= 2))
 }
 
 recover_distinctive_source_locations() {
@@ -1881,10 +1940,14 @@ format_located_answer() {
 }
 
 recover_bm25_source_locations() {
-  local deadline_ns="${1:-}" strict_relevance="${2:-false}" candidate file line_start line_end line_scan_end line_number text relative score scan_start candidate_ranked header_scan score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
+  local deadline_ns="${1:-}" strict_relevance="${2:-false}" candidate file line_start line_end line_scan_end line_number text relative score scan_start candidate_ranked header_scan footer_candidates score_tokens="" phrase_tokens="" distinctive_tokens="" ranked=""
   local candidates="${bm25_candidates:-}"
   [[ -n "${candidates//[[:space:]]/}" ]] || return 1
   fast_path_deadline_reached "$deadline_ns" && return 1
+  if [[ "$strict_relevance" == true ]]; then
+    footer_candidates="$(remaining_file_candidates "$candidates" "${question:-}" "$deadline_ns")"
+    [[ -z "$footer_candidates" ]] || candidates+=$'\n'"$footer_candidates"
+  fi
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     phrase_tokens+="$token"$'\n'
@@ -1952,7 +2015,7 @@ recover_bm25_source_locations() {
         is_test_coverage_evidence "$file" "$text" || continue
       elif [[ "$header_scan" != true || "$strict_relevance" == true ]]; then
         if [[ "$strict_relevance" == true ]]; then
-          search_overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+          search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || continue
         else
           overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
         fi
