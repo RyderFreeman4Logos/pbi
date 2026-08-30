@@ -6418,6 +6418,49 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "audit.py:1\n")
         self.assertEqual(result.stderr, "")
 
+    def test_explicit_removed_or_renamed_symbol_uses_bounded_history_and_current_test_imports(self) -> None:
+        symbol = "LegacySymbol"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "pkg.py"
+            test = repo / "tests" / "test_pkg.py"
+            test.parent.mkdir()
+            source.write_text(f"def {symbol}():\n    pass\n")
+            test.write_text(f"from pkg import {symbol}\n")
+            git_env = os.environ.copy()
+            git_env.update(
+                GIT_AUTHOR_NAME="history-test",
+                GIT_AUTHOR_EMAIL="history-test@example.invalid",
+                GIT_COMMITTER_NAME="history-test",
+                GIT_COMMITTER_EMAIL="history-test@example.invalid",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, env=git_env)
+            subprocess.run(["git", "commit", "-qm", "add legacy symbol"], cwd=repo, check=True, env=git_env)
+            source.write_text("def CurrentSymbol():\n    pass\n")
+            subprocess.run(["git", "add", "pkg.py"], cwd=repo, check=True, env=git_env)
+            subprocess.run(["git", "commit", "-qm", "rename legacy symbol"], cwd=repo, check=True, env=git_env)
+            removal = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            env, trace = self.fake_environment(directory)
+            result = self.run_pbi(
+                f"Where was {symbol} removed or renamed, and which tests import it?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, directory / "probe"),
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(removal, result.stdout)
+        self.assertIn("rename legacy symbol", result.stdout)
+        self.assertIn("tests/test_pkg.py:1", result.stdout)
+        self.assertIn(f"from pkg import {symbol}", result.stdout)
+        self.assertIn("removed", result.stdout)
+        self.assertFalse(trace.exists(), "explicit history lookup must not start Probe Chat")
+
     def test_default_semantic_trace_assembles_multi_target_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result, trace = self.run_default_semantic_fixture(

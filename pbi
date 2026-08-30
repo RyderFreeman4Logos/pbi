@@ -919,6 +919,34 @@ question_allows_compact_stamp() {
   return 0
 }
 
+explicit_removed_or_renamed_symbol_history() {
+  local q="$1" symbol git_command history commit subject diff imports change
+  [[ "$q" =~ ^[[:space:]]*[Ww]here[[:space:]]+was[[:space:]]+([[:alpha:]_][[:alnum:]_]*)[[:space:]]+removed[[:space:]]+or[[:space:]]+renamed,[[:space:]]+and[[:space:]]+which[[:space:]]+tests[[:space:]]+import[[:space:]]+it[?!.[:space:]]*$ ]] || return 1
+  symbol="${BASH_REMATCH[1]}"
+  git_command="$(command -v git || true)"
+  [[ -n "$git_command" ]] || return 1
+  [[ "$("$git_command" rev-parse --is-inside-work-tree 2>/dev/null || true)" == true ]] || return 1
+  history="$("$git_command" log -S"$symbol" -n 1 --format='%H%x09%s' 2>/dev/null || true)"
+  [[ "$history" == *$'\t'* ]] || return 1
+  commit="${history%%$'\t'*}"
+  subject="${history#*$'\t'}"
+  imports="$("$git_command" grep -n -F -- "$symbol" 2>/dev/null | awk -F: '
+    $1 ~ /(^|\/)tests?\// || $1 ~ /(^|\/)[^\/]*_tests?(_|\.|\/|$)/ {
+      text = $0
+      sub(/^[^:]*:[0-9]+:/, "", text)
+      if (text ~ /^[[:space:]]*(from|import)[[:space:]]/) print
+    }
+  ' || true)"
+  [[ -n "${imports//[[:space:]]/}" ]] || return 1
+  diff="$("$git_command" show --format= --unified=0 "$commit" 2>/dev/null || true)"
+  if printf '%s\n' "$diff" | awk -v symbol="$symbol" '$0 !~ /^---/ && $0 ~ "^-.*" symbol { found = 1 } END { exit !found }'; then
+    change="$symbol was removed in this diff; whether it was renamed is uncertain."
+  else
+    change="$symbol changed in this diff; removal versus rename is uncertain."
+  fi
+  printf 'History: %s %s\n%s\nCurrent test imports:\n%s\n' "$commit" "$subject" "$change" "$imports"
+}
+
 build_fast_path_queries() {
   local token is_stem normalized fallback_token queries="" fallback_queries="" count=0 fallback_count=0
   if fast_path_requires_cache_key "$1"; then
@@ -2981,6 +3009,10 @@ else
     exit 2
   fi
   question="${message_parts[*]}"
+  if output="$(explicit_removed_or_renamed_symbol_history "$question")"; then
+    printf '%s' "$output"
+    exit 0
+  fi
   configure_local_routing
   if run_default_bm25_fast_path; then
     exit 0
