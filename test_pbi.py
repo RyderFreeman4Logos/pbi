@@ -127,21 +127,26 @@ class PbiTest(unittest.TestCase):
         probe.chmod(0o755)
 
     def run_default_semantic_fixture(
-        self, directory: Path, question: str, sources: dict[str, str]
+        self,
+        directory: Path,
+        question: str,
+        sources: dict[str, str],
+        candidate_paths: tuple[str, ...] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         repo = directory / "repo"
         repo.mkdir()
-        paths = []
+        paths: dict[str, Path] = {}
         for relative, content in sources.items():
             path = repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
-            paths.append(path)
+            paths[relative] = path
+        candidates = [paths[relative] for relative in candidate_paths or tuple(paths)]
         env, trace = self.fake_environment(directory)
         probe = directory / "probe"
         probe.write_text(
             "#!/usr/bin/env python3\n"
-            + "\n".join(f"print('File: {path}, Lines: 1-8')" for path in paths)
+            + "\n".join(f"print('File: {path}, Lines: 1-8')" for path in candidates)
             + "\n"
         )
         probe.chmod(0o755)
@@ -150,7 +155,7 @@ class PbiTest(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import os\n"
             "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
-            + "\n".join(f"print({str(path.relative_to(repo)) + ':1'!r})" for path in paths)
+            + "\n".join(f"print({str(path.relative_to(repo)) + ':1'!r})" for path in candidates)
             + "\n"
         )
         fake_chat.chmod(0o755)
@@ -444,8 +449,9 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("LICENSE:1", result.stdout)
         self.assertNotIn("Located in", result.stdout)
 
-    def test_multi_target_where_recovers_bm25_candidates_after_chat_timeout(self) -> None:
-        # A multi-target answer must not turn one unrelated BM25 hit into success.
+    def test_multi_target_where_recovers_relevant_candidates_before_chat(self) -> None:
+        # Deterministic local recovery must retain relevant source evidence and
+        # never promote the unrelated initial BM25 candidate or start chat.
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
@@ -481,17 +487,25 @@ class PbiTest(unittest.TestCase):
                 timeout=8,
             )
             elapsed = time.monotonic() - started
-            self.assertTrue(trace.exists(), "Probe Chat must start before timing out")
         self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
         self.assertEqual(result.stdout, "")
+        self.assertFalse(trace.exists(), "relevant pre-chat recovery must not invoke Probe Chat")
+        self.assertNotIn("distractor.py", result.stdout + result.stderr)
+        self.assertIn("pbi: partial source answer; verified candidates retained", result.stderr)
+        self.assertIn("Verified source evidence:", result.stderr)
+        for evidence in (
+            "tests/quality-gate-receipt-tests.sh:1",
+            "run_exact_reuse()",
+            "tests/quality-gate-isolation-tests.sh:1",
+            "ambient-inputs)",
+            "isolate_ambient_inputs",
+        ):
+            self.assertIn(evidence, result.stderr)
         self.assertIn(
+            "Missing: requested target groups: the shared receipt helper it exercises\n",
             result.stderr,
-            {
-                "pbi: source answer lacks requested semantic evidence\n",
-                "pbi: model returned only BM25 location stamps; no source answer\n",
-                "pbi: no source locations found\n",
-            },
         )
+        self.assertNotIn("Coverage: complete", result.stdout + result.stderr)
         self.assertLess(elapsed, 6)
 
     def test_where_are_question_quotes_bm25_source_instead_of_stamps(self) -> None:
@@ -6379,6 +6393,54 @@ class PbiTest(unittest.TestCase):
         self.assertIn("quality-gate", result.stdout)
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "verified candidates must not require chat synthesis")
+
+    def test_default_semantic_trace_retrieves_after_generic_initial_candidates(self) -> None:
+        generic = {
+            "spikes/framework/src/lib.rs": "#[cfg(test)]\npub mod fixtures;\n",
+            "crates/workflow/src/lib.rs": "pub mod agent;\npub mod graph;\n",
+            "crates/testkit/src/lib.rs": "pub mod harness;\npub mod assertions;\n",
+            "justfile": 'set shell := ["bash", "-uc"]\nset positional-arguments\n',
+        }
+        relevant = {
+            "catalog/pattern-catalog.schema.json": '{"required": ["name"], "contract": "pattern catalog schema"}\n',
+            "scripts/validate_pattern_catalog.py": "validate_pattern_catalog(catalog, schema)  # validator contract\n",
+            "tests/test_pattern_catalog.py": "assert validate_pattern_catalog(catalog, schema)  # catalog tests\n",
+            "gates/local-gates.just": "quality-gate: validate-pattern-catalog test-pattern-catalog\n",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                "Where are the pattern catalog schema, validator, tests, and quality-gate wiring, and what contracts do they implement?",
+                generic | relevant,
+                tuple(generic),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in relevant:
+            self.assertIn(path, result.stdout)
+        for path in generic:
+            self.assertNotIn(path, result.stdout)
+            self.assertNotIn(path, result.stderr)
+        self.assertFalse(trace.exists(), "bounded local retrieval must not require chat")
+
+    def test_default_semantic_trace_generic_candidates_fail_opaque(self) -> None:
+        generic = {
+            "spikes/framework/src/lib.rs": "#[cfg(test)]\npub mod fixtures;\n",
+            "crates/workflow/src/lib.rs": "pub mod agent;\npub mod graph;\n",
+            "crates/testkit/src/lib.rs": "pub mod harness;\npub mod assertions;\n",
+            "justfile": 'set shell := ["bash", "-uc"]\nset positional-arguments\n',
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _ = self.run_default_semantic_fixture(
+                Path(temporary),
+                "Where are the pattern catalog schema, validator, tests, and quality-gate wiring, and what contracts do they implement?",
+                generic,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("partial source answer", result.stderr)
+        self.assertNotIn("Verified source evidence", result.stderr)
+        for path in generic:
+            self.assertNotIn(path, result.stderr)
 
     def test_default_semantic_trace_assembles_cross_call_edges(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

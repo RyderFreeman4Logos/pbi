@@ -2104,10 +2104,32 @@ recover_bm25_source_locations() {
   printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
 }
 
+semantic_trace_line_links_evidence() {
+  local text="$1" evidence="$2" token score
+  [[ -n "$evidence" ]] || return 1
+  line_has_relationship_edge "$text" || return 1
+  while IFS= read -r token; do
+    score="$(token_overlap_score "$evidence" "$token")"
+    [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) && return 0
+  done < <(printf '%s\n' "$text" | awk '
+    {
+      gsub(/[^[:alnum:]_-]+/, " ")
+      for (i = 1; i <= NF; i++) {
+        token = tolower($i)
+        if (length(token) >= 8 && token !~ /^(assert|consumer|function|production|requested|return)$/) print token
+      }
+    }
+  ')
+  return 1
+}
+
 recover_semantic_trace_locations() {
   local candidate file line_start line_end line_number line_scan_end text relative location emitted=0
+  local distinctive_tokens phrase_tokens accepted_haystack=""
   local -A seen=()
   [[ -n "${bm25_candidates//[[:space:]]/}" ]] || return 1
+  distinctive_tokens="$(search_distinctive_tokens "${question:-}")"
+  phrase_tokens="$(question_phrase_tokens "${question:-}")"
   while IFS= read -r candidate; do
     if [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
@@ -2138,14 +2160,40 @@ recover_semantic_trace_locations() {
       text="${text#"${text%%[![:space:]]*}"}"
       [[ -n "$text" ]] || continue
       is_synthesis_junk_line "$text" && continue
+      search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" ||
+        semantic_trace_line_links_evidence "$relative $text" "$accepted_haystack" || continue
       location="$relative:$line_number"
       [[ -z "${seen[$location]+seen}" ]] || continue
       seen["$location"]=1
+      accepted_haystack+="${accepted_haystack:+ }$relative $text"
       printf '%s\n' "$location"
       emitted=$((emitted + 1))
       ((emitted < 16)) || return 0
     done
   done <<< "$bm25_candidates"
+  ((emitted > 0))
+}
+
+filter_semantic_trace_locations() {
+  local locations="$1" location file line_number text relative emitted=0
+  local distinctive_tokens phrase_tokens accepted_haystack=""
+  distinctive_tokens="$(search_distinctive_tokens "${question:-}")"
+  phrase_tokens="$(question_phrase_tokens "${question:-}")"
+  while IFS= read -r location; do
+    [[ "$location" =~ ^(.+):([[:digit:]]+)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+    line_number="${BASH_REMATCH[2]}"
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    [[ -f "$file" ]] || continue
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
+    text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
+    search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" ||
+      semantic_trace_line_links_evidence "$relative $text" "$accepted_haystack" || continue
+    accepted_haystack+="${accepted_haystack:+ }$relative $text"
+    printf '%s:%s\n' "$relative" "$line_number"
+    emitted=$((emitted + 1))
+  done <<< "$locations"
   ((emitted > 0))
 }
 
@@ -2171,6 +2219,7 @@ format_semantic_trace_evidence() {
 semantic_trace_is_complete() {
   local locations="$1" location file line_number text group tokens score
   local haystack="" target_count=0 covered_count=0 group_index=0 relationship_count=0
+  local missing_groups=""
   local -A relationship_files=()
   semantic_trace_missing='requested target coverage'
   semantic_trace_target_count=0
@@ -2183,7 +2232,7 @@ semantic_trace_is_complete() {
     [[ -f "$file" ]] || continue
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
     [[ -n "$text" ]] || continue
-    haystack+="${haystack:+ }$text"
+    haystack+="${haystack:+ }$file $text"
     if line_has_relationship_edge "$text"; then
       relationship_count=$((relationship_count + 1))
       relationship_files["$file"]=1
@@ -2197,13 +2246,16 @@ semantic_trace_is_complete() {
     score="$(token_overlap_score "$haystack" "$tokens")"
     if [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)); then
       covered_count=$((covered_count + 1))
-    elif [[ "$semantic_trace_missing" == 'requested target coverage' ]]; then
-      semantic_trace_missing="requested target group $group_index"
+    else
+      missing_groups+="${missing_groups:+; }$group"
     fi
   done < <(semantic_target_groups "${question:-}")
   semantic_trace_target_count="$target_count"
   semantic_trace_covered_count="$covered_count"
-  ((target_count >= 2 && covered_count == target_count)) || return 1
+  if ((target_count < 2 || covered_count != target_count)); then
+    semantic_trace_missing="requested target groups: ${missing_groups:-unresolved}"
+    return 1
+  fi
   if question_requires_semantic_trace "${question:-}" &&
       ((relationship_count < 2 || ${#relationship_files[@]} < 2)); then
     semantic_trace_missing='requested relationship edge'
@@ -2214,12 +2266,19 @@ semantic_trace_is_complete() {
 }
 
 emit_semantic_trace_from_candidates() {
-  local deadline_ns="${1:-}" locations evidence answer
+  local deadline_ns="${1:-}" locations fallback_locations evidence answer
   locations="$(recover_semantic_trace_locations || true)"
-  if [[ -z "${locations//[[:space:]]/}" ]]; then
-    locations="$(recover_bm25_source_locations "$deadline_ns" || true)"
+  if [[ -z "${locations//[[:space:]]/}" ]] || ! semantic_trace_is_complete "$locations"; then
+    fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" || true)"
+    fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
+    if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
+      locations="$(printf '%s\n%s\n' "$locations" "$fallback_locations" | awk 'NF && !seen[$0]++')"
+    fi
   fi
-  [[ -n "${locations//[[:space:]]/}" ]] || return 1
+  if [[ -z "${locations//[[:space:]]/}" ]]; then
+    search_fast_path_miss=true
+    return 1
+  fi
   evidence="$(format_semantic_trace_evidence "$locations")" || return 1
   answer="Coverage: complete across requested source targets and relationship edges."$'\n'"$evidence"
   if semantic_trace_is_complete "$locations" && source_answer_has_semantic_evidence "$answer" "$deadline_ns"; then
