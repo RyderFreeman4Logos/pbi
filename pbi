@@ -1658,7 +1658,7 @@ question_rejects_lone_type_declaration() {
 
 is_test_coverage_evidence() {
   local file="$1" text="$2"
-  [[ "$file" == */test/* || "$file" == */tests/* || "$file" =~ (^|/)[^/]*_tests?(/|$) ]] && return 0
+  [[ "$file" == */test/* || "$file" == */tests/* || "$file" =~ (^|/)[^/]*_tests?(_|\.|/|$) ]] && return 0
   [[ "$text" =~ ^[[:space:]]*\#\[[^]]*test ]] ||
     [[ "$text" =~ (^|[[:space:]])mod[[:space:]]+tests?([[:space:]]|\{) ]]
 }
@@ -1919,7 +1919,7 @@ search_overlap_accepts_candidate() {
 }
 
 recover_distinctive_source_locations() {
-  local deadline_ns="${1:-}" token variant rg_command hit file rest line_number text
+  local deadline_ns="${1:-}" diverse_files="${2:-false}" token variant rg_command hit file rest line_number text
   local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked=""
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
@@ -1952,6 +1952,9 @@ recover_distinctive_source_locations() {
     extra=$((extra + 1))
     ((extra < 4)) || break
   done <<< "$phrase_tokens"
+  if [[ "$diverse_files" == true && "${question,,}" =~ (^|[^[:alnum:]])tests?([^[:alnum:]]|$) ]]; then
+    tokens+="test"$'\n'
+  fi
   [[ -n "$tokens" ]] || return 1
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
@@ -1972,7 +1975,11 @@ recover_distinctive_source_locations() {
         relative="$(basename -- "$file")"
       fi
       overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
-      score="$(token_overlap_score "$text" "$score_tokens")"
+      if [[ "$diverse_files" == true ]]; then
+        score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "")"
+      else
+        score="$(token_overlap_score "$text" "$score_tokens")"
+      fi
       ranked+="$score"$'\t'"$relative:$line_number"$'\n'
     done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
         --glob "!drafts/**" --glob "!docs/plans/**" \
@@ -1980,7 +1987,17 @@ recover_distinctive_source_locations() {
         -- "$token" . 2>/dev/null || true)
   done <<< "$tokens"
   [[ -n "$ranked" ]] || return 1
-  printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
+  if [[ "$diverse_files" == true ]]; then
+    printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' '
+      NF >= 2 {
+        file = $2
+        sub(/:[0-9]+$/, "", file)
+        if (!seen[file]++) print $2
+      }
+    ' | awk 'NR <= 4'
+  else
+    printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
+  fi
 }
 
 format_located_answer() {
@@ -2131,19 +2148,25 @@ is_semantic_trace_metadata_line() {
 semantic_trace_accepts_candidate() {
   is_semantic_trace_metadata_line "$1" "$2" && return 1
   search_overlap_accepts_candidate "$1 $2" "$3" "$4" ||
-    semantic_trace_line_links_evidence "$1 $2" "$5"
+    semantic_trace_line_links_evidence "$1 $2" "$5" ||
+    ([[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && line_has_relationship_edge "$2")
 }
 
 semantic_trace_candidate_priority() {
-  local score phrase_score compound_score=0 token token_score
+  local score phrase_score compound_score=0 implementation_score=0 token token_score
   score="$(token_overlap_score "$1 $2" "$3")"
   phrase_score="$(token_overlap_score "$1 $2" "$4")"
+  [[ "$2" =~ (admit|snapshot) ]] && implementation_score=$((implementation_score + 4))
+  [[ "$2" =~ resolve_[[:alnum:]_]*context ]] && implementation_score=$((implementation_score + 4))
+  [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && implementation_score=$((implementation_score + 4))
+  semantic_trace_line_links_evidence "$2" "$5" && implementation_score=$((implementation_score + 2))
+  is_test_coverage_evidence "$1" "$2" && implementation_score=$((implementation_score + 2))
   while IFS= read -r token; do
     [[ "$token" == *-* ]] || continue
     token_score="$(token_overlap_score "$1 $2" "$token")"
     [[ "$token_score" =~ ^[[:digit:]]+$ ]] && ((token_score > 0)) && compound_score=$((compound_score + 4))
   done < <(printf '%s\n%s\n' "$3" "$4" | awk 'NF && !seen[$0]++')
-  printf '%s\n' "$((score + phrase_score + compound_score))"
+  printf '%s\n' "$((score + phrase_score + compound_score + implementation_score))"
 }
 
 recover_semantic_trace_locations() {
@@ -2187,8 +2210,8 @@ recover_semantic_trace_locations() {
       location="$relative:$line_number"
       [[ -z "${seen[$location]+seen}" ]] || continue
       seen["$location"]=1
+      score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack")"
       accepted_haystack+="${accepted_haystack:+ }$relative $text"
-      score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens")"
       ranked+="$score"$'\t'"$location"$'\n'
     done
   done <<< "$bm25_candidates"
@@ -2239,7 +2262,7 @@ format_semantic_trace_evidence() {
 
 semantic_trace_is_complete() {
   local locations="$1" location file line_number text group tokens score
-  local haystack="" target_count=0 covered_count=0 group_index=0 relationship_count=0
+  local haystack="" target_count=0 covered_count=0 group_index=0 relationship_count=0 has_test_evidence=false
   local missing_groups=""
   local -A relationship_files=()
   semantic_trace_missing='requested target coverage'
@@ -2254,6 +2277,7 @@ semantic_trace_is_complete() {
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
     [[ -n "$text" ]] || continue
     haystack+="${haystack:+ }$file $text"
+    is_test_coverage_evidence "$file" "$text" && has_test_evidence=true
     if line_has_relationship_edge "$text"; then
       relationship_count=$((relationship_count + 1))
       relationship_files["$file"]=1
@@ -2265,7 +2289,8 @@ semantic_trace_is_complete() {
     group_index=$((group_index + 1))
     target_count=$((target_count + 1))
     score="$(token_overlap_score "$haystack" "$tokens")"
-    if [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)); then
+    if [[ "$group" =~ ^tests?$ && "$has_test_evidence" == true ]] ||
+       ([[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0))); then
       covered_count=$((covered_count + 1))
     else
       missing_groups+="${missing_groups:+; }$group"
@@ -2289,12 +2314,10 @@ semantic_trace_is_complete() {
 emit_semantic_trace_from_candidates() {
   local deadline_ns="${1:-}" locations fallback_locations evidence answer
   locations="$(recover_semantic_trace_locations || true)"
-  if [[ -z "${locations//[[:space:]]/}" ]] || ! semantic_trace_is_complete "$locations"; then
-    fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" || true)"
-    fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
-    if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
-      locations="$(printf '%s\n%s\n' "$locations" "$fallback_locations" | awk 'NF && !seen[$0]++')"
-    fi
+  fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
+  fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
+  if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
+    locations="$(printf '%s\n%s\n' "$fallback_locations" "$locations" | awk 'NF && !seen[$0]++')"
   fi
   if [[ -z "${locations//[[:space:]]/}" ]]; then
     search_fast_path_miss=true

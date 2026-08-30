@@ -6510,6 +6510,49 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("Missing:", result.stdout + result.stderr)
         self.assertFalse(trace.exists(), "verified local evidence must not require chat")
 
+    def test_default_semantic_trace_prioritizes_review_context_production_and_test_evidence(self) -> None:
+        question = (
+            "Trace the main...HEAD review-context extra-readable path authority and "
+            "pre-exec host-memory seam through production callers and tests."
+        )
+        generic = {
+            "src/review_convergence/production_clean_room_provider.rs": (
+                "if request.extra_readable() != [request.evidence_bundle()] { /* authority */ }\n"
+            ),
+            "src/pipeline_sandbox_tests.rs": (
+                "extra_readable: &[PathBuf::from(\".csa/review-context.md\")],\n"
+            ),
+            "src/generic_review_caller.rs": (
+                "run_pre_exec_host_memory(request.extra_readable()); // generic caller\n"
+            ),
+        }
+        relevant = {
+            "src/review_context.rs": (
+                "let admitted = admit_extra_readable_paths(request.extra_readable_paths())?;\n"
+                "let snapshot = ReviewContextSnapshot::new(admitted, pre_exec_host_memory())?;\n"
+            ),
+            "src/review_cmd_handle.rs": (
+                "let prompt = build_review_instruction(&scope, context.as_ref())?;\n"
+            ),
+            "src/review_cmd_resolve.rs": (
+                "instruction.push_str(context.snapshot());\n"
+            ),
+            "src/review_cmd_tests_preflight.rs": (
+                "#[test]\nassert!(review_context_snapshot_admits_extra_readable()); // matching test\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), question, generic | relevant
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in relevant:
+            self.assertIn(path, result.stdout)
+        for path in generic:
+            self.assertGreater(result.stdout.find(path), result.stdout.find("src/review_context.rs"))
+        self.assertNotIn("Missing:", result.stdout + result.stderr)
+        self.assertFalse(trace.exists(), "verified trace edges must not require chat synthesis")
+
     def test_default_semantic_trace_generic_candidates_fail_opaque(self) -> None:
         generic = {
             "spikes/framework/src/lib.rs": "#[cfg(test)]\npub mod fixtures;\n",
