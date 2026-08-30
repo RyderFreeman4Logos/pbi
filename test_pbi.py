@@ -6440,6 +6440,24 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "verified candidates must not require chat synthesis")
 
+    def test_semantic_trace_normalizes_validator_and_test_target_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _ = self.run_default_semantic_fixture(
+                Path(temporary),
+                "Where are schema, validator, tests, wiring, and admission?",
+                {
+                    "catalog/schema.py": "schema_catalog()  # tests wiring\n",
+                    "scripts/validate_catalog.py": "validate_catalog(schema_catalog)  # tests wiring\n",
+                    "scripts/test_catalog.py": "test_catalog(schema_catalog)  # schema wiring\n",
+                },
+            )
+        output = result.stdout + result.stderr
+        missing = output.partition("Missing: ")[2]
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("admission", missing)
+        self.assertNotIn("validator", missing)
+        self.assertNotIn("tests", missing)
+
     def test_default_semantic_trace_retrieves_after_generic_initial_candidates(self) -> None:
         generic = {
             "spikes/framework/src/lib.rs": "#[cfg(test)]\npub mod fixtures;\n",
