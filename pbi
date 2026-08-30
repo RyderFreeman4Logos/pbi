@@ -1693,7 +1693,7 @@ is_test_coverage_evidence() {
 
 question_requests_semantic_evidence() {
   local q="${1,,}"
-  [[ "$q" =~ (^|[^[:alnum:]])(api|symbol|symbols|test|tests|caller|callers|calling|called|invocation|invocations|coverage|owner|owners|owns|ownership|production[[:space:]_-]+path|integration[[:space:]_-]+tests?)([^[:alnum:]]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]])(api|symbol|symbols|test|tests|caller|callers|calling|called|invocation|invocations|coverage|owner|owners|owns|ownership|production[[:space:]_-]+path|integration[[:space:]_-]+tests?|routing)([^[:alnum:]]|$) ]] || return 1
   [[ "$q" =~ (^|[^[:alnum:]])(what|where|which|find|locate|show|does|are|is|cover|how|trace)([^[:alnum:]]|$) ]]
 }
 
@@ -1717,6 +1717,7 @@ semantic_target_groups() {
     {
       q = tolower($0)
       gsub(/[?!.;]+/, "", q)
+      sub(/[[:space:]]+give exact functions and key line ranges at current head[[:space:]]*$/, "", q)
       gsub(/,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)[[:space:]]+/, "\n", q)
       gsub(/,[[:space:]]*/, "\n", q)
       gsub(/[[:space:]]+and[[:space:]]+/, "\n", q)
@@ -2181,11 +2182,33 @@ is_semantic_trace_metadata_line() {
   [[ "$2" =~ ^[[:space:]]*(issue|rationale|provenance|revision|source[_-]?commit|commit|range)[[:space:]]*[:=] ]]
 }
 
+semantic_trace_candidate_matches_target() {
+  local candidate="$1" group tokens token score plain_overlap
+  while IFS= read -r group; do
+    [[ -n "$group" ]] || continue
+    tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
+    [[ -n "${tokens//[[:space:]]/}" ]] || continue
+    plain_overlap=0
+    while IFS= read -r token; do
+      [[ -n "$token" ]] || continue
+      score="$(token_overlap_score "$candidate" "$token")"
+      [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) || continue
+      [[ "$token" == *-* ]] && return 0
+      plain_overlap=$((plain_overlap + 1))
+    done <<< "$tokens"
+    ((plain_overlap >= 2)) && return 0
+  done < <(semantic_target_groups "${question:-}")
+  return 1
+}
+
 semantic_trace_accepts_candidate() {
+  if ! semantic_trace_candidate_matches_target "$1 $2" &&
+      ! semantic_trace_line_links_evidence "$2" "$5" &&
+      ! { [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && line_has_relationship_edge "$2"; }; then
+    return 1
+  fi
   is_semantic_trace_metadata_line "$1" "$2" && return 1
-  search_overlap_accepts_candidate "$1 $2" "$3" "$4" ||
-    semantic_trace_line_links_evidence "$1 $2" "$5" ||
-    ([[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && line_has_relationship_edge "$2")
+  return 0
 }
 
 semantic_trace_candidate_priority() {

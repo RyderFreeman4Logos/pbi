@@ -6461,6 +6461,29 @@ class PbiTest(unittest.TestCase):
         self.assertIn("removed", result.stdout)
         self.assertFalse(trace.exists(), "explicit history lookup must not start Probe Chat")
 
+    def test_forced_model_alias_trace_is_semantic_and_bounded(self) -> None:
+        question = (
+            "Trace forced model alias request routing, ingress/model-detail rejection, "
+            "model listing rewriting, response alias restoration, and hot reload "
+            "generation atomicity. Give exact functions and key line ranges at current HEAD."
+        )
+        sources = {
+            "proxy/routing.py": "route_forced_model_alias_request() selects the target routing profile.\n",
+            "proxy/ingress.py": "reject_ingress_model_detail() validates the model-detail request.\n",
+            "proxy/models.py": "model listing rewriting via rewrite_model_listing() and response alias restoration via restore_response_alias().\n",
+            "proxy/reload.py": "reload_generation_atomicity() publishes one hot-reload generation.\n",
+            "proxy/unrelated.py": "unrelated_model_function() handles a model cache lookup.\n",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(Path(temporary), question, sources)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Coverage: complete", result.stdout)
+        for path in sources:
+            if path != "proxy/unrelated.py":
+                self.assertIn(path, result.stdout)
+        self.assertNotIn("proxy/unrelated.py", result.stdout)
+        self.assertFalse(trace.exists(), "semantic traces must not require Probe Chat")
+
     def test_default_semantic_trace_assembles_multi_target_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result, trace = self.run_default_semantic_fixture(
