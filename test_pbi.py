@@ -508,6 +508,52 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("Coverage: complete", result.stdout + result.stderr)
         self.assertLess(elapsed, 6)
 
+    def test_possessive_multi_target_where_recovers_validator_and_schema_before_chat(self) -> None:
+        # #170: possessive conjunctions are semantic multi-target questions,
+        # not singleton where-is lookups that can fall through to helper126.
+        for possessive in ("its", "their"):
+            with self.subTest(possessive=possessive), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repo = directory / "repo"
+                repo.mkdir()
+                distractor = repo / "unrelated.py"
+                distractor.write_text("def unrelated():\n    return True\n")
+                validator = repo / "src" / "receipt_validator.py"
+                validator.parent.mkdir()
+                validator.write_text("receipt_validator = lambda receipt: validate_receipt(receipt)\n")
+                schema = repo / "schemas" / "receipt_schema.json"
+                schema.parent.mkdir()
+                schema.write_text('{"$id": "receipt-validator-schema", "title": "schema", "type": "object"}\n')
+                env, trace = self.fake_environment(directory)
+                probe = directory / "probe"
+                probe.write_text(
+                    "#!/usr/bin/env python3\n"
+                    f"print('File: {distractor}, Lines: 1-1')\n"
+                )
+                probe.chmod(0o755)
+                fake_chat = directory / "probe-chat"
+                fake_chat.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import os\n"
+                    "open(os.environ['PBI_TEST_TRACE'], 'w').close()\n"
+                    "raise SystemExit(126)\n"
+                )
+                fake_chat.chmod(0o755)
+                result = self.run_pbi(
+                    f"where is the audit receipt validator and {possessive} schema?",
+                    env=env,
+                    cwd=repo,
+                    binary=self.fake_pbi(directory, probe),
+                    timeout=8,
+                )
+            self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+            self.assertFalse(trace.exists(), "possessive recovery must not invoke Probe Chat")
+            self.assertIn("Coverage: complete", result.stdout)
+            self.assertIn("Verified source evidence:", result.stdout)
+            self.assertIn("src/receipt_validator.py:1", result.stdout)
+            self.assertIn("schemas/receipt_schema.json:1", result.stdout)
+            self.assertEqual(result.stderr, "")
+
     def test_where_are_question_quotes_bm25_source_instead_of_stamps(self) -> None:
         # #123: a natural-language where-are question whose BM25 hits include
         # real source must quote a cited line. Stamp-only fail-closed is not
