@@ -891,7 +891,7 @@ question_is_multi_target_where() {
     return
   fi
   [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how)([[:space:]]|$) ]] && return 0
+  [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|its|their)([[:space:]]|$) ]] && return 0
   [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
 }
 
@@ -1680,7 +1680,8 @@ question_has_multiple_semantic_targets() {
 question_requires_semantic_trace() {
   local q="${1,,}"
   question_has_multiple_semantic_targets "$1" || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])(trace|through|contracts?|callers?|wiring)([^[:alnum:]]|$) ]]
+  [[ "$q" =~ (^|[^[:alnum:]])(trace|through|contracts?|callers?|wiring)([^[:alnum:]]|$) ]] ||
+    [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]]
 }
 
 semantic_target_groups() {
