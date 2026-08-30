@@ -126,6 +126,43 @@ class PbiTest(unittest.TestCase):
         )
         probe.chmod(0o755)
 
+    def run_default_semantic_fixture(
+        self, directory: Path, question: str, sources: dict[str, str]
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        repo = directory / "repo"
+        repo.mkdir()
+        paths = []
+        for relative, content in sources.items():
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+            paths.append(path)
+        env, trace = self.fake_environment(directory)
+        probe = directory / "probe"
+        probe.write_text(
+            "#!/usr/bin/env python3\n"
+            + "\n".join(f"print('File: {path}, Lines: 1-8')" for path in paths)
+            + "\n"
+        )
+        probe.chmod(0o755)
+        fake_chat = directory / "probe-chat"
+        fake_chat.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+            + "\n".join(f"print({str(path.relative_to(repo)) + ':1'!r})" for path in paths)
+            + "\n"
+        )
+        fake_chat.chmod(0o755)
+        result = self.run_pbi(
+            question,
+            env=env,
+            cwd=repo,
+            binary=self.fake_pbi(directory, probe),
+            timeout=15,
+        )
+        return result, trace
+
     def test_static_interface_never_starts_an_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env, trace = self.fake_environment(Path(temporary))
@@ -6320,6 +6357,74 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "audit.py:1\n")
         self.assertEqual(result.stderr, "")
+
+    def test_default_semantic_trace_assembles_multi_target_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                "Where are the pattern catalog schema, validator, tests, and quality-gate wiring, and what contracts do they implement?",
+                {
+                    "catalog/schema.json": '{"required": ["name", "summary", "tags", "steps"], "contract": "pattern catalog schema"}\n',
+                    "scripts/validate_catalog.py": 'validate_catalog(catalog, schema["required"])  # validator enforces the catalog contract\n',
+                    "tests/test_catalog.py": "assert validate_catalog(valid_catalog, required_fields)  # tests the schema contract\n",
+                    "justfile": "quality-gate: validate-catalog test-catalog  # wiring runs validator and tests\n",
+                },
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Verified source evidence:", result.stdout)
+        self.assertIn("Coverage: complete", result.stdout)
+        for path in ("catalog/schema.json", "scripts/validate_catalog.py", "tests/test_catalog.py", "justfile"):
+            self.assertIn(path, result.stdout)
+        self.assertIn("validate_catalog", result.stdout)
+        self.assertIn("quality-gate", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "verified candidates must not require chat synthesis")
+
+    def test_default_semantic_trace_assembles_cross_call_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                "Trace review-context extra-readable path authority and pre-exec host-memory seam through production callers and tests.",
+                {
+                    "src/review_context.rs": (
+                        "let admitted = admit_extra_readable_paths(request.extra_readable_paths())?;\n"
+                        "let snapshot = ReviewContextSnapshot::new(admitted, pre_exec_host_memory())?;\n"
+                    ),
+                    "src/review_cmd_handle.rs": "let context = prepare_review_context(&request)?; // production caller\n",
+                    "src/review_cmd_resolve.rs": "let prompt = resolve_prompt(context.snapshot())?; // snapshot consumer\n",
+                    "tests/review_preflight.rs": "assert_eq!(preflight.extra_readable_paths(), admitted_paths); // admission test\n",
+                },
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Coverage: complete", result.stdout)
+        self.assertIn("admit_extra_readable_paths", result.stdout)
+        self.assertIn("ReviewContextSnapshot::new", result.stdout)
+        self.assertIn("prepare_review_context", result.stdout)
+        self.assertIn("resolve_prompt", result.stdout)
+        self.assertIn("tests/review_preflight.rs", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "verified trace edges must not require chat synthesis")
+
+    def test_default_semantic_trace_keeps_structured_partial_when_edge_missing(self) -> None:
+        question = "Trace private-needle authority and host-memory seam through production callers and tests."
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _ = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                {
+                    "src/authority.rs": 'const AUTHORITY: &str = "private-needle authority";\n',
+                    "src/memory.rs": 'const MEMORY: &str = "host-memory seam";\n',
+                    "tests/memory.rs": 'const COVERAGE: &str = "production callers and tests";\n',
+                },
+            )
+        self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "")
+        self.assertIn("pbi: partial source answer", result.stderr)
+        self.assertIn("Verified source evidence:", result.stderr)
+        self.assertIn("src/authority.rs:1", result.stderr)
+        self.assertIn("src/memory.rs:1", result.stderr)
+        self.assertIn("Missing: requested relationship edge", result.stderr)
+        self.assertNotIn(question, result.stderr)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
