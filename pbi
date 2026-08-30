@@ -1713,6 +1713,14 @@ semantic_group_tokens() {
       count = split(text, words, /[[:space:]]+/)
       for (i = 1; i <= count; i++) {
         word = words[i]
+        if (word ~ /^(validate|validation|validator)$/) {
+          print "validate"
+          print "validate-"
+        }
+        if (word ~ /^tests?(_|$)/) {
+          print "test"
+          print "test-"
+        }
         if (word ~ /^(admission|authority|caller|callers|consumer|consumers|contract|contracts|gate|schema|seam|snapshot|test|tests|validator|wiring)$/) {
           print word
           if (word ~ /^(callers|consumers|contracts|tests)$/) {
