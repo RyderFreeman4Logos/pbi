@@ -6675,6 +6675,70 @@ class PbiTest(unittest.TestCase):
         self.assertIn("removed", result.stdout)
         self.assertFalse(trace.exists(), "explicit history lookup must not start Probe Chat")
 
+    def test_semantic_investigation_grammars_never_return_bare_singletons(self) -> None:
+        sources = {
+            "src/fake_environment.py": (
+                "def setup_fake_gemini_environment():\n"
+                "    child_env = dict(os.environ)\n"
+                "    child_env['HOME'] = fake_home\n"
+                "    child_env['GEMINI_CLI_HOME'] = fake_gemini_home\n"
+                "    return child_env\n"
+            ),
+            "tests/test_fake_environment.py": (
+                "def test_fake_child_environment():\n"
+                "    child_env = setup_fake_gemini_environment()\n"
+                "    assert child_env['HOME'] == fake_home\n"
+                "    assert child_env['GEMINI_CLI_HOME'] == fake_gemini_home\n"
+            ),
+            "src/mcp_hub.rs": (
+                "fn spawn_mcp_hub_daemon(socket_path: &Path) { daemon.spawn(socket_path); }\n"
+                "fn wait_for_socket_readiness(socket_path: &Path) { socket.wait_ready(); }\n"
+                "fn teardown_mcp_hub(socket_path: &Path) { daemon.stop(socket_path); }\n"
+            ),
+            "tests/mcp_hub_e2e.rs": (
+                "fn hub_forwards_requests_and_proxy_latency_budget_is_within_environment_budget() {\n"
+                "    let daemon = spawn_mcp_hub_daemon(&owned_socket_path);\n"
+                "    wait_for_socket_readiness(&owned_socket_path);\n"
+                "    teardown_mcp_hub(&owned_socket_path);\n"
+                "}\n"
+            ),
+            "src/setup_cmds.rs": "fn unrelated_setup_command() { print_help(); }\n",
+        }
+        cases = {
+            "where-symbol-and-how": (
+                "where is setup_fake_gemini_environment and how are HOME GEMINI_CLI_HOME and fake child environment assembled?",
+                ("src/fake_environment.py", "tests/test_fake_environment.py"),
+            ),
+            "noun-phrase-lifecycle": (
+                "MCP hub socket readiness fixture setup daemon spawn socket path ownership readiness wait teardown",
+                ("src/mcp_hub.rs", "tests/mcp_hub_e2e.rs"),
+            ),
+            "trace-symbol-lifecycle": (
+                "Trace hub_forwards_requests_and_proxy_latency_budget_is_within_environment_budget MCP hub socket readiness lifecycle",
+                ("src/mcp_hub.rs", "tests/mcp_hub_e2e.rs"),
+            ),
+        }
+        for grammar, (question, relevant_paths) in cases.items():
+            with self.subTest(grammar=grammar), tempfile.TemporaryDirectory() as temporary:
+                result, trace = self.run_default_semantic_fixture(
+                    Path(temporary), question, sources
+                )
+            output = result.stdout + result.stderr
+            self.assertIn(result.returncode, (0, 1), output)
+            self.assertFalse(trace.exists(), "bounded semantic recovery must skip Probe Chat")
+            self.assertNotRegex(output, r"(?m)^[^\n:]+:\d+\n?$")
+            self.assertNotIn("only BM25 location stamps", output)
+            self.assertNotIn("src/setup_cmds.rs", output)
+            self.assertIn("Verified source evidence:", output)
+            self.assertTrue(any(path in output for path in relevant_paths), output)
+            self.assertGreaterEqual(output.count(" — "), 2, output)
+            if result.returncode == 0:
+                self.assertIn("Coverage: complete", result.stdout)
+            else:
+                self.assertIn("pbi: partial source answer", result.stderr)
+                self.assertRegex(result.stderr, r"(?m)^Missing: requested (?:target groups|relationship edge|lifecycle stage coverage)")
+                self.assertNotIn("unresolved", result.stderr)
+
     def test_forced_model_alias_trace_is_semantic_and_bounded(self) -> None:
         question = (
             "Trace forced model alias request routing, ingress/model-detail rejection, "
