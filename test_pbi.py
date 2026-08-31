@@ -554,6 +554,135 @@ class PbiTest(unittest.TestCase):
             self.assertIn("schemas/receipt_schema.json:1", result.stdout)
             self.assertEqual(result.stderr, "")
 
+    def test_enforced_multi_target_where_uses_semantic_trace_before_chat(self) -> None:
+        # #181: enforcement questions must use the bounded semantic trace path,
+        # preserving evidence for every requested production/test target.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            sources = {
+                "src/runtime_plan.rs": (
+                    "model cardinality = validate_model_cardinality(model_cardinality);\n"
+                ),
+                "src/execution.rs": (
+                    "capability narrowing = enforce_capability_narrowing(capability_narrowing);\n"
+                ),
+                "src/checkpoint.rs": (
+                    "checkpoint provenance = enforce_checkpoint_provenance(checkpoint_provenance);\n"
+                ),
+                "tests/runtime_plan_tests.rs": (
+                    "fn checkpoint_provenance_tests() { "
+                    "assert!(capability_narrowing.is_enforced()); }\n"
+                ),
+            }
+            paths = {}
+            for relative, content in sources.items():
+                path = repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                paths[relative] = path
+            env, trace = self.fake_environment(directory)
+            env["PBI_CHAT_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "import time\n"
+                "with open(__import__('os').environ['PBI_TEST_PROBE_TRACE'], 'a') as trace:\n"
+                "    trace.write(sys.argv[-1] + '\\n')\n"
+                "if sys.argv[-1] == 'Where are model cardinality, capability narrowing, and checkpoint provenance enforced?':\n"
+                + "\n".join(f"    print('File: {path}, Lines: 1-1')" for path in paths.values())
+                + "\nelse:\n"
+                "    time.sleep(2)\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "sleep 30\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "Where are model cardinality, capability narrowing, and checkpoint provenance enforced?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=15,
+            )
+            probe_queries = (directory / "probe-trace.json").read_text().splitlines()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            probe_queries,
+            ["Where are model cardinality, capability narrowing, and checkpoint provenance enforced?"],
+        )
+        self.assertFalse(trace.exists(), "bounded semantic trace recovery must skip Probe Chat")
+        self.assertIn("Coverage: complete", result.stdout)
+        self.assertIn("src/runtime_plan.rs:1", result.stdout)
+        self.assertIn("src/execution.rs:1", result.stdout)
+        self.assertIn("src/checkpoint.rs:1", result.stdout)
+        self.assertIn("tests/runtime_plan_tests.rs:1", result.stdout)
+        self.assertNotIn("BM25 location stamps", result.stdout + result.stderr)
+        self.assertNotIn("planner timed out", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_enforced_multi_target_where_reports_partial_missing_groups_after_routing(self) -> None:
+        # #181: post-routing recovery must retain multiple relevant files and
+        # report missing target groups instead of falling back to BM25 stamps.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            sources = {
+                "src/runtime_plan.rs": (
+                    "models = resolve_model_bindings();\n"
+                    "tools = resolve_tool_bindings();\n"
+                    "cardinality = bindings.len();\n"
+                ),
+                "src/execution.rs": (
+                    "effective_capabilities = plan.effective_capabilities();\n"
+                    "narrowing = capability.intersection(allowed);\n"
+                ),
+            }
+            paths = {}
+            for relative, content in sources.items():
+                path = repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                paths[relative] = path
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "with open(__import__('os').environ['PBI_TEST_PROBE_TRACE'], 'a') as trace:\n"
+                "    trace.write(sys.argv[-1] + '\\n')\n"
+                "if sys.argv[-1] == 'Where are model and tool cardinality, capability narrowing, and checkpoint provenance enforced?':\n"
+                + "\n".join(f"    print('File: {path}, Lines: 1-3')" for path in paths.values())
+                + "\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "Where are model and tool cardinality, capability narrowing, and checkpoint provenance enforced?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+            probe_queries = (directory / "probe-trace.json").read_text().splitlines()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(
+            probe_queries,
+            ["Where are model and tool cardinality, capability narrowing, and checkpoint provenance enforced?"],
+        )
+        self.assertFalse(trace.exists(), "partial semantic trace recovery must skip Probe Chat")
+        self.assertIn("partial source answer", result.stderr)
+        self.assertIn("Verified source evidence:", result.stderr)
+        self.assertIn("src/runtime_plan.rs:", result.stderr)
+        self.assertIn("src/execution.rs:", result.stderr)
+        self.assertIn("Missing: requested target groups:", result.stderr)
+        self.assertIn("checkpoint provenance enforced", result.stderr)
+        self.assertNotIn("BM25 location stamps", result.stdout + result.stderr)
+        self.assertNotIn("planner timed out", result.stdout + result.stderr)
+
     def test_where_are_question_quotes_bm25_source_instead_of_stamps(self) -> None:
         # #123: a natural-language where-are question whose BM25 hits include
         # real source must quote a cited line. Stamp-only fail-closed is not
