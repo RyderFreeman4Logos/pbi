@@ -6774,6 +6774,37 @@ class PbiTest(unittest.TestCase):
         self.assertIn("removed", result.stdout)
         self.assertFalse(trace.exists(), "explicit history lookup must not start Probe Chat")
 
+    def test_where_are_feature_sources_admit_split_semantic_evidence(self) -> None:
+        question = "Where are Cargo REST feature defaults and shipped daemon service build features defined?"
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                {
+                    "Cargo.toml": "[features]\ndefault = []\nrest = [\"dep:axum\"]\n",
+                    "justfile": "build-rest:\n    cargo build --release --features rest\n",
+                    "README.md": "The shipped daemon service is built with REST support.\n",
+                    "src/daemon.rs": "pub fn build_daemon_service() { let features = \"rest\"; }\n",
+                    "docs/usage.md": "The shipped Codex feature flag is under development.\n",
+                    "specs/hooks.md": "Codex ships feature hooks for user prompts.\n",
+                    "skills/smoke/tests.py": "features = ['feature.a', 'feature.b']\n",
+                    "src/doctor.rs": "Install REST support with cargo install --features rest.\n",
+                    "src/core/remote_calls.rs": "report.services[0].status\n",
+                },
+                candidate_paths=(
+                    "docs/usage.md",
+                    "src/doctor.rs",
+                    "src/core/remote_calls.rs",
+                ),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Verified source evidence:", result.stdout)
+        self.assertIn("Coverage: complete", result.stdout)
+        for path in ("Cargo.toml", "justfile", "src/daemon.rs"):
+            self.assertIn(path, result.stdout)
+        self.assertNotIn("source answer lacks requested semantic evidence", result.stderr)
+        self.assertFalse(trace.exists(), "semantic source evidence must not need Probe Chat")
+
     def test_semantic_investigation_grammars_never_return_bare_singletons(self) -> None:
         sources = {
             "src/fake_environment.py": (
