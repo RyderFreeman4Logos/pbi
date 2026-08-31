@@ -4484,7 +4484,7 @@ class PbiTest(unittest.TestCase):
             env, _ = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
-                "#!/usr/bin/env python3\nimport time\ntime.sleep(9)\n"
+                "#!/usr/bin/env python3\nimport time\ntime.sleep(.1)\n"
                 f"print(\"File: {source}, Lines: 20-20\")\n"
             )
             probe.chmod(0o755)
@@ -4603,6 +4603,91 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "a named-symbol miss must skip Probe Chat")
         self.assertNotIn("pbi: probe-chat failed", result.stderr)
         self.assertNotIn("pbi: probe-chat timed out answering the question", result.stderr)
+
+    def test_search_probe_hang_has_internal_deadline_and_reaps_descendants(self) -> None:
+        def current_start_time(pid: int) -> str | None:
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            except (FileNotFoundError, IndexError, ProcessLookupError):
+                return None
+
+        identities: dict[str, dict[str, int | str]] = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            identity_file = directory / "probe-identities.json"
+            child_identity_file = directory / "probe-child.json"
+            env["PBI_TEST_PROBE_IDENTITIES"] = str(identity_file)
+            env["PBI_TEST_PROBE_CHILD_IDENTITY"] = str(child_identity_file)
+            probe = directory / "probe"
+            child_code = (
+                "import json, os, pathlib, signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "start = pathlib.Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid': os.getpid(), 'start_time': start, 'pgid': os.getpgrp()}))\n"
+                "while True: time.sleep(.1)\n"
+            )
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, signal, subprocess, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"child_code = {child_code!r}\n"
+                "child_path = pathlib.Path(os.environ['PBI_TEST_PROBE_CHILD_IDENTITY'])\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code, str(child_path)])\n"
+                "deadline = time.monotonic() + .5\n"
+                "while not child_path.exists() and time.monotonic() < deadline: time.sleep(.005)\n"
+                "child_identity = json.loads(child_path.read_text())\n"
+                "start = pathlib.Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
+                "identities = {'parent': {'pid': os.getpid(), 'start_time': start, 'pgid': os.getpgrp()}, 'child': child_identity}\n"
+                "pathlib.Path(os.environ['PBI_TEST_PROBE_IDENTITIES']).write_text(json.dumps(identities))\n"
+                "while True: time.sleep(.1)\n"
+            )
+            probe.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(binary.read_text().replace(
+                'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="1"',
+            ))
+            binary.chmod(0o755)
+            result: subprocess.CompletedProcess[str] | None = None
+            started = time.monotonic()
+            try:
+                result = self.run_pbi(
+                    "search", "generic", "blocking", "multi", "term", env=env, cwd=ROOT,
+                    binary=binary, timeout=4,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(f"search must enforce its internal deadline: {error}")
+            elapsed = time.monotonic() - started
+            try:
+                identities = json.loads(identity_file.read_text())
+                self.assertEqual(identities["parent"]["pgid"], identities["child"]["pgid"])
+                survivors = {
+                    name: identity
+                    for name, identity in identities.items()
+                    if current_start_time(int(identity["pid"])) == identity["start_time"]
+                }
+                self.assertFalse(survivors, f"timed-out search left live child identities: {survivors}")
+            finally:
+                for identity in identities.values():
+                    pid = int(identity["pid"])
+                    try:
+                        pidfd = os.pidfd_open(pid)
+                    except (AttributeError, ProcessLookupError):
+                        continue
+                    try:
+                        if current_start_time(pid) == identity["start_time"]:
+                            try:
+                                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                    finally:
+                        os.close(pidfd)
+        assert result is not None
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: search timed out before producing source locations\n")
+        self.assertLess(elapsed, 3, "search timeout and process cleanup must fit the internal deadline")
 
     def test_search_probe_hang_fails_closed_without_locations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

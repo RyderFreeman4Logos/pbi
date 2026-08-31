@@ -2895,17 +2895,30 @@ case "${1:-}" in
     search_status=0
     search_output_file="$(mktemp)"
     track_temp_file "$search_output_file"
-    if "$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run \
-        -- "${search_pattern_parts[*]}" >"$search_output_file" 2>&1; then
+    search_started_ns="$(fast_path_now_ns)"
+    search_timeout_diagnostic='pbi: search timed out before producing source locations'
+    active_timeout_diagnostic="$search_timeout_diagnostic"
+    if run_timed_command "$DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS" "$search_output_file" "$search_output_file" \
+        "$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run \
+        -- "${search_pattern_parts[*]}"; then
       search_status=0
     else
       search_status=$?
     fi
+    active_timeout_diagnostic=
+    search_elapsed_ns=$(( $(fast_path_now_ns) - search_started_ns ))
     candidates="$(<"$search_output_file")"
     candidates="$(printf '%s\n' "$candidates" | grep -Ev "^BERT reranker .* is not available\.$|^Falling back to BM25 ranking\.\.\.$|^Killed$" || true)"
     bm25_candidates="$candidates"
     if ((search_status != 0)); then
       if planner_timeout_or_kill "$search_status"; then
+        # timeout shares 124/137 with a child that exits by timeout status;
+        # elapsed time identifies the deadline owned by this search phase.
+        if ((search_elapsed_ns >= DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000)) &&
+            [[ -z "${candidates//[[:space:]]/}" ]]; then
+          printf '%s\n' "$search_timeout_diagnostic" >&2
+          exit 124
+        fi
         if [[ -z "${candidates//[[:space:]]/}" ]]; then
           printf '%s\n' 'pbi: no source locations found' >&2
           exit 1
