@@ -508,6 +508,54 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("Coverage: complete", result.stdout + result.stderr)
         self.assertLess(elapsed, 6)
 
+    def test_multi_target_locate_with_followup_uses_semantic_trace_before_chat(self) -> None:
+        question = (
+            "Locate the Just quality-gates recipe, scripts/hooks/check-path-included-src.sh, "
+            "and the nextest/static/live partition configuration that define All versus "
+            "default Static inventory; also locate cleanup around parent checkout"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            started = time.monotonic()
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                {
+                    "justfile": "quality-gates: scripts/hooks/quality-gates.sh\n",
+                    "scripts/hooks/check-path-included-src.sh": (
+                        "# Pre-commit: path-included src modules compile under the integration test crate root.\n"
+                        'repo_root="$(git rev-parse --show-toplevel)"\ncd "$repo_root"\n'
+                    ),
+                    ".config/nextest.toml": (
+                        "[profile.static]\ndefault-filter = 'not live_tests'\n"
+                    ),
+                    "scripts/hooks/quality-gates-live.sh": (
+                        "run_live_nextest list all --ignore-default-filter\n"
+                        "run_live_nextest list static\n"
+                        "run_live_nextest list live -E 'not default()'\n"
+                    ),
+                    "scripts/tests/quality-gate-isolation-tests.sh": (
+                        "run_parent_death_cleanup() { cleanup_parent_checkout; }\n"
+                    ),
+                },
+            )
+            elapsed = time.monotonic() - started
+        output = result.stdout + result.stderr
+        self.assertIn(result.returncode, (0, 1), output)
+        self.assertFalse(trace.exists(), "multi-target Locate recovery must not invoke Probe Chat")
+        self.assertIn("Verified source evidence:", output)
+        for evidence in (
+            "justfile:1",
+            "scripts/hooks/quality-gates-live.sh:",
+            "scripts/tests/quality-gate-isolation-tests.sh:1",
+        ):
+            self.assertIn(evidence, output)
+        if result.returncode == 1:
+            self.assertIn("Missing: requested target groups:", result.stderr)
+            self.assertIn("scripts/hooks/check-path-included-srcsh", result.stderr)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotRegex(output, r"(?m)^[^\n:]+:\d+\n?$")
+        self.assertLess(elapsed, 6)
+
     def test_possessive_multi_target_where_recovers_validator_and_schema_before_chat(self) -> None:
         # #170: possessive conjunctions are semantic multi-target questions,
         # not singleton where-is lookups that can fall through to helper126.
@@ -5591,26 +5639,37 @@ class PbiTest(unittest.TestCase):
         self.assertIn("primary_model=spark", result.stdout)
 
 
-    def test_fails_closed_with_diagnostic_when_probe_chat_cannot_launch(self) -> None:
+    def test_non_executable_probe_chat_fails_preflight_without_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            env, _ = self.fake_environment(directory)
-            # Non-executable probe-chat on PATH: execve fails, bash returns exit 126.
+            env, trace = self.fake_environment(directory)
+            child_pid = directory / "probe-chat-child.pid"
+            env["PBI_TEST_CHILD_PID"] = str(child_pid)
             (directory / "probe-chat").write_text(
-                "#! /usr/bin/env bash\necho should-not-run\n"
+                "#!/usr/bin/env bash\n"
+                "sleep 30 &\n"
+                "printf '%s\\n' \"$!\" >\"$PBI_TEST_CHILD_PID\"\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "wait\n"
             )
             (directory / "probe-chat").chmod(0o644)
-            # Drop PATH entries that carry a real executable probe-chat so the non-exec
-            # fake is what command -v resolves; keep node (pbi config) and core utils.
             node_bin = os.path.dirname(shutil.which("node") or "/usr/bin/node")
             env["PATH"] = f"{directory}:{node_bin}:/usr/bin:/bin"
+            started = time.monotonic()
             result = self.run_pbi("--message", "hello", env=env, cwd=ROOT)
+            elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 126, result.stderr)
         self.assertEqual(result.stdout, "")
-        self.assertIn("failed to launch", result.stderr)
-        self.assertIn("126", result.stderr)
-        self.assertNotIn("probe-chat reported an API error", result.stderr)
-        self.assertNotIn("probe-chat failed", result.stderr)
+        self.assertEqual(
+            result.stderr,
+            "pbi: probe-chat helper preflight failed; phase=preflight "
+            f"category=found-but-not-executable helper={directory / 'probe-chat'} "
+            "recovery=fix permissions or reinstall probe-chat\n",
+        )
+        self.assertFalse(trace.exists(), "non-executable helper must not launch")
+        self.assertFalse(child_pid.exists(), "non-executable helper must not spawn a child")
+        self.assertNotIn("retry", result.stderr)
+        self.assertLess(elapsed, 2)
 
     def test_fails_closed_with_classified_probe_chat_launch_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5622,10 +5681,7 @@ class PbiTest(unittest.TestCase):
             node_bin = os.path.dirname(shutil.which("node") or "/usr/bin/node")
             env["PATH"] = f"{directory}:{node_bin}:/usr/bin:/bin"
             helper = directory / "probe-chat"
-            cases = (
-                ("not-executable", "#! /usr/bin/env bash\necho should-not-run\n", 0o644, 126),
-                ("interpreter-loader", "#!/definitely/missing/interpreter\n", 0o755, 127),
-            )
+            cases = (("interpreter-loader", "#!/definitely/missing/interpreter\n", 0o755, 127),)
             for category, source, mode, expected_status in cases:
                 with self.subTest(category=category):
                     helper.write_text(source)

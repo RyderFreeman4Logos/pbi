@@ -894,6 +894,11 @@ fast_path_match_variants() {
 
 question_is_multi_target_where() {
   local q="${1,,}"
+  if [[ "$q" =~ (^|[[:space:]])locate([[:space:]]|$) ]]; then
+    [[ "$q" =~ (^|[^[:alnum:]])also[[:space:]]+locate([^[:alnum:]]|$) ]] ||
+      { [[ "$q" == *,* ]] && [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]; }
+    return
+  fi
   if [[ "$q" =~ (^|[[:space:]])where[[:space:]]+are([[:space:]]|$) ]]; then
     [[ "$q" == *,* || "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
     return
@@ -1737,7 +1742,8 @@ question_requires_semantic_trace() {
   question_describes_lifecycle_investigation "$1" && return 0
   question_has_multiple_semantic_targets "$1" || return 1
   [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing))([^[:alnum:]]|$) ]] ||
-    [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]]
+    [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]] ||
+    [[ "$q" =~ (^|[^[:alnum:]])also[[:space:]]+locate([^[:alnum:]]|$) ]]
 }
 
 semantic_target_groups() {
@@ -1745,6 +1751,7 @@ semantic_target_groups() {
     {
       q = tolower($0)
       gsub(/[?!.;]+/, "", q)
+      gsub(/[[:space:]]+also[[:space:]]+locate[[:space:]]+/, "\nlocate ", q)
       sub(/[[:space:]]+give exact functions and key line ranges at current head[[:space:]]*$/, "", q)
       gsub(/,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)[[:space:]]+/, "\n", q)
       gsub(/,[[:space:]]*/, "\n", q)
@@ -3053,6 +3060,10 @@ fi
 if [[ "${1:-}" != "--debug-config" && -z "$agent_command" ]]; then
   printf '%s\n' 'pbi: probe-chat is unavailable on PATH' >&2
   exit 127
+fi
+if [[ "${1:-}" != "--debug-config" && ! -x "$agent_command" ]]; then
+  printf '%s\n' "pbi: probe-chat helper preflight failed; phase=preflight category=found-but-not-executable helper=$agent_command recovery=fix permissions or reinstall probe-chat" >&2
+  exit 126
 fi
 rg_command="$(command -v rg || true)"
 rg_ignores=(--glob '!drafts/**' --glob '!docs/plans/**' --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**')
