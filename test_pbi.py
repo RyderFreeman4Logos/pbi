@@ -5808,6 +5808,49 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("reclaim", probe_queries)
         self.assertNotIn("alias", probe_queries)
 
+    def test_default_compile_resolve_dispatch_resume_query_uses_source_trace(self) -> None:
+        question = (
+            "Where are workflow node declarations compiled into RuntimePlanRequest and "
+            "ResolvedRuntimePlan, then dispatched and checked on resume?"
+        )
+        sources = {
+            "crates/workflow-compiler/src/runtime_plan.rs": (
+                "pub struct RuntimePlanRequest {}\n"
+                "pub fn compile_node_declarations(nodes: &[Node]) -> RuntimePlanRequest {\n"
+                "    RuntimePlanRequest::from_node_declarations(nodes)\n"
+                "}\n"
+            ),
+            "crates/workflow-compiler/src/resolve.rs": (
+                "pub struct ResolvedRuntimePlan {}\n"
+                "pub fn resolve_runtime_plan(request: RuntimePlanRequest) -> ResolvedRuntimePlan {\n"
+                "    ResolvedRuntimePlan::from_request(request)\n"
+                "}\n"
+            ),
+            "crates/workflow-adk/src/execution.rs": (
+                "pub fn dispatch_runtime_plan(plan: ResolvedRuntimePlan) {\n"
+                "    executor.dispatch(plan);\n"
+                "}\n"
+            ),
+            "crates/workflow-adk/src/resume.rs": (
+                "pub fn check_runtime_plan_on_resume(plan: &ResolvedRuntimePlan) {\n"
+                "    resume.check_runtime_plan(plan);\n"
+                "}\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), question, sources
+            )
+        evidence = result.stdout + result.stderr
+        self.assertNotIn("model returned only BM25 location stamps", evidence)
+        self.assertIn("Verified source evidence:", evidence)
+        self.assertTrue(
+            result.returncode == 0 or "pbi: partial source answer" in evidence,
+            result.stderr,
+        )
+        self.assertIn("Missing:", evidence) if result.returncode != 0 else None
+        self.assertFalse(trace.exists(), "semantic source traces must not start Probe Chat")
+
     def test_default_query_bm25_fast_path_expands_compound_miss_within_cited_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

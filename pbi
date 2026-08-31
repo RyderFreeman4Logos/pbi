@@ -1741,7 +1741,7 @@ question_requires_semantic_trace() {
   local q="${1,,}"
   question_describes_lifecycle_investigation "$1" && return 0
   question_has_multiple_semantic_targets "$1" || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing))([^[:alnum:]]|$) ]] ||
+  [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing)|compil(e|ed|ation|ing)|dispatch(ed|ing)?|resum(e|ed|ing)|check(ed|ing|s)?)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])also[[:space:]]+locate([^[:alnum:]]|$) ]]
 }
