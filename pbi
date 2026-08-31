@@ -769,6 +769,14 @@ singularize_overlap_token() {
   fi
 }
 
+canonical_overlap_tokens() {
+  local word singular
+  while IFS= read -r word; do
+    singular="$(singularize_overlap_token "$word")"
+    [[ -n "$singular" ]] && printf '%s\n' "$singular"
+  done < <(printf '%s\n' "$1" | awk '{ gsub(/[^[:alnum:]_-]+/, " "); for (i = 1; i <= NF; i++) print $i }')
+}
+
 question_phrase_tokens() {
   local prev="" word word_lower stem count=0
   while IFS= read -r word; do
@@ -954,6 +962,10 @@ build_fast_path_queries() {
     return 0
   fi
   if question_is_test_coverage "$1"; then
+    printf '%s\n' "$1"
+    return 0
+  fi
+  if question_requires_semantic_trace "$1"; then
     printf '%s\n' "$1"
     return 0
   fi
@@ -1708,7 +1720,7 @@ question_has_multiple_semantic_targets() {
 question_requires_semantic_trace() {
   local q="${1,,}"
   question_has_multiple_semantic_targets "$1" || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])(trace|through|contracts?|callers?|wiring)([^[:alnum:]]|$) ]] ||
+  [[ "$q" =~ (^|[^[:alnum:]])(trace|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing))([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]]
 }
 
@@ -1733,8 +1745,12 @@ semantic_target_groups() {
 }
 
 semantic_group_tokens() {
-  local group="$1"
-  search_distinctive_tokens "$group"
+  local group="$1" token singular
+  while IFS= read -r token; do
+    printf '%s\n' "$token"
+    singular="$(singularize_overlap_token "$token")"
+    [[ -n "$singular" ]] && printf '%s\n' "$singular"
+  done < <(search_distinctive_tokens "$group")
   printf '%s\n' "$group" | awk '
     {
       text = tolower($0)
@@ -2027,11 +2043,27 @@ recover_distinctive_source_locations() {
   if [[ "$diverse_files" == true ]]; then
     printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' '
       NF >= 2 {
-        file = $2
-        sub(/:[0-9]+$/, "", file)
-        if (!seen[file]++) print $2
+        locations[++count] = $2
       }
-    ' | awk 'NR <= 4'
+      END {
+        for (i = 1; i <= count && distinct < 4; i++) {
+          file = locations[i]
+          sub(/:[0-9]+$/, "", file)
+          if (!seen[file]++) {
+            selected[file] = 1
+            print locations[i]
+            distinct++
+          }
+        }
+        if (distinct < 4) {
+          for (i = 1; i <= count && i <= 16; i++) {
+            file = locations[i]
+            sub(/:[0-9]+$/, "", file)
+            if (selected[file]) print locations[i]
+          }
+        }
+      }
+    ' | awk '!seen[$0]++ && NR <= 16'
   else
     printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
   fi
@@ -2184,6 +2216,8 @@ is_semantic_trace_metadata_line() {
 
 semantic_trace_candidate_matches_target() {
   local candidate="$1" group tokens token score plain_overlap
+  local canonical_candidate
+  canonical_candidate="$(canonical_overlap_tokens "$candidate")"
   while IFS= read -r group; do
     [[ -n "$group" ]] || continue
     tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
@@ -2196,6 +2230,8 @@ semantic_trace_candidate_matches_target() {
       [[ "$token" == *-* ]] && return 0
       plain_overlap=$((plain_overlap + 1))
     done <<< "$tokens"
+    score="$(token_overlap_score "$canonical_candidate" "$tokens")"
+    [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) && return 0
     ((plain_overlap >= 2)) && return 0
   done < <(semantic_target_groups "${question:-}")
   return 1
@@ -2335,7 +2371,7 @@ semantic_trace_is_complete() {
     [[ -f "$file" ]] || continue
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
     [[ -n "$text" ]] || continue
-    haystack+="${haystack:+ }$file $text"
+    haystack+="${haystack:+ }$file $text $(canonical_overlap_tokens "$file $text")"
     is_test_coverage_evidence "$file" "$text" && has_test_evidence=true
     if line_has_relationship_edge "$text"; then
       relationship_count=$((relationship_count + 1))
@@ -2388,7 +2424,7 @@ emit_semantic_trace_from_candidates() {
     printf '%s\n' "$answer"
     return 0
   fi
-  (( ${semantic_trace_covered_count:-0} >= 1 )) || return 1
+  [[ -n "${locations//[[:space:]]/}" ]] || return 1
   semantic_trace_partial_emitted=true
   printf '%s\n' 'pbi: partial source answer; verified candidates retained' >&2
   printf '%s\n' "$evidence" >&2
