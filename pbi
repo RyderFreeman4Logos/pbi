@@ -772,6 +772,8 @@ singularize_overlap_token() {
 canonical_overlap_tokens() {
   local word singular
   while IFS= read -r word; do
+    word="${word#--}"
+    word="${word#-}"
     singular="$(singularize_overlap_token "$word")"
     [[ -n "$singular" ]] && printf '%s\n' "$singular"
   done < <(printf '%s\n' "$1" | awk '{ gsub(/[^[:alnum:]_-]+/, " "); for (i = 1; i <= NF; i++) print $i }')
@@ -1697,6 +1699,13 @@ is_synthesis_junk_path() {
   [[ "$file" == *.md ]]
 }
 
+is_synthesis_junk_source() {
+  is_synthesis_junk_path "$1" || return 1
+  question_is_multi_target_where "${question:-}" || return 0
+  semantic_trace_candidate_matches_target "$2" || return 0
+  return 1
+}
+
 question_is_test_coverage() {
   local q="${1,,}"
   [[ "$q" =~ (^|[[:space:]])which[[:space:]]+test[[:space:]]+module([[:space:]]|$) ]] ||
@@ -1741,6 +1750,7 @@ question_requires_semantic_trace() {
   local q="${1,,}"
   question_describes_lifecycle_investigation "$1" && return 0
   question_has_multiple_semantic_targets "$1" || return 1
+  [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+are([^[:alnum:]]|$) ]] && return 0
   [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing)|compil(e|ed|ation|ing)|dispatch(ed|ing)?|resum(e|ed|ing)|check(ed|ing|s)?)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])also[[:space:]]+locate([^[:alnum:]]|$) ]]
@@ -1899,7 +1909,7 @@ token_overlap_score() {
 
 overlap_accepts_candidate() {
   local haystack="$1" distinctive="$2" phrases="$3"
-  local phrase_score=0 distinctive_score=0 token
+  local phrase_score=0 distinctive_score=0 token canonical_haystack=""
   if [[ -n "${phrases//[[:space:]]/}" ]]; then
     phrase_score="$(token_overlap_score "$haystack" "$phrases")"
     [[ "$phrase_score" =~ ^[[:digit:]]+$ ]] && ((phrase_score > 0)) && return 0
@@ -1911,7 +1921,15 @@ overlap_accepts_candidate() {
   done <<< "$distinctive"
   distinctive_score="$(token_overlap_score "$haystack" "$distinctive")"
   [[ "$distinctive_score" =~ ^[[:digit:]]+$ ]] || return 1
-  [[ -z "${phrases//[[:space:]]/}" ]] && ((distinctive_score > 0))
+  if [[ -z "${phrases//[[:space:]]/}" ]]; then
+    ((distinctive_score > 0))
+  elif question_is_multi_target_where "${question:-}"; then
+    canonical_haystack="$(canonical_overlap_tokens "$haystack")"
+    distinctive_score="$(token_overlap_score "$canonical_haystack" "$distinctive")"
+    [[ "$distinctive_score" =~ ^[[:digit:]]+$ ]] && ((distinctive_score > 0))
+  else
+    return 1
+  fi
 }
 
 search_structured_query_anchors() {
@@ -2043,7 +2061,7 @@ recover_distinctive_source_locations() {
       text="${rest#*:}"
       [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
       [[ -f "$file" ]] || continue
-      is_synthesis_junk_path "$file" && continue
+      is_synthesis_junk_source "$file" "$text" && continue
       is_synthesis_junk_line "$text" && continue
       question_is_test_coverage "${question:-}" && ! is_test_coverage_evidence "$file" "$text" && continue
       relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
@@ -2069,7 +2087,7 @@ recover_distinctive_source_locations() {
         locations[++count] = $2
       }
       END {
-        for (i = 1; i <= count && distinct < 4; i++) {
+        for (i = 1; i <= count && distinct < 12; i++) {
           file = locations[i]
           sub(/:[0-9]+$/, "", file)
           if (!seen[file]++) {
@@ -2078,7 +2096,7 @@ recover_distinctive_source_locations() {
             distinct++
           }
         }
-        if (distinct < 4) {
+        if (distinct < 12) {
           for (i = 1; i <= count && i <= 16; i++) {
             file = locations[i]
             sub(/:[0-9]+$/, "", file)
@@ -2104,10 +2122,10 @@ format_located_answer() {
     file="${line%:*}"
     line_number="${line##*:}"
     [[ "$line_number" =~ ^[[:digit:]]+$ && -f "$file" ]] || continue
-    is_synthesis_junk_path "$file" && continue
     text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null || true)"
     text="${text#"${text%%[![:space:]]*}"}"
     [[ -n "$text" ]] || continue
+    is_synthesis_junk_source "$file" "$text" && continue
     is_synthesis_junk_line "$text" && continue
     question_is_test_coverage "${question:-}" && ! is_test_coverage_evidence "$file" "$text" && continue
     if ((${#text} > 200)); then
@@ -2167,7 +2185,6 @@ recover_bm25_source_locations() {
     fi
     [[ "$file" != /* ]] && file="$PWD/$file"
     [[ -f "$file" ]] || continue
-    is_synthesis_junk_path "$file" && continue
     [[ "$line_start" =~ ^[[:digit:]]+$ && "$line_end" =~ ^[[:digit:]]+$ ]] || continue
     relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
@@ -2191,6 +2208,7 @@ recover_bm25_source_locations() {
       fi
       text="${text#"${text%%[![:space:]]*}"}"
       [[ -n "$text" ]] || continue
+      is_synthesis_junk_source "$file" "$text" && continue
       is_synthesis_junk_line "$text" && continue
       if question_is_test_coverage "${question:-}"; then
         is_test_coverage_evidence "$file" "$text" || continue
@@ -2311,7 +2329,6 @@ recover_semantic_trace_locations() {
     fi
     [[ "$file" != /* ]] && file="$PWD/$file"
     [[ -f "$file" ]] || continue
-    is_synthesis_junk_path "$file" && continue
     [[ "$line_start" =~ ^[[:digit:]]+$ && "$line_end" =~ ^[[:digit:]]+$ ]] || continue
     line_scan_end="$line_end"
     ((line_scan_end > line_start + 7)) && line_scan_end=$((line_start + 7))
@@ -2323,6 +2340,7 @@ recover_semantic_trace_locations() {
       text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
       text="${text#"${text%%[![:space:]]*}"}"
       [[ -n "$text" ]] || continue
+      is_synthesis_junk_source "$file" "$text" && continue
       is_synthesis_junk_line "$text" && continue
       semantic_trace_accepts_candidate "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack" || continue
       location="$relative:$line_number"
@@ -2429,6 +2447,7 @@ semantic_trace_is_complete() {
     return 1
   fi
   if question_requires_semantic_trace "${question:-}" &&
+      ! question_is_multi_target_where "${question:-}" &&
       ((relationship_count < 2 || ${#relationship_files[@]} < 2)); then
     semantic_trace_missing='requested relationship edge'
     return 1
