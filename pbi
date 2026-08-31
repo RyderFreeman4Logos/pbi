@@ -921,6 +921,7 @@ question_allows_compact_stamp() {
   local q="${1,,}"
   # Identifier / where-is lookups stay compact path:line. Synthesis and
   # which/find/where-does questions must quote a line or fail closed.
+  question_requires_semantic_trace "$1" && return 1
   question_needs_synthesized_answer "$1" && return 1
   question_requests_semantic_evidence "$1" && return 1
   [[ "$q" =~ (^|[[:space:]])(which|find|where[[:space:]]+does)([[:space:]]|$) ]] && return 1
@@ -1497,7 +1498,7 @@ fast_path_fail_closed() {
 run_default_bm25_fast_path() {
   local candidate_batch fast_path_output_file fast_path_status fast_path_query
   local candidate_symbol candidate_locations recovered_named_locations candidate_symbols
-  local deadline_ns now_ns remaining_ns remaining_ms per_query_ns timeout_seconds
+  local deadline_ns now_ns remaining_ns search_remaining_ns remaining_ms per_query_ns timeout_seconds
   local fast_path_query_index=0 remaining_queries
   local fast_path_fallback=false fast_path_timed_out=false
   local -a fast_path_queries=() named_files=()
@@ -1534,14 +1535,19 @@ run_default_bm25_fast_path() {
     now_ns="$(fast_path_now_ns)"
     remaining_ns=$((deadline_ns - now_ns))
     ((remaining_ns > 0)) || break
+    search_remaining_ns="$remaining_ns"
+    if question_requires_semantic_trace "${question:-}" && ((search_remaining_ns > 2000000000)); then
+      # Keep the final 2s of the existing 8s budget for source admission.
+      search_remaining_ns=$((search_remaining_ns - 2000000000))
+    fi
     # Reserve the TERM/KILL/reap allowance inside the absolute budget: a
     # TERM-ignoring initial probe must be killed and reaped before the
     # deadline, never about a second after it. Escalation is capped at 1.1s
     # and halves when little budget remains so the command still gets a
     # bounded slice in tight tests.
-    escalation_ns=$((remaining_ns / 2))
+    escalation_ns=$((search_remaining_ns / 2))
     ((escalation_ns > 1100000000)) && escalation_ns=1100000000
-    per_query_ns=$(( (remaining_ns - escalation_ns) / remaining_queries ))
+    per_query_ns=$(( (search_remaining_ns - escalation_ns) / remaining_queries ))
     ((per_query_ns > 0)) || { fast_path_timed_out=true; break; }
     remaining_ms=$(( (per_query_ns + 999999) / 1000000 ))
     printf -v timeout_seconds '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
@@ -1717,10 +1723,20 @@ question_has_multiple_semantic_targets() {
   }
 }
 
+question_describes_lifecycle_investigation() {
+  local q="${1,,}" phase_count=0 phase
+  [[ "$q" =~ (^|[^[:alnum:]])lifecycle([^[:alnum:]]|$) ]] && return 0
+  for phase in 'setup|initiali[sz]' 'spawn|start|launch|daemon' 'ready|readiness|wait' 'teardown|cleanup|shutdown|stop'; do
+    [[ "$q" =~ (^|[^[:alnum:]])($phase)([^[:alnum:]]|$) ]] && phase_count=$((phase_count + 1))
+  done
+  ((phase_count >= 3))
+}
+
 question_requires_semantic_trace() {
   local q="${1,,}"
+  question_describes_lifecycle_investigation "$1" && return 0
   question_has_multiple_semantic_targets "$1" || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])(trace|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing))([^[:alnum:]]|$) ]] ||
+  [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing))([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]]
 }
 
@@ -2393,7 +2409,15 @@ semantic_trace_is_complete() {
   done < <(semantic_target_groups "${question:-}")
   semantic_trace_target_count="$target_count"
   semantic_trace_covered_count="$covered_count"
-  if ((target_count < 2 || covered_count != target_count)); then
+  if ((target_count < 2)); then
+    if question_describes_lifecycle_investigation "${question:-}"; then
+      semantic_trace_missing='requested lifecycle stage coverage'
+    else
+      semantic_trace_missing="requested target groups: ${missing_groups:-unresolved}"
+    fi
+    return 1
+  fi
+  if ((covered_count != target_count)); then
     semantic_trace_missing="requested target groups: ${missing_groups:-unresolved}"
     return 1
   fi
@@ -2407,8 +2431,14 @@ semantic_trace_is_complete() {
 }
 
 emit_semantic_trace_from_candidates() {
-  local deadline_ns="${1:-}" locations fallback_locations evidence answer
-  locations="$(recover_semantic_trace_locations || true)"
+  local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations
+  locations=""
+  while IFS= read -r symbol; do
+    symbol_locations="$(recover_named_symbol_definition "$symbol" "$deadline_ns" || true)"
+    [[ -z "${symbol_locations//[[:space:]]/}" ]] || locations+="${locations:+$'\n'}$symbol_locations"
+  done < <(search_named_symbols "${question:-}")
+  symbol_locations="$(recover_semantic_trace_locations || true)"
+  locations="$(printf '%s\n%s\n' "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
   fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
   fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
   if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
