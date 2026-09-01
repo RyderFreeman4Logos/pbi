@@ -141,14 +141,16 @@ class PbiTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
             paths[relative] = path
-        candidates = [paths[relative] for relative in candidate_paths or tuple(paths)]
+        selected = tuple(paths) if candidate_paths is None else candidate_paths
+        candidates = [paths[relative] for relative in selected]
         env, trace = self.fake_environment(directory)
         probe = directory / "probe"
-        probe.write_text(
-            "#!/usr/bin/env python3\n"
-            + "\n".join(f"print('File: {path}, Lines: 1-8')" for path in candidates)
-            + "\n"
-        )
+        probe_lines = [
+            f"print({'Pattern: ' + question!r})",
+            f"print({'Path: ' + str(repo)!r})",
+            *[f"print('File: {path}, Lines: 1-8')" for path in candidates],
+        ]
+        probe.write_text("#!/usr/bin/env python3\n" + "\n".join(probe_lines) + "\n")
         probe.chmod(0o755)
         fake_chat = directory / "probe-chat"
         fake_chat.write_text(
@@ -167,6 +169,38 @@ class PbiTest(unittest.TestCase):
             timeout=15,
         )
         return result, trace
+
+    def test_default_lifecycle_trace_recovers_footer_source(self) -> None:
+        candidates = {f"src/{name}.py": f"def unrelated_{name}():\n    return {index}\n" for index, name in enumerate("abcdefgh", 1)}
+        target = "scripts/run_tests_parallel.py"
+        sources = {
+            **candidates,
+            target: (
+                "# timed BM25 output omitted this ranked footer candidate\n" * 12
+                + "def _linux_supervise(cmd):\n"
+                "    child = subprocess.Popen(cmd)\n"
+                "    # cleanup follows child completion\n"
+                "    cleanup_deadline = time.monotonic() + CLEANUP_SECONDS\n"
+                "    return _linux_terminate_and_reap_descendants(cleanup_deadline)\n"
+                "\n"
+                "def _spawn_test_process(cmd):\n"
+                "    return subprocess.Popen(cmd)\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _ = self.run_default_semantic_fixture(
+                Path(temporary),
+                "trace run_tests runner spawning and cleanup",
+                sources,
+                candidate_paths=(),
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("partial source answer; verified candidates retained", result.stderr)
+        self.assertIn("scripts/run_tests_parallel.py:", result.stderr)
+        self.assertIn("subprocess.Popen", result.stderr)
+        self.assertIn("cleanup_deadline", result.stderr)
+        self.assertIn("Missing: requested relationship edge", result.stderr)
 
     def test_static_interface_never_starts_an_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
