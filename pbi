@@ -872,6 +872,9 @@ fast_path_match_variants() {
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     printf '%s\n' "$token"
+    case "${token,,}" in
+      spawning|starting|launching) printf '%s\n' "${token:0:${#token}-3}" ;;
+    esac
     normalized="${token//-/_}"
     [[ "$normalized" == "$token" ]] || printf '%s\n' "$normalized"
     if [[ "$token" == *[-_]* ]]; then
@@ -1288,7 +1291,8 @@ fast_path_footer_path_matches_query() {
 remaining_file_candidates() {
   local line path resolved_path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
   local footer_rg_matches rg_command footer_rg_pattern footer_rg_status deadline_ns="${3:-}"
-  local -a footer_source_paths=() footer_path_matches=()
+  local footer_line_matches hit line_number fallback_path_tokens="" symbol normalized
+  local -a footer_source_paths=() footer_path_matches=() footer_match_args=()
   footer_tokens="$(fast_path_footer_tokens "$query")"
   fast_path_deadline_reached "$deadline_ns" && return 1
   footer_rg_matches=""
@@ -1319,6 +1323,38 @@ remaining_file_candidates() {
       footer_path_matches+=("$path")
     fi
   done <<<"$1"
+  rg_command="$(command -v rg || true)"
+  while IFS= read -r symbol; do
+    normalized="${symbol,,}"
+    normalized="${normalized//[^[:alnum:]]/}"
+    [[ -n "$normalized" ]] && fallback_path_tokens+="${fallback_path_tokens:+$'\n'}$normalized"
+  done < <(search_named_symbols "$query")
+  [[ -n "$fallback_path_tokens" ]] || fallback_path_tokens="$footer_tokens"
+  if ((${#footer_path_matches[@]} == 0)) && [[ -n "$rg_command" ]] &&
+     ! fast_path_deadline_reached "$deadline_ns"; then
+    while IFS= read -r path; do
+      fast_path_deadline_reached "$deadline_ns" && break
+      footer_path_matches+=("$path")
+      ((${#footer_path_matches[@]} < 16)) || break
+    done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" --files \
+      --glob '*.py' --glob '*.rs' \
+      --glob '!drafts/**' --glob '!docs/plans/**' \
+      --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' 2>/dev/null |
+      awk -v tokens="$fallback_path_tokens" '
+        BEGIN { count = split(tokens, wanted, "\n") }
+        {
+          normalized = tolower($0)
+          gsub(/[^[:alnum:]]/, "", normalized)
+          for (i = 1; i <= count; i++) {
+            if (wanted[i] != "" && index(normalized, wanted[i])) {
+              priority = ($0 ~ /(^|\/)tests?\// || $0 ~ /(^|\/)test_[^/]+$/) ? 1 : 0
+              print priority "\t" $0
+              break
+            }
+          }
+        }
+      ' | sort -k1,1n -k2,2 | cut -f2-)
+  fi
   if [[ -n "$footer_rg_pattern" ]] && ! fast_path_deadline_reached "$deadline_ns" &&
      ((${#footer_source_paths[@]} > 0)); then
     rg_command="$(command -v rg || true)"
@@ -1338,7 +1374,37 @@ remaining_file_candidates() {
       fast_path_deadline_reached "$deadline_ns" && return 1
     fi
   fi
-  declare -A emitted_footer_paths=()
+  declare -A emitted_footer_paths=() last_footer_line=()
+  if ((${#footer_path_matches[@]} > 0)) && [[ -n "$rg_command" ]] &&
+     ! fast_path_deadline_reached "$deadline_ns"; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && footer_match_args+=( -e "$line" )
+    done < <(fast_path_match_variants "$query" | awk 'NF && !seen[$0]++')
+    if ((${#footer_match_args[@]} > 0)); then
+      footer_line_matches=""
+      for path in "${footer_path_matches[@]}"; do
+        fast_path_deadline_reached "$deadline_ns" && break
+        hit="$(run_rg_with_deadline "$deadline_ns" "$rg_command" \
+          -n -F -m 32 --with-filename "${footer_match_args[@]}" -- "$path" 2>/dev/null || true)"
+        [[ -z "$hit" ]] || footer_line_matches+="${footer_line_matches:+$'\n'}$hit"
+      done
+      while IFS= read -r hit; do
+        fast_path_deadline_reached "$deadline_ns" && break
+        [[ "$hit" =~ ^(.+):([[:digit:]]+): ]] || continue
+        path="${BASH_REMATCH[1]}"
+        line_number="${BASH_REMATCH[2]}"
+        if [[ -n "${last_footer_line[$path]+seen}" ]] &&
+           ((line_number <= last_footer_line[$path] + 2)); then
+          continue
+        fi
+        last_footer_line["$path"]="$line_number"
+        printf 'File: %s, Lines: %s-%s\n' "$path" "$line_number" "$((line_number + 2))"
+        kept=$((kept + 1))
+        ((kept < 16)) || break
+      done <<< "$footer_line_matches"
+    fi
+  fi
+  ((kept < 16)) || return 0
   while IFS= read -r path; do
     fast_path_deadline_reached "$deadline_ns" && break
     [[ -n "$path" && -z "${emitted_footer_paths[$path]+seen}" ]] || continue
@@ -2293,6 +2359,7 @@ semantic_trace_candidate_priority() {
   score="$(token_overlap_score "$1 $2" "$3")"
   phrase_score="$(token_overlap_score "$1 $2" "$4")"
   [[ "$2" =~ (admit|snapshot) ]] && implementation_score=$((implementation_score + 4))
+  [[ "$2" =~ ^[[:space:]]*(async[[:space:]]+)?(def|fn|func|function)[[:space:]]+ ]] && implementation_score=$((implementation_score + 3))
   [[ "$2" =~ resolve_[[:alnum:]_]*context ]] && implementation_score=$((implementation_score + 4))
   [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && implementation_score=$((implementation_score + 4))
   semantic_trace_line_links_evidence "$2" "$5" && implementation_score=$((implementation_score + 2))
@@ -2307,9 +2374,13 @@ semantic_trace_candidate_priority() {
 
 recover_semantic_trace_locations() {
   local candidate file line_start line_end line_number line_scan_end text relative location score
-  local distinctive_tokens phrase_tokens accepted_haystack="" ranked=""
+  local distinctive_tokens phrase_tokens accepted_haystack="" ranked="" footer_candidates
   local -A seen=()
   [[ -n "${bm25_candidates//[[:space:]]/}" ]] || return 1
+  footer_candidates="$(remaining_file_candidates "$bm25_candidates" "${question:-}" "${deadline_ns:-}" || true)"
+  if [[ -n "${footer_candidates//[[:space:]]/}" ]]; then
+    bm25_candidates+=$'\n'"$footer_candidates"
+  fi
   distinctive_tokens="$(search_distinctive_tokens "${question:-}")"
   phrase_tokens="$(question_phrase_tokens "${question:-}")"
   while IFS= read -r candidate; do
@@ -2426,7 +2497,8 @@ semantic_trace_is_complete() {
     target_count=$((target_count + 1))
     score="$(token_overlap_score "$haystack" "$tokens")"
     if [[ "$group" =~ ^tests?$ && "$has_test_evidence" == true ]] ||
-       ([[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0))); then
+       ([[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0))) ||
+       [[ "$group" =~ ^[[:alnum:]]+$ && "$haystack" =~ (^|[^[:alnum:]])${group}[_-] ]]; then
       covered_count=$((covered_count + 1))
     else
       missing_groups+="${missing_groups:+; }$group"
