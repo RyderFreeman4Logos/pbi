@@ -709,7 +709,13 @@ emit_bm25_locations_or_fail_closed() {
 }
 
 emit_search_locations_or_fail_closed() {
+  local recovered_locations
   search_final_selection=true
+  if recovered_locations="$(recover_distinctive_source_locations "" false || true)" &&
+      [[ -n "${recovered_locations//[[:space:]]/}" ]] &&
+      emit_source_locations "$recovered_locations"; then
+    exit 0
+  fi
   emit_bm25_locations_or_fail_closed
 }
 
@@ -852,7 +858,7 @@ search_distinctive_tokens() {
     token="${token%%[,:;.!?]*}"
     token_lower="${token,,}"
     is_search_stopword "$token_lower" && continue
-    [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{4,}$ ]] || continue
+    [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{3,}$ ]] || continue
     printf "%s\t%s\n" "${#token}" "$token"
   done < <(printf "%s\n" "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }') |
     sort -rn -k1,1 -k2,2 | cut -f2-
@@ -1991,7 +1997,7 @@ source_answer_has_semantic_evidence() {
   question_requests_semantic_evidence "${question:-}" ||
     question_is_multi_target_where "${question:-}" || return 0
   q="${question,,}"
-  locations="$(compact_search_locations "$answer" "" false "$deadline_ns")"
+  locations="$(compact_search_locations "$answer" "" false "")"
   [[ -n "${locations//[[:space:]]/}" ]] || return 1
   if question_has_multiple_semantic_targets "${question:-}"; then
     location_count="$(printf '%s\n' "$locations" | awk 'NF { count += 1 } END { print count + 0 }')"
@@ -2005,7 +2011,7 @@ source_answer_has_semantic_evidence() {
     line_number="${BASH_REMATCH[2]}"
     [[ "$file" != /* ]] && file="$PWD/$file"
     [[ -f "$file" ]] || continue
-    text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null || true)"
+    text="$(run_sed_with_deadline "" -n "${line_number}p" "$file" 2>/dev/null || true)"
     [[ -n "$text" ]] || continue
     is_synthesis_junk_line "$text" && continue
     [[ "$requires_named_test_evidence" == true ]] && ! is_test_coverage_evidence "$file" "$text" && continue
@@ -2152,8 +2158,10 @@ search_independent_concept_score() {
 
 search_overlap_accepts_candidate() {
   local haystack="$1" distinctive="$2" phrases="$3" anchors concept_score anchor_match=false
-  local phrase_score=0 distinctive_score=0 token plain_overlap=0 plain_tokens=0 strong_overlap=0
+  local phrase_score=0 distinctive_score=0 token plain_overlap=0 plain_tokens=0 strong_overlap=0 canonical_haystack
   anchors="$(search_structured_query_anchors "${question:-}")"
+  canonical_haystack="$(canonical_overlap_tokens "$haystack")"
+  haystack+=" $canonical_haystack"
   if [[ -z "${anchors//[[:space:]]/}" ]] || search_structured_anchors_match "$haystack" "$anchors"; then
     anchor_match=true
   fi
@@ -2191,7 +2199,7 @@ search_overlap_accepts_candidate() {
 
 recover_distinctive_source_locations() {
   local deadline_ns="${1:-}" diverse_files="${2:-false}" token variant rg_command hit file rest line_number text
-  local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked=""
+  local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked="" canonical_haystack path_score text_score
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
   while IFS= read -r token; do
@@ -2245,11 +2253,14 @@ recover_distinctive_source_locations() {
       if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
         relative="$(basename -- "$file")"
       fi
-      overlap_accepts_candidate "$text" "$distinctive_tokens" "$phrase_tokens" || continue
+      search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || continue
       if [[ "$diverse_files" == true ]]; then
         score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "")"
       else
-        score="$(token_overlap_score "$text" "$score_tokens")"
+        canonical_haystack="$(canonical_overlap_tokens "$relative")"
+        path_score="$(token_overlap_score "$relative $canonical_haystack" "$distinctive_tokens")"
+        text_score="$(token_overlap_score "$text" "$score_tokens")"
+        score=$((path_score * 2 + text_score))
       fi
       ranked+="$score"$'\t'"$relative:$line_number"$'\n'
     done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
@@ -2283,7 +2294,7 @@ recover_distinctive_source_locations() {
       }
     ' | awk '!seen[$0]++ && NR <= 16'
   else
-    printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 4'
+    printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2; exit }'
   fi
 }
 
@@ -2611,7 +2622,7 @@ semantic_trace_is_complete() {
     fi
   done <<< "$locations"
   while IFS= read -r group; do
-    tokens="$(semantic_group_tokens "$group" | awk 'NF && !seen[$0]++')"
+    tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
     [[ -n "${tokens//[[:space:]]/}" ]] || continue
     group_index=$((group_index + 1))
     target_count=$((target_count + 1))
