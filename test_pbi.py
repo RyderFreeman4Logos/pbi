@@ -938,6 +938,51 @@ class PbiTest(unittest.TestCase):
         self.assertNotRegex(output, r"(?m)^[^\n:]+:\d+\n?$")
         self.assertLess(elapsed, 6)
 
+    def test_provider_send_boundary_incomplete_bm25_fails_closed_before_chat(self) -> None:
+        question = (
+            "Locate provider request adapters, final transport send boundaries, and "
+            "existing request capture or dump logic for PR #227 exact provider-bound capture."
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "unrelated.py"
+            source.write_text("provider unrelated\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_rg = directory / "rg"
+            fake_rg.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if '-l' in sys.argv:\n"
+                "    raise SystemExit(1)\n"
+                "if '-q' in sys.argv or '--files' in sys.argv:\n"
+                "    raise SystemExit(1)\n"
+                f"while True: print({source!r} + ':1:provider unrelated')\n"
+            )
+            fake_rg.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+            elapsed = time.monotonic() - started
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(trace.exists(), "incomplete multi-target Locate must not invoke Probe Chat")
+        self.assertIn("pbi: no source locations found", result.stderr)
+        self.assertLess(elapsed, 6)
+
     def test_possessive_multi_target_where_recovers_validator_and_schema_before_chat(self) -> None:
         # #170: possessive conjunctions are semantic multi-target questions,
         # not singleton where-is lookups that can fall through to helper126.
