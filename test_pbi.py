@@ -602,6 +602,142 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("unrelated.py", output)
         self.assertIn("no source", result.stderr)
 
+    def test_search_fake_profile_finds_plural_profile_path(self) -> None:
+        # #204: a source can satisfy a lookup through its directory path even
+        # when the quoted line contains only the profile's provider.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "examples" / "01-code-investigation" / "profiles" / "fake.json"
+            source.parent.mkdir(parents=True)
+            source.write_text('{"provider": "fake", "model": "fake-investigation"}\n')
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "fake",
+                "profile",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("examples/01-code-investigation/profiles/fake.json:1", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_search_fake_profile_rejects_model_profiles_answer(self) -> None:
+        # #204: a model answer about model_profiles.rs must not hide the
+        # canonical fake-profile source that the local checkout can prove.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "examples" / "01-code-investigation" / "profiles" / "fake.json"
+            source.parent.mkdir(parents=True)
+            source.write_text('{"provider": "fake", "model": "fake-investigation"}\n')
+            distractor = repo / "crates" / "workflow-adk" / "src" / "model_profiles.rs"
+            distractor.parent.mkdir(parents=True)
+            distractor.write_text("// fake profile registry\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('The source shows // profile registry. "
+                "(crates/workflow-adk/src/model_profiles.rs:1).')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "fake",
+                "profile",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "examples/01-code-investigation/profiles/fake.json:1\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("model_profiles.rs", result.stdout)
+
+    def test_multi_target_where_covers_compound_live_dogfood_group(self) -> None:
+        # #204: target coverage must use the same compound phrase evidence as
+        # candidate admission; dogfood appears in a live_dogfood identifier.
+        question = (
+            "Where are live dogfood, fake profile, and canonical "
+            "examples/01-code-investigation?"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            result, trace = self.run_default_semantic_fixture(
+                directory,
+                question,
+                {
+                    "crates/workflow-testkit/src/code_investigation.rs": (
+                        "async fn live_dogfood_reuses_the_callers_async_runtime() {}\n"
+                    ),
+                    "examples/01-code-investigation/profiles/fake.json": (
+                        '{"provider": "fake", "model": "fake-investigation"}\n'
+                    ),
+                    "examples/01-code-investigation/README.md": (
+                        "canonical examples/01-code-investigation package\n"
+                    ),
+                },
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(trace.exists(), "semantic recovery must not invoke Probe Chat")
+        self.assertIn("Coverage: complete", result.stdout)
+        for location in (
+            "crates/workflow-testkit/src/code_investigation.rs:1",
+            "examples/01-code-investigation/profiles/fake.json:1",
+            "examples/01-code-investigation/README.md:1",
+        ):
+            self.assertIn(location, result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_multi_target_where_validates_after_recovery_budget(self) -> None:
+        # #204: validating recovered source must not discard it after the
+        # bounded discovery budget is spent.
+        question = (
+            "Where are live dogfood, fake profile, and canonical "
+            "examples/01-code-investigation?"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            slow_sed = directory / "sed"
+            slow_sed.write_text(
+                "#!/usr/bin/env bash\n"
+                "sleep 0.25\n"
+                "exec /usr/bin/sed \"$@\"\n"
+            )
+            slow_sed.chmod(0o755)
+            result, trace = self.run_default_semantic_fixture(
+                directory,
+                question,
+                {
+                    "crates/workflow-testkit/src/code_investigation.rs": (
+                        "\n" * 7
+                        + "async fn live_dogfood_reuses_the_callers_async_runtime() {}\n"
+                    ),
+                    "examples/01-code-investigation/profiles/fake.json": (
+                        "\n" * 7
+                        + '{"provider": "fake", "model": "fake-investigation"}\n'
+                    ),
+                    "examples/01-code-investigation/README.md": (
+                        "\n" * 7
+                        + "canonical examples/01-code-investigation package\n"
+                    ),
+                },
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(trace.exists(), "semantic recovery must not invoke Probe Chat")
+        self.assertIn("Coverage: complete", result.stdout)
+
     def test_why_question_answers_from_source_when_chat_omits_locations(self) -> None:
         # #120: BM25 hits exist, but chat returns location-less prose. A
         # fail-closed diagnostic is not a source-grounded answer.
