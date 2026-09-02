@@ -3097,6 +3097,52 @@ class PbiTest(unittest.TestCase):
         )
         self.assertNotIn("ms-marco-minilm-l6", probe_recorded["argv"])
 
+    def test_search_recovers_present_test_file_when_bm25_omits_it(self) -> None:
+        query = "run_tests_parallel nonblocking watch pipe deadline systemd-run"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            (repo / "scripts").mkdir(parents=True)
+            (repo / "tests").mkdir()
+            (repo / "scripts" / "run_tests_parallel.py").write_text(
+                "\n".join(
+                    line
+                    for index in range(20)
+                    for line in (
+                        f"run_tests_parallel nonblocking watch pipe deadline systemd_run_{index} = {index}",
+                        "",
+                        "",
+                        "",
+                    )
+                )
+                + "\n"
+            )
+            (repo / "tests" / "test_run_tests_parallel.py").write_text(
+                "def test_run_tests_parallel():\n    return run_tests_parallel()\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'Pattern: run_tests_parallel nonblocking watch pipe deadline systemd-run'\n"
+                "printf '%s\\n' 'File: scripts/run_tests_parallel.py, Lines: 1-2'\n"
+                "printf '%s\\n' 'Remaining files not shown:'\n"
+                "printf '%s\\n' '  scripts/run_tests_parallel.py <10> <2>'\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                *query.split(),
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("scripts/run_tests_parallel.py:", result.stdout)
+        self.assertIn("tests/test_run_tests_parallel.py:", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "compact search must not start chat")
+
     def test_search_hides_mocked_bert_fallback_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
