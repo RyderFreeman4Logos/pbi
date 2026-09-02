@@ -3400,6 +3400,68 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("only BM25 location stamps", output)
         self.assertFalse(trace.exists(), "colon query recovery must not invoke Probe Chat")
 
+    def test_unknown_route_wrap_prefers_production_definition_over_testkit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            production = repo / "crates" / "workflow-adk" / "src" / "lib.rs"
+            conformance = repo / "crates" / "workflow-testkit" / "src" / "conformance.rs"
+            testkit = repo / "crates" / "workflow-testkit" / "src" / "lib.rs"
+            production.parent.mkdir(parents=True)
+            conformance.parent.mkdir(parents=True)
+            production.write_text(
+                'const UNKNOWN_ROUTE_ERROR_PREFIX: &str = "unknown route: ";\n'
+                "fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {\n"
+                "    if message.starts_with(UNKNOWN_ROUTE_ERROR_PREFIX) {\n"
+                "        Some(AdkGraphError::InvalidOutput)\n"
+                "    } else { None }\n"
+                "}\n"
+            )
+            conformance.write_text("fn unknown_route_test_name() { /* diagnostic map wrap */ }\n")
+            testkit.write_text("enum AdkGraphError { InvalidOutput }\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                f"print('File: {conformance}, Lines: 1-1')\n"
+                f"if sys.argv[-1] != 'unknown route diagnostic map wrap':\n"
+                f"    print('File: {testkit}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            search = self.run_pbi(
+                "search",
+                "unknown",
+                "route",
+                "diagnostic",
+                "map",
+                "wrap",
+                env=env,
+                cwd=repo,
+                binary=binary,
+                timeout=15,
+            )
+            question = self.run_pbi(
+                "where",
+                "unknown",
+                "route",
+                "is",
+                "mapped",
+                "to",
+                "InvalidOutput",
+                env=env,
+                cwd=repo,
+                binary=binary,
+                timeout=15,
+            )
+        for result in (search, question):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("crates/workflow-adk/src/lib.rs:2", result.stdout)
+            self.assertEqual(result.stderr, "")
+            self.assertNotIn("workflow-testkit", result.stdout)
+        self.assertFalse(trace.exists(), "verified production locations must not invoke Probe Chat")
+
     def test_search_prints_only_compact_locations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
