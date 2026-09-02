@@ -659,6 +659,10 @@ emit_bm25_locations_or_fail_closed() {
     printf '%s\n' "$source_answer"
     exit 0
   fi
+  if recovered_named_locations="$(recover_unknown_route_wrap_location "${question:-}")" &&
+      emit_source_locations "$recovered_named_locations"; then
+    exit 0
+  fi
   locations="$(compact_search_locations "$bm25_candidates")"
   recovered_named_locations=""
   while IFS= read -r candidate_symbol; do
@@ -1715,6 +1719,18 @@ run_default_bm25_fast_path() {
     [[ "${semantic_trace_partial_emitted:-false}" == true ]] && return 1
   fi
   recovered_named_locations=""
+  if recovered_named_locations="$(recover_unknown_route_wrap_location "${question:-}" "$deadline_ns")" &&
+      [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
+    if question_allows_compact_stamp "${question:-}"; then
+      printf '%s\n' "$recovered_named_locations"
+      return 0
+    fi
+    if output="$(format_located_answer "$recovered_named_locations" "$deadline_ns")" &&
+        [[ -n "${output//[[:space:]]/}" ]]; then
+      printf '%s' "$output"
+      return 0
+    fi
+  fi
   candidate_symbols="$(search_named_symbols "${question:-}")"
   while IFS= read -r candidate_symbol; do
     fast_path_deadline_reached "$deadline_ns" && break
@@ -1817,6 +1833,27 @@ recover_named_symbol_definition() {
       fi
     done <<<"$matching_files"
   fi
+  return 1
+}
+
+recover_unknown_route_wrap_location() {
+  local q="${1,,}" file line_number relative rg_command
+  [[ "$q" =~ (^|[^[:alnum:]_])unknown[[:space:]_-]+route([^[:alnum:]_]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]_])(wrap|wrapped|wrapper|map|mapped|mapping|diagnostic|invalid[[:space:]_-]*output)([^[:alnum:]_]|$) ]] || return 1
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  while IFS= read -r file; do
+    [[ "$file" == */workflow-adk/src/* && "$file" != */tests/* ]] || continue
+    "$rg_command" -q -F -- "AdkGraphError::InvalidOutput" "$file" || continue
+    line_number="$(named_symbol_definition_line "$file" terminal_graph_error definition 0 0 "${2:-}")"
+    [[ -n "$line_number" ]] || continue
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || continue
+    printf '%s:%s\n' "$relative" "$line_number"
+    return 0
+  done < <("$rg_command" -l -F --glob '!drafts/**' --glob '!docs/plans/**' \
+      --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' \
+      -- 'UNKNOWN_ROUTE_ERROR_PREFIX' . 2>/dev/null || true)
   return 1
 }
 
