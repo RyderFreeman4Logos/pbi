@@ -3357,23 +3357,29 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "a verified BM25 location must not invoke stamp-producing chat")
 
     def test_search_visits_revise_quotes_wrap_use_site_instead_of_bm25_stamps(self) -> None:
-        # #207: the colon query is semantic despite having no prose cue. Its
-        # answer must identify the source wrap/use site, not dump BM25 stamps.
+        # #207: the BM25 hit is an unrelated visits-as-usize line. Recovery
+        # must quote the literal colon use sites from the same source file.
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             repo = directory / "repo"
-            source = repo / "crates" / "workflow-review" / "src" / "review_loop.rs"
+            source = repo / "crates" / "workflow-adk" / "src" / "lib.rs"
             source.parent.mkdir(parents=True)
-            source.write_text(
-                "fn review_revisions_counts_one_event_per_revise_visit() { visits.revise(); }\n"
-            )
+            lines = ["// filler"] * 1316
+            lines.append('let wrapped = state.get("visits:revise");')
+            lines.extend(["// filler"] * 8)
+            lines.append('let updated = state.with_update("visits:revise", wrapped);')
+            lines.extend(["// filler"] * (1536 - len(lines)))
+            lines.append("let max_visits = values.map(|visits| visits as usize);")
+            source.write_text("\n".join(lines) + "\n")
             env, trace = self.fake_environment(directory)
             probe = directory / "probe"
             probe.write_text(
                 "#!/usr/bin/env python3\n"
                 "import sys\n"
                 "if sys.argv[-1] == 'visits revise':\n"
-                f"    print('File: {source}, Lines: 1-1')\n"
+                f"    print('File: {source}, Lines: 1532-1540')\n"
+                "    print('Remaining files not shown:')\n"
+                f"    print('  {source} <2> <9>')\n"
             )
             probe.chmod(0o755)
             result = self.run_pbi(
@@ -3387,8 +3393,9 @@ class PbiTest(unittest.TestCase):
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
         self.assertEqual(result.stderr, "")
-        self.assertIn("review_loop.rs:", result.stdout)
-        self.assertIn("review_revisions_counts_one_event_per_revise_visit", result.stdout)
+        self.assertIn("lib.rs:1317", result.stdout)
+        self.assertIn('get("visits:revise")', result.stdout)
+        self.assertNotIn("visits as usize", result.stdout)
         self.assertNotRegex(result.stdout, r"(?m)^[\\w./-]+:\\d+\\n?$")
         self.assertNotIn("only BM25 location stamps", output)
         self.assertFalse(trace.exists(), "colon query recovery must not invoke Probe Chat")

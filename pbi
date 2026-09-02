@@ -878,6 +878,10 @@ fast_path_token_variants() {
 # Matching may use a morphological stem only when it remains distinctive.
 fast_path_match_variants() {
   local token normalized stem tail
+  if [[ "$1" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]]; then
+    printf '%s\n' "$1"
+    return 0
+  fi
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     printf '%s\n' "$token"
@@ -1361,6 +1365,13 @@ remaining_file_candidates() {
       footer_path_seen["$path"]=1
     fi
   done <<<"$1"
+  if [[ "$query" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]]; then
+    for path in "${footer_source_paths[@]}"; do
+      [[ -z "${footer_path_seen[$path]+seen}" ]] || continue
+      footer_path_matches+=("$path")
+      footer_path_seen["$path"]=1
+    done
+  fi
   rg_command="$(command -v rg || true)"
   while IFS= read -r symbol; do
     normalized="${symbol,,}"
@@ -2274,7 +2285,12 @@ recover_bm25_source_locations() {
   fast_path_deadline_reached "$deadline_ns" && return 1
   if [[ "$strict_relevance" == true ]]; then
     footer_candidates="$(remaining_file_candidates "$candidates" "${question:-}" "$deadline_ns")"
-    [[ -z "$footer_candidates" ]] || candidates+=$'\n'"$footer_candidates"
+    if [[ "${question:-}" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]]; then
+      [[ -n "$footer_candidates" ]] || return 1
+      candidates="$footer_candidates"
+    elif [[ -n "$footer_candidates" ]]; then
+      candidates+=$'\n'"$footer_candidates"
+    fi
   fi
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
