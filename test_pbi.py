@@ -202,6 +202,64 @@ class PbiTest(unittest.TestCase):
         self.assertIn("cleanup_deadline", result.stderr)
         self.assertIn("Missing: requested relationship edge", result.stderr)
 
+    def test_default_named_file_query_rejects_unrelated_stamps(self) -> None:
+        sources = {
+            "install.sh": (
+                "HOME=${PBI_INSTALL_HOME:-${HOME:?HOME is required; "
+                "use PBI_INSTALL_HOME for tests}}\n"
+            )
+        }
+        question = "Where are the runner containment scripts run_tests_parallel.py and their tests?"
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _ = self.run_default_semantic_fixture(Path(temporary), question, sources)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("partial source answer", result.stderr)
+        self.assertNotIn("install.sh:", result.stderr)
+        self.assertIn("no source answer", result.stderr)
+        self.assertNotIn("run_tests_parallelpy", result.stderr)
+
+    def test_default_named_file_query_timeout_is_bounded_and_reaped(self) -> None:
+        question = "Where are the runner containment scripts run_tests_parallel.py and their tests?"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "install.sh"
+            source.write_text(
+                "HOME=${PBI_INSTALL_HOME:-${HOME:?HOME is required; "
+                "use PBI_INSTALL_HOME for tests}}\n"
+            )
+            env, _ = self.fake_environment(directory)
+            pid_file = directory / "probe.pid"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, signal, time\n"
+                f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"print({f'File: {source}, Lines: 1-1'!r}, flush=True)\n"
+                "time.sleep(120)\n"
+            )
+            probe.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=15,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertLess(elapsed, 12, result.stderr)
+            self.assertNotIn("124", result.stderr)
+            self.assertIn("no source answer", result.stderr)
+            child_pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+
     def test_static_interface_never_starts_an_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env, trace = self.fake_environment(Path(temporary))

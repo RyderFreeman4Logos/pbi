@@ -1784,7 +1784,7 @@ question_rejects_lone_type_declaration() {
 
 is_test_coverage_evidence() {
   local file="$1" text="$2"
-  [[ "$file" == */test/* || "$file" == */tests/* || "$file" =~ (^|/)[^/]*_tests?(_|\.|/|$) ]] && return 0
+  [[ "$file" == */test/* || "$file" == */tests/* || "$file" == */test_* || "$file" =~ (^|/)[^/]*_tests?(_|\.|/|$) ]] && return 0
   [[ "$text" =~ ^[[:space:]]*\#\[[^]]*test ]] ||
     [[ "$text" =~ (^|[[:space:]])mod[[:space:]]+tests?([[:space:]]|\{) ]]
 }
@@ -1826,7 +1826,8 @@ semantic_target_groups() {
   printf '%s\n' "$1" | awk '
     {
       q = tolower($0)
-      gsub(/[?!.;]+/, "", q)
+      gsub(/[?!;]+/, "", q)
+      sub(/[.]+[[:space:]]*$/, "", q)
       gsub(/[[:space:]]+also[[:space:]]+locate[[:space:]]+/, "\nlocate ", q)
       sub(/[[:space:]]+give exact functions and key line ranges at current head[[:space:]]*$/, "", q)
       gsub(/,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)[[:space:]]+/, "\n", q)
@@ -2322,12 +2323,16 @@ is_semantic_trace_metadata_line() {
 }
 
 semantic_trace_candidate_matches_target() {
-  local candidate="$1" group tokens token score plain_overlap
+  local candidate="$1" candidate_file="${2:-}" group tokens token score plain_overlap
   local canonical_candidate
   canonical_candidate="$(canonical_overlap_tokens "$candidate")"
   while IFS= read -r group; do
     [[ -n "$group" ]] || continue
     tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
+    if [[ "$group" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]] &&
+       [[ -n "$candidate_file" ]] && ! is_test_coverage_evidence "$candidate_file" "$candidate"; then
+      tokens="$(printf '%s\n' "$tokens" | awk '$0 !~ /^tests?-?$/')"
+    fi
     [[ -n "${tokens//[[:space:]]/}" ]] || continue
     plain_overlap=0
     while IFS= read -r token; do
@@ -2345,7 +2350,7 @@ semantic_trace_candidate_matches_target() {
 }
 
 semantic_trace_accepts_candidate() {
-  if ! semantic_trace_candidate_matches_target "$1 $2" &&
+  if ! semantic_trace_candidate_matches_target "$1 $2" "$1" &&
       ! semantic_trace_line_links_evidence "$2" "$5" &&
       ! { [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && line_has_relationship_edge "$2"; }; then
     return 1
@@ -2496,8 +2501,12 @@ semantic_trace_is_complete() {
     group_index=$((group_index + 1))
     target_count=$((target_count + 1))
     score="$(token_overlap_score "$haystack" "$tokens")"
-    if [[ "$group" =~ ^tests?$ && "$has_test_evidence" == true ]] ||
-       ([[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0))) ||
+    if [[ "$group" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]] &&
+       [[ "$has_test_evidence" != true ]]; then
+      missing_groups+="${missing_groups:+; }$group"
+      continue
+    fi
+    if ([[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0))) ||
        [[ "$group" =~ ^[[:alnum:]]+$ && "$haystack" =~ (^|[^[:alnum:]])${group}[_-] ]]; then
       covered_count=$((covered_count + 1))
     else
