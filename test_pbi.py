@@ -3356,6 +3356,43 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "a verified BM25 location must not invoke stamp-producing chat")
 
+    def test_search_visits_revise_quotes_wrap_use_site_instead_of_bm25_stamps(self) -> None:
+        # #207: the colon query is semantic despite having no prose cue. Its
+        # answer must identify the source wrap/use site, not dump BM25 stamps.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "crates" / "workflow-review" / "src" / "review_loop.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "fn review_revisions_counts_one_event_per_revise_visit() { visits.revise(); }\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if sys.argv[-1] == 'visits revise':\n"
+                f"    print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "visits:revise",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("review_loop.rs:", result.stdout)
+        self.assertIn("review_revisions_counts_one_event_per_revise_visit", result.stdout)
+        self.assertNotRegex(result.stdout, r"(?m)^[\\w./-]+:\\d+\\n?$")
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertFalse(trace.exists(), "colon query recovery must not invoke Probe Chat")
+
     def test_search_prints_only_compact_locations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

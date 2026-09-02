@@ -924,6 +924,8 @@ question_is_multi_target_where() {
 
 question_is_keyword_bag() {
   local q="${1,,}" token count=0
+  # Colon-separated concept/action queries need a quoted source line.
+  [[ "$q" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]] && return 0
   # Identifier-free keyword bags need a quoted line. Hyphenated tokens stay compact.
   [[ "$q" =~ (^|[[:space:]])(why|how|explain|where|find|locate|which|show|classify)([[:space:]]|$) ]] && return 1
   [[ -n "$(search_named_symbols "$1")" ]] && return 1
@@ -3122,6 +3124,10 @@ case "${1:-}" in
       [[ -z "$bm25_stderr" ]] || printf '%s\n' "$bm25_stderr" >&2
       exit 0
     fi
+    search_query="${search_pattern_parts[*]}"
+    if [[ "$search_query" =~ ^([[:alnum:]_-]+):([[:alnum:]_-]+)$ ]]; then
+      search_query="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    fi
     search_options+=(--ignore drafts)
     search_uses_local_model=true
     search_fail_closed_no_locations=true
@@ -3133,7 +3139,7 @@ case "${1:-}" in
     active_timeout_diagnostic="$search_timeout_diagnostic"
     if run_timed_command "$DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS" "$search_output_file" "$search_output_file" \
         "$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run \
-        -- "${search_pattern_parts[*]}"; then
+        -- "${search_query}"; then
       search_status=0
     else
       search_status=$?
