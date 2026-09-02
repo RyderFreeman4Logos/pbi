@@ -1292,7 +1292,9 @@ remaining_file_candidates() {
   local line path resolved_path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
   local footer_rg_matches rg_command footer_rg_pattern footer_rg_status deadline_ns="${3:-}"
   local footer_line_matches hit line_number fallback_path_tokens="" symbol normalized
+  local path_kept footer_path_limit
   local -a footer_source_paths=() footer_path_matches=() footer_match_args=()
+  local -A footer_source_path_seen=() footer_path_seen=()
   footer_tokens="$(fast_path_footer_tokens "$query")"
   fast_path_deadline_reached "$deadline_ns" && return 1
   footer_rg_matches=""
@@ -1317,10 +1319,16 @@ remaining_file_candidates() {
     resolved_path="$path"
     [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
     [[ -f "$resolved_path" ]] || continue
-    [[ "$path" == *.rs || "$path" == *.py ]] && footer_source_paths+=("$path")
+    if [[ "$path" == *.rs || "$path" == *.py ]] &&
+       [[ -z "${footer_source_path_seen[$path]+seen}" ]]; then
+      footer_source_paths+=("$path")
+      footer_source_path_seen["$path"]=1
+    fi
     if ! fast_path_requires_cache_key "$query" &&
-       fast_path_footer_path_matches_query "$path" "$footer_tokens"; then
+       fast_path_footer_path_matches_query "$path" "$footer_tokens" &&
+       [[ -z "${footer_path_seen[$path]+seen}" ]]; then
       footer_path_matches+=("$path")
+      footer_path_seen["$path"]=1
     fi
   done <<<"$1"
   rg_command="$(command -v rg || true)"
@@ -1330,11 +1338,13 @@ remaining_file_candidates() {
     [[ -n "$normalized" ]] && fallback_path_tokens+="${fallback_path_tokens:+$'\n'}$normalized"
   done < <(search_named_symbols "$query")
   [[ -n "$fallback_path_tokens" ]] || fallback_path_tokens="$footer_tokens"
-  if ((${#footer_path_matches[@]} == 0)) && [[ -n "$rg_command" ]] &&
-     ! fast_path_deadline_reached "$deadline_ns"; then
+  if [[ -n "$rg_command" ]] && ! fast_path_deadline_reached "$deadline_ns"; then
     while IFS= read -r path; do
       fast_path_deadline_reached "$deadline_ns" && break
-      footer_path_matches+=("$path")
+      if [[ -z "${footer_path_seen[$path]+seen}" ]]; then
+        footer_path_matches+=("$path")
+        footer_path_seen["$path"]=1
+      fi
       ((${#footer_path_matches[@]} < 16)) || break
     done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" --files \
       --glob '*.py' --glob '*.rs' \
@@ -1374,9 +1384,13 @@ remaining_file_candidates() {
       fast_path_deadline_reached "$deadline_ns" && return 1
     fi
   fi
-  declare -A emitted_footer_paths=() last_footer_line=()
+  declare -A emitted_footer_paths=() last_footer_line=() footer_path_kept=()
   if ((${#footer_path_matches[@]} > 0)) && [[ -n "$rg_command" ]] &&
      ! fast_path_deadline_reached "$deadline_ns"; then
+    # ponytail: fixed 16-location budget; per-file fairness keeps later
+    # candidates visible, with round-robin extraction as the upgrade path.
+    footer_path_limit=$((16 / ${#footer_path_matches[@]}))
+    ((footer_path_limit > 0)) || footer_path_limit=1
     while IFS= read -r line; do
       [[ -n "$line" ]] && footer_match_args+=( -e "$line" )
     done < <(fast_path_match_variants "$query" | awk 'NF && !seen[$0]++')
@@ -1397,8 +1411,11 @@ remaining_file_candidates() {
            ((line_number <= last_footer_line[$path] + 2)); then
           continue
         fi
+        path_kept="${footer_path_kept[$path]:-0}"
+        ((path_kept < footer_path_limit)) || continue
         last_footer_line["$path"]="$line_number"
         printf 'File: %s, Lines: %s-%s\n' "$path" "$line_number" "$((line_number + 2))"
+        footer_path_kept["$path"]=$((path_kept + 1))
         kept=$((kept + 1))
         ((kept < 16)) || break
       done <<< "$footer_line_matches"
@@ -3139,6 +3156,32 @@ case "${1:-}" in
         if [[ "$symbol_scan_status" -eq 1 ]]; then
           printf "%s\n" "pbi: no source location contains the queried symbol" >&2
           exit 1
+        fi
+      fi
+    fi
+    if [[ -n "$symbol" ]]; then
+      supplemental_candidates="$(remaining_file_candidates "$candidates" "${search_pattern_parts[*]}")"
+      if [[ -n "$supplemental_candidates" ]]; then
+        supplemental_locations="$(compact_search_locations "$supplemental_candidates")"
+        if [[ -n "$supplemental_locations" ]]; then
+          search_fallback_locations="$({
+            printf '%s\n' "$search_fallback_locations"
+            printf '%s\n' "$supplemental_locations" | awk '{ print "\034" $0 }'
+          } | awk '
+            function source_path(location) {
+              sub(/:[[:digit:]]+$/, "", location)
+              return location
+            }
+            index($0, "\034") == 1 {
+              location = substr($0, 2)
+              if (location != "" && !seen[source_path(location)]++) print location
+              next
+            }
+            NF {
+              print
+              seen[source_path($0)] = 1
+            }
+          ')"
         fi
       fi
     fi
