@@ -654,6 +654,7 @@ emit_bm25_locations_or_fail_closed() {
       "${question:-}" =~ ^[a-z0-9[:space:]-]+$ &&
       -z "$(search_named_symbol "${question:-}")" &&
       ! "${question,,}" =~ (^|[[:space:]])(find|locate|which|where)[[:space:]] ]] &&
+      ! question_is_keyword_bag "${question:-}" &&
       source_answer="$(emit_synthesized_source_answer)" && [[ -n "${source_answer//[[:space:]]/}" ]]; then
     printf '%s\n' "$source_answer"
     exit 0
@@ -695,6 +696,10 @@ emit_bm25_locations_or_fail_closed() {
     printf '%s\n' 'pbi: source answer lacks requested semantic evidence' >&2
     exit 1
   fi
+  if question_is_keyword_bag "${question:-}"; then
+    printf '%s\n' 'pbi: no source locations found' >&2
+    exit 1
+  fi
   printf '%s\n' "$locations"
   exit 0
 }
@@ -715,6 +720,10 @@ emit_search_final_selection_or_fail_closed() {
   if recovered_locations="$(recover_bm25_source_locations "" true)" &&
       emit_source_locations "$recovered_locations"; then
     exit 0
+  fi
+  if question_is_keyword_bag "${question:-}"; then
+    printf '%s\n' 'pbi: no source locations found' >&2
+    exit 1
   fi
   if [[ "${question:-}" =~ [[:alnum:]]+[-_][[:alnum:]]+ ]] &&
       [[ ! "${question,,}" =~ (^|[[:space:]])(find|locate|where|which|show)[[:space:]] ]]; then
@@ -913,6 +922,24 @@ question_is_multi_target_where() {
   [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
 }
 
+question_is_keyword_bag() {
+  local q="${1,,}" token count=0
+  # Identifier-free keyword bags need a quoted line. Hyphenated tokens stay compact.
+  [[ "$q" =~ (^|[[:space:]])(why|how|explain|where|find|locate|which|show|classify)([[:space:]]|$) ]] && return 1
+  [[ -n "$(search_named_symbols "$1")" ]] && return 1
+  [[ -n "$(named_query_files "$1")" ]] && return 1
+  while IFS= read -r token; do
+    token="${token,,}"
+    token="${token%%[,:;.!?]*}"
+    [[ -n "$token" ]] || continue
+    [[ "$token" == *-* ]] && return 1
+    is_search_stopword "$token" && continue
+    [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{3,}$ ]] || continue
+    count=$((count + 1))
+  done < <(printf '%s\n' "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }')
+  ((count >= 3))
+}
+
 question_needs_synthesized_answer() {
   local q="${1,,}" token
   [[ "$q" =~ (^|[[:space:]])(why|how|explain)([[:space:]]|$) ]] && return 0
@@ -934,6 +961,7 @@ question_allows_compact_stamp() {
   question_requires_semantic_trace "$1" && return 1
   question_needs_synthesized_answer "$1" && return 1
   question_requests_semantic_evidence "$1" && return 1
+  question_is_keyword_bag "$1" && return 1
   [[ "$q" =~ (^|[[:space:]])(which|find|where[[:space:]]+does)([[:space:]]|$) ]] && return 1
   return 0
 }
@@ -1727,6 +1755,11 @@ run_default_bm25_fast_path() {
     fast_path_fail_closed
     return 1
   }
+  if question_is_keyword_bag "${question:-}"; then
+    # Leftover BM25 hits without a quoted line are a miss, not a stamp dump.
+    fast_path_fail_closed
+    return 1
+  fi
   # 8s bounds recovery reads only. Candidates without an in-hand answer
   # fall through to planner/chat instead of aborting the command.
   search_uses_local_model=false
@@ -1943,10 +1976,11 @@ source_answer_has_semantic_evidence() {
 emit_source_locations() {
   local locations="$1" answer
   if question_requests_semantic_evidence "${question:-}" ||
-      question_is_multi_target_where "${question:-}"; then
+      question_is_multi_target_where "${question:-}" ||
+      question_is_keyword_bag "${question:-}"; then
     answer="$(format_located_answer "$locations")" || return 1
     [[ -n "${answer//[[:space:]]/}" ]] || return 1
-    printf '%s' "$answer"
+    printf '%s\n' "$answer"
   else
     printf '%s\n' "$locations"
   fi
@@ -2075,7 +2109,10 @@ search_overlap_accepts_candidate() {
   fi
   if [[ "$anchor_match" == true && -n "${phrases//[[:space:]]/}" ]]; then
     phrase_score="$(token_overlap_score "$haystack" "$phrases")"
-    [[ "$phrase_score" =~ ^[[:digit:]]+$ ]] && ((phrase_score > 0)) && return 0
+    if [[ "$phrase_score" =~ ^[[:digit:]]+$ ]] && ((phrase_score > 0)); then
+      # Keyword bags need a distinctive hit; leftover hint-cap phrases are not enough.
+      question_is_keyword_bag "${question:-}" || return 0
+    fi
   fi
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
@@ -2088,9 +2125,15 @@ search_overlap_accepts_candidate() {
       ((distinctive_score > 0)) && plain_overlap=$((plain_overlap + 1))
     fi
   done <<< "$distinctive"
-  if [[ "$anchor_match" == true ]] &&
-     ((strong_overlap > 0 || plain_overlap > 0 && plain_tokens == 1 || plain_overlap >= 2)); then
-    return 0
+  if [[ "$anchor_match" == true ]]; then
+    if ((strong_overlap > 0 || plain_overlap >= 2)); then
+      return 0
+    fi
+    # A lone leftover distinctive token is not enough when the query also
+    # formed phrases; those need a phrase hit or a second concept.
+    if ((plain_overlap > 0 && plain_tokens == 1)) && [[ -z "${phrases//[[:space:]]/}" ]]; then
+      return 0
+    fi
   fi
   concept_score="$(search_independent_concept_score "$haystack" "$distinctive")"
   [[ "$concept_score" =~ ^[[:digit:]]+$ ]] && ((concept_score >= 2))
@@ -3275,6 +3318,14 @@ else
   fi
   [[ "${semantic_trace_partial_emitted:-false}" == true ]] && exit 1
   if [[ "$search_fast_path_miss" == true ]]; then
+    if ! question_allows_compact_stamp "$question"; then
+      if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+        printf '%s' "$output"
+        exit 0
+      fi
+      printf '%s\n' 'pbi: no source locations found' >&2
+      exit 1
+    fi
     if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
       printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     else

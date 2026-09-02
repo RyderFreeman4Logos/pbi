@@ -448,6 +448,160 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, f"{answer}\n")
         self.assertEqual(result.stderr, "")
 
+    def test_default_compression_keyword_query_quotes_source_instead_of_bm25_stamps(self) -> None:
+        # #199: a default keyword-bag query with BM25 hits must quote a cited
+        # compression line. Compact path:line and stamp-only fail-closed are not
+        # source-grounded answers.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "agent" / "conversation_compression.py"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "def prune_proactive_result(hint, tail):\n"
+                "    return demote_hint(hint, tail)\n"
+            )
+            unrelated = repo / "unrelated.py"
+            unrelated.write_text("def unrelated():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 1-2')\n"
+                f"print('File: {source}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'w').close()\n"
+                "raise SystemExit(126)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "compression proactive prune result hint tail demote",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertFalse(trace.exists(), "keyword-bag recovery must not invoke Probe Chat")
+        self.assertIn("conversation_compression.py:", result.stdout)
+        self.assertRegex(result.stdout, r"prune_proactive_result|demote_hint")
+        self.assertNotRegex(result.stdout, r"(?m)^[\w./-]+:\d+\n?$")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertEqual(result.stderr, "")
+
+    def test_default_compression_keyword_query_rejects_unrelated_bm25_stamps(self) -> None:
+        # #199: unrelated BM25 leftovers are not a source answer, even at rc=0.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            unrelated = repo / "unrelated.py"
+            unrelated.write_text("def unrelated():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'w').close()\n"
+                "raise SystemExit(126)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "compression proactive prune result hint tail demote",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertIn("no source", result.stderr)
+
+    def test_search_compression_keyword_query_rejects_unrelated_hint_cap_source(self) -> None:
+        # #199: leftover hint/cap overlap is not a compression location.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            unrelated = repo / "test_subdirectory_hints.py"
+            unrelated.write_text(
+                "\n" * 110 + "def test_total_hint_cap_keeps_nearest_unicode_context(self, tmp_path):\n"
+            )
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 111-111')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "compression",
+                "estimator",
+                "tail",
+                "hint",
+                "caps",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("test_subdirectory_hints.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertIn("no source", result.stderr)
+
+    def test_search_compression_keyword_query_rejects_unrelated_bm25_stamps(self) -> None:
+        # #199: search success may be compact path:line, but not unrelated stamps.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            unrelated = repo / "unrelated.py"
+            unrelated.write_text("\n" * 41 + "estimator helper\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 42-42')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "compression",
+                "estimator",
+                "tail",
+                "hint",
+                "caps",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("unrelated.py", output)
+        self.assertIn("no source", result.stderr)
+
     def test_why_question_answers_from_source_when_chat_omits_locations(self) -> None:
         # #120: BM25 hits exist, but chat returns location-less prose. A
         # fail-closed diagnostic is not a source-grounded answer.
