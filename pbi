@@ -878,6 +878,10 @@ fast_path_token_variants() {
 # Matching may use a morphological stem only when it remains distinctive.
 fast_path_match_variants() {
   local token normalized stem tail
+  if [[ "$1" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]]; then
+    printf '%s\n' "$1"
+    return 0
+  fi
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     printf '%s\n' "$token"
@@ -924,6 +928,8 @@ question_is_multi_target_where() {
 
 question_is_keyword_bag() {
   local q="${1,,}" token count=0
+  # Colon-separated concept/action queries need a quoted source line.
+  [[ "$q" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]] && return 0
   # Identifier-free keyword bags need a quoted line. Hyphenated tokens stay compact.
   [[ "$q" =~ (^|[[:space:]])(why|how|explain|where|find|locate|which|show|classify)([[:space:]]|$) ]] && return 1
   [[ -n "$(search_named_symbols "$1")" ]] && return 1
@@ -1359,6 +1365,13 @@ remaining_file_candidates() {
       footer_path_seen["$path"]=1
     fi
   done <<<"$1"
+  if [[ "$query" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]]; then
+    for path in "${footer_source_paths[@]}"; do
+      [[ -z "${footer_path_seen[$path]+seen}" ]] || continue
+      footer_path_matches+=("$path")
+      footer_path_seen["$path"]=1
+    done
+  fi
   rg_command="$(command -v rg || true)"
   while IFS= read -r symbol; do
     normalized="${symbol,,}"
@@ -2272,7 +2285,12 @@ recover_bm25_source_locations() {
   fast_path_deadline_reached "$deadline_ns" && return 1
   if [[ "$strict_relevance" == true ]]; then
     footer_candidates="$(remaining_file_candidates "$candidates" "${question:-}" "$deadline_ns")"
-    [[ -z "$footer_candidates" ]] || candidates+=$'\n'"$footer_candidates"
+    if [[ "${question:-}" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]]; then
+      [[ -n "$footer_candidates" ]] || return 1
+      candidates="$footer_candidates"
+    elif [[ -n "$footer_candidates" ]]; then
+      candidates+=$'\n'"$footer_candidates"
+    fi
   fi
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
@@ -3122,6 +3140,10 @@ case "${1:-}" in
       [[ -z "$bm25_stderr" ]] || printf '%s\n' "$bm25_stderr" >&2
       exit 0
     fi
+    search_query="${search_pattern_parts[*]}"
+    if [[ "$search_query" =~ ^([[:alnum:]_-]+):([[:alnum:]_-]+)$ ]]; then
+      search_query="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    fi
     search_options+=(--ignore drafts)
     search_uses_local_model=true
     search_fail_closed_no_locations=true
@@ -3133,7 +3155,7 @@ case "${1:-}" in
     active_timeout_diagnostic="$search_timeout_diagnostic"
     if run_timed_command "$DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS" "$search_output_file" "$search_output_file" \
         "$(resolve_probe)" search "${search_options[@]}" --reranker bm25 --format plain --dry-run \
-        -- "${search_pattern_parts[*]}"; then
+        -- "${search_query}"; then
       search_status=0
     else
       search_status=$?
