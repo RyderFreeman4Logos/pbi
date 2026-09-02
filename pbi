@@ -1765,8 +1765,7 @@ run_default_bm25_fast_path() {
       return 0
     fi
     # Multi-target synthesis must not defer incomplete BM25 evidence to chat.
-    if [[ "${question,,}" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] &&
-        question_is_multi_target_where "${question:-}"; then
+    if question_has_multiple_semantic_targets "${question:-}"; then
       fast_path_fail_closed
       return 1
     fi
@@ -2199,7 +2198,7 @@ search_overlap_accepts_candidate() {
 
 recover_distinctive_source_locations() {
   local deadline_ns="${1:-}" diverse_files="${2:-false}" token variant rg_command hit file rest line_number text
-  local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked="" canonical_haystack path_score text_score
+  local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked="" canonical_haystack path_score text_score hit_count
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
   while IFS= read -r token; do
@@ -2238,7 +2237,11 @@ recover_distinctive_source_locations() {
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     fast_path_deadline_reached "$deadline_ns" && break
+    hit_count=0
     while IFS= read -r hit; do
+      # ponytail: cap raw matches per token at 32; broaden only if relevant hits are lost.
+      ((hit_count >= 32)) && break
+      hit_count=$((hit_count + 1))
       [[ "$hit" == *:*:* ]] || continue
       file="${hit%%:*}"
       rest="${hit#*:}"
