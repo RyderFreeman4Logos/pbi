@@ -5250,6 +5250,95 @@ class PbiTest(unittest.TestCase):
         self.assertIn("no source locations found", result.stderr)
         self.assertFalse(trace.exists(), "absent inject/persist must skip Probe Chat")
 
+    def test_adr_0024_compact_query_quotes_source(self) -> None:
+        # #213 residual: compact "ADR-0024" must quote the ADR (or a real use
+        # site). Leftover BM25 stamps-only is not a source-grounded answer
+        # while ADR-0024.md exists.
+        heading = "# ADR-0024: Do not create a companion recipes repository\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            adr = repo / "docs" / "architecture" / "adrs" / "ADR-0024.md"
+            leftover = repo / "unrelated.py"
+            adr.parent.mkdir(parents=True)
+            adr.write_text(heading)
+            leftover.write_text("def leftover():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {leftover}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "ADR-0024",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertRegex(result.stdout, r"ADR-0024\.md:\d+")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotIn("no source locations found", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "ADR-0024 recovery must skip Probe Chat")
+
+    def test_adr_0024_compact_query_fails_closed_when_absent(self) -> None:
+        # #213 residual: leftover BM25 stamps are not an answer when the
+        # ADR-0024 source is absent. Fail closed with no locations found.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            leftover = repo / "unrelated.py"
+            leftover.write_text("def leftover():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {leftover}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "ADR-0024",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertIn("no source locations found", result.stderr)
+        self.assertFalse(trace.exists(), "absent ADR-0024 must skip Probe Chat")
+
     def test_search_skips_hanging_chat_when_candidates_contain_named_symbol(self) -> None:
         symbol = "rest_response_prefers_created_ids_when_both_fields_exist"
         with tempfile.TemporaryDirectory() as temporary:
