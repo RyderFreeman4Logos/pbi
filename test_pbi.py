@@ -5143,6 +5143,113 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "definition recovery must skip Probe Chat")
 
+    def test_where_is_loop_timing_injected_and_persisted_quotes_source(self) -> None:
+        # #213: compact "Where is loop timing injected and persisted?" must
+        # quote the real inject and persist sites. BM25 stamps-only is not
+        # a source-grounded answer while those sites exist.
+        inject = (
+            "self._loop_timing_context_text = _loop_timing_context(self) or \"\"\n"
+        )
+        persist = (
+            "messages.append("
+            "{\"role\": \"system\", \"content\": loop_timing_persisted_text})\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            inject_file = repo / "run_agent.py"
+            persist_file = repo / "agent" / "conversation_loop.py"
+            unrelated = repo / "unrelated.py"
+            persist_file.parent.mkdir(parents=True)
+            inject_file.write_text("// filler\n" * 20 + inject)
+            persist_file.write_text("// filler\n" * 20 + persist)
+            unrelated.write_text("def leftover_timing():\n    return True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "Where is loop timing injected and persisted?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("run_agent.py", result.stdout)
+        self.assertIn("conversation_loop.py", result.stdout)
+        self.assertIn("_loop_timing_context", result.stdout)
+        self.assertIn("loop_timing_persisted_text", result.stdout)
+        self.assertNotRegex(result.stdout, r"(?m)^[\w./-]+:\d+\n?$")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotIn("no source locations found", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "inject/persist recovery must skip Probe Chat")
+
+    def test_where_is_loop_timing_injected_and_persisted_fails_closed_when_absent(
+        self,
+    ) -> None:
+        # #213: leftover BM25 stamps are not an answer when inject/persist
+        # sites are absent. Fail closed with an actionable diagnostic.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            leftover = repo / "unrelated.py"
+            leftover.write_text(
+                "def leftover_timing():\n"
+                "    persist_user_message()\n"
+                "    return True\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {leftover}, Lines: 1-3')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+                "print('unrelated.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "Where is loop timing injected and persisted?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertIn("no source locations found", result.stderr)
+        self.assertFalse(trace.exists(), "absent inject/persist must skip Probe Chat")
+
     def test_search_skips_hanging_chat_when_candidates_contain_named_symbol(self) -> None:
         symbol = "rest_response_prefers_created_ids_when_both_fields_exist"
         with tempfile.TemporaryDirectory() as temporary:

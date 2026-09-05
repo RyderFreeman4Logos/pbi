@@ -936,6 +936,13 @@ question_is_multi_target_where() {
   [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
 }
 
+question_is_inject_persist() {
+  local q="${1,,}"
+  [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]_])inject(ed|ion)?([^[:alnum:]_]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]_])persist(ed|ence|s)?([^[:alnum:]_]|$) ]]
+}
+
 question_is_keyword_bag() {
   local q="${1,,}" token count=0
   # Colon-separated concept/action queries need a quoted source line.
@@ -975,6 +982,7 @@ question_allows_compact_stamp() {
   # Identifier / where-is lookups stay compact path:line. Synthesis and
   # which/find/where-does questions must quote a line or fail closed.
   question_requires_semantic_trace "$1" && return 1
+  question_is_inject_persist "$1" && return 1
   question_needs_synthesized_answer "$1" && return 1
   question_requests_semantic_evidence "$1" && return 1
   question_is_keyword_bag "$1" && return 1
@@ -1658,6 +1666,15 @@ run_default_bm25_fast_path() {
     fast_path_fail_closed
     return 1
   fi
+  if question_is_inject_persist "${question:-}"; then
+    if output="$(emit_synthesized_source_answer "$deadline_ns")" &&
+        [[ -n "${output//[[:space:]]/}" ]]; then
+      printf '%s' "$output"
+      return 0
+    fi
+    fast_path_fail_closed
+    return 1
+  fi
   mapfile -t fast_path_queries < <(build_fast_path_queries "${question:-}")
   if ((${#fast_path_queries[@]} == 0)); then
     fast_path_queries=("${question:-}")
@@ -1839,6 +1856,62 @@ recover_named_symbol_definition() {
     done <<<"$matching_files"
   fi
   return 1
+}
+
+recover_inject_persist_locations() {
+  local deadline_ns="${1:-}" rg_command token compound="" hit file rest line_number text relative
+  local inject_loc="" persist_loc="" inject_score=0 persist_score=0 score
+  local -a topics=()
+  question_is_inject_persist "${question:-}" || return 1
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  while IFS= read -r token; do
+    token="${token%%[,:;.!?]*}"
+    token="${token,,}"
+    is_search_stopword "$token" && continue
+    case "$token" in
+      inject|injected|injection|persist|persisted|persistence|persists) continue ;;
+    esac
+    [[ "$token" =~ ^[[:alpha:]][[:alnum:]_]{2,}$ ]] || continue
+    topics+=("$token")
+  done < <(printf '%s\n' "${question:-}" | awk '{ for (i = 1; i <= NF; i++) print $i }')
+  ((${#topics[@]} > 0)) || return 1
+  compound="${topics[0]}"
+  for ((i = 1; i < ${#topics[@]}; i++)); do
+    compound+="_${topics[i]}"
+  done
+  while IFS= read -r hit; do
+    fast_path_deadline_reached "$deadline_ns" && break
+    [[ "$hit" == *:*:* ]] || continue
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    line_number="${rest%%:*}"
+    text="${rest#*:}"
+    [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
+    [[ -f "$file" ]] || continue
+    is_synthesis_junk_source "$file" "$text" && continue
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || continue
+    score=1
+    if [[ "${text,,}" =~ persist ]]; then
+      [[ "$text" =~ loop_timing_persisted ]] && score=4
+      ((score > persist_score)) || continue
+      persist_score="$score"
+      persist_loc="$relative:$line_number"
+    else
+      [[ "$text" =~ inject ]] && score=3
+      [[ "$text" =~ _loop_timing_context_text ]] && score=4
+      [[ "$text" =~ _loop_timing_context ]] && ((score < 3)) && score=3
+      ((score > inject_score)) || continue
+      inject_score="$score"
+      inject_loc="$relative:$line_number"
+    fi
+  done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F \
+      --glob '!drafts/**' --glob '!docs/plans/**' \
+      --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' \
+      -- "$compound" . 2>/dev/null || true)
+  [[ -n "$inject_loc" && -n "$persist_loc" ]] || return 1
+  printf '%s\n%s\n' "$inject_loc" "$persist_loc"
 }
 
 recover_unknown_route_wrap_location() {
@@ -2703,6 +2776,11 @@ emit_semantic_trace_from_candidates() {
 
 emit_synthesized_source_answer() {
   local deadline_ns="${1:-}" recovered
+  if question_is_inject_persist "${question:-}"; then
+    recovered="$(recover_inject_persist_locations "$deadline_ns")" || return 1
+    format_located_answer "$recovered" "$deadline_ns"
+    return
+  fi
   recovered="$(recover_bm25_source_locations "$deadline_ns")" || recovered=""
   if [[ -z "${recovered//[[:space:]]/}" ]]; then
     if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] && ! fast_path_remaining_timeout "$deadline_ns" 100000000 >/dev/null; then
