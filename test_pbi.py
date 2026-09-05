@@ -5081,6 +5081,68 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "named-symbol recovery must skip planner and chat")
         self.assertLess(elapsed, 5)
 
+    def test_where_is_pub_super_const_defined_for_mcp_tests_quotes_definition(self) -> None:
+        # #212: compact "where is CONST defined for MCP tests" must quote the
+        # pub(super) const definition. BM25 stamps-only and fail-closed
+        # "no source locations found" are both wrong while the constant exists.
+        symbol = "ADMISSION_LOCK_TIMEOUT"
+        definition = (
+            "pub(super) const ADMISSION_LOCK_TIMEOUT: Duration = "
+            "Duration::from_millis(250);"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "src" / "core" / "db_admission.rs"
+            use_site = repo / "src" / "core" / "db_admission_state.rs"
+            test_mention = repo / "tests" / "mcp.rs"
+            source.parent.mkdir(parents=True)
+            test_mention.parent.mkdir(parents=True)
+            source.write_text(
+                "// filler\n" * 38 + definition + "\n"
+            )
+            use_site.write_text(
+                "Ok(false) if started.elapsed() < super::db_admission::"
+                "ADMISSION_LOCK_TIMEOUT => {}\n"
+            )
+            test_mention.write_text(
+                "// MCP tests mention ADMISSION_LOCK_TIMEOUT without defining it\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {use_site}, Lines: 1-1')\n"
+                f"print('File: {test_mention}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "print('src/core/db_admission_state.rs:1')\n"
+                "print('tests/mcp.rs:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is ADMISSION_LOCK_TIMEOUT defined for MCP tests",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("src/core/db_admission.rs", result.stdout)
+        self.assertIn(symbol, result.stdout)
+        self.assertRegex(result.stdout, r"pub\(super\) const ADMISSION_LOCK_TIMEOUT")
+        self.assertNotRegex(result.stdout, r"(?m)^[\w./-]+:\d+\n?$")
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotIn("no source locations found", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "definition recovery must skip Probe Chat")
+
     def test_search_skips_hanging_chat_when_candidates_contain_named_symbol(self) -> None:
         symbol = "rest_response_prefers_created_ids_when_both_fields_exist"
         with tempfile.TemporaryDirectory() as temporary:
