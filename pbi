@@ -1675,6 +1675,27 @@ run_default_bm25_fast_path() {
     fast_path_fail_closed
     return 1
   fi
+  if [[ -n "$(search_structured_query_anchors "${question:-}")" ]]; then
+    search_uses_local_model=true
+    bm25_candidates=""
+    search_fallback_locations=""
+    output=""
+    recovered_from_candidates=false
+    if output="$(recover_distinctive_source_locations "$deadline_ns")" &&
+        [[ -n "${output//[[:space:]]/}" ]]; then
+      if question_allows_compact_stamp "${question:-}"; then
+        printf '%s\n' "$output"
+        return 0
+      fi
+      if output="$(format_located_answer "$output" "$deadline_ns")" &&
+          [[ -n "${output//[[:space:]]/}" ]]; then
+        printf '%s' "$output"
+        return 0
+      fi
+    fi
+    fast_path_fail_closed
+    return 1
+  fi
   mapfile -t fast_path_queries < <(build_fast_path_queries "${question:-}")
   if ((${#fast_path_queries[@]} == 0)); then
     fast_path_queries=("${question:-}")
@@ -1944,7 +1965,13 @@ is_synthesis_junk_path() {
 }
 
 is_synthesis_junk_source() {
+  local anchors
   is_synthesis_junk_path "$1" || return 1
+  anchors="$(search_structured_query_anchors "${question:-}")"
+  if [[ -n "${anchors//[[:space:]]/}" ]] &&
+      search_structured_anchors_match "$1 $2" "$anchors"; then
+    return 1
+  fi
   question_is_multi_target_where "${question:-}" || return 0
   semantic_trace_candidate_matches_target "$2" || return 0
   return 1
