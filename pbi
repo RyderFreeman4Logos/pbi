@@ -396,7 +396,7 @@ named_symbol_definition_line() {
   local deadline_ns="${6:-}"
   run_awk_with_deadline "$deadline_ns" -v symbol="$symbol" -v mode="$mode" -v line_start="$line_start" -v line_end="$line_end" '
     BEGIN {
-      declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
+      declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub(\\([^)]*\\))?|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type|const)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
       # ponytail: enum-variant / Type::Variant match; upgrade if it starts ranking every mention of a camelCase word.
       variant_qualified = "^[[:space:]]*([[:alnum:]_]+::)+" symbol "([[:space:](<{,;}]|$)"
@@ -2003,7 +2003,10 @@ source_answer_has_semantic_evidence() {
     (( location_count >= 2 )) || return 1
   fi
   named_symbols="$(search_named_symbols "${question:-}")"
-  [[ -z "${named_symbols//[[:space:]]/}" || ! "$q" =~ (^|[^[:alnum:]])tests?([^[:alnum:]]|$) ]] || requires_named_test_evidence=true
+  if [[ -n "${named_symbols//[[:space:]]/}" &&
+      "$q" =~ (which[[:space:]]+tests?|test[[:space:]]+module|test-?coverage|tests?[[:space:]]+cover|tests?[[:space:]]+import) ]]; then
+    requires_named_test_evidence=true
+  fi
   while IFS= read -r location; do
     [[ "$location" =~ ^(.+):([[:digit:]]+)$ ]] || continue
     file="${BASH_REMATCH[1]}"
