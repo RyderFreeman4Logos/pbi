@@ -1700,9 +1700,10 @@ class PbiTest(unittest.TestCase):
             )
             elapsed = time.monotonic() - started
             self.assertEqual(list(tmpdir.iterdir()), [])
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("entrypoint", result.stdout)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
         self.assertLess(elapsed, 5)
 
     def test_default_query_ambient_duplicate_stamps_fail_closed(self) -> None:
@@ -1736,7 +1737,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_default_query_bm25_fast_path_requires_distinctive_token_on_cited_line(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2575,7 +2576,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
 
     def test_default_query_identifier_free_dotted_file_citation_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2832,11 +2833,12 @@ class PbiTest(unittest.TestCase):
             )
             elapsed = time.monotonic() - started
             self.assertFalse(trace.exists(), "planner/chat must not run after a completed fast-path miss")
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(elapsed, 3)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertIn("entrypoint", result.stdout)
         self.assertNotIn("LICENSE:1", result.stdout + result.stderr)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_loads_cwd_dotenv_for_local_router_without_leaking_secret(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2915,10 +2917,11 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi(
                 "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe)
             )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("entrypoint", result.stdout)
         self.assertNotIn("pbi:211", result.stdout + result.stderr)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_default_query_fails_closed_when_answer_has_no_usable_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2952,11 +2955,12 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi(
                 "where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, probe)
             )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("entrypoint", result.stdout)
         self.assertNotIn("SEARCH_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("PLANNER_SENTINEL", result.stdout + result.stderr)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_default_query_lone_non_one_stamp_is_not_success(self) -> None:
         # #126/#130: a lone path:line stamp, including non-1 lines, is never
@@ -2989,7 +2993,7 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(result.stderr, "")
         else:
             self.assertEqual(result.stdout, "")
-            self.assertIn("location stamps", result.stderr)
+            self.assertIn("no source locations found", result.stderr)
 
     def test_find_question_lone_stamp_is_not_success(self) -> None:
         # #126/#129: a Find/path question must not succeed with a lone
@@ -3053,9 +3057,10 @@ class PbiTest(unittest.TestCase):
                 cwd=ROOT,
                 binary=self.fake_pbi(directory, directory / "probe"),
             )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("location stamps", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("entrypoint", result.stdout)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_default_query_mixed_compact_stamps_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3087,19 +3092,22 @@ class PbiTest(unittest.TestCase):
                 cwd=ROOT,
                 binary=self.fake_pbi(directory, probe),
             )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("entrypoint", result.stdout)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_default_query_real_path_stamp_only_answer_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
+            repo = directory / "repo"
+            repo.mkdir()
             paths = (
-                directory / "website/docs/developer-guide/trajectory-format.md",
-                directory / "tui_gateway/server.py",
-                directory / "apps/desktop/electron/main.ts",
-                directory / "tools/delegate_tool.py",
+                repo / "website/docs/developer-guide/trajectory-format.md",
+                repo / "tui_gateway/server.py",
+                repo / "apps/desktop/electron/main.ts",
+                repo / "tools/delegate_tool.py",
             )
             for path in paths:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -3124,18 +3132,21 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi(
                 "where is the entrypoint",
                 env=env,
-                cwd=directory,
+                cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertIn("no source locations found", result.stderr)
 
     def test_default_query_spaced_and_punctuated_real_path_stamps_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, _ = self.fake_environment(directory)
-            paths = (directory / "docs/user guide.md", directory / "src/foo+bar.rs")
+            repo = directory / "repo"
+            repo.mkdir()
+            paths = (repo / "docs/user guide.md", repo / "src/foo+bar.rs")
             for path in paths:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("source\n")
@@ -3156,12 +3167,13 @@ class PbiTest(unittest.TestCase):
             result = self.run_pbi(
                 "where is the entrypoint",
                 env=env,
-                cwd=directory,
+                cwd=repo,
                 binary=self.fake_pbi(directory, probe),
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertIn("no source locations found", result.stderr)
 
     def test_question_spaced_relative_path_stamps_fail_closed(self) -> None:
         for answer in ("user guide.md:1", "user docs/foo.md:1"):
@@ -3196,11 +3208,10 @@ class PbiTest(unittest.TestCase):
                     cwd=ROOT,
                     binary=self.fake_pbi(directory, directory / "probe"),
                 )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(result.stdout, "")
-            self.assertEqual(
-                result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n"
-            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("entrypoint", result.stdout)
+            self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+            self.assertEqual(result.stderr, "")
 
     def test_question_stamp_per_line_narrative_answer_still_succeeds(self) -> None:
         # #12: a real compact answer (narrative + citation) still prints, even
@@ -3270,7 +3281,7 @@ class PbiTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertNotIn("AI SDK Warning", result.stdout)
 
     def test_query_planning_system_message_warning_keeps_local_model_answer(self) -> None:
@@ -3310,9 +3321,10 @@ class PbiTest(unittest.TestCase):
             fake_chat.chmod(0o755)
             result = self.run_pbi("where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, directory / "probe"))
             self.assertFalse(trace.exists(), "a completed fast-path miss must skip planner and chat")
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("entrypoint", result.stdout)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_nonzero_query_planning_warning_fails_closed_without_echoing_sentinels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3331,11 +3343,12 @@ class PbiTest(unittest.TestCase):
             )
             fake_chat.chmod(0o755)
             result = self.run_pbi("where is the entrypoint", env=env, cwd=ROOT, binary=self.fake_pbi(directory, directory / "probe"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "pbi: model returned only BM25 location stamps; no source answer\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("entrypoint", result.stdout)
         self.assertNotIn("PROMPT_SENTINEL", result.stdout + result.stderr)
         self.assertNotIn("SECRET_SENTINEL", result.stdout + result.stderr)
+        self.assertNotIn("only BM25 location stamps", result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_routes_primary_retries_then_fallback_and_forwards_args(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -8227,6 +8240,80 @@ exit "$status"
         self.assertNotIn("no source locations found", output)
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "host admission recovery must skip Probe Chat")
+
+    def _run_short_tracer_compact_query(
+        self,
+        directory: Path,
+        *,
+        source_present: bool,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        # #219: remaining compact default-query class. Short source-tracing
+        # question, no extra flags. BM25 leftover stamps are not an answer.
+        repo = directory / "repo"
+        leftover = repo / "unrelated.py"
+        leftover.parent.mkdir(parents=True)
+        leftover.write_text("def leftover():\n    return True\n")
+        if source_present:
+            # Path must not contain the query token; leftover BM25 stamps
+            # otherwise hide this remaining compact default-query miss.
+            tracer = repo / "src" / "observability.py"
+            tracer.parent.mkdir(parents=True)
+            tracer.write_text("def run_tracer():\n    return True\n")
+        env, trace = self.fake_environment(directory)
+        probe = directory / "probe"
+        probe.write_text(
+            "#!/usr/bin/env python3\n"
+            f"print('File: {leftover}, Lines: 1-2')\n"
+        )
+        probe.chmod(0o755)
+        fake_chat = directory / "probe-chat"
+        fake_chat.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+            "print('unrelated.py:1')\n"
+            "print('unrelated.py:1')\n"
+            "print('unrelated.py:1')\n"
+            "print('unrelated.py:1')\n"
+        )
+        fake_chat.chmod(0o755)
+        result = self.run_pbi(
+            "where is the tracer",
+            env=env,
+            cwd=repo,
+            binary=self.fake_pbi(directory, probe),
+            timeout=8,
+        )
+        return result, trace
+
+    def test_default_compact_tracer_query_quotes_source_instead_of_bm25_stamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self._run_short_tracer_compact_query(
+                Path(temporary), source_present=True
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("src/observability.py", result.stdout)
+        self.assertIn("run_tracer", result.stdout)
+        self.assertNotRegex(result.stdout, r"(?m)^[\w./-]+:\d+\n?$")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotIn("no source locations found", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "tracer recovery must skip Probe Chat")
+
+    def test_default_compact_tracer_query_fails_closed_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self._run_short_tracer_compact_query(
+                Path(temporary), source_present=False
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("unrelated.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertIn("no source locations found", result.stderr)
+        self.assertFalse(trace.exists(), "absent tracer must skip Probe Chat")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

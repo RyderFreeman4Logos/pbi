@@ -1840,6 +1840,22 @@ run_default_bm25_fast_path() {
       return 0
     fi
   fi
+  # Leftover BM25 stamps are not an answer. Quote a tree-backed site first
+  # when the query named no code symbol; named-symbol recovery already ran.
+  if [[ -z "${candidate_symbols//[[:space:]]/}" ]] &&
+      ! fast_path_deadline_reached "$deadline_ns" &&
+      output="$(recover_distinctive_source_locations "$deadline_ns")" &&
+      [[ -n "${output//[[:space:]]/}" ]]; then
+    if formatted="$(format_located_answer "$output" "$deadline_ns")" &&
+        [[ -n "${formatted//[[:space:]]/}" ]]; then
+      printf '%s' "$formatted"
+      return 0
+    fi
+    if question_allows_compact_stamp "${question:-}"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+  fi
   if [[ -z "${search_fallback_locations//[[:space:]]/}" ]]; then
     fast_path_fail_closed
     return 1
@@ -1850,6 +1866,23 @@ run_default_bm25_fast_path() {
   }
   if question_is_keyword_bag "${question:-}"; then
     # Leftover BM25 hits without a quoted line are a miss, not a stamp dump.
+    fast_path_fail_closed
+    return 1
+  fi
+  if fast_path_deadline_reached "$deadline_ns"; then
+    # 8s bounds recovery reads only. Candidates without an in-hand answer
+    # fall through to planner/chat instead of aborting the command.
+    search_uses_local_model=false
+    output=""
+    recovered_from_candidates=false
+    return 1
+  fi
+  if [[ -z "${candidate_symbols//[[:space:]]/}" ]] &&
+      ! question_needs_synthesized_answer "${question:-}" &&
+      ! fast_path_requires_cache_key "${question:-}" &&
+      { is_stamp_dump "$search_fallback_locations" ||
+        has_mixed_stamp_junk "$search_fallback_locations" ||
+        is_lone_path_line_stamp "$search_fallback_locations"; }; then
     fast_path_fail_closed
     return 1
   fi
@@ -2286,11 +2319,12 @@ search_independent_concept_score() {
 }
 
 path_component_token_match() {
-  local haystack="$1" token="${2,,}" path component
-  path="${haystack%%[[:space:]]*}"
-  path="${path,,}"
-  [[ -n "$path" && -n "$token" ]] || return 1
-  IFS='._/-' read -r -a components <<< "$path"
+  local haystack="$1" token="${2,,}" component
+  haystack="${haystack,,}"
+  [[ -n "$token" ]] || return 1
+  # Identifier pieces after _/- count; leftover "identity" still needs a
+  # second distinctive hit in search_overlap_accepts_candidate.
+  IFS=' ._/-()[]{}:,' read -r -a components <<< "$haystack"
   for component in "${components[@]}"; do
     [[ "$component" == "$token" ]] && return 0
   done
@@ -3646,19 +3680,12 @@ else
   fi
   [[ "${semantic_trace_partial_emitted:-false}" == true ]] && exit 1
   if [[ "$search_fast_path_miss" == true ]]; then
-    if ! question_allows_compact_stamp "$question"; then
-      if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
-        printf '%s' "$output"
-        exit 0
-      fi
-      printf '%s\n' 'pbi: no source locations found' >&2
-      exit 1
+    if ! question_allows_compact_stamp "$question" &&
+        output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+      printf '%s' "$output"
+      exit 0
     fi
-    if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
-      printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
-    else
-      printf '%s\n' 'pbi: no source locations found' >&2
-    fi
+    printf '%s\n' 'pbi: no source locations found' >&2
     exit 1
   fi
   if ! question_allows_compact_stamp "$question"; then
