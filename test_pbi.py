@@ -7985,5 +7985,166 @@ class PbiTest(unittest.TestCase):
         self.assertIn("Missing: requested relationship edge", result.stderr)
         self.assertNotIn(question, result.stderr)
 
+    def _replay_admission_fixture(self, repo: Path) -> None:
+        chat = repo / "web" / "src" / "pages" / "ChatPage.tsx"
+        stories = repo / "website" / "src" / "data" / "userStories.json"
+        discord = repo / "plugins" / "platforms" / "discord" / "adapter.py"
+        replay = repo / "hermes_cli" / "session_replay.py"
+        sessions = repo / "hermes_cli" / "sessions_cmd.py"
+        engine_replay = repo / "agent" / "checkpoint_engine" / "replay.py"
+        budget = repo / "agent" / "checkpoint_engine" / "budget.py"
+        compression = repo / "agent" / "conversation_compression.py"
+        for path in (chat, stories, discord, replay, sessions, engine_replay, budget, compression):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        chat.write_text(
+            "// filler\n" * 1233
+            + "// Resumed sessions replay export classified pre and post boundaries from SessionDB.\n"
+        )
+        stories.write_text(
+            "[\n" + '{"id": 1},\n' * 2033
+            + '{"quote": "Point it at your existing setup — Obsidian, vimwiki, Hermes sessions — and you\'ve already built a semantic topology."}\n'
+            + "]\n"
+        )
+        discord.write_text(
+            "# filler\n" * 1558
+            + "    def _discord_message_admission(self, message, *, claim: bool):\n"
+            + "        return True, True\n"
+        )
+        replay.write_text(
+            "def export_boundary(db_path, session_id, pre_end_id, post_end_id):\n"
+            "    return classified_pre_post_sessiondb_boundaries()\n"
+            "\n"
+            "def export_sequence(db_path, session_id, boundaries):\n"
+            "    return [export_boundary(db_path, session_id, *pair) for pair in boundaries]\n"
+        )
+        sessions.write_text(
+            "def get_hermes_home():\n"
+            "    return Path.home()\n"
+            "\n"
+            "def cmd_sessions(args):\n"
+            "    if args.sessions_action == \"replay\":\n"
+            "        from hermes_cli.session_replay import run_cli\n"
+            "        return run_cli(args)\n"
+        )
+        engine_replay.write_text(
+            "class ReplayUnavailable(RuntimeError):\n"
+            "    pass\n"
+            "\n"
+            "    def replay(self, messages, **kwargs):\n"
+            "        raise ReplayUnavailable(\"post-context fallback is not replay\")\n"
+        )
+        budget.write_text(
+            "def admit_at_host(engine, agent, messages, system_prompt):\n"
+            "    \"\"\"Fit only optional checkpoint text; count again before host publication.\"\"\"\n"
+            "    return messages\n"
+        )
+        compression.write_text(
+            "# filler\n" * 20
+            + "from agent.checkpoint_engine.budget import admit_at_host\n"
+            + "compressed = admit_at_host(engine, agent, compressed, new_system_prompt)\n"
+        )
+
+    def _run_replay_admission_query(
+        self,
+        directory: Path,
+        *args: str,
+        candidate_globs: tuple[str, ...] = (
+            "web/src/pages/ChatPage.tsx",
+            "website/src/data/userStories.json",
+            "plugins/platforms/discord/adapter.py",
+        ),
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        repo = directory / "repo"
+        repo.mkdir()
+        self._replay_admission_fixture(repo)
+        env, trace = self.fake_environment(directory)
+        probe = directory / "probe"
+        prints = "\n".join(
+            f"print('File: {repo / relative}, Lines: 1-8')"
+            for relative in candidate_globs
+        )
+        probe.write_text("#!/usr/bin/env python3\n" + prints + "\n")
+        probe.chmod(0o755)
+        fake_chat = directory / "probe-chat"
+        fake_chat.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+            "print('web/src/pages/ChatPage.tsx:1234')\n"
+            "print('website/src/data/userStories.json:2034')\n"
+            "print('plugins/platforms/discord/adapter.py:1559')\n"
+        )
+        fake_chat.chmod(0o755)
+        result = self.run_pbi(
+            *args,
+            env=env,
+            cwd=repo,
+            binary=self.fake_pbi(directory, probe),
+            timeout=8,
+        )
+        return result, trace
+
+    def test_search_hermes_sessions_replay_quotes_cli_not_ui_stamps(self) -> None:
+        # #217: compact "hermes sessions replay" must quote the CLI, not
+        # ChatPage/userStories narrative stamps. Fail-closed is not success
+        # while session_replay.py / sessions_cmd.py exist.
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self._run_replay_admission_query(
+                Path(temporary), "search", "hermes", "sessions", "replay",
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertRegex(result.stdout, r"hermes_cli/session_replay\.py|hermes_cli/sessions_cmd\.py")
+        self.assertNotIn("ChatPage.tsx", output)
+        self.assertNotIn("userStories.json", output)
+        self.assertNotIn("discord/adapter.py", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotIn("no source locations found", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "CLI replay recovery must skip Probe Chat")
+
+    def test_where_sessions_replay_export_quotes_boundaries_not_chatpage(self) -> None:
+        # #217: compact "Where does sessions replay export classified pre and
+        # post boundaries from SessionDB?" must quote export_boundary /
+        # export_sequence, not ChatPage.
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self._run_replay_admission_query(
+                Path(temporary),
+                "Where does sessions replay export classified pre and post boundaries from SessionDB?",
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("hermes_cli/session_replay.py", result.stdout)
+        self.assertRegex(result.stdout, r"export_boundary|export_sequence")
+        self.assertNotIn("ChatPage.tsx", output)
+        self.assertNotIn("userStories.json", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotIn("no source locations found", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "boundary export recovery must skip Probe Chat")
+
+    def test_where_host_publication_admission_quotes_engine_not_discord(self) -> None:
+        # #217: compact "Where is host publication admission for checkpoint
+        # candidates?" must quote admit_at_host, not discord adapter stamps.
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self._run_replay_admission_query(
+                Path(temporary),
+                "Where is host publication admission for checkpoint candidates?",
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertRegex(
+            result.stdout,
+            r"agent/checkpoint_engine/budget\.py|agent/conversation_compression\.py",
+        )
+        self.assertIn("admit_at_host", result.stdout)
+        self.assertNotIn("discord/adapter.py", output)
+        self.assertNotIn("ChatPage.tsx", output)
+        self.assertNotIn("userStories.json", output)
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertNotIn("no source locations found", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "host admission recovery must skip Probe Chat")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
