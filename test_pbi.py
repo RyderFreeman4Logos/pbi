@@ -5921,6 +5921,79 @@ class PbiTest(unittest.TestCase):
         )
         self.assertNotIn("FTS5", argv)
 
+    def test_search_metacharacter_tokens_do_not_trip_conditional_expression_parser(self) -> None:
+        # #221: query tokens interpolated into [[ =~ $pat ]] must not yield
+        # exit 2 / "syntax error in conditional expression".
+        source = PBI.read_text()
+        self.assertIn('$(ere_quote "$token")', source)
+        self.assertIn('$(ere_quote "$anchor")', source)
+        helpers = source.partition('\ncase "${1:-}" in\n')[0]
+        script = helpers + r"""
+set +e
+status=0
+while IFS= read -r token; do
+  [[ -n "$token" ]] || continue
+  if declare -F ere_quote >/dev/null; then
+    quoted="$(ere_quote "$token")"
+  else
+    quoted="$token"
+  fi
+  pat='(^|[^[:alnum:]-])'"$quoted"'([^[:alnum:]-]|$)'
+  [[ "haystack" =~ $pat ]]
+  (( $? == 2 )) && status=2
+  pattern='(^|[^[:alnum:]])'"$quoted"'([^[:alnum:]]|$)'
+  [[ "haystack" =~ $pattern ]]
+  (( $? == 2 )) && status=2
+done <<'TOKENS'
+(
+[
+{
+*
++
+?
+)
+]
+}
+foo(
+TOKENS
+if ((status == 2)); then
+  printf '%s\n' 'syntax error in conditional expression' >&2
+fi
+exit "$status"
+"""
+        parser = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+        self.assertNotEqual(parser.returncode, 2, parser.stderr)
+        self.assertNotIn("syntax error in conditional expression", parser.stderr)
+        self.assertNotIn("syntax error in conditional expression", parser.stdout)
+
+        tokens = ("(", "[", "{", "*", "+", "?", ")", "]", "}")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            self.record_probe_argv(probe)
+            for token in tokens:
+                with self.subTest(token=token):
+                    result = self.run_pbi(
+                        "search",
+                        "annotate_wire_calls",
+                        token,
+                        env=env,
+                        binary=self.fake_pbi(directory, probe),
+                    )
+                    self.assertNotEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn("syntax error in conditional expression", result.stderr)
+                    self.assertNotIn("syntax error in conditional expression", result.stdout)
+                    accepted = (
+                        result.stdout.strip() != ""
+                        or "pbi: no source locations found" in result.stderr
+                        or "Usage:" in result.stderr
+                        or "question is required" in result.stderr
+                    )
+                    self.assertTrue(accepted, result.stderr)
+                    if result.returncode == 0:
+                        self.assertNotEqual(result.stdout.strip(), "")
+
     def test_defaults_probe_folder_to_the_calling_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

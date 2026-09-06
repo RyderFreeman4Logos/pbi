@@ -2181,6 +2181,11 @@ is_synthesis_junk_line() {
   [[ "$1" =~ ^[[:space:]]*(pub[[:space:]]+)?type[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*= ]]
 }
 
+# Quote a string as a literal POSIX ERE so [[ =~ $pat ]] cannot parse user tokens.
+ere_quote() {
+  printf '%s' "$1" | sed 's/[][\\^$.|?*+(){}]/\\&/g'
+}
+
 token_overlap_score() {
   local haystack="$1" tokens="$2" token score=0 spaced pat
   haystack="${haystack,,}"
@@ -2198,7 +2203,7 @@ token_overlap_score() {
       fi
     else
       # ponytail: hyphen is a word char so leftover "identity" does not match azure-identity
-      pat='(^|[^[:alnum:]-])'"$token"'([^[:alnum:]-]|$)'
+      pat='(^|[^[:alnum:]-])'"$(ere_quote "$token")"'([^[:alnum:]-]|$)'
       [[ "$haystack" =~ $pat ]] && score=$((score + 1))
     fi
   done <<< "$tokens"
@@ -2254,7 +2259,7 @@ search_structured_anchors_match() {
   haystack="${haystack//./-}"
   while IFS= read -r anchor; do
     [[ -n "$anchor" ]] || continue
-    pattern='(^|[^[:alnum:]])'"$anchor"'([^[:alnum:]]|$)'
+    pattern='(^|[^[:alnum:]])'"$(ere_quote "$anchor")"'([^[:alnum:]]|$)'
     [[ "$haystack" =~ $pattern ]] && return 0
   done <<< "$anchors"
   return 1
