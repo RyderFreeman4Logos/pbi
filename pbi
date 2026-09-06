@@ -25,8 +25,16 @@ usage() {
 }
 
 resolve_command() {
-  local command_name="$1" candidate resolved mise_path
-  if mise_path="$(mise which "$command_name" 2>/dev/null)" && [[ -x "$mise_path" ]]; then
+  local command_name="$1" candidate resolved mise_bin="" mise_path
+  mise_bin="$(command -v mise 2>/dev/null || true)"
+  if [[ -z "$mise_bin" ]]; then
+    for candidate in ${HOME:+"$HOME/.local/bin/mise"} /usr/local/bin/mise; do
+      [[ -x "$candidate" ]] || continue
+      mise_bin="$candidate"
+      break
+    done
+  fi
+  if [[ -n "$mise_bin" ]] && mise_path="$("$mise_bin" which "$command_name" 2>/dev/null)" && [[ -x "$mise_path" ]]; then
     printf '%s' "$mise_path"
     return 0
   fi

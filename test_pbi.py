@@ -306,6 +306,43 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "real.py:1\n")
         self.assertNotIn("mise ERROR", result.stdout + result.stderr)
 
+    def test_bm25_search_resolves_real_probe_when_path_lacks_non_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            shim_dir = directory / "shim-root" / "mise" / "shims"
+            real_bin = directory / "real-bin"
+            home_mise_dir = directory / ".local" / "bin"
+            shim_dir.mkdir(parents=True)
+            real_bin.mkdir()
+            home_mise_dir.mkdir(parents=True)
+            broken_probe = shim_dir / "probe"
+            broken_probe.write_text(
+                "#!/usr/bin/env bash\nprintf '%s\\n' 'mise ERROR No version is set for shim: probe' >&2\nexit 1\n"
+            )
+            broken_probe.chmod(0o755)
+            real_probe = real_bin / "probe"
+            real_probe.write_text("#!/usr/bin/env bash\nprintf '%s\\n' 'real.py:1'\n")
+            real_probe.chmod(0o755)
+            home_mise = home_mise_dir / "mise"
+            home_mise.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "[ \"$1\" = which ] && [ \"$2\" = probe ]\n"
+                f"printf '%s\\n' {str(real_probe)!r}\n"
+            )
+            home_mise.chmod(0o755)
+            env["PATH"] = f"{shim_dir}:/usr/bin:/bin"
+            env["PBI_TEST_PROBE"] = str(directory / "missing-probe")
+            result = self.run_pbi(
+                "search", "--bm25", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, broken_probe)
+            )
+        self.assertNotEqual(result.returncode, 127, result.stderr)
+        self.assertNotIn("pbi: probe is unavailable on PATH", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "real.py:1\n")
+        self.assertNotIn("mise ERROR", result.stdout + result.stderr)
+
     def test_local_routing_skips_an_unconfigured_mise_node_shim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
