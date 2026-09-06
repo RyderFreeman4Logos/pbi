@@ -7989,12 +7989,13 @@ class PbiTest(unittest.TestCase):
         chat = repo / "web" / "src" / "pages" / "ChatPage.tsx"
         stories = repo / "website" / "src" / "data" / "userStories.json"
         discord = repo / "plugins" / "platforms" / "discord" / "adapter.py"
+        meet = repo / "plugins" / "google_meet" / "meet_bot.py"
         replay = repo / "hermes_cli" / "session_replay.py"
         sessions = repo / "hermes_cli" / "sessions_cmd.py"
         engine_replay = repo / "agent" / "checkpoint_engine" / "replay.py"
         budget = repo / "agent" / "checkpoint_engine" / "budget.py"
         compression = repo / "agent" / "conversation_compression.py"
-        for path in (chat, stories, discord, replay, sessions, engine_replay, budget, compression):
+        for path in (chat, stories, discord, meet, replay, sessions, engine_replay, budget, compression):
             path.parent.mkdir(parents=True, exist_ok=True)
         chat.write_text(
             "// filler\n" * 1233
@@ -8009,6 +8010,10 @@ class PbiTest(unittest.TestCase):
             "# filler\n" * 1558
             + "    def _discord_message_admission(self, message, *, claim: bool):\n"
             + "        return True, True\n"
+        )
+        meet.write_text(
+            "# filler\n" * 652
+            + '                            error="host denied admission",\n'
         )
         replay.write_text(
             "def export_boundary(db_path, session_id, pre_end_id, post_end_id):\n"
@@ -8052,6 +8057,7 @@ class PbiTest(unittest.TestCase):
             "web/src/pages/ChatPage.tsx",
             "website/src/data/userStories.json",
             "plugins/platforms/discord/adapter.py",
+            "plugins/google_meet/meet_bot.py",
         ),
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         repo = directory / "repo"
@@ -8073,6 +8079,7 @@ class PbiTest(unittest.TestCase):
             "print('web/src/pages/ChatPage.tsx:1234')\n"
             "print('website/src/data/userStories.json:2034')\n"
             "print('plugins/platforms/discord/adapter.py:1559')\n"
+            "print('plugins/google_meet/meet_bot.py:653')\n"
         )
         fake_chat.chmod(0o755)
         result = self.run_pbi(
@@ -8125,7 +8132,7 @@ class PbiTest(unittest.TestCase):
 
     def test_where_host_publication_admission_quotes_engine_not_discord(self) -> None:
         # #217: compact "Where is host publication admission for checkpoint
-        # candidates?" must quote admit_at_host, not discord adapter stamps.
+        # candidates?" must quote admit_at_host, not discord/meet_bot stamps.
         with tempfile.TemporaryDirectory() as temporary:
             result, trace = self._run_replay_admission_query(
                 Path(temporary),
@@ -8139,6 +8146,8 @@ class PbiTest(unittest.TestCase):
         )
         self.assertIn("admit_at_host", result.stdout)
         self.assertNotIn("discord/adapter.py", output)
+        self.assertNotIn("google_meet/meet_bot.py", output)
+        self.assertNotIn("host denied admission", output)
         self.assertNotIn("ChatPage.tsx", output)
         self.assertNotIn("userStories.json", output)
         self.assertNotIn("only BM25 location stamps", output)

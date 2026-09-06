@@ -2514,7 +2514,7 @@ recover_distinctive_source_locations() {
         run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
           --glob "!drafts/**" --glob "!docs/plans/**" \
           --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
-          --glob "!**/tests/**" --glob "!**/test/**" \
+          --glob "!**/tests/**" --glob "!**/test/**" --glob "!plugins/**" \
           -- "$token" . 2>/dev/null || true
       fi
     )
