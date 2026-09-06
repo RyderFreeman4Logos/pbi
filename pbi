@@ -995,6 +995,19 @@ question_allows_compact_stamp() {
   question_requests_semantic_evidence "$1" && return 1
   question_is_keyword_bag "$1" && return 1
   [[ "$q" =~ (^|[[:space:]])(which|find|where[[:space:]]+does)([[:space:]]|$) ]] && return 1
+  # Conceptual where-is with several distinctive tokens must quote a line.
+  # Cache-key assembly and short identifier lookups stay compact path:line.
+  if [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] &&
+      [[ -z "$(search_named_symbols "$1")" ]] &&
+      ! fast_path_requires_cache_key "$1"; then
+    local token count=0
+    while IFS= read -r token; do
+      [[ -n "$token" ]] || continue
+      [[ "$token" == *-* ]] && continue
+      count=$((count + 1))
+    done < <(search_distinctive_tokens "$1")
+    ((count >= 4)) && return 1
+  fi
   return 0
 }
 
@@ -1969,7 +1982,8 @@ is_synthesis_junk_path() {
   case "$base" in
     LICENSE|NOTICE|COPYING|Cargo.toml|Cargo.lock) return 0 ;;
   esac
-  [[ "$file" == *.md ]]
+  [[ "$file" == *.md || "$file" == *.json || "$file" == *.tsx || "$file" == *.jsx ]] && return 0
+  [[ "$file" == website/* || "$file" == */website/* || "$file" == web/src/pages/* || "$file" == */web/src/pages/* ]]
 }
 
 is_synthesis_junk_source() {
@@ -2266,6 +2280,18 @@ search_independent_concept_score() {
   '
 }
 
+path_component_token_match() {
+  local haystack="$1" token="${2,,}" path component
+  path="${haystack%%[[:space:]]*}"
+  path="${path,,}"
+  [[ -n "$path" && -n "$token" ]] || return 1
+  IFS='._/-' read -r -a components <<< "$path"
+  for component in "${components[@]}"; do
+    [[ "$component" == "$token" ]] && return 0
+  done
+  return 1
+}
+
 search_overlap_accepts_candidate() {
   local haystack="$1" distinctive="$2" phrases="$3" anchors concept_score anchor_match=false
   local phrase_score=0 distinctive_score=0 token plain_overlap=0 plain_tokens=0 strong_overlap=0 canonical_haystack
@@ -2285,7 +2311,10 @@ search_overlap_accepts_candidate() {
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     distinctive_score="$(token_overlap_score "$haystack" "$token")"
-    [[ "$distinctive_score" =~ ^[[:digit:]]+$ ]] || continue
+    [[ "$distinctive_score" =~ ^[[:digit:]]+$ ]] || distinctive_score=0
+    if ((distinctive_score == 0)) && path_component_token_match "$1" "$token"; then
+      distinctive_score=1
+    fi
     if [[ "$token" =~ [-_[:digit:]] ]]; then
       ((distinctive_score > 0)) && strong_overlap=$((strong_overlap + 1))
     else
@@ -2309,7 +2338,81 @@ search_overlap_accepts_candidate() {
 
 recover_distinctive_source_locations() {
   local deadline_ns="${1:-}" diverse_files="${2:-false}" token variant rg_command hit file rest line_number text
-  local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked="" canonical_haystack path_score text_score hit_count
+  local relative location score tokens="" score_tokens="" phrase_tokens="" distinctive_tokens="" seen_tokens=$'\n' count=0 extra=0 ranked="" canonical_haystack path_score text_score hit_count path_tokens="" path_select_tokens=""
+
+  rank_distinctive_hit() {
+    local file="$1" line_number="$2" text="$3" relative
+    [[ "$line_number" =~ ^[[:digit:]]+$ ]] || return 1
+    [[ -f "$file" ]] || return 1
+    text="${text#"${text%%[![:space:]]*}"}"
+    [[ -n "$text" ]] || return 1
+    is_synthesis_junk_source "$file" "$text" && return 1
+    is_synthesis_junk_line "$text" && return 1
+    # ponytail: skip code comments/docstrings in compact ranking; markdown headings stay.
+    [[ "$diverse_files" != true && "$file" != *.md &&
+       "$text" =~ ^[[:space:]]*(#|//|//!|///|/\*|\*|\"\"\"|\'\'\') ]] && return 1
+    question_is_test_coverage "${question:-}" && ! is_test_coverage_evidence "$file" "$text" && return 1
+    if [[ "$diverse_files" != true ]] &&
+       ! question_is_test_coverage "${question:-}" &&
+       [[ ! "${question,,}" =~ (^|[^[:alnum:]])tests?([^[:alnum:]]|$) ]]; then
+      is_test_coverage_evidence "$file" "$text" && return 1
+    fi
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
+      relative="$(basename -- "$file")"
+    fi
+    search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || return 1
+    if [[ "$diverse_files" == true ]]; then
+      score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "")"
+    else
+      if [[ "$relative" == *.py || "$relative" == *.rs ]]; then
+        case "$text" in
+          def\ *|async\ def\ *|fn\ *|func\ *|function\ *|class\ *|if\ *|*\=*) ;;
+          *) return 1 ;;
+        esac
+      fi
+      canonical_haystack="$(canonical_overlap_tokens "$relative")"
+      path_score="$(token_overlap_score "$relative $canonical_haystack" "$distinctive_tokens")"
+      text_score="$(token_overlap_score "$text" "$score_tokens")"
+      component_haystack="${relative//[._\/-]/ } ${text//[._\/-]/ }"
+      component_score="$(token_overlap_score "$component_haystack" "$distinctive_tokens")"
+      score=$((path_score * 2 + text_score + component_score * 2))
+      ident=""
+      case "$text" in
+        async\ def\ *) ident="${text#async def }" ;;
+        def\ *) ident="${text#def }" ;;
+        fn\ *|func\ *|function\ *) ident="${text#* }" ;;
+      esac
+      ident="${ident%%[(:[:space:]]*}"
+      if [[ -n "$ident" ]]; then
+        ident_score="$(token_overlap_score "$ident ${ident//_/ }" "$distinctive_tokens")"
+        path_ident="$(token_overlap_score "$relative $canonical_haystack ${relative//[._\/-]/ }" "$distinctive_tokens")"
+        [[ "$ident_score" =~ ^[[:digit:]]+$ ]] || ident_score=0
+        [[ "$path_ident" =~ ^[[:digit:]]+$ ]] || path_ident=0
+        ((ident_score > path_ident)) && score=$((score + 10))
+      fi
+      if [[ -n "${path_tokens//[[:space:]]/}" ]]; then
+        path_only="$(token_overlap_score "$relative $canonical_haystack ${relative//[._\/-]/ }" "$path_tokens")"
+        [[ "$path_only" =~ ^[[:digit:]]+$ ]] && score=$((score + path_only * 4))
+      fi
+      path_haystack="$relative $canonical_haystack ${relative//[._\/-]/ }"
+      phrase_path="$(token_overlap_score "$path_haystack" "$phrase_tokens")"
+      [[ "$phrase_path" =~ ^[[:digit:]]+$ ]] && score=$((score + phrase_path * 6))
+      while IFS= read -r token; do
+        [[ "$token" == *-* ]] || continue
+        left="${token%%-*}"
+        right="${token#*-}"
+        stem="$(singularize_overlap_token "$left")"
+        [[ -n "$stem" && "$stem" != "$left" ]] || continue
+        extra_path="$(token_overlap_score "$path_haystack" "$stem-$right"$'\n')"
+        [[ "$extra_path" =~ ^[[:digit:]]+$ ]] && score=$((score + extra_path * 6))
+      done <<< "$phrase_tokens"
+      [[ "$relative" == *.py || "$relative" == *.rs ]] && score=$((score + 1))
+    fi
+    ranked+="$score"$'\t'"$relative:$line_number"$'\n'
+    return 0
+  }
+
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
   while IFS= read -r token; do
@@ -2344,7 +2447,49 @@ recover_distinctive_source_locations() {
   if [[ "$diverse_files" == true && "${question,,}" =~ (^|[^[:alnum:]])tests?([^[:alnum:]]|$) ]]; then
     tokens+="test"$'\n'
   fi
+  while IFS= read -r word; do
+    word="${word,,}"
+    word="${word%%[,:;.!?]*}"
+    case "$word" in
+      session|sessions)
+        path_tokens+="session"$'\n'"sessions"$'\n'
+        ;;
+    esac
+  done < <(printf '%s\n' "${question:-}" | awk '{ for (i = 1; i <= NF; i++) print $i }')
   [[ -n "$tokens" ]] || return 1
+  path_select_tokens="$tokens$path_tokens"
+  while IFS= read -r path; do
+    [[ -n "$path" && -f "$path" ]] || continue
+    while IFS= read -r token; do
+      [[ -n "$token" ]] || continue
+      fast_path_deadline_reached "$deadline_ns" && break 2
+      while IFS= read -r hit; do
+        [[ "$hit" == *:* ]] || continue
+        line_number="${hit%%:*}"
+        text="${hit#*:}"
+        rank_distinctive_hit "$path" "$line_number" "$text" || true
+      done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 8 \
+          -- "$token" "$path" 2>/dev/null || true)
+    done <<< "$tokens"
+  done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" --files \
+      --glob '*.py' --glob '*.rs' \
+      --glob '!drafts/**' --glob '!docs/plans/**' \
+      --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' 2>/dev/null |
+      awk -v tokens="$path_select_tokens" -v keep_tests="$diverse_files" '
+        BEGIN { count = split(tokens, wanted, "\n") }
+        {
+          if (keep_tests != "true" && $0 ~ /(^|\/)tests?\//) next
+          normalized = tolower($0)
+          gsub(/[^[:alnum:]]/, "", normalized)
+          hits = 0
+          for (i = 1; i <= count; i++) {
+            tok = tolower(wanted[i])
+            gsub(/[^[:alnum:]]/, "", tok)
+            if (tok != "" && index(normalized, tok)) hits++
+          }
+          if (hits > 0) print hits "\t" $0
+        }
+      ' | sort -k1,1nr -k2,2 | cut -f2- | awk 'NR <= 16')
   while IFS= read -r token; do
     [[ -n "$token" ]] || continue
     fast_path_deadline_reached "$deadline_ns" && break
@@ -2358,29 +2503,21 @@ recover_distinctive_source_locations() {
       rest="${hit#*:}"
       line_number="${rest%%:*}"
       text="${rest#*:}"
-      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
-      [[ -f "$file" ]] || continue
-      is_synthesis_junk_source "$file" "$text" && continue
-      is_synthesis_junk_line "$text" && continue
-      question_is_test_coverage "${question:-}" && ! is_test_coverage_evidence "$file" "$text" && continue
-      relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
-      if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
-        relative="$(basename -- "$file")"
-      fi
-      search_overlap_accepts_candidate "$relative $text" "$distinctive_tokens" "$phrase_tokens" || continue
+      rank_distinctive_hit "$file" "$line_number" "$text" || true
+    done < <(
       if [[ "$diverse_files" == true ]]; then
-        score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "")"
+        run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
+          --glob "!drafts/**" --glob "!docs/plans/**" \
+          --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
+          -- "$token" . 2>/dev/null || true
       else
-        canonical_haystack="$(canonical_overlap_tokens "$relative")"
-        path_score="$(token_overlap_score "$relative $canonical_haystack" "$distinctive_tokens")"
-        text_score="$(token_overlap_score "$text" "$score_tokens")"
-        score=$((path_score * 2 + text_score))
+        run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
+          --glob "!drafts/**" --glob "!docs/plans/**" \
+          --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
+          --glob "!**/tests/**" --glob "!**/test/**" --glob "!plugins/**" \
+          -- "$token" . 2>/dev/null || true
       fi
-      ranked+="$score"$'\t'"$relative:$line_number"$'\n'
-    done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
-        --glob "!drafts/**" --glob "!docs/plans/**" \
-        --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
-        -- "$token" . 2>/dev/null || true)
+    )
   done <<< "$tokens"
   [[ -n "$ranked" ]] || return 1
   if [[ "$diverse_files" == true ]]; then
@@ -2816,12 +2953,9 @@ emit_synthesized_source_answer() {
     format_located_answer "$recovered" "$deadline_ns"
     return
   fi
-  recovered="$(recover_bm25_source_locations "$deadline_ns")" || recovered=""
+  recovered="$(recover_distinctive_source_locations "$deadline_ns")" || recovered=""
   if [[ -z "${recovered//[[:space:]]/}" ]]; then
-    if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] && ! fast_path_remaining_timeout "$deadline_ns" 100000000 >/dev/null; then
-      return 1
-    fi
-    recovered="$(recover_distinctive_source_locations "$deadline_ns")" || recovered=""
+    recovered="$(recover_bm25_source_locations "$deadline_ns")" || recovered=""
   fi
   [[ -n "${recovered//[[:space:]]/}" ]] || return 1
   format_located_answer "$recovered" "$deadline_ns"
