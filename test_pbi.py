@@ -8315,5 +8315,36 @@ exit "$status"
         self.assertIn("no source locations found", result.stderr)
         self.assertFalse(trace.exists(), "absent tracer must skip Probe Chat")
 
+    def test_compact_stall_holder_query_rejects_immediate_and_snapshot_standins(
+        self,
+    ) -> None:
+        # #225: mixed stall/holder/owner must fail closed, not rc=0 from
+        # TransactionBehavior::Immediate or DaemonRecovery::snapshot stand-ins.
+        question = "writer stall snapshot holder census current writer label"
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                {
+                    "src/core/queue_writer_lease_fence.rs": (
+                        "let tx = conn.transaction_with_behavior("
+                        "TransactionBehavior::Immediate)?;\n"
+                    ),
+                    "src/daemon/writer_lease.rs": (
+                        "let snapshot = recovery.snapshot()"
+                        '.expect("read isolated recovery state");\n'
+                    ),
+                },
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "pbi: no source locations found\n")
+        self.assertNotIn("TransactionBehavior::Immediate", output)
+        self.assertNotIn("recovery.snapshot", output)
+        self.assertNotIn("queue_writer_lease_fence.rs", output)
+        self.assertNotIn("writer_lease.rs", output)
+        self.assertFalse(trace.exists(), "stand-in reject must skip Probe Chat")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

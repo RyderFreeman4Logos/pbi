@@ -2055,6 +2055,19 @@ question_requests_semantic_evidence() {
   [[ "$q" =~ (^|[^[:alnum:]])(what|where|which|find|locate|show|does|are|is|cover|how|trace)([^[:alnum:]]|$) ]]
 }
 
+question_requests_stall_holder_evidence() {
+  local q="${1,,}"
+  [[ "$q" =~ (^|[^[:alnum:]])stall([^[:alnum:]]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]])(holder|holders|owner|owners|ownership)([^[:alnum:]]|$) ]]
+}
+
+line_has_stall_holder_evidence() {
+  local haystack="${1,,}"
+  haystack="${haystack//_/ }"
+  haystack="${haystack//-/ }"
+  [[ "$haystack" =~ (^|[^[:alnum:]])(stall|holder|holders|owner|owners|ownership)([^[:alnum:]]|$) ]]
+}
+
 question_has_multiple_semantic_targets() {
   local q="${1,,}"
   question_is_multi_target_where "$1" || {
@@ -2200,6 +2213,9 @@ emit_source_locations() {
 }
 
 is_synthesis_junk_line() {
+  if question_requests_stall_holder_evidence "${question:-}"; then
+    line_has_stall_holder_evidence "$1" || return 0
+  fi
   question_requests_semantic_evidence "${question:-}" &&
     [[ "$1" =~ ^[[:space:]]*(//!|///|/\*|\*|\"\"\"|\'\'\') ]] && return 0
   [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]] && return 0
