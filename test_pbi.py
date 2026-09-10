@@ -8027,6 +8027,40 @@ exit "$status"
         for path in generic:
             self.assertNotIn(path, result.stderr)
 
+    def test_default_multi_group_query_rejects_unrelated_partial_source(self) -> None:
+        # #229: a multi-group default query must not publish unrelated BM25
+        # candidates as verified source merely because a token overlaps.
+        question = (
+            "Trace the shared replay settlement flow: breaker-open preflight, "
+            "receipt identity checks, breaker success reset callers, and explicit "
+            "conclude polling/backoff. Name every relevant function and test file."
+        )
+        cases = {
+            "receipt-comment": {
+                "src/historical_rejudge_apply_receipt_tests.rs": (
+                    "// Historical rejudge apply receipt and OCC regression tests.\n"
+                ),
+            },
+            "identity-binding": {
+                "src/db_path_identity.rs": (
+                    "let mut identity = Self::default();\n"
+                    "identity.insert_target(path);\n"
+                ),
+            },
+        }
+        for name, unrelated in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                result, trace = self.run_default_semantic_fixture(
+                    Path(temporary), question, unrelated
+                )
+                self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(trace.exists(), "unrelated partial evidence must not invoke Probe Chat")
+                self.assertNotIn("partial source answer", result.stderr)
+                self.assertNotIn("Verified source evidence", result.stderr)
+                for path in unrelated:
+                    self.assertNotIn(path, result.stderr)
+
     def test_default_semantic_trace_assembles_cross_call_edges(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result, trace = self.run_default_semantic_fixture(
