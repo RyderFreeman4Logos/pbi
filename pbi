@@ -2760,8 +2760,6 @@ is_semantic_trace_metadata_line() {
 
 semantic_trace_candidate_matches_target() {
   local candidate="$1" candidate_file="${2:-}" group tokens token score plain_overlap
-  local canonical_candidate
-  canonical_candidate="$(canonical_overlap_tokens "$candidate")"
   while IFS= read -r group; do
     [[ -n "$group" ]] || continue
     tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
@@ -2775,12 +2773,12 @@ semantic_trace_candidate_matches_target() {
       [[ -n "$token" ]] || continue
       score="$(token_overlap_score "$candidate" "$token")"
       [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) || continue
-      [[ "$token" == *-* ]] && return 0
+      # ponytail: one 8-char token is not a group match; compounds or 9+ tokens are.
+      [[ "$token" == *-* || ${#token} -ge 9 ]] && return 0
       plain_overlap=$((plain_overlap + 1))
     done <<< "$tokens"
-    score="$(token_overlap_score "$canonical_candidate" "$tokens")"
-    [[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0)) && return 0
     ((plain_overlap >= 2)) && return 0
+    [[ "$group" =~ ^[[:alnum:]]+$ && "$candidate" =~ (^|[^[:alnum:]])${group}[_-] ]] && return 0
   done < <(semantic_target_groups "${question:-}")
   return 1
 }
@@ -2997,7 +2995,7 @@ emit_semantic_trace_from_candidates() {
     printf '%s\n' "$answer"
     return 0
   fi
-  [[ -n "${locations//[[:space:]]/}" ]] || return 1
+  ((semantic_trace_covered_count > 0)) || return 1
   semantic_trace_partial_emitted=true
   printf '%s\n' 'pbi: partial source answer; verified candidates retained' >&2
   printf '%s\n' "$evidence" >&2
