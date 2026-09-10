@@ -6605,29 +6605,32 @@ exit "$status"
             env, trace = self.fake_environment(directory)
             child_pid = directory / "probe-chat-child.pid"
             env["PBI_TEST_CHILD_PID"] = str(child_pid)
-            (directory / "probe-chat").write_text(
+            helper = directory / "probe-chat"
+            helper.write_text(
                 "#!/usr/bin/env bash\n"
                 "sleep 30 &\n"
                 "printf '%s\\n' \"$!\" >\"$PBI_TEST_CHILD_PID\"\n"
                 "touch \"$PBI_TEST_TRACE\"\n"
                 "wait\n"
             )
-            (directory / "probe-chat").chmod(0o644)
+            helper.chmod(0o644)
             node_bin = os.path.dirname(shutil.which("node") or "/usr/bin/node")
             env["PATH"] = f"{directory}:{node_bin}:/usr/bin:/bin"
             started = time.monotonic()
             result = self.run_pbi("--message", "hello", env=env, cwd=ROOT)
             elapsed = time.monotonic() - started
-        self.assertEqual(result.returncode, 126, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 126, result.stderr)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(
-            result.stderr,
-            "pbi: probe-chat helper preflight failed; phase=preflight "
-            f"category=found-but-not-executable helper={directory / 'probe-chat'} "
-            "recovery=fix permissions or reinstall probe-chat\n",
-        )
+        self.assertIn("phase=preflight", result.stderr)
+        self.assertIn("category=found-but-not-executable", result.stderr)
+        self.assertIn(f"helper={helper}", result.stderr)
+        self.assertIn("mode=644", result.stderr)
+        self.assertIn(f"provenance={helper.resolve()}", result.stderr)
+        self.assertIn(f"chmod +x -- {helper}", result.stderr)
         self.assertFalse(trace.exists(), "non-executable helper must not launch")
         self.assertFalse(child_pid.exists(), "non-executable helper must not spawn a child")
+        self.assertNotIn("runtime-exit", result.stderr)
         self.assertNotIn("retry", result.stderr)
         self.assertLess(elapsed, 2)
 
@@ -6686,17 +6689,16 @@ exit "$status"
                 cwd=repo,
                 binary=self.fake_pbi(directory, directory / "probe"),
             )
-        self.assertEqual(result.returncode, 126, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 126, result.stderr)
         self.assertEqual(result.stdout, "")
-        self.assertIn("category=runtime-exit", result.stderr)
-        self.assertIn(f"helper={helper}", result.stderr)
-        self.assertIn("exit=126", result.stderr)
-        self.assertIn("recovery=inspect probe-chat, then retry once", result.stderr)
-        self.assertNotIn("failed to launch", result.stderr)
+        self.assertIn("pbi: probe-chat failed", result.stderr)
+        self.assertNotIn("category=runtime-exit", result.stderr)
+        self.assertNotIn("exit=126", result.stderr)
+        self.assertNotIn("inspect probe-chat", result.stderr)
         self.assertNotIn("runtime-output-should-not-leak", result.stdout + result.stderr)
         self.assertNotIn("runtime-error-should-not-leak", result.stdout + result.stderr)
         self.assertNotIn("test-key", result.stdout + result.stderr)
-
 
     def test_default_query_bm25_fast_path_requires_append_audit_co_signal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
