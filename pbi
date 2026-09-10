@@ -241,9 +241,13 @@ emit_probe_launch_diagnostic() {
   printf '%s\n' "pbi: probe-chat found on PATH but failed to launch; category=$category helper=$agent_command $status_detail recovery=$recovery"
 }
 
-emit_probe_runtime_exit_diagnostic() {
-  local status="$1"
-  printf '%s\n' "pbi: probe-chat exited after launch; category=runtime-exit helper=$agent_command exit=$status recovery=inspect probe-chat, then retry once"
+normalize_probe_exit() {
+  # 126 is an OS launch code. Never report it as pbi's process status.
+  if [[ "$1" == 126 ]]; then
+    printf '%s' 1
+  else
+    printf '%s' "$1"
+  fi
 }
 
 active_timeout_pid=
@@ -3626,8 +3630,10 @@ if [[ "${1:-}" != "--debug-config" && -z "$agent_command" ]]; then
   exit 127
 fi
 if [[ "${1:-}" != "--debug-config" && ! -x "$agent_command" ]]; then
-  printf '%s\n' "pbi: probe-chat helper preflight failed; phase=preflight category=found-but-not-executable helper=$agent_command recovery=fix permissions or reinstall probe-chat" >&2
-  exit 126
+  helper_mode="$(stat -c '%a' "$agent_command" 2>/dev/null || printf '%s' unknown)"
+  helper_provenance="$(readlink -f -- "$agent_command" 2>/dev/null || printf '%s' "$agent_command")"
+  printf '%s\n' "pbi: probe-chat helper preflight failed; phase=preflight category=found-but-not-executable helper=$agent_command mode=$helper_mode provenance=$helper_provenance recovery=chmod +x -- $agent_command" >&2
+  exit 1
 fi
 rg_command="$(command -v rg || true)"
 rg_ignores=(--glob '!drafts/**' --glob '!docs/plans/**' --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**')
@@ -3915,11 +3921,7 @@ if ((status != 0)); then
     launch_category="$(probe_launch_category "$status" "$probe_diagnostic_input")"
     if [[ "$launch_category" != exit ]]; then
       emit_probe_launch_diagnostic "$status" "$probe_diagnostic_input" >&2
-      exit "$status"
-    fi
-    if [[ "$status" == 126 ]]; then
-      emit_probe_runtime_exit_diagnostic "$status" >&2
-      exit "$status"
+      exit "$(normalize_probe_exit "$status")"
     fi
   fi
   if planner_timeout_or_kill "$status"; then
@@ -3948,7 +3950,7 @@ if ((status != 0)); then
     else
       printf '%s\n' 'pbi: probe-chat failed' >&2
     fi
-    exit "$status"
+    exit "$(normalize_probe_exit "$status")"
   fi
 fi
 output="$(strip_probe_chrome "$output")"
