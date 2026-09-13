@@ -1741,6 +1741,19 @@ run_default_bm25_fast_path() {
     fast_path_fail_closed
     return 1
   fi
+  if [[ -n "$(question_named_test_symbol "${question:-}")" ]]; then
+    search_uses_local_model=true
+    bm25_candidates=""
+    search_fallback_locations=""
+    output=""
+    recovered_from_candidates=false
+    if emit_semantic_trace_from_candidates "$deadline_ns"; then
+      return 0
+    fi
+    [[ "${semantic_trace_partial_emitted:-false}" == true ]] && return 1
+    fast_path_fail_closed
+    return 1
+  fi
   if [[ -n "$(search_structured_query_anchors "${question:-}")" ]]; then
     search_uses_local_model=true
     bm25_candidates=""
@@ -2011,6 +2024,7 @@ recover_named_symbol_definition() {
       fast_path_deadline_reached "$deadline_ns" && break
       [[ -n "$file" && -f "$file" ]] || continue
       if ! question_is_test_coverage "${question:-}" &&
+          [[ "$symbol" != test_* ]] &&
           [[ "$file" == */tests/* || "$file" == */test/* ]]; then
         continue
       fi
@@ -2145,6 +2159,58 @@ question_is_test_coverage() {
   local q="${1,,}"
   [[ "$q" =~ (^|[[:space:]])which[[:space:]]+test[[:space:]]+module([[:space:]]|$) ]] ||
     [[ "$q" =~ (^|[[:space:]])test-?coverage([[:space:]]|$) ]]
+}
+
+question_named_test_symbol() {
+  search_named_symbols "$1" | awk '/^test_/ { print; exit }'
+}
+
+# ponytail: 80-line named-test body window; raise if real tests outgrow it.
+recover_named_test_body_locations() {
+  local deadline_ns="${1:-}" named_test file def_line def_text def_indent line_number scan_end text relative symbol indent
+  local rg_command matching_files
+  named_test="$(question_named_test_symbol "${question:-}")"
+  [[ -n "$named_test" ]] || return 1
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  matching_files="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -l -F \
+      --glob '**/tests/**' --glob '**/test/**' --glob '**/test_*' \
+      --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' \
+      -- "$named_test" . 2>/dev/null || true)"
+  [[ -n "$matching_files" ]] || return 1
+  while IFS= read -r file; do
+    fast_path_deadline_reached "$deadline_ns" && return 1
+    [[ -n "$file" && -f "$file" ]] || continue
+    def_line="$(named_symbol_definition_line "$file" "$named_test" definition 0 0 "$deadline_ns")"
+    [[ "$def_line" =~ ^[[:digit:]]+$ ]] || continue
+    def_text="$(sed -n "${def_line}p" "$file" 2>/dev/null || true)"
+    def_indent="${def_text%%[![:space:]]*}"
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
+    printf '%s:%s\n' "$relative" "$def_line"
+    scan_end=$((def_line + 80))
+    for ((line_number = def_line + 1; line_number <= scan_end; line_number++)); do
+      fast_path_deadline_reached "$deadline_ns" && break
+      text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
+      # Nested helpers stay in-body; a same-or-left indent def/class ends the test.
+      if [[ "$text" =~ ^[[:space:]]*(async[[:space:]]+)?(def|fn|func|function|class)[[:space:]] ]]; then
+        indent="${text%%[![:space:]]*}"
+        (( ${#indent} <= ${#def_indent} )) && break
+      fi
+      text="${text#"${text%%[![:space:]]*}"}"
+      [[ -n "$text" ]] || continue
+      is_synthesis_junk_line "$text" && continue
+      line_has_relationship_edge "$text" || [[ "$text" == *"(" ]] || continue
+      while IFS= read -r symbol; do
+        [[ -n "$symbol" && "$symbol" != "$named_test" ]] || continue
+        [[ "$text" == *"$symbol("* || "$text" == *"$symbol."* ]] || continue
+        printf '%s:%s\n' "$relative" "$line_number"
+        break
+      done < <(search_named_symbols "${question:-}")
+    done
+    return 0
+  done <<<"$matching_files"
+  return 1
 }
 
 question_rejects_lone_type_declaration() {
@@ -2327,6 +2393,7 @@ is_synthesis_junk_line() {
   if question_requests_stall_holder_evidence "${question:-}"; then
     line_has_stall_holder_evidence "$1" || return 0
   fi
+  [[ -n "$(question_named_test_symbol "${question:-}")" && "$1" =~ ^[[:space:]]*# ]] && return 0
   question_requests_semantic_evidence "${question:-}" &&
     [[ "$1" =~ ^[[:space:]]*(//!|///|/\*|\*|\"\"\"|\'\'\') ]] && return 0
   [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]] && return 0
@@ -2896,6 +2963,12 @@ semantic_trace_candidate_matches_target() {
 }
 
 semantic_trace_accepts_candidate() {
+  local named_test
+  named_test="$(question_named_test_symbol "${question:-}")"
+  if [[ -n "$named_test" ]]; then
+    [[ "$1 $2" == *"$named_test"* ]] ||
+      rg -q -F -- "$named_test" "$1" 2>/dev/null || return 1
+  fi
   if ! semantic_trace_candidate_matches_target "$1 $2" "$1" &&
       ! semantic_trace_line_links_evidence "$2" "$5" &&
       ! { [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && line_has_relationship_edge "$2"; }; then
@@ -3074,28 +3147,39 @@ semantic_trace_is_complete() {
     return 1
   fi
   if question_requires_semantic_trace "${question:-}" &&
-      ! question_is_multi_target_where "${question:-}" &&
-      ((relationship_count < 2 || ${#relationship_files[@]} < 2)); then
-    semantic_trace_missing='requested relationship edge'
-    return 1
+      ! question_is_multi_target_where "${question:-}"; then
+    if [[ -n "$(question_named_test_symbol "${question:-}")" ]]; then
+      if ((relationship_count < 2)); then
+        semantic_trace_missing='requested relationship edge'
+        return 1
+      fi
+    elif ((relationship_count < 2 || ${#relationship_files[@]} < 2)); then
+      semantic_trace_missing='requested relationship edge'
+      return 1
+    fi
   fi
   semantic_trace_missing=''
   return 0
 }
 
 emit_semantic_trace_from_candidates() {
-  local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations
+  local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations named_test
   locations=""
-  while IFS= read -r symbol; do
-    symbol_locations="$(recover_named_symbol_definition "$symbol" "$deadline_ns" || true)"
-    [[ -z "${symbol_locations//[[:space:]]/}" ]] || locations+="${locations:+$'\n'}$symbol_locations"
-  done < <(search_named_symbols "${question:-}")
-  symbol_locations="$(recover_semantic_trace_locations || true)"
-  locations="$(printf '%s\n%s\n' "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
-  fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
-  fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
-  if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
-    locations="$(printf '%s\n%s\n' "$fallback_locations" "$locations" | awk 'NF && !seen[$0]++')"
+  named_test="$(question_named_test_symbol "${question:-}")"
+  if [[ -n "$named_test" ]]; then
+    locations="$(recover_named_test_body_locations "$deadline_ns" || true)"
+  else
+    while IFS= read -r symbol; do
+      symbol_locations="$(recover_named_symbol_definition "$symbol" "$deadline_ns" || true)"
+      [[ -z "${symbol_locations//[[:space:]]/}" ]] || locations+="${locations:+$'\n'}$symbol_locations"
+    done < <(search_named_symbols "${question:-}")
+    symbol_locations="$(recover_semantic_trace_locations || true)"
+    locations="$(printf '%s\n%s\n' "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
+    fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
+    fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
+    if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
+      locations="$(printf '%s\n%s\n' "$fallback_locations" "$locations" | awk 'NF && !seen[$0]++')"
+    fi
   fi
   if [[ -z "${locations//[[:space:]]/}" ]]; then
     search_fast_path_miss=true
