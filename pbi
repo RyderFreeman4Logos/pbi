@@ -410,9 +410,9 @@ named_symbol_definition_line() {
     BEGIN {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub(\\([^)]*\\))?|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type|const)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
-      # ponytail: Python ALL_CAPS / YAML mapping keys; upgrade if bare equals/colon starts ranking every mention.
-      bare_assignment = "^[[:space:]]*" symbol "[[:space:]]*=([^=]|$)"
-      yaml_key = "^[[:space:]]*(-[[:space:]]+)?" symbol "[[:space:]]*:"
+      # ponytail: Python ALL_CAPS / YAML mapping keys; leading _ / attr prefix for class memos.
+      bare_assignment = "^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*\\.)?_?" symbol "[[:space:]]*=([^=]|$)"
+      yaml_key = "^[[:space:]]*(-[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*\\.)?_?" symbol "[[:space:]]*:"
       # ponytail: enum-variant / Type::Variant match; upgrade if it starts ranking every mention of a camelCase word.
       variant_qualified = "^[[:space:]]*([[:alnum:]_]+::)+" symbol "([[:space:](<{,;}]|$)"
       variant_lone = "^[[:space:]]*" symbol "([[:space:](<{,;}]|$)"
@@ -696,6 +696,9 @@ emit_bm25_locations_or_fail_closed() {
       recovered_named_locations+="$candidate_locations"
     fi
   done < <(search_named_symbols "${question:-}")
+  if [[ -n "$recovered_named_locations" ]]; then
+    recovered_named_locations="$(select_query_relevant_locations "$recovered_named_locations" || true)"
+  fi
   if [[ -n "$recovered_named_locations" ]] && emit_source_locations "$recovered_named_locations"; then
     exit 0
   fi
@@ -1849,6 +1852,9 @@ run_default_bm25_fast_path() {
     fi
   done <<<"$candidate_symbols"
   if [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
+    recovered_named_locations="$(select_query_relevant_locations "$recovered_named_locations" "$deadline_ns" || true)"
+  fi
+  if [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
     if question_allows_compact_stamp "${question:-}"; then
       printf '%s\n' "$recovered_named_locations"
       return 0
@@ -1936,11 +1942,57 @@ run_default_bm25_fast_path() {
   return 1
 }
 
+query_location_relevance_score() {
+  local file="$1" text="$2" relative="$3" distinctive="$4" named_symbols="$5"
+  local score=0 token extra
+  extra="$(token_overlap_score "$relative $text" "$distinctive"$'\n'"$named_symbols")"
+  [[ "$extra" =~ ^[[:digit:]]+$ ]] && score=$((score + extra))
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    rg -q -F -- "$token" "$file" 2>/dev/null && score=$((score + 3))
+  done <<< "$named_symbols"
+  if ! question_is_test_coverage "${question:-}" &&
+      [[ "$file" == */tests/* || "$file" == */test/* ]]; then
+    score=0
+  else
+    score=$((score + 2))
+  fi
+  printf '%s\n' "$score"
+}
+
+select_query_relevant_locations() {
+  local locations="$1" deadline_ns="${2:-}" loc file line_number text relative score
+  local distinctive named_symbols ranked="" best=-1
+  [[ -n "${locations//[[:space:]]/}" ]] || return 1
+  distinctive="$(search_distinctive_tokens "${question:-}")"
+  named_symbols="$(search_named_symbols "${question:-}")"
+  while IFS= read -r loc; do
+    [[ "$loc" =~ ^(.+):([[:digit:]]+)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+    line_number="${BASH_REMATCH[2]}"
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    [[ -f "$file" ]] || continue
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
+    text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null || true)"
+    score="$(query_location_relevance_score "$file" "$text" "$relative" "$distinctive" "$named_symbols")"
+    [[ "$score" =~ ^[[:digit:]]+$ ]] || continue
+    ranked+="$score"$'\t'"$relative:$line_number"$'\n'
+    ((score > best)) && best="$score"
+  done <<< "$locations"
+  [[ "$best" -ge 0 && -n "$ranked" ]] || return 1
+  printf '%s' "$ranked" | awk -F '\t' -v best="$best" 'NF >= 2 && $1 + 0 == best + 0 && !seen[$2]++ { print $2 }'
+}
+
 recover_named_symbol_definition() {
   local symbol="$1" deadline_ns="${2:-}" mode="${3:-definition}"
   local file locations line_number rg_command matching_files rg_status
+  local relative text score best_score=-1 best_locations="" file_count=0
+  local distinctive named_symbols
   rg_command="$(command -v rg || true)"
   [[ -n "$rg_command" ]] || return 1
+  distinctive="$(search_distinctive_tokens "${question:-}")"
+  named_symbols="$(search_named_symbols "${question:-}")"
   if matching_files="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -l -F \
       --glob "!drafts/**" --glob "!docs/plans/**" \
       --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
@@ -1956,23 +2008,38 @@ recover_named_symbol_definition() {
   fast_path_deadline_reached "$deadline_ns" && return 1
   if [[ -n "$matching_files" ]]; then
     while IFS= read -r file; do
-      fast_path_deadline_reached "$deadline_ns" && return 1
+      fast_path_deadline_reached "$deadline_ns" && break
+      [[ -n "$file" && -f "$file" ]] || continue
+      if ! question_is_test_coverage "${question:-}" &&
+          [[ "$file" == */tests/* || "$file" == */test/* ]]; then
+        continue
+      fi
+      file_count=$((file_count + 1))
+      ((file_count <= 16)) || break
       if [[ "$mode" == occurrence ]]; then
         locations="$(compact_search_locations "File: $file, Lines: 1-1" "$symbol" true "$deadline_ns")"
+        line_number="${locations##*:}"
       else
         line_number="$(named_symbol_definition_line "$file" "$symbol" "$mode" 0 0 "$deadline_ns")"
-        fast_path_deadline_reached "$deadline_ns" && return 1
+        fast_path_deadline_reached "$deadline_ns" && break
         [[ -n "$line_number" ]] || continue
         locations="$(compact_search_locations "File: $file, Lines: $line_number-$line_number" "$symbol" false "$deadline_ns")"
       fi
-      fast_path_deadline_reached "$deadline_ns" && return 1
-      if [[ -n "$locations" ]]; then
-        printf "%s\n" "$locations"
-        return 0
+      fast_path_deadline_reached "$deadline_ns" && break
+      [[ -n "$locations" ]] || continue
+      relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+      [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
+      text="$(run_sed_with_deadline "$deadline_ns" -n "${line_number}p" "$file" 2>/dev/null || true)"
+      score="$(query_location_relevance_score "$file" "$text" "$relative" "$distinctive" "$named_symbols")"
+      [[ "$score" =~ ^[[:digit:]]+$ ]] || continue
+      if ((score > best_score)); then
+        best_score="$score"
+        best_locations="$locations"
       fi
     done <<<"$matching_files"
   fi
-  return 1
+  [[ -n "$best_locations" ]] || return 1
+  printf "%s\n" "$best_locations"
 }
 
 recover_inject_persist_locations() {
@@ -2508,6 +2575,10 @@ recover_distinctive_source_locations() {
         [[ "$extra_path" =~ ^[[:digit:]]+$ ]] && score=$((score + extra_path * 6))
       done <<< "$phrase_tokens"
       [[ "$relative" == *.py || "$relative" == *.rs ]] && score=$((score + 1))
+      while IFS= read -r token; do
+        [[ "$token" == *-* ]] || continue
+        [[ "${relative,,}" == *"${token,,}"* ]] && score=$((score + 8))
+      done <<< "$distinctive_tokens"
     fi
     ranked+="$score"$'\t'"$relative:$line_number"$'\n'
     return 0
@@ -2571,9 +2642,9 @@ recover_distinctive_source_locations() {
       done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 8 \
           -- "$token" "$path" 2>/dev/null || true)
     done <<< "$tokens"
-  done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" --files \
-      --glob '*.py' --glob '*.rs' \
-      --glob '!drafts/**' --glob '!docs/plans/**' \
+  done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" --files --hidden \
+      --glob '*.py' --glob '*.rs' --glob '*.yml' --glob '*.yaml' \
+      --glob '!.git/**' --glob '!drafts/**' --glob '!docs/plans/**' \
       --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' 2>/dev/null |
       awk -v tokens="$path_select_tokens" -v keep_tests="$diverse_files" '
         BEGIN { count = split(tokens, wanted, "\n") }
@@ -2606,13 +2677,13 @@ recover_distinctive_source_locations() {
       rank_distinctive_hit "$file" "$line_number" "$text" || true
     done < <(
       if [[ "$diverse_files" == true ]]; then
-        run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
-          --glob "!drafts/**" --glob "!docs/plans/**" \
+        run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 --hidden \
+          --glob "!.git/**" --glob "!drafts/**" --glob "!docs/plans/**" \
           --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
           -- "$token" . 2>/dev/null || true
       else
-        run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 \
-          --glob "!drafts/**" --glob "!docs/plans/**" \
+        run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -m 20 --hidden \
+          --glob "!.git/**" --glob "!drafts/**" --glob "!docs/plans/**" \
           --glob "!**/__pycache__/**" --glob "!target/**" --glob "!node_modules/**" \
           --glob "!**/tests/**" --glob "!**/test/**" --glob "!plugins/**" \
           -- "$token" . 2>/dev/null || true
