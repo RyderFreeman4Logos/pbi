@@ -410,6 +410,9 @@ named_symbol_definition_line() {
     BEGIN {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub(\\([^)]*\\))?|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type|const)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
+      # ponytail: Python ALL_CAPS / YAML mapping keys; upgrade if bare equals/colon starts ranking every mention.
+      bare_assignment = "^[[:space:]]*" symbol "[[:space:]]*=([^=]|$)"
+      yaml_key = "^[[:space:]]*(-[[:space:]]+)?" symbol "[[:space:]]*:"
       # ponytail: enum-variant / Type::Variant match; upgrade if it starts ranking every mention of a camelCase word.
       variant_qualified = "^[[:space:]]*([[:alnum:]_]+::)+" symbol "([[:space:](<{,;}]|$)"
       variant_lone = "^[[:space:]]*" symbol "([[:space:](<{,;}]|$)"
@@ -550,6 +553,7 @@ named_symbol_definition_line() {
       gsub(/[^[:alnum:]]/, "", normalized_symbol)
       compound_match = index(tolower(normalized_code), tolower(normalized_symbol))
       if (in_range && (code ~ declaration || code ~ assignment ||
+          code ~ bare_assignment || code ~ yaml_key ||
           (mode == "definition" &&
            (code ~ variant_qualified || (enum_body_open && code ~ variant_lone))) ||
           (mode == "any" &&
@@ -580,6 +584,7 @@ named_symbol_definition_line() {
 compact_search_locations() {
   local line file location suffix relative symbol line_start line_end line_number
   local allow_outside definition_line first_symbol_line deadline_ns="${4:-}"
+  local -A seen_compact_locations=()
   symbol="${2:-}"
   allow_outside="${3:-false}"
   while IFS= read -r line; do
@@ -617,10 +622,13 @@ compact_search_locations() {
         fi
         relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
         if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
-          printf '%s:%s\n' "$relative" "$line_number"
+          location="$relative:$line_number"
         else
-          printf '%s:%s\n' "$(basename -- "$file")" "$line_number"
+          location="$(basename -- "$file"):$line_number"
         fi
+        [[ -z "${seen_compact_locations[$location]+seen}" ]] || continue
+        seen_compact_locations["$location"]=1
+        printf '%s\n' "$location"
       fi
     elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
       location="${BASH_REMATCH[1]}"
@@ -634,14 +642,17 @@ compact_search_locations() {
         if [[ -f "$file" ]]; then
           relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
           if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
-            printf '%s:%s\n' "$relative" "$suffix"
+            location="$relative:$suffix"
           else
-            printf '%s:%s\n' "$(basename -- "$file")" "$suffix"
+            location="$(basename -- "$file"):$suffix"
           fi
+        else
+          continue
         fi
-      else
-        printf '%s\n' "$location"
       fi
+      [[ -z "${seen_compact_locations[$location]+seen}" ]] || continue
+      seen_compact_locations["$location"]=1
+      printf '%s\n' "$location"
     fi
   done <<<"$1"
 }
@@ -656,7 +667,7 @@ emit_bm25_locations_or_fail_closed() {
     [[ "${semantic_trace_partial_emitted:-false}" == true ]] && exit 1
   fi
   mapfile -t named_files < <(named_query_files "${question:-}")
-  if ((${#named_files[@]} > 0)); then
+  if ((${#named_files[@]} > 0)) && ! question_requires_semantic_trace "${question:-}"; then
     if recovered_named_locations="$(recover_named_file_claims "" "${named_files[@]}")" &&
         emit_source_locations "$recovered_named_locations"; then
       exit 0
@@ -691,13 +702,15 @@ emit_bm25_locations_or_fail_closed() {
   if [[ "${search_final_selection:-false}" == true ]]; then
     emit_search_final_selection_or_fail_closed "$locations"
   fi
-  if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
+  if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations" ||
+      is_lone_path_line_stamp "$locations"; then
     locations="$(recover_timeout_location_from_bm25 || true)"
     if [[ -n "$locations" ]] && emit_source_locations "$locations"; then
       exit 0
     fi
   fi
-  if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations"; then
+  if is_stamp_dump "$locations" || has_mixed_stamp_junk "$locations" ||
+      is_lone_path_line_stamp "$locations"; then
     if [[ "${search_fail_closed_no_locations:-false}" == true && -z "${locations//[[:space:]]/}" ]]; then
       printf '%s\n' 'pbi: no source locations found' >&2
       exit 1
@@ -1114,7 +1127,7 @@ fast_path_requires_cache_key() {
 }
 
 named_query_files() {
-  local token candidate relative
+  local token candidate relative rg_command found
   while IFS= read -r token; do
     token="${token#(}"
     token="${token#\"}"
@@ -1133,13 +1146,29 @@ named_query_files() {
           printf '%s\n' "$relative"
         done
         ;;
-      *.md)
+      *.md|*.py|*.yml|*.yaml|*.ts|*.js|*.rs|*.toml)
         [[ "$token" != /* ]] || continue
-        candidate="$PWD/$token"
-        [[ -f "$candidate" ]] || continue
-        relative="$(realpath --relative-to="$PWD" -- "$candidate" 2>/dev/null || true)"
-        [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
-        printf '%s\n' "$relative"
+        if [[ -f "$PWD/$token" ]]; then
+          candidate="$PWD/$token"
+          relative="$(realpath --relative-to="$PWD" -- "$candidate" 2>/dev/null || true)"
+          [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
+          printf '%s\n' "$relative"
+        else
+          rg_command="$(command -v rg || true)"
+          [[ -n "$rg_command" ]] || continue
+          found=false
+          while IFS= read -r candidate; do
+            [[ -f "$candidate" ]] || continue
+            relative="$(realpath --relative-to="$PWD" -- "$candidate" 2>/dev/null || true)"
+            [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
+            printf '%s\n' "$relative"
+            found=true
+          done < <("$rg_command" --files --hidden --glob '!.git/**' \
+              --glob '!drafts/**' --glob '!docs/plans/**' \
+              --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' \
+              -g "${token##*/}" . 2>/dev/null | awk 'NR <= 8' || true)
+          [[ "$found" == true ]] || continue
+        fi
         ;;
     esac
   done < <(printf '%s\n' "$1" | awk '{ for (i = 1; i <= NF; i++) print $i }') |
@@ -1197,7 +1226,16 @@ recover_named_file_claims() {
     fast_path_deadline_reached "$deadline_ns" && return 1
     line="$(named_file_claim_line "$PWD/$file" "$deadline_ns" || true)"
     fast_path_deadline_reached "$deadline_ns" && return 1
-    [[ "$line" =~ ^[[:digit:]]+$ ]] || continue
+    if ! [[ "$line" =~ ^[[:digit:]]+$ ]]; then
+      case "$file" in
+        *.md|README) continue ;;
+      esac
+      line="$(run_awk_with_deadline "$deadline_ns" '
+        $0 ~ /[^[:space:]]/ { print NR; exit }
+      ' < "$PWD/$file" 2>/dev/null || true)"
+      fast_path_deadline_reached "$deadline_ns" && return 1
+      [[ "$line" =~ ^[[:digit:]]+$ ]] || continue
+    fi
     relative="$(realpath --relative-to="$PWD" -- "$PWD/$file" 2>/dev/null || true)"
     [[ -n "$relative" && "$relative" != /* && "$relative" != ../* && "$relative" != .. ]] || continue
     printf '%s:%s\n' "$relative" "$line"
@@ -1678,7 +1716,7 @@ run_default_bm25_fast_path() {
   local -a fast_path_queries=() named_files=()
   deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
   mapfile -t named_files < <(named_query_files "${question:-}")
-  if ((${#named_files[@]} > 0)); then
+  if ((${#named_files[@]} > 0)) && ! question_requires_semantic_trace "${question:-}"; then
     search_uses_local_model=true
     bm25_candidates=""
     search_fallback_locations=""
@@ -2205,6 +2243,8 @@ source_answer_has_semantic_evidence() {
 
 emit_source_locations() {
   local locations="$1" answer
+  locations="$(compact_search_locations "$locations")" || return 1
+  [[ -n "${locations//[[:space:]]/}" ]] || return 1
   if question_requests_semantic_evidence "${question:-}" ||
       question_is_multi_target_where "${question:-}" ||
       question_is_keyword_bag "${question:-}"; then
