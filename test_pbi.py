@@ -2199,6 +2199,122 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "named target recovery must skip Probe Chat")
 
+    def test_default_query_prefers_cache_memo_intent_over_partial_symbol_hits(self) -> None:
+        # #237: a where-is intent naming HONCHO_CACHE_BUSTING_MEMO, mtime_ns, and
+        # pin_peer_name must cite the memo_key assembly, not a test annotation
+        # or an unrelated mtime_ns hit.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            cache = repo / "gateway" / "run_agent_cache.py"
+            cache.parent.mkdir(parents=True)
+            cache.write_text(
+                "class AgentCache:\n"
+                "    def _extract_honcho_cache_busting_config(cls):\n"
+                "        path = resolve_config_path()\n"
+                "        mtime_ns = path.stat().st_mtime_ns\n"
+                "        memo_key = (str(path), mtime_ns)\n"
+                "        cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)\n"
+                "        values = {\"honcho.pin_peer_name\": bool(hcfg.pin_peer_name)}\n"
+                "        cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}\n"
+            )
+            run = repo / "gateway" / "run.py"
+            run.write_text(
+                "class AgentCache:\n"
+                "    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict] = {}\n"
+            )
+            test = repo / "tests" / "honcho_plugin" / "test_pin_peer_name.py"
+            test.parent.mkdir(parents=True)
+            test.write_text(
+                "class TestPeerResolutionOrder:\n"
+                "    def _config(self, *,\n"
+                "        pin_peer_name: bool,\n"
+                "    ) -> HonchoClientConfig:\n"
+                "        return HonchoClientConfig(pin_peer_name=pin_peer_name)\n"
+            )
+            oauth = repo / "tools" / "mcp_oauth_manager.py"
+            oauth.parent.mkdir(parents=True)
+            oauth.write_text(
+                "async def invalidate_if_disk_changed(self, server_name):\n"
+                "    mtime_ns = path.stat().st_mtime_ns\n"
+                "    if mtime_ns == entry.last_mtime_ns:\n"
+                "        return False\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {test}, Lines: 3-4')\n"
+                f"print('File: {oauth}, Lines: 2-3')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where is HONCHO_CACHE_BUSTING_MEMO keyed by mtime_ns for pin_peer_name",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertTrue(
+            "gateway/run_agent_cache.py:" in result.stdout
+            or "gateway/run.py:" in result.stdout,
+            output,
+        )
+        self.assertNotIn("test_pin_peer_name.py", output)
+        self.assertNotIn("mcp_oauth_manager.py", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "intent-relevant recovery must skip Probe Chat")
+
+    def test_default_query_prefers_hidden_workflow_over_partial_merge_base_hit(self) -> None:
+        # #237: a where-does intent naming history-check and
+        # git merge-base origin/main HEAD must cite the hidden workflow, not a
+        # banner merge-base mention.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            workflow = repo / ".github" / "workflows" / "history-check.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(
+                "name: history-check\n"
+                "on: push\n"
+                "jobs:\n"
+                "  check:\n"
+                "    steps:\n"
+                "      - run: |\n"
+                "          if ! BASE=$(git merge-base origin/main HEAD 2>/dev/null); then\n"
+                "            echo unrelated\n"
+            )
+            banner = repo / "hermes_cli" / "banner.py"
+            banner.parent.mkdir(parents=True)
+            banner.write_text(
+                "def _tips_behind(head_rev, target_rev, repo_dir=None):\n"
+                "    if head_rev == target_rev or _git_ok(\n"
+                "            [\"merge-base\", \"--is-ancestor\", target_rev, \"HEAD\"], cwd=repo_dir):\n"
+                "        return 0\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {banner}, Lines: 1-3')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where does history-check require git merge-base origin/main HEAD",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("history-check.yml:", result.stdout)
+        self.assertNotIn("banner.py", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "intent-relevant recovery must skip Probe Chat")
+
     def test_default_query_term_ignoring_rg_is_killed_inside_deadline(self) -> None:
         def current_start_time(pid: int) -> str | None:
             try:
