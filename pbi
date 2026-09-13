@@ -2093,7 +2093,7 @@ question_requires_semantic_trace() {
   local q="${1,,}"
   question_describes_lifecycle_investigation "$1" && return 0
   question_has_multiple_semantic_targets "$1" || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+are([^[:alnum:]]|$) ]] && return 0
+  [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+(are|does)([^[:alnum:]]|$) ]] && return 0
   [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing)|compil(e|ed|ation|ing)|dispatch(ed|ing)?|resum(e|ed|ing)|check(ed|ing|s)?)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])also[[:space:]]+locate([^[:alnum:]]|$) ]]
@@ -2319,8 +2319,9 @@ search_structured_anchors_match() {
 }
 
 search_independent_concept_score() {
-  printf '%s' "$2" | awk -v haystack="$1" '
-    BEGIN { haystack = tolower(haystack); gsub(/[^[:alnum:]]+/, " ", haystack); haystack = " " haystack " " }
+  # ponytail: ENVIRON avoids awk -v C-escape warnings on source backslashes.
+  printf '%s' "$2" | HAYSTACK="$1" awk '
+    BEGIN { haystack = tolower(ENVIRON["HAYSTACK"]); gsub(/[^[:alnum:]]+/, " ", haystack); haystack = " " haystack " " }
     {
       token = tolower($0); gsub(/_/, "-", token)
       if (token ~ /-/) {

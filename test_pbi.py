@@ -8382,5 +8382,76 @@ exit "$status"
         self.assertNotIn("writer_lease.rs", output)
         self.assertFalse(trace.exists(), "stand-in reject must skip Probe Chat")
 
+    def test_where_does_just_recipe_delegates_literal_matrix_to_shell_helper(self) -> None:
+        # #235: a Just recipe that only names the helper must still recover
+        # the helper's literal feature/test selector matrix. Awk must not
+        # warn about source backslashes on the no-result path either.
+        question = (
+            "Where does just local-gates define its literal feature and "
+            "test selector matrix?"
+        )
+        sources = {
+            "justfile": (
+                'set shell := ["bash", "-c"]\n'
+                "local-gates:\n"
+                "    bash scripts/gates/local-gate-receipt.sh produce\n"
+            ),
+            "scripts/gates/local-gate-receipt.sh": (
+                "run_literal_aggregate() {\n"
+                "    just fmt-check\n"
+                "    just quality-gates\n"
+                "    just test-rest\n"
+                "    just test-rest-feature-contract\n"
+                "}\n"
+            ),
+            "src/bench_matrix.rs": (
+                r'const ESCAPED: &str = r"\. \[ \] \ ";' + "\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                sources,
+                candidate_paths=("src/bench_matrix.rs",),
+            )
+        output = result.stdout + result.stderr
+        self.assertIn(result.returncode, (0, 1), output)
+        self.assertNotIn("awk: warning", output)
+        self.assertNotIn("escape sequence", output)
+        self.assertFalse(trace.exists(), "Just helper recovery must skip Probe Chat")
+        self.assertTrue(
+            "justfile" in output and "local-gate-receipt.sh" in output,
+            output,
+        )
+        self.assertTrue(
+            "run_literal_aggregate" in output
+            or "test-rest-feature-contract" in output,
+            output,
+        )
+        self.assertNotIn("src/bench_matrix.rs", output)
+
+    def test_no_result_path_does_not_emit_awk_escape_warning(self) -> None:
+        question = (
+            "Where does just local-gates define its literal feature and "
+            "test selector matrix?"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                {
+                    "src/bench_matrix.rs": (
+                        r'const ESCAPED: &str = r"\. \[ \] \ ";' + "\n"
+                    ),
+                },
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("awk: warning", output)
+        self.assertNotIn("escape sequence", output)
+        self.assertFalse(trace.exists(), "no-result path must skip Probe Chat")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
