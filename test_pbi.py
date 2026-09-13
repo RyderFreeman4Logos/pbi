@@ -8374,6 +8374,93 @@ exit "$status"
         self.assertIn("Missing: requested relationship edge", result.stderr)
         self.assertNotIn(question, result.stderr)
 
+    def test_named_test_relationship_edge_rejects_unrelated_symbol(self) -> None:
+        # #239: a named-test relative-to query must recover the test-body
+        # child_started/coordinator edge, not advertise an unrelated
+        # begin_turn definition or Event as verified source.
+        question = (
+            "Where does test_timed_out_child_keeps_relay_session_until_its_turn_exits "
+            "signal child_started relative to acquire_conversation and begin_turn?"
+        )
+        sources = {
+            "tests/tools/test_zombie_process_cleanup.py": (
+                "def test_timed_out_child_keeps_relay_session_until_its_turn_exits():\n"
+                + ("    # wait for in-flight timeout handshake\n" * 12)
+                + "    def submit_then_time_in_flight():\n"
+                + "        def result(timeout=None):\n"
+                + "            return timeout\n"
+                + "        return result\n"
+                + "    lease = SESSION_COORDINATOR.acquire_conversation(session_id=child.session_id)\n"
+                + "    turn = SESSION_COORDINATOR.begin_turn(\n"
+                + "        lease,\n"
+                + "        turn_id=\"timed-out-child-turn\",\n"
+                + "    )\n"
+                + "    child_started.set()\n"
+                + "    release_child.wait(timeout=5)\n"
+            ),
+            "agent/fast_mode.py": (
+                "def begin_turn(agent, conversation_history):\n"
+                "    agent._fast_until = 0.0\n"
+            ),
+            "tests/run_interrupt_test.py": (
+                "child_started = Event()\n"
+                "child_started.set()\n"
+            ),
+            "agent/relay_runtime.py": (
+                "def acquire_conversation(self, session_id):\n"
+                "    return ConversationLease(session_id)\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), question, sources
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "named-test relationship recovery must skip Probe Chat")
+        self.assertNotIn("agent/fast_mode.py", output)
+        self.assertNotIn("tests/run_interrupt_test.py", output)
+        if result.returncode == 0:
+            self.assertIn("Verified source evidence:", result.stdout)
+            self.assertIn("tests/tools/test_zombie_process_cleanup.py", result.stdout)
+            self.assertIn("child_started.set()", result.stdout)
+            self.assertRegex(result.stdout, r"acquire_conversation|begin_turn")
+        else:
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn("Verified source evidence", result.stderr)
+            self.assertNotIn("partial source answer", result.stderr)
+
+    def test_named_test_relationship_edge_fail_closes_without_named_test_body(self) -> None:
+        question = (
+            "Where does test_timed_out_child_keeps_relay_session_until_its_turn_exits "
+            "signal child_started relative to acquire_conversation and begin_turn?"
+        )
+        sources = {
+            "agent/fast_mode.py": (
+                "def begin_turn(agent, conversation_history):\n"
+                "    agent._fast_until = 0.0\n"
+            ),
+            "tests/run_interrupt_test.py": (
+                "child_started = Event()\n"
+                "child_started.set()\n"
+            ),
+            "agent/relay_runtime.py": (
+                "def acquire_conversation(self, session_id):\n"
+                "    return ConversationLease(session_id)\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), question, sources
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(trace.exists(), "missing named-test body must skip Probe Chat")
+        self.assertNotIn("Verified source evidence", output)
+        self.assertNotIn("partial source answer", result.stderr)
+        self.assertNotIn("agent/fast_mode.py", output)
+        self.assertNotIn("tests/run_interrupt_test.py", output)
+
     def _replay_admission_fixture(self, repo: Path) -> None:
         chat = repo / "web" / "src" / "pages" / "ChatPage.tsx"
         stories = repo / "website" / "src" / "data" / "userStories.json"
