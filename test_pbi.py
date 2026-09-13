@@ -2088,6 +2088,117 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(probe_invoked, "a README miss must not invoke the probe")
         self.assertFalse(trace.exists(), "a README miss must never start planner/chat")
 
+    def test_default_query_recovers_named_python_file(self) -> None:
+        # #236: a present named .py file is source evidence even when it is
+        # not a declaration-keyword or distinctive py/rs ranker hit.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "hermes_cli" / "heartbeat.py"
+            source.parent.mkdir(parents=True)
+            source.write_text('"""Heartbeat scheduler for the CLI."""\n')
+            banner = repo / "banner.py"
+            banner.write_text("def history():\n    check = True\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {banner}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where is heartbeat.py",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("hermes_cli/heartbeat.py:", result.stdout)
+        self.assertNotIn("banner.py", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named present source recovery must skip Probe Chat")
+
+    def test_default_query_named_python_file_strips_raw_listing_prefix(self) -> None:
+        # #240: named-file recovery must keep the source location and drop an
+        # unrelated raw directory listing captured on the same stdout boundary.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "hermes_cli" / "heartbeat.py"
+            source.parent.mkdir(parents=True)
+            source.write_text('"""Heartbeat scheduler for the CLI."""\n')
+            env, trace = self.fake_environment(directory)
+            count_file = directory / "realpath-count"
+            realpath = directory / "realpath"
+            realpath.write_text(
+                "#!/usr/bin/env bash\n"
+                f"count_file={str(count_file)!r}\n"
+                "n=0\n"
+                "[[ -f $count_file ]] && n=$(<\"$count_file\")\n"
+                "n=$((n + 1))\n"
+                "printf '%s\\n' \"$n\" >\"$count_file\"\n"
+                # Second call is recover_named_file_claims; prefix its stdout.
+                "if [[ $n -eq 2 ]]; then\n"
+                "  printf '%s\\n' 'AGENTS.md' 'CLAUDE.md' 'src'\n"
+                "fi\n"
+                "exec /usr/bin/realpath \"$@\"\n"
+            )
+            realpath.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('File: /tmp/unrelated.py, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where is heartbeat.py",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(result.stdout, "hermes_cli/heartbeat.py:1\n", output)
+        self.assertNotIn("AGENTS.md", output)
+        self.assertNotIn("CLAUDE.md", output)
+        self.assertNotIn("\nsrc\n", "\n" + result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named present source recovery must skip Probe Chat")
+
+    def test_default_query_named_target_is_not_crowded_out(self) -> None:
+        # #236: a named/relevant YAML target must beat a py bag-of-words miss.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            workflow = repo / ".github" / "workflows" / "history-check.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("name: history-check\non: push\n")
+            banner = repo / "banner.py"
+            banner.write_text("def history():\n    check = 'workflow banner'\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {banner}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "where is history-check.yml",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("history-check.yml:", result.stdout)
+        self.assertNotIn("banner.py", output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "named target recovery must skip Probe Chat")
+
     def test_default_query_term_ignoring_rg_is_killed_inside_deadline(self) -> None:
         def current_start_time(pid: int) -> str | None:
             try:
@@ -3547,6 +3658,46 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertNotIn("BERT reranker", result.stdout)
         self.assertNotIn("Falling back to BM25", result.stdout)
+
+    def test_search_repeated_identical_path_line_is_not_stamp_dump(self) -> None:
+        # #236: repeated identical path:N is not a source-grounded compact
+        # search result. Recover one real line or fail closed.
+        stamp = "ui-tui/src/app/turnController.ts:1105"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "ui-tui" / "src" / "app" / "turnController.ts"
+            source.parent.mkdir(parents=True)
+            source.write_text("\n" * 1104 + "const compressionBound = promptCacheTokens;\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                + "\n".join(
+                    f"print('File: {source}, Lines: 1105-1105')" for _ in range(6)
+                )
+                + "\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "turnController",
+                "compressionBound",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.stdout.count(stamp), 6, output)
+        if result.returncode == 0:
+            self.assertLessEqual(result.stdout.count(stamp), 1, output)
+            self.assertIn("turnController.ts", result.stdout)
+            self.assertEqual(result.stderr, "")
+        else:
+            self.assertEqual(result.stdout, "")
+            self.assertIn("no source", result.stderr)
+        self.assertFalse(trace.exists(), "search stamp recovery must skip Probe Chat")
 
     def test_named_symbol_candidate_skips_stamp_diagnostic_without_api_key(self) -> None:
         symbol = "soft_delete_drawer"
