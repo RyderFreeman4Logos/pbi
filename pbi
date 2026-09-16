@@ -261,6 +261,13 @@ track_temp_file() {
   active_temp_files+=("$1")
 }
 
+allocate_temp_file() {
+  local allocated
+  allocated="$(mktemp)" || exit 1
+  printf -v "$1" '%s' "$allocated"
+  track_temp_file "$allocated"
+}
+
 cleanup_temp_files() {
   local temp_file
   for temp_file in "${active_temp_files[@]}"; do
@@ -1785,8 +1792,7 @@ run_default_bm25_fast_path() {
   search_fallback_locations=""
   output=""
   recovered_from_candidates=false
-  fast_path_output_file="$(mktemp)"
-  track_temp_file "$fast_path_output_file"
+  allocate_temp_file fast_path_output_file
   for fast_path_query in "${fast_path_queries[@]}"; do
     fast_path_query_index=$((fast_path_query_index + 1))
     remaining_queries=$(( ${#fast_path_queries[@]} - fast_path_query_index + 1 ))
@@ -3457,10 +3463,8 @@ planner_had_system_message_warning=false
 
 run_planner() {
   local stderr_file planner_stdout_file
-  stderr_file="$(mktemp)"
-  track_temp_file "$stderr_file"
-  planner_stdout_file="$(mktemp)"
-  track_temp_file "$planner_stdout_file"
+  allocate_temp_file stderr_file
+  allocate_temp_file planner_stdout_file
   active_timeout_diagnostic='pbi: planner timed out before producing a source answer'
   if run_timed_command "$planner_timeout_seconds" "$planner_stdout_file" "$stderr_file" "$agent_command" "$@"; then
     planner_status=0
@@ -3672,7 +3676,7 @@ case "${1:-}" in
       search_options+=(--max-results "$DEFAULT_SEARCH_MAX_RESULTS")
     fi
     if [[ "$search_bm25" == true ]]; then
-      bm25_stderr_file="$(mktemp)"
+      allocate_temp_file bm25_stderr_file
       search_status=0
       if bm25_output="$("$(resolve_probe)" search --reranker bm25 "${search_options[@]}" -- "${search_pattern_parts[*]}" 2>"$bm25_stderr_file")"; then
         search_status=0
@@ -3702,8 +3706,7 @@ case "${1:-}" in
     search_uses_local_model=true
     search_fail_closed_no_locations=true
     search_status=0
-    search_output_file="$(mktemp)"
-    track_temp_file "$search_output_file"
+    allocate_temp_file search_output_file
     search_started_ns="$(fast_path_now_ns)"
     search_timeout_diagnostic='pbi: search timed out before producing source locations'
     active_timeout_diagnostic="$search_timeout_diagnostic"
@@ -4095,10 +4098,8 @@ fi
 
 configure_local_routing
 
-probe_stdout_file="$(mktemp)"
-track_temp_file "$probe_stdout_file"
-probe_stderr_file="$(mktemp)"
-track_temp_file "$probe_stderr_file"
+allocate_temp_file probe_stdout_file
+allocate_temp_file probe_stderr_file
 active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
 if run_timed_command "$chat_timeout_seconds" "$probe_stdout_file" "$probe_stderr_file" \
     "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}"; then
@@ -4168,8 +4169,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  reviewed_output_file="$(mktemp)"
-  track_temp_file "$reviewed_output_file"
+  allocate_temp_file reviewed_output_file
   active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
   if run_timed_command "$chat_timeout_seconds" "$reviewed_output_file" "$reviewed_output_file" \
       "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}"; then
@@ -4185,8 +4185,7 @@ if [[ "$explore_uses_local_model" == true ]]; then
     --max-iterations 1
     "${final_format_args[@]}"
   )
-  audited_output_file="$(mktemp)"
-  track_temp_file "$audited_output_file"
+  allocate_temp_file audited_output_file
   active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
   if run_timed_command "$chat_timeout_seconds" "$audited_output_file" "$audited_output_file" \
       "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}"; then
