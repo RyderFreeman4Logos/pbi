@@ -3997,15 +3997,79 @@ class PbiTest(unittest.TestCase):
             fake_chat = directory / "probe-chat"
             fake_chat.write_text(
                 f"#!/usr/bin/env bash\n"
-                f"printf '%s\\n' '- /repo ✓' '{PBI}:5' "
+                f"printf '%s\\\\n' '- /repo ✓' '{PBI}:5' "
                 "'AI SDK Warning: System messages can enable prompt injection.'\n"
-                "printf '%s\\n' 'AI SDK Warning: System messages can enable prompt injection.' >&2\n"
+                "printf '%s\\\\n' 'AI SDK Warning: System messages can enable prompt injection.' >&2\n"
             )
             fake_chat.chmod(0o755)
             result = self.run_pbi("search", "PBI_VERSION", env=env, binary=self.fake_pbi(directory, directory / "probe"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "pbi:5\n")
         self.assertEqual(result.stderr, "")
+
+    def test_search_rejects_worktree_listing_prefix_and_stamp_dump(self) -> None:
+        # #251: compact search must not emit a worktree ls prefix plus BM25
+        # path:1 stamps as an rc=0 answer. Bounded locations or fail-closed.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "crates" / "guardian" / "src" / "receipt.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("pub struct ReceiptPublisher;\n")
+            (repo / "AGENTS.md").write_text("# agents\n")
+            (repo / "Cargo.toml").write_text("[package]\nname = 'guardian'\n")
+            unrelated = repo / "crates" / "guardian" / "src" / "config.rs"
+            unrelated.write_text("pub struct UnrelatedConfig;\n")
+            env, trace = self.fake_environment(directory)
+            realpath = directory / "realpath"
+            realpath.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' 'AGENTS.md' 'Cargo.toml' 'crates' 'src'\n"
+                "exec /usr/bin/realpath \"$@\"\n"
+            )
+            realpath.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('AGENTS.md')\n"
+                "print('Cargo.toml')\n"
+                "print('crates')\n"
+                f"print('File: {unrelated}, Lines: 1-1')\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                "ReceiptPublisher",
+                "Drop",
+                "shutdown_receipt_writer",
+                "production",
+                "JoinHandle",
+                "CLI",
+                "guardian",
+                "abort",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotIn("AGENTS.md", result.stdout, output)
+        self.assertNotIn("Cargo.toml", result.stdout, output)
+        self.assertNotIn("config.rs", result.stdout, output)
+        self.assertNotRegex(result.stdout, r"(^|\n)(crates|src)(\n|$)", output)
+        if result.returncode == 0:
+            self.assertRegex(result.stdout, r"receipt\.rs:\d+\n\Z", output)
+            self.assertEqual(result.stderr, "")
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertEqual(result.stdout, "")
+            self.assertTrue(
+                "no source locations found" in result.stderr
+                or "location stamps" in result.stderr,
+                result.stderr,
+            )
+        self.assertFalse(trace.exists(), "compact search must skip Probe Chat")
 
     def test_search_compact_fixture_records_probe_input_and_zero_chat(self) -> None:
         # #118: the default explicit search is a compact verified BM25

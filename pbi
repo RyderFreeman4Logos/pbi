@@ -628,6 +628,7 @@ compact_search_locations() {
           [[ -n "$line_number" ]] || continue
         fi
         relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+        relative="${relative##*$'\n'}"
         if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
           location="$relative:$line_number"
         else
@@ -648,6 +649,7 @@ compact_search_locations() {
         file="${location%:*}"
         if [[ -f "$file" ]]; then
           relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+          relative="${relative##*$'\n'}"
           if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
             location="$relative:$suffix"
           else
