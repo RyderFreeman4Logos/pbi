@@ -2981,6 +2981,36 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
         self.assertLess(elapsed, 5)
 
+    def test_unwritable_tmpdir_query_scratch_fails_closed_without_empty_path_cascade(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            env, _ = self.fake_environment(directory)
+            node = directory / "node"
+            node.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\nprint('[]')\n")
+            node.chmod(0o755)
+            tmpdir = directory / "readonly-tmp"
+            tmpdir.mkdir()
+            env["TMPDIR"] = str(tmpdir)
+            tmpdir.chmod(0o555)
+            try:
+                result = self.run_pbi(
+                    "where is the entrypoint",
+                    env=env,
+                    cwd=directory,
+                    binary=self.fake_pbi(directory, directory / "probe"),
+                    timeout=4,
+                )
+            finally:
+                tmpdir.chmod(0o755)
+        combined = f"{result.stdout}{result.stderr}"
+        self.assertNotEqual(result.returncode, 0, combined)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("mktemp:", result.stderr)
+        self.assertEqual(result.stderr.count("mktemp:"), 1)
+        self.assertNotIn("no source locations found", result.stderr)
+        self.assertNotRegex(combined, r"pbi: line \d+: : No such file or directory")
+        self.assertNotRegex(combined, r": : No such file or directory")
+
     def test_term_resistant_initial_planner_times_out_to_direct_bm25(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
