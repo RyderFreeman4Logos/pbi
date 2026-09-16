@@ -927,6 +927,58 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("Coverage: complete", result.stdout + result.stderr)
         self.assertLess(elapsed, 6)
 
+    def test_launcher_runtime_asset_query_rejects_unrelated_evidence(self) -> None:
+        # #247: launcher/runtime-asset questions must not accept unrelated stamps.
+        question = (
+            "Where does the hermes CLI launch the TUI, and what repository files "
+            "or built assets must exist at runtime?"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            (repo / "src").mkdir(parents=True)
+            launcher = repo / "src" / "entrypoint.py"
+            launcher.write_text(
+                "def main():\n"
+                "    import ui\n"
+                "    ui.start(Path('public/bundle.js'))\n"
+            )
+            parser = repo / "src" / "parser.py"
+            parser.write_text(
+                "# unrelated parser help location\n" * 6
+                + "def ignore_user_configuration_file_for_runtime_asset_cache():\n"
+            )
+            asset = repo / "public" / "bundle.js"
+            asset.parent.mkdir()
+            asset.write_text("compiled interface bundle\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {parser}, Lines: 7-7')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "source localization must not start Probe Chat")
+        self.assertNotEqual(
+            result.returncode == 0 and "parser.py" in result.stdout,
+            True,
+            output,
+        )
+        if result.returncode == 0:
+            self.assertIn("entrypoint.py", result.stdout)
+            self.assertIn("bundle.js", result.stdout)
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertRegex(result.stderr, r"pbi: no source locations found|Missing:")
+
     def test_multi_target_locate_with_followup_uses_semantic_trace_before_chat(self) -> None:
         question = (
             "Locate the Just quality-gates recipe, scripts/hooks/check-path-included-src.sh, "
