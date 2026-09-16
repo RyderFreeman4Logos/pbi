@@ -703,6 +703,10 @@ emit_bm25_locations_or_fail_closed() {
       recovered_named_locations+="$candidate_locations"
     fi
   done < <(search_named_symbols "${question:-}")
+  hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
+  if [[ -n "$hyphen_locations" ]]; then
+    recovered_named_locations="$hyphen_locations"
+  fi
   if [[ -n "$recovered_named_locations" ]]; then
     recovered_named_locations="$(select_query_relevant_locations "$recovered_named_locations" || true)"
   fi
@@ -2060,6 +2064,42 @@ recover_named_symbol_definition() {
   fi
   [[ -n "$best_locations" ]] || return 1
   printf "%s\n" "$best_locations"
+}
+
+recover_hyphen_compound_named_locations() {
+  local deadline_ns="${1:-}" token locations="" file relative line_number
+  local rg_command
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  while IFS= read -r token; do
+    token="${token#\#}"
+    token="${token%%[,:;.!?]*}"
+    [[ "$token" == *-* ]] || continue
+    token="${token//-/_}"
+    while IFS= read -r file; do
+      [[ -f "$file" ]] || continue
+      if ! question_is_test_coverage "${question:-}" &&
+          [[ "$file" == */tests/* || "$file" == */test/* || "$file" == *_tests.rs ]]; then
+        continue
+      fi
+      relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+      [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || continue
+      line_number="$(named_symbol_definition_line "$file" "$token" any 0 0 "$deadline_ns" || true)"
+      if ! [[ "$line_number" =~ ^[[:digit:]]+$ ]]; then
+        line_number="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -m 1 \
+            -e "$token" -e "_$token" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1 }')"
+      fi
+      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || line_number=1
+      locations+="${locations:+$'\n'}$relative:$line_number"
+      break
+    done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" --files \
+        --glob "*${token}*" \
+        --glob '!drafts/**' --glob '!docs/plans/**' \
+        --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' \
+        --glob '!**/tests/**' --glob '!**/test/**' . 2>/dev/null || true)
+  done < <(printf '%s\n' "${question:-}" | awk '{ for (i = 1; i <= NF; i++) print $i }')
+  [[ -n "$locations" ]] || return 1
+  printf '%s\n' "$locations"
 }
 
 recover_inject_persist_locations() {
@@ -3899,6 +3939,18 @@ else
   fi
   [[ "${semantic_trace_partial_emitted:-false}" == true ]] && exit 1
   if [[ "$search_fast_path_miss" == true ]]; then
+    hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
+    if [[ -n "$hyphen_locations" ]]; then
+      if question_allows_compact_stamp "$question"; then
+        printf '%s\n' "$hyphen_locations"
+        exit 0
+      fi
+      if output="$(format_located_answer "$hyphen_locations")" &&
+          [[ -n "${output//[[:space:]]/}" ]]; then
+        printf '%s' "$output"
+        exit 0
+      fi
+    fi
     if ! question_allows_compact_stamp "$question" &&
         output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
       printf '%s' "$output"
@@ -3932,6 +3984,10 @@ else
         recovered_named_locations+="$candidate_locations"
       fi
     done < <(search_named_symbols "$question")
+    hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
+    if [[ -n "$hyphen_locations" ]]; then
+      recovered_named_locations="$hyphen_locations"
+    fi
     if [[ -n "$recovered_named_locations" ]]; then
       if question_allows_compact_stamp "$question"; then
         printf '%s\n' "$recovered_named_locations"
@@ -3944,6 +4000,11 @@ else
       fi
     fi
     if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
+      hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
+      if [[ -n "$hyphen_locations" ]]; then
+        printf '%s\n' "$hyphen_locations"
+        exit 0
+      fi
       if output="$(recover_timeout_location_from_bm25)" &&
           [[ -n "${output//[[:space:]]/}" ]] && emit_source_locations "$output"; then
         exit 0
