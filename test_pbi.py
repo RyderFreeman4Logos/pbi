@@ -7990,6 +7990,65 @@ exit "$status"
         self.assertEqual(result.stdout, "audit.py:1\n")
         self.assertEqual(result.stderr, "")
 
+    def test_planner_timeout_recovers_hyphenated_write_reserve_source(self) -> None:
+        # #246: SQLite is a decoy named symbol. Distinctive write-reserve
+        # allocate/cleanup must still be recovered; leftover BM25 + hanging
+        # planner must not become the product answer.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            decoy = repo / "src" / "core" / "sqlite_retry.rs"
+            source = repo / "src" / "core" / "db_write_reserve.rs"
+            source.parent.mkdir(parents=True)
+            decoy.write_text(
+                "async fn async_retry_preserves_success_returned_after_deadline() {}\n"
+            )
+            source.write_text(
+                "pub(crate) fn ensure_write_reserve() {}\n"
+                "pub(crate) fn consume_write_reserve() {}\n"
+            )
+            env, _ = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys, time\n"
+                "with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as f:\n"
+                "    f.write('invoked')\n"
+                "if '--dry-run' in sys.argv:\n"
+                "    time.sleep(30)\n"
+                f"print('File: {decoy}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, signal, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    f.write('planner-timeout\\n')\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "    while True: time.sleep(0.1)\n"
+                "raise SystemExit(2)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "where is SQLite write-reserve allocated and cleaned up?",
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+            self.assertTrue((directory / "probe-trace.json").exists(), "BM25 must run")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn("db_write_reserve.rs", result.stdout)
+        self.assertRegex(result.stdout, r"db_write_reserve\.rs:\d+")
+        self.assertNotIn("sqlite_retry.rs", result.stdout)
+        self.assertNotIn("planner timed out", combined)
+        self.assertEqual(result.stderr, "")
+
     def test_explicit_removed_or_renamed_symbol_uses_bounded_history_and_current_test_imports(self) -> None:
         symbol = "LegacySymbol"
         with tempfile.TemporaryDirectory() as temporary:
