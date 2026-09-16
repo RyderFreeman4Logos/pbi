@@ -1398,6 +1398,60 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "in-hand quoted-line hits must not start planner")
         self.assertLess(elapsed, 6)
 
+    def test_named_script_multi_parse_boundary_rejects_single_partial_location(self) -> None:
+        # #245: a named-script multi-parse-boundary question must not succeed
+        # with only one field-count line when the script has several parse sites.
+        question = (
+            "where does scripts/hooks/review-check.sh parse native receipt "
+            "and report bytes and fail closed on malformed fields"
+        )
+        script = (
+            "#!/usr/bin/env bash\n"
+            "require_report_field() {\n"
+            "  IFS= read -r field || review_blocked \"malformed report field\"\n"
+            "}\n"
+            "hash_then_parse_report() {\n"
+            "  report_hash=$(sha256sum \"$report\")\n"
+            "  parse_report_bytes \"$report_hash\"\n"
+            "}\n"
+            "mapfile -t receipt_fields < native_receipt\n"
+            "[[ ${#receipt_fields[@]} -eq 18 ]] || "
+            "review_blocked \"native receipt must contain exactly 18 fields\"\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            named = repo / "scripts" / "hooks"
+            named.mkdir(parents=True)
+            source = named / "review-check.sh"
+            source.write_text(script)
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 10-10')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "named-script parse-boundary recovery must skip Probe Chat")
+        if result.returncode == 0:
+            self.assertIn("mapfile", result.stdout)
+            self.assertRegex(result.stdout, r"require_report_field|\bread\b")
+            self.assertRegex(result.stdout, r"sha256sum|parse_report_bytes")
+            self.assertIn("18 fields", result.stdout)
+            self.assertGreaterEqual(result.stdout.count("review-check.sh:"), 2)
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("pbi: no source locations found", result.stderr)
+
     def test_which_test_module_rejects_type_declarations_and_import_lists(self) -> None:
         # #130: declarations, imports, and non-test source do not answer coverage questions.
         for path, line in (
