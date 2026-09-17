@@ -3880,7 +3880,7 @@ case "${1:-}" in
     if [[ -n "$symbol" ]]; then
       supplemental_candidates="$(remaining_file_candidates "$candidates" "${search_pattern_parts[*]}")"
       if [[ -n "$supplemental_candidates" ]]; then
-        supplemental_locations="$(compact_search_locations "$supplemental_candidates")"
+        supplemental_locations="$(compact_search_locations "$supplemental_candidates" "$symbol")"
         if [[ -n "$supplemental_locations" ]]; then
           search_fallback_locations="$({
             printf '%s\n' "$search_fallback_locations"
