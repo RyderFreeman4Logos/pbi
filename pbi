@@ -2412,8 +2412,10 @@ semantic_group_tokens() {
 
 line_has_relationship_edge() {
   local text="$1" call_pattern='\([^)]*\)' recipe_pattern='^[^#[:space:]][^:]*:[[:space:]]+[^#[:space:]]'
+  local opener_pattern='[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\('
   [[ "$text" =~ ^[[:space:]]*(pub[[:space:]]+)?(const|type|struct|class|enum|interface|fn|def|func|function)[[:space:]] ]] && return 1
   [[ "$text" =~ ^[[:space:]]*(import|from|use|pub[[:space:]]+use)[[:space:]] ]] && return 1
+  [[ "$text" =~ $opener_pattern ]] && return 0
   [[ "$text" =~ $call_pattern ]] && return 0
   [[ "$text" =~ $recipe_pattern ]]
 }
@@ -3090,7 +3092,6 @@ semantic_trace_candidate_priority() {
   [[ "$2" =~ ^[[:space:]]*(async[[:space:]]+)?(def|fn|func|function)[[:space:]]+ ]] && implementation_score=$((implementation_score + 3))
   [[ "$2" =~ resolve_[[:alnum:]_]*context ]] && implementation_score=$((implementation_score + 4))
   [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && implementation_score=$((implementation_score + 4))
-  [[ "$2" =~ (_run_write_boundary|_is_write_contention) ]] && implementation_score=$((implementation_score + 8))
   semantic_trace_line_links_evidence "$2" "$5" && implementation_score=$((implementation_score + 2))
   is_test_coverage_evidence "$1" "$2" && implementation_score=$((implementation_score + 2))
   is_timeout_call_noise_line "$1" "$2" && implementation_score=$((implementation_score - 6))
@@ -3356,7 +3357,7 @@ emit_semantic_trace_from_candidates() {
     fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
     fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
     if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
-      locations="$(printf '%s\n%s\n' "$locations" "$fallback_locations" | awk 'NF && !seen[$0]++')"
+      locations="$(printf '%s\n%s\n' "$fallback_locations" "$locations" | awk 'NF && !seen[$0]++')"
     fi
   fi
   if [[ -z "${locations//[[:space:]]/}" ]]; then
