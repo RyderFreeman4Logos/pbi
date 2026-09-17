@@ -927,6 +927,140 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("Coverage: complete", result.stdout + result.stderr)
         self.assertLess(elapsed, 6)
 
+    def test_launcher_runtime_asset_query_rejects_unrelated_evidence(self) -> None:
+        # #247: launcher/runtime-asset questions must not accept unrelated stamps.
+        question = (
+            "Where does the hermes CLI launch the TUI, and what repository files "
+            "or built assets must exist at runtime?"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            (repo / "src").mkdir(parents=True)
+            launcher = repo / "src" / "entrypoint.py"
+            launcher.write_text(
+                "def main():\n"
+                "    import ui\n"
+                "    ui.start(Path('public/bundle.js'))\n"
+            )
+            parser = repo / "src" / "parser.py"
+            parser.write_text(
+                "# unrelated parser help location\n" * 6
+                + "def ignore_user_configuration_file_for_runtime_asset_cache():\n"
+            )
+            asset = repo / "public" / "bundle.js"
+            asset.parent.mkdir()
+            asset.write_text("compiled interface bundle\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {parser}, Lines: 7-7')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "source localization must not start Probe Chat")
+        self.assertNotEqual(
+            result.returncode == 0 and "parser.py" in result.stdout,
+            True,
+            output,
+        )
+        if result.returncode == 0:
+            self.assertIn("entrypoint.py", result.stdout)
+            self.assertIn("bundle.js", result.stdout)
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertRegex(result.stderr, r"pbi: no source locations found|Missing:")
+
+    def test_launcher_runtime_asset_query_rejects_generic_hermes_cli_config_evidence(
+        self,
+    ) -> None:
+        # #247: generic hermes_cli config/plugin sources cannot complete a
+        # CLI-to-TUI launch plus runtime-asset question.
+        question = (
+            "Where does the hermes CLI launch the TUI, and what repository files "
+            "or built assets must exist at runtime?"
+        )
+        unrelated = {
+            "hermes_cli/agent_import.py": (
+                '"""hermes import-agent — import setups. repository files must exist."""\n'
+                "from pathlib import Path\n"
+            ),
+            "hermes_cli/agent_plugins.py": (
+                '"""Compatibility helpers for Agent Plugins. repository homepage."""\n'
+                'PLUGIN_SCHEMA_V1 = "x"\n'
+            ),
+            "hermes_cli/approval_mode.py": (
+                '"""Shared persistent approval-mode command logic.\n'
+                'Approval mode is profile-scoped configuration."""\n'
+                'VALID_APPROVAL_MODES = ("manual",)\n'
+            ),
+            "hermes_cli/approvals_suggest.py": (
+                '"""hermes approvals suggest — mine approval history.\n'
+                'always answers land in config.yaml files."""\n'
+                "import json\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            result, trace = self.run_default_semantic_fixture(
+                directory,
+                question,
+                unrelated,
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "source localization must not start Probe Chat")
+        if result.returncode == 0:
+            self.assertNotIn("Coverage: complete", result.stdout)
+            self.assertRegex(result.stdout, r"launch|tui|runtime|asset|bundle", output)
+            for path in unrelated:
+                self.assertNotIn(path, result.stdout)
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertNotIn("Coverage: complete", output)
+            self.assertRegex(result.stderr, r"pbi: no source locations found|Missing:")
+
+    def test_where_does_standalone_and_keeps_single_quoted_location(self) -> None:
+        # Generic "where does ... pre and post ..." is one target, not multi-target.
+        question = "Where does widget rendering pre and post layout get applied?"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "layout.py"
+            source.write_text(
+                "def apply_pre_and_post_layout():\n"
+                "    render_widget()\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "standalone and must not start Probe Chat")
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("layout.py", result.stdout)
+        self.assertIn("apply_pre_and_post_layout", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("Missing:", output)
+
     def test_multi_target_locate_with_followup_uses_semantic_trace_before_chat(self) -> None:
         question = (
             "Locate the Just quality-gates recipe, scripts/hooks/check-path-included-src.sh, "

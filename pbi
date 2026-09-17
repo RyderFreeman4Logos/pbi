@@ -975,7 +975,13 @@ question_is_multi_target_where() {
   if [[ "$q" =~ (^|[[:space:]])where[[:space:]]+does([[:space:]]|$) ]]; then
     # Named-path where-does plus and-separated parse/action boundaries.
     # A single quoted line is not a complete source answer (#245).
-    [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]] && [[ "$1" == */* ]]
+    # Compound where-does plus a second interrogative (#247 launcher/runtime).
+    # A generic standalone "and" stays one target.
+    if [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]] && [[ "$1" == */* ]]; then
+      return 0
+    fi
+    [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|its|their)([[:space:]]|$) ]] && return 0
+    [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
     return
   fi
   [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] || return 1
@@ -3145,6 +3151,20 @@ format_semantic_trace_evidence() {
   ((emitted > 0))
 }
 
+semantic_group_has_required_behavior() {
+  local group="$1" haystack="$2" required
+  # Generic hermes_cli/config tokens are not CLI-to-TUI launch or runtime-asset
+  # evidence (#247). Require a behavior word from the group itself.
+  if [[ "$group" =~ (^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$) ]]; then
+    required='(^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$)'
+  elif [[ "$group" =~ (^|[^[:alnum:]_-])(runtime|assets?)([^[:alnum:]_-]|$) ]]; then
+    required='(^|[^[:alnum:]_-])(runtime|assets?|bundle)([^[:alnum:]_-]|$)'
+  else
+    return 0
+  fi
+  [[ "$haystack" =~ $required ]]
+}
+
 semantic_trace_is_complete() {
   local locations="$1" location file line_number text group tokens score
   local haystack="" target_count=0 covered_count=0 group_index=0 relationship_count=0 has_test_evidence=false
@@ -3176,6 +3196,10 @@ semantic_trace_is_complete() {
     score="$(token_overlap_score "$haystack" "$tokens")"
     if [[ "$group" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]] &&
        [[ "$has_test_evidence" != true ]]; then
+      missing_groups+="${missing_groups:+; }$group"
+      continue
+    fi
+    if ! semantic_group_has_required_behavior "$group" "$haystack"; then
       missing_groups+="${missing_groups:+; }$group"
       continue
     fi
