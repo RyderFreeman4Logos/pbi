@@ -132,6 +132,7 @@ class PbiTest(unittest.TestCase):
         question: str,
         sources: dict[str, str],
         candidate_paths: tuple[str, ...] | None = None,
+        extra_args: tuple[str, ...] = (),
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         repo = directory / "repo"
         repo.mkdir()
@@ -162,6 +163,7 @@ class PbiTest(unittest.TestCase):
         )
         fake_chat.chmod(0o755)
         result = self.run_pbi(
+            *extra_args,
             question,
             env=env,
             cwd=repo,
@@ -8976,11 +8978,11 @@ exit "$status"
         self.assertNotIn("tests/run_interrupt_test.py", output)
 
     def test_default_metrics_contention_trace_recovers_helper_not_timeout_noise(self) -> None:
-        # #255: default helper/change traces must not publish scattered
-        # timeout-test noise as relationship-edge coverage.
+        # #255: present helper/caller/lock tests must recover; fail-closed is
+        # not success, and no-edge timeout-test noise is not coverage.
         question = (
             "trace the shared metrics cross-process contention helper and timeout tests; "
-            "identify task-introduced changes versus baseline"
+            "identify task-introduced changes versus 19f6ccf5"
         )
         timeout_noise = {
             f"tests/test_timeout_{name}.py": (
@@ -8989,47 +8991,59 @@ exit "$status"
             )
             for name in "abcdefghijklmn"
         }
+        crowding = {
+            f"src/timeout_process_{index:02d}.py": (
+                f"def timeout_process_handler_{index:02d}():\n"
+                "    return True\n"
+            )
+            for index in range(16)
+        }
         relevant = {
-            "src/metrics_contention.py": (
-                "def shared_metrics_cross_process_contention_helper(lock):\n"
-                "    return acquire_cross_process_metrics(lock)\n"
+            "hermes_cli/observability/shared_metrics.py": (
+                "# module header omitted from compact BM25 windows\n" * 330
+                + "    def _run_write_boundary(self, connection, statement, deadline):\n"
+                + "        if not SharedMetricsStore._is_write_contention(exc):\n"
+                + "            raise\n"
+                + "    def _is_write_contention(exc):\n"
+                + "        return str(exc) == 'database is locked'\n"
             ),
-            "src/task_introduced_metrics.py": (
-                "def apply_task_introduced_metrics_change():\n"
-                "    return shared_metrics_cross_process_contention_helper(lock)\n"
-            ),
-            "tests/test_metrics_contention_timeout.py": (
-                "def test_metrics_contention_timeout():\n"
-                "    assert shared_metrics_cross_process_contention_helper(lock)\n"
+            "tests/hermes_cli/test_relay_shared_metrics.py": (
+                "def test_cross_process_model_call_updates_are_transactional():\n"
+                "    store.record_model_call(dimensions, resource)\n"
+                "def test_begin_and_commit_share_one_lock_retry_budget():\n"
+                "    SharedMetricsStore._run_write_boundary(connection, 'COMMIT', deadline)\n"
+                "def test_write_contention_timeout():\n"
+                "    assert SharedMetricsStore._is_write_contention(exc)\n"
             ),
         }
         with tempfile.TemporaryDirectory() as temporary:
             result, trace = self.run_default_semantic_fixture(
                 Path(temporary),
                 question,
-                timeout_noise | relevant,
+                timeout_noise | crowding | relevant,
                 tuple(timeout_noise),
+                extra_args=(
+                    "--model-name",
+                    "qwen3.6-27b-decensor-by-aeon",
+                    "--force-provider",
+                    "openai",
+                ),
             )
         output = result.stdout + result.stderr
-        self.assertFalse(trace.exists(), "helper/change recovery must skip Probe Chat")
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "present helper recovery must skip Probe Chat")
+        self.assertIn("Coverage: complete", result.stdout)
+        self.assertIn("Verified source evidence:", result.stdout)
+        self.assertIn("hermes_cli/observability/shared_metrics.py", result.stdout)
+        self.assertIn("_is_write_contention", result.stdout)
+        self.assertRegex(result.stdout, r"_run_write_boundary|test_relay_shared_metrics")
         self.assertNotIn("Missing: requested relationship edge", output)
+        self.assertNotIn("no source locations found", output)
         for path in timeout_noise:
             self.assertNotIn(path, output)
-        if result.returncode == 0:
-            self.assertIn("Coverage: complete", result.stdout)
-            self.assertIn("Verified source evidence:", result.stdout)
-            self.assertIn("src/metrics_contention.py", result.stdout)
-            self.assertIn("src/task_introduced_metrics.py", result.stdout)
-            self.assertRegex(
-                result.stdout,
-                r"shared_metrics_cross_process_contention_helper|acquire_cross_process_metrics",
-            )
-            self.assertIn("apply_task_introduced_metrics_change", result.stdout)
-        else:
-            self.assertEqual(result.stdout, "")
-            self.assertNotIn("partial source answer", result.stderr)
-            self.assertNotIn("Verified source evidence", result.stderr)
-            self.assertRegex(result.stderr, r"(?m)^pbi: no source locations found$")
+        for path in crowding:
+            self.assertNotIn(path, output)
 
     def _replay_admission_fixture(self, repo: Path) -> None:
         chat = repo / "web" / "src" / "pages" / "ChatPage.tsx"

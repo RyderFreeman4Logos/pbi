@@ -3981,12 +3981,22 @@ if [[ "$1" == "--message" ]]; then
 else
   message_parts=()
   chat_args=()
-  for argument in "$@"; do
-    if [[ "$argument" == "--json" ]]; then
-      chat_args+=("$argument")
-    else
-      message_parts+=("$argument")
-    fi
+  while (($#)); do
+    argument="$1"
+    shift
+    case "$argument" in
+      --json)
+        chat_args+=("$argument")
+        ;;
+      --model-name|--force-provider)
+        (($#)) && shift
+        ;;
+      --model-name=*|--force-provider=*)
+        ;;
+      *)
+        message_parts+=("$argument")
+        ;;
+    esac
   done
   if ((${#message_parts[@]} == 0)); then
     printf '%s\n' 'pbi: question is required; interactive mode is disabled' >&2
