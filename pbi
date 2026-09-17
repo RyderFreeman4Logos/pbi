@@ -3022,13 +3022,17 @@ is_semantic_trace_metadata_line() {
 }
 
 semantic_trace_candidate_matches_target() {
-  local candidate="$1" candidate_file="${2:-}" group tokens token score plain_overlap
+  local candidate="$1" candidate_file="${2:-}" skip_timeout_test_noise="${3:-false}" group tokens token score plain_overlap
   while IFS= read -r group; do
     [[ -n "$group" ]] || continue
     tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
     if [[ "$group" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]] &&
        [[ -n "$candidate_file" ]] && ! is_test_coverage_evidence "$candidate_file" "$candidate"; then
       tokens="$(printf '%s\n' "$tokens" | awk '$0 !~ /^tests?-?$/')"
+    fi
+    # No-edge timeout-test defs must match leftover helper/change tokens (#255).
+    if [[ "$skip_timeout_test_noise" == true ]]; then
+      tokens="$(printf '%s\n' "$tokens" | awk '$0 !~ /^(timeout|tests?-?)$/')"
     fi
     [[ -n "${tokens//[[:space:]]/}" ]] || continue
     plain_overlap=0
@@ -3047,13 +3051,17 @@ semantic_trace_candidate_matches_target() {
 }
 
 semantic_trace_accepts_candidate() {
-  local named_test
+  local named_test skip_timeout_test_noise=false
   named_test="$(question_named_test_symbol "${question:-}")"
   if [[ -n "$named_test" ]]; then
     [[ "$1 $2" == *"$named_test"* ]] ||
       rg -q -F -- "$named_test" "$1" 2>/dev/null || return 1
   fi
-  if ! semantic_trace_candidate_matches_target "$1 $2" "$1" &&
+  if is_test_coverage_evidence "$1" "$2" && ! line_has_relationship_edge "$2" &&
+      [[ "${1,,} ${2,,}" =~ timeout ]]; then
+    skip_timeout_test_noise=true
+  fi
+  if ! semantic_trace_candidate_matches_target "$1 $2" "$1" "$skip_timeout_test_noise" &&
       ! semantic_trace_line_links_evidence "$2" "$5" &&
       ! { [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && line_has_relationship_edge "$2"; }; then
     return 1

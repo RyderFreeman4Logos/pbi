@@ -8975,6 +8975,62 @@ exit "$status"
         self.assertNotIn("agent/fast_mode.py", output)
         self.assertNotIn("tests/run_interrupt_test.py", output)
 
+    def test_default_metrics_contention_trace_recovers_helper_not_timeout_noise(self) -> None:
+        # #255: default helper/change traces must not publish scattered
+        # timeout-test noise as relationship-edge coverage.
+        question = (
+            "trace the shared metrics cross-process contention helper and timeout tests; "
+            "identify task-introduced changes versus baseline"
+        )
+        timeout_noise = {
+            f"tests/test_timeout_{name}.py": (
+                f"def test_timeout_{name}():\n"
+                f"    # timeout handshake {name}\n"
+            )
+            for name in "abcdefghijklmn"
+        }
+        relevant = {
+            "src/metrics_contention.py": (
+                "def shared_metrics_cross_process_contention_helper(lock):\n"
+                "    return acquire_cross_process_metrics(lock)\n"
+            ),
+            "src/task_introduced_metrics.py": (
+                "def apply_task_introduced_metrics_change():\n"
+                "    return shared_metrics_cross_process_contention_helper(lock)\n"
+            ),
+            "tests/test_metrics_contention_timeout.py": (
+                "def test_metrics_contention_timeout():\n"
+                "    assert shared_metrics_cross_process_contention_helper(lock)\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                timeout_noise | relevant,
+                tuple(timeout_noise),
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "helper/change recovery must skip Probe Chat")
+        self.assertNotIn("Missing: requested relationship edge", output)
+        for path in timeout_noise:
+            self.assertNotIn(path, output)
+        if result.returncode == 0:
+            self.assertIn("Coverage: complete", result.stdout)
+            self.assertIn("Verified source evidence:", result.stdout)
+            self.assertIn("src/metrics_contention.py", result.stdout)
+            self.assertIn("src/task_introduced_metrics.py", result.stdout)
+            self.assertRegex(
+                result.stdout,
+                r"shared_metrics_cross_process_contention_helper|acquire_cross_process_metrics",
+            )
+            self.assertIn("apply_task_introduced_metrics_change", result.stdout)
+        else:
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn("partial source answer", result.stderr)
+            self.assertNotIn("Verified source evidence", result.stderr)
+            self.assertRegex(result.stderr, r"(?m)^pbi: no source locations found$")
+
     def _replay_admission_fixture(self, repo: Path) -> None:
         chat = repo / "web" / "src" / "pages" / "ChatPage.tsx"
         stories = repo / "website" / "src" / "data" / "userStories.json"
