@@ -592,8 +592,23 @@ compact_search_locations() {
   local line file location suffix relative symbol line_start line_end line_number
   local allow_outside definition_line first_symbol_line deadline_ns="${4:-}"
   local -A seen_compact_locations=()
+  local input="$1"
   symbol="${2:-}"
   allow_outside="${3:-false}"
+  # Named-symbol compact `path:N` stamps use the same File: remap as snippets.
+  if [[ -n "$symbol" ]]; then
+    input="$(printf '%s\n' "$1" | awk '
+      /^File:[[:space:]]+/ { print; next }
+      /^[[:alnum:]_./-]+:[[:digit:]]+$/ {
+        n = split($0, parts, ":")
+        line = parts[n]
+        file = substr($0, 1, length($0) - length(line) - 1)
+        print "File: " file ", Lines: " line "-" line
+        next
+      }
+      { print }
+    ')"
+  fi
   while IFS= read -r line; do
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
@@ -672,7 +687,7 @@ compact_search_locations() {
       seen_compact_locations["$location"]=1
       printf '%s\n' "$location"
     fi
-  done <<<"$1"
+  done <<<"$input"
 }
 
 emit_bm25_locations_or_fail_closed() {

@@ -4729,6 +4729,92 @@ class PbiTest(unittest.TestCase):
             self.assertIn("no source location", stderr)
         self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
 
+    def test_search_named_symbol_rejects_compact_line1_named_symbol_stamps(self) -> None:
+        # #256: compact `path:1` stamps (not File: snippet ranges) must still
+        # recover the class/function/type definition line, not rc0 with only a
+        # TypeScript homonym and a Python module-docstring :1.
+        symbol = "BackendIdentity"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            ownership = repo / "apps" / "desktop" / "electron" / "backend-ownership.ts"
+            identity = repo / "agent" / "backend_identity.py"
+            caller = repo / "agent" / "auxiliary_client.py"
+            test_hit = repo / "tests" / "agent" / "test_backend_identity.py"
+            ownership.parent.mkdir(parents=True)
+            identity.parent.mkdir(parents=True)
+            test_hit.parent.mkdir(parents=True)
+            ownership.write_text(
+                "export interface BackendIdentity {\n"
+                "  nonce: string\n"
+                "  pid: number\n"
+                "}\n"
+            )
+            identity.write_text(
+                '"""Call sites should build :class:`BackendIdentity` values."""\n'
+                "\n"
+                f"class {symbol}:\n"
+                "    pass\n"
+            )
+            caller.write_text(
+                f"from agent.backend_identity import {symbol}\n"
+                "\n"
+                f"def build_identity():\n"
+                f"    return {symbol}.build()\n"
+            )
+            test_hit.write_text(f"def test_backend_identity():\n    {symbol}()\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('apps/desktop/electron/backend-ownership.ts:1')\n"
+                "print('agent/backend_identity.py:1')\n"
+                "print('tests/agent/test_backend_identity.py:1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "printf '%s\\n' "
+                "'apps/desktop/electron/backend-ownership.ts:1' "
+                "'agent/backend_identity.py:1' "
+                "'tests/agent/test_backend_identity.py:1'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                symbol,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        stdout = result.stdout
+        stderr = result.stderr
+        false_success = (
+            "apps/desktop/electron/backend-ownership.ts:1\n"
+            "agent/backend_identity.py:1\n"
+            "tests/agent/test_backend_identity.py:1\n"
+        )
+        if result.returncode == 0:
+            self.assertNotEqual(
+                stdout,
+                false_success,
+                "compact :1 success must not be only homonym + docstring + test :1",
+            )
+            self.assertNotIn("agent/backend_identity.py:1\n", stdout)
+            self.assertRegex(
+                stdout,
+                r"(agent/backend_identity\.py:3|agent/auxiliary_client\.py:[14])",
+            )
+            self.assertEqual(stderr, "")
+        else:
+            self.assertEqual(result.returncode, 1, stderr)
+            self.assertEqual(stdout, "")
+            self.assertIn("no source location", stderr)
+        self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
+
     def test_search_stamp_only_model_answer_fails_closed(self) -> None:
         # #12 r2: a search whose compacted stdout is only bare `path:1` stamps
         # (the model echoing the BM25 candidate set) must not report success.
