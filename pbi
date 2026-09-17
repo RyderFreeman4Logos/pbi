@@ -619,7 +619,16 @@ compact_search_locations() {
           if [[ -n "$definition_line" ]] && ((definition_line >= line_start && (line_end == 0 || definition_line <= line_end))); then
             line_number="$definition_line"
           elif [[ -n "$first_symbol_line" ]] && ((first_symbol_line >= line_start && (line_end == 0 || first_symbol_line <= line_end))); then
-            line_number="$first_symbol_line"
+            in_range_definition="$(named_symbol_definition_line "$file" "$symbol" definition "$line_start" "$line_end" "$deadline_ns")"
+            fast_path_deadline_reached "$deadline_ns" && return 1
+            if [[ -n "$in_range_definition" ]]; then
+              line_number="$in_range_definition"
+            elif [[ -n "$definition_line" ]]; then
+              # Snippet mention (docstring :class:`Symbol`) is not the definition.
+              line_number="$definition_line"
+            else
+              line_number="$first_symbol_line"
+            fi
           elif [[ "$allow_outside" == true && -n "$definition_line" ]]; then
             line_number="$definition_line"
           elif [[ "$allow_outside" == true && ( -n "${candidates:-}" || -n "${bm25_candidates:-}" ) ]]; then

@@ -4648,6 +4648,87 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(right.stdout, "real.py:1\n")
         self.assertEqual(right.stderr, "")
 
+    def test_search_named_symbol_rejects_ts_ownership_and_python_docstring_line1(self) -> None:
+        # #256: exact BackendIdentity search must not succeed with only a
+        # TypeScript ownership homonym plus a Python module-docstring :1 hit
+        # when a real class definition and production callers exist.
+        symbol = "BackendIdentity"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            ownership = repo / "apps" / "desktop" / "electron" / "backend-ownership.ts"
+            identity = repo / "agent" / "backend_identity.py"
+            caller = repo / "agent" / "auxiliary_client.py"
+            ownership.parent.mkdir(parents=True)
+            identity.parent.mkdir(parents=True)
+            ownership.write_text(
+                "export interface BackendIdentity {\n"
+                "  nonce: string\n"
+                "  pid: number\n"
+                "}\n"
+            )
+            identity.write_text(
+                '"""Call sites should build :class:`BackendIdentity` values."""\n'
+                "\n"
+                f"class {symbol}:\n"
+                "    pass\n"
+            )
+            caller.write_text(
+                f"from agent.backend_identity import {symbol}\n"
+                "\n"
+                f"def build_identity():\n"
+                f"    return {symbol}.build()\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {ownership}, Lines: 1-3')\n"
+                f"print('File: {identity}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "printf '%s\\n' "
+                "'apps/desktop/electron/backend-ownership.ts:1' "
+                "'agent/backend_identity.py:1'\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                symbol,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=5,
+            )
+        stdout = result.stdout
+        stderr = result.stderr
+        false_success = (
+            "apps/desktop/electron/backend-ownership.ts:1\n"
+            "agent/backend_identity.py:1\n"
+        )
+        if result.returncode == 0:
+            self.assertNotEqual(
+                stdout,
+                false_success,
+                "exact-symbol success must not be only the TS homonym and docstring :1",
+            )
+            self.assertNotEqual(stdout, "apps/desktop/electron/backend-ownership.ts:1\n")
+            self.assertNotEqual(stdout, "agent/backend_identity.py:1\n")
+            self.assertRegex(
+                stdout,
+                r"(agent/backend_identity\.py:3|agent/auxiliary_client\.py:[14])",
+            )
+            self.assertEqual(stderr, "")
+        else:
+            self.assertEqual(result.returncode, 1, stderr)
+            self.assertEqual(stdout, "")
+            self.assertIn("no source location", stderr)
+        self.assertFalse(trace.exists(), "named-symbol recovery must skip Probe Chat")
+
     def test_search_stamp_only_model_answer_fails_closed(self) -> None:
         # #12 r2: a search whose compacted stdout is only bare `path:1` stamps
         # (the model echoing the BM25 candidate set) must not report success.
