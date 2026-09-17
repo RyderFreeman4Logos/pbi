@@ -132,6 +132,7 @@ class PbiTest(unittest.TestCase):
         question: str,
         sources: dict[str, str],
         candidate_paths: tuple[str, ...] | None = None,
+        extra_args: tuple[str, ...] = (),
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         repo = directory / "repo"
         repo.mkdir()
@@ -162,6 +163,7 @@ class PbiTest(unittest.TestCase):
         )
         fake_chat.chmod(0o755)
         result = self.run_pbi(
+            *extra_args,
             question,
             env=env,
             cwd=repo,
@@ -8867,6 +8869,66 @@ exit "$status"
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "verified trace edges must not require chat synthesis")
 
+    def test_default_semantic_trace_counts_wrapped_call_openers(self) -> None:
+        # Two-file default trace: production same-line call plus a test-file
+        # opener whose closing paren is on a later line. Completeness needs
+        # relationship edges in both files; defs/imports must stay rejected.
+        question = (
+            "Trace alpha-handler dispatch authority and pre-exec host-memory "
+            "seam through production callers and tests."
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                {
+                    "src/alpha_handler.py": (
+                        "result = dispatch_alpha_handler(payload)  # production caller authority\n"
+                    ),
+                    "tests/test_alpha_handler.py": (
+                        "assert pre_exec_host_memory(\n"
+                        "    payload,\n"
+                        ")  # admission test\n"
+                    ),
+                },
+            )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn("Coverage: complete", result.stdout)
+        self.assertIn("src/alpha_handler.py", result.stdout)
+        self.assertIn("tests/test_alpha_handler.py", result.stdout)
+        self.assertIn("dispatch_alpha_handler(", result.stdout)
+        self.assertIn("pre_exec_host_memory(", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "verified wrapped openers must not require chat")
+        self.assertNotIn("Missing: requested relationship edge", result.stdout + result.stderr)
+
+    def test_default_semantic_trace_rejects_def_and_import_openers(self) -> None:
+        question = (
+            "Trace alpha-handler dispatch authority and pre-exec host-memory "
+            "seam through production callers and tests."
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                {
+                    "src/alpha_handler.py": (
+                        "def dispatch_alpha_handler(payload):  # production caller authority\n"
+                        "    return payload\n"
+                    ),
+                    "tests/test_alpha_handler.py": (
+                        "from alpha_handler import dispatch_alpha_handler, pre_exec_host_memory\n"
+                        "def test_pre_exec_host_memory(payload):\n"
+                        "    return payload\n"
+                    ),
+                },
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Missing: requested relationship edge", result.stderr)
+        self.assertFalse(trace.exists(), "def/import false positives must not invoke Probe Chat")
+
     def test_default_semantic_trace_keeps_structured_partial_when_edge_missing(self) -> None:
         question = "Trace private-needle authority and host-memory seam through production callers and tests."
         with tempfile.TemporaryDirectory() as temporary:
@@ -8974,6 +9036,82 @@ exit "$status"
         self.assertNotIn("partial source answer", result.stderr)
         self.assertNotIn("agent/fast_mode.py", output)
         self.assertNotIn("tests/run_interrupt_test.py", output)
+
+    def test_default_metrics_contention_trace_recovers_helper_not_timeout_noise(self) -> None:
+        # #255: live BM25 returns timeout-test call edges from the relay
+        # metrics test; the write-boundary helper sits past the 8-line window.
+        # Timeout-named files crowd footer/distinctive caps. Fail-closed and
+        # no-edge defs are not this miss; call-edge timeout noise is.
+        question = (
+            "trace the shared metrics cross-process contention helper and timeout tests; "
+            "identify task-introduced changes versus 19f6ccf5"
+        )
+        timeout_noise = {
+            f"tests/test_timeout_{name}.py": (
+                f"def test_timeout_{name}():\n"
+                "    ready.wait(timeout=5)\n"
+                "    future.result(timeout=1)\n"
+                "    proc.join(timeout=5)\n"
+            )
+            for name in "abcdefghijklmn"
+        }
+        crowding = {
+            f"hermes_cli/observability/shared_metrics_{index:02d}.py": (
+                f"def leftover_shared_metrics_{index:02d}():\n"
+                "    return True\n"
+            )
+            for index in range(16)
+        }
+        relevant = {
+            "hermes_cli/observability/shared_metrics.py": (
+                "# module header omitted from compact BM25 windows\n" * 330
+                + "    def _run_write_boundary(self, connection, statement, deadline):\n"
+                + "        if not SharedMetricsStore._is_write_contention(exc):\n"
+                + "            raise\n"
+                + "    def _is_write_contention(exc):\n"
+                + "        return str(exc) == 'database is locked'\n"
+            ),
+            "tests/hermes_cli/test_relay_shared_metrics.py": (
+                "def test_cross_process_model_call_updates_are_transactional():\n"
+                "    ready.wait(timeout=5)\n"
+                "    future.result(timeout=1)\n"
+                "    proc.join(timeout=5)\n"
+                "    schema_path = 'metrics.json'\n"
+                "    store.record_model_call(dimensions, resource)\n"
+                "def test_begin_and_commit_share_one_lock_retry_budget():\n"
+                "    SharedMetricsStore._run_write_boundary(connection, 'COMMIT', deadline)\n"
+                "def test_write_contention_timeout():\n"
+                "    assert SharedMetricsStore._is_write_contention(exc)\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary),
+                question,
+                timeout_noise | crowding | relevant,
+                ("tests/hermes_cli/test_relay_shared_metrics.py",),
+                extra_args=(
+                    "--model-name",
+                    "qwen3.6-27b-decensor-by-aeon",
+                    "--force-provider",
+                    "openai",
+                ),
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "present helper recovery must skip Probe Chat")
+        self.assertIn("Coverage: complete", result.stdout)
+        self.assertIn("Verified source evidence:", result.stdout)
+        self.assertIn("hermes_cli/observability/shared_metrics.py", result.stdout)
+        self.assertIn("_is_write_contention", result.stdout)
+        self.assertRegex(result.stdout, r"_run_write_boundary|test_relay_shared_metrics")
+        self.assertNotIn("Missing: requested relationship edge", output)
+        self.assertNotIn("no source locations found", output)
+        for path in timeout_noise:
+            self.assertNotIn(path, output)
+        for path in crowding:
+            self.assertNotIn(path, output)
 
     def _replay_admission_fixture(self, repo: Path) -> None:
         chat = repo / "web" / "src" / "pages" / "ChatPage.tsx"
