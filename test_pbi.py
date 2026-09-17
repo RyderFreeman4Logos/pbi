@@ -979,6 +979,40 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1, output)
             self.assertRegex(result.stderr, r"pbi: no source locations found|Missing:")
 
+    def test_where_does_standalone_and_keeps_single_quoted_location(self) -> None:
+        # Generic "where does ... pre and post ..." is one target, not multi-target.
+        question = "Where does widget rendering pre and post layout get applied?"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "layout.py"
+            source.write_text(
+                "def apply_pre_and_post_layout():\n"
+                "    render_widget()\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "standalone and must not start Probe Chat")
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("layout.py", result.stdout)
+        self.assertIn("apply_pre_and_post_layout", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("Missing:", output)
+
     def test_multi_target_locate_with_followup_uses_semantic_trace_before_chat(self) -> None:
         question = (
             "Locate the Just quality-gates recipe, scripts/hooks/check-path-included-src.sh, "

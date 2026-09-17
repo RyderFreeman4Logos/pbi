@@ -975,7 +975,13 @@ question_is_multi_target_where() {
   if [[ "$q" =~ (^|[[:space:]])where[[:space:]]+does([[:space:]]|$) ]]; then
     # Named-path where-does plus and-separated parse/action boundaries.
     # A single quoted line is not a complete source answer (#245).
-    [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]]
+    # Compound where-does plus a second interrogative (#247 launcher/runtime).
+    # A generic standalone "and" stays one target.
+    if [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]] && [[ "$1" == */* ]]; then
+      return 0
+    fi
+    [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|its|their)([[:space:]]|$) ]] && return 0
+    [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
     return
   fi
   [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] || return 1
