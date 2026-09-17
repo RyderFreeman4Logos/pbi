@@ -662,7 +662,7 @@ compact_search_locations() {
         seen_compact_locations["$location"]=1
         printf '%s\n' "$location"
       fi
-    elif [[ "$line" =~ ([[:alnum:]_./-]+:([[:alnum:]_~-]+|[[:digit:]]+)) ]]; then
+    elif [[ "$line" =~ ([[:alnum:]_./-]+:[[:digit:]]+) ]]; then
       location="${BASH_REMATCH[1]}"
       if [[ "$location" =~ ^[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}T[[:digit:]]{2}:[[:digit:]]{2}(:[[:digit:]]{2})?$ ||
             "$location" =~ ^(([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}|localhost):[[:digit:]]+$ ]]; then
@@ -1004,13 +1004,13 @@ question_is_multi_target_where() {
     if [[ "$q" =~ (^|[^[:alnum:]])and([^[:alnum:]]|$) ]] && [[ "$1" == */* ]]; then
       return 0
     fi
-    [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|its|their)([[:space:]]|$) ]] && return 0
-    [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
+    [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|does|its|their)([[:space:]]|$) ]] && return 0
+    [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how|does)([[:space:]]|$) ]]
     return
   fi
   [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|its|their)([[:space:]]|$) ]] && return 0
-  [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)([[:space:]]|$) ]]
+  [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|does|its|their)([[:space:]]|$) ]] && return 0
+  [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how|does)([[:space:]]|$) ]]
 }
 
 question_is_inject_persist() {
@@ -2362,7 +2362,7 @@ semantic_target_groups() {
       sub(/[.]+[[:space:]]*$/, "", q)
       gsub(/[[:space:]]+also[[:space:]]+locate[[:space:]]+/, "\nlocate ", q)
       sub(/[[:space:]]+give exact functions and key line ranges at current head[[:space:]]*$/, "", q)
-      gsub(/,[[:space:]]*(and[[:space:]]+)?(what|which|where|how)[[:space:]]+/, "\n", q)
+      gsub(/,[[:space:]]*(and[[:space:]]+)?(what|which|where|how|does)[[:space:]]+/, "\n", q)
       gsub(/,[[:space:]]*/, "\n", q)
       gsub(/[[:space:]]+and[[:space:]]+/, "\n", q)
       count = split(q, groups, "\n")

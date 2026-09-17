@@ -1029,6 +1029,77 @@ class PbiTest(unittest.TestCase):
             self.assertNotIn("Coverage: complete", output)
             self.assertRegex(result.stderr, r"pbi: no source locations found|Missing:")
 
+    def test_where_is_and_does_rejects_synthetic_chat_kwargs_stamp(self) -> None:
+        # #260: "and does" is a second interrogative; a model echo of
+        # chat_kwargs:1 / chat_kwargs:true is not a source location.
+        question = (
+            "Where is cache warming armed, and does idle emit provider chat "
+            "completions?"
+        )
+        for stamp, extra_body_only in (
+            ("chat_kwargs:1", False),
+            ("chat_kwargs:true", False),
+            ("extra_body:1", True),
+        ):
+            with self.subTest(stamp=stamp), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repo = directory / "repo"
+                repo.mkdir()
+                warming = repo / "warming.py"
+                warming.write_text("def arm_cache_warming():\n    schedule_idle_warmup()\n")
+                idle = repo / "idle.py"
+                idle.write_text(
+                    "def idle_emit_provider_chat_completions():\n"
+                    "    provider.chat.completions.create()\n"
+                )
+                env, trace = self.fake_environment(directory)
+                probe = directory / "probe"
+                if extra_body_only:
+                    probe.write_text(
+                        "#!/usr/bin/env python3\n"
+                        f"print('File: {warming}, Lines: 1-1')\n"
+                        "print('extra_body: true')\n"
+                    )
+                else:
+                    probe.write_text(
+                        "#!/usr/bin/env python3\n"
+                        f"print('File: {warming}, Lines: 1-1')\n"
+                        f"print({stamp!r})\n"
+                    )
+                probe.chmod(0o755)
+                fake_chat = directory / "probe-chat"
+                fake_chat.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import os\n"
+                    "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                    f"print({stamp!r})\n"
+                    f"print({warming.name + ':1'!r})\n"
+                )
+                fake_chat.chmod(0o755)
+                result = self.run_pbi(
+                    question,
+                    env=env,
+                    cwd=repo,
+                    binary=self.fake_pbi(directory, probe),
+                    timeout=8,
+                )
+                output = result.stdout + result.stderr
+                self.assertNotIn("chat_kwargs:", result.stdout, output)
+                self.assertNotRegex(result.stdout, r"(?m)^chat_kwargs:", output)
+                self.assertNotRegex(result.stdout, r"(?m)^extra_body:", output)
+                # rc0 with one quoted site is false source success: coverage
+                # accepted a single target because "and does" was not admitted.
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertEqual(result.stdout, "")
+                self.assertRegex(
+                    result.stderr,
+                    r"pbi: no source locations found|Missing:|partial source answer",
+                )
+                self.assertFalse(
+                    trace.exists(),
+                    "incomplete multi-target recovery must skip Probe Chat",
+                )
+
     def test_where_does_standalone_and_keeps_single_quoted_location(self) -> None:
         # Generic "where does ... pre and post ..." is one target, not multi-target.
         question = "Where does widget rendering pre and post layout get applied?"
