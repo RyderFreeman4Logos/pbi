@@ -979,6 +979,54 @@ class PbiTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1, output)
             self.assertRegex(result.stderr, r"pbi: no source locations found|Missing:")
 
+    def test_launcher_runtime_asset_query_rejects_generic_hermes_cli_config_evidence(
+        self,
+    ) -> None:
+        # #247: generic hermes_cli config/plugin sources cannot complete a
+        # CLI-to-TUI launch plus runtime-asset question.
+        question = (
+            "Where does the hermes CLI launch the TUI, and what repository files "
+            "or built assets must exist at runtime?"
+        )
+        unrelated = {
+            "hermes_cli/agent_import.py": (
+                '"""hermes import-agent — import setups. repository files must exist."""\n'
+                "from pathlib import Path\n"
+            ),
+            "hermes_cli/agent_plugins.py": (
+                '"""Compatibility helpers for Agent Plugins. repository homepage."""\n'
+                'PLUGIN_SCHEMA_V1 = "x"\n'
+            ),
+            "hermes_cli/approval_mode.py": (
+                '"""Shared persistent approval-mode command logic.\n'
+                'Approval mode is profile-scoped configuration."""\n'
+                'VALID_APPROVAL_MODES = ("manual",)\n'
+            ),
+            "hermes_cli/approvals_suggest.py": (
+                '"""hermes approvals suggest — mine approval history.\n'
+                'always answers land in config.yaml files."""\n'
+                "import json\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            result, trace = self.run_default_semantic_fixture(
+                directory,
+                question,
+                unrelated,
+            )
+        output = result.stdout + result.stderr
+        self.assertFalse(trace.exists(), "source localization must not start Probe Chat")
+        if result.returncode == 0:
+            self.assertNotIn("Coverage: complete", result.stdout)
+            self.assertRegex(result.stdout, r"launch|tui|runtime|asset|bundle", output)
+            for path in unrelated:
+                self.assertNotIn(path, result.stdout)
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertNotIn("Coverage: complete", output)
+            self.assertRegex(result.stderr, r"pbi: no source locations found|Missing:")
+
     def test_where_does_standalone_and_keeps_single_quoted_location(self) -> None:
         # Generic "where does ... pre and post ..." is one target, not multi-target.
         question = "Where does widget rendering pre and post layout get applied?"
