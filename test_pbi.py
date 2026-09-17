@@ -8978,8 +8978,10 @@ exit "$status"
         self.assertNotIn("tests/run_interrupt_test.py", output)
 
     def test_default_metrics_contention_trace_recovers_helper_not_timeout_noise(self) -> None:
-        # #255: present helper/caller/lock tests must recover; fail-closed is
-        # not success, and no-edge timeout-test noise is not coverage.
+        # #255: live BM25 returns timeout-test call edges from the relay
+        # metrics test; the write-boundary helper sits past the 8-line window.
+        # Timeout-named files crowd footer/distinctive caps. Fail-closed and
+        # no-edge defs are not this miss; call-edge timeout noise is.
         question = (
             "trace the shared metrics cross-process contention helper and timeout tests; "
             "identify task-introduced changes versus 19f6ccf5"
@@ -8987,13 +8989,15 @@ exit "$status"
         timeout_noise = {
             f"tests/test_timeout_{name}.py": (
                 f"def test_timeout_{name}():\n"
-                f"    # timeout handshake {name}\n"
+                "    ready.wait(timeout=5)\n"
+                "    future.result(timeout=1)\n"
+                "    proc.join(timeout=5)\n"
             )
             for name in "abcdefghijklmn"
         }
         crowding = {
-            f"src/timeout_process_{index:02d}.py": (
-                f"def timeout_process_handler_{index:02d}():\n"
+            f"hermes_cli/observability/shared_metrics_{index:02d}.py": (
+                f"def leftover_shared_metrics_{index:02d}():\n"
                 "    return True\n"
             )
             for index in range(16)
@@ -9009,6 +9013,10 @@ exit "$status"
             ),
             "tests/hermes_cli/test_relay_shared_metrics.py": (
                 "def test_cross_process_model_call_updates_are_transactional():\n"
+                "    ready.wait(timeout=5)\n"
+                "    future.result(timeout=1)\n"
+                "    proc.join(timeout=5)\n"
+                "    schema_path = 'metrics.json'\n"
                 "    store.record_model_call(dimensions, resource)\n"
                 "def test_begin_and_commit_share_one_lock_retry_budget():\n"
                 "    SharedMetricsStore._run_write_boundary(connection, 'COMMIT', deadline)\n"
@@ -9021,7 +9029,7 @@ exit "$status"
                 Path(temporary),
                 question,
                 timeout_noise | crowding | relevant,
-                tuple(timeout_noise),
+                ("tests/hermes_cli/test_relay_shared_metrics.py",),
                 extra_args=(
                     "--model-name",
                     "qwen3.6-27b-decensor-by-aeon",

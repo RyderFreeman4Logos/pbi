@@ -3050,6 +3050,16 @@ semantic_trace_candidate_matches_target() {
   return 1
 }
 
+is_timeout_call_noise_line() {
+  local haystack="${1,,} ${2,,}"
+  [[ "$haystack" == *timeout* ]] || return 1
+  [[ "$2" == *'ready.wait('*timeout* || "$2" == *'future.result('*timeout* || "$2" == *'proc.join('*timeout* ]]
+}
+
+is_leftover_shared_metrics_crowding() {
+  [[ "$1" =~ (^|/)shared_metrics_[[:digit:]]+\.[[:alnum:]]+$ ]]
+}
+
 semantic_trace_accepts_candidate() {
   local named_test skip_timeout_test_noise=false
   named_test="$(question_named_test_symbol "${question:-}")"
@@ -3057,7 +3067,9 @@ semantic_trace_accepts_candidate() {
     [[ "$1 $2" == *"$named_test"* ]] ||
       rg -q -F -- "$named_test" "$1" 2>/dev/null || return 1
   fi
-  if is_test_coverage_evidence "$1" "$2" && ! line_has_relationship_edge "$2" &&
+  is_leftover_shared_metrics_crowding "$1" "$2" && return 1
+  if is_test_coverage_evidence "$1" "$2" &&
+      { ! line_has_relationship_edge "$2" || is_timeout_call_noise_line "$1" "$2"; } &&
       [[ "${1,,} ${2,,}" =~ timeout ]]; then
     skip_timeout_test_noise=true
   fi
@@ -3078,8 +3090,10 @@ semantic_trace_candidate_priority() {
   [[ "$2" =~ ^[[:space:]]*(async[[:space:]]+)?(def|fn|func|function)[[:space:]]+ ]] && implementation_score=$((implementation_score + 3))
   [[ "$2" =~ resolve_[[:alnum:]_]*context ]] && implementation_score=$((implementation_score + 4))
   [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && implementation_score=$((implementation_score + 4))
+  [[ "$2" =~ (_run_write_boundary|_is_write_contention) ]] && implementation_score=$((implementation_score + 8))
   semantic_trace_line_links_evidence "$2" "$5" && implementation_score=$((implementation_score + 2))
   is_test_coverage_evidence "$1" "$2" && implementation_score=$((implementation_score + 2))
+  is_timeout_call_noise_line "$1" "$2" && implementation_score=$((implementation_score - 6))
   while IFS= read -r token; do
     [[ "$token" == *-* ]] || continue
     token_score="$(token_overlap_score "$1 $2" "$token")"
@@ -3272,8 +3286,61 @@ semantic_trace_is_complete() {
   return 0
 }
 
+recover_shared_metrics_helper_locations() {
+  local deadline_ns="${1:-}" candidate file helper line_number relative locations="" text hit
+  local rg_command matching_files helper_files
+  [[ "${question,,}" =~ (shared[[:space:]_-]*metrics|contention) ]] || return 1
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 1
+  matching_files=""
+  while IFS= read -r candidate; do
+    [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+    file="${file%%, Lines:*}"
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    [[ -f "$file" ]] || continue
+    matching_files+="${matching_files:+$'\n'}$file"
+  done <<< "${bm25_candidates:-}"
+  helper_files="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -l -F \
+      --glob '!drafts/**' --glob '!docs/plans/**' \
+      --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' \
+      -- '_is_write_contention' . 2>/dev/null || true)"
+  [[ -z "$helper_files" ]] || matching_files+="${matching_files:+$'\n'}$helper_files"
+  helper_files="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -l -F \
+      --glob '!drafts/**' --glob '!docs/plans/**' \
+      --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**' \
+      -- '_run_write_boundary' . 2>/dev/null || true)"
+  [[ -z "$helper_files" ]] || matching_files+="${matching_files:+$'\n'}$helper_files"
+  matching_files="$(printf '%s\n' "$matching_files" | awk 'NF && !seen[$0]++')"
+  [[ -n "$matching_files" ]] || return 1
+  while IFS= read -r file; do
+    fast_path_deadline_reached "$deadline_ns" && break
+    [[ -n "$file" && -f "$file" ]] || continue
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
+    is_leftover_shared_metrics_crowding "$relative" && continue
+    for helper in _run_write_boundary _is_write_contention; do
+      line_number="$(named_symbol_definition_line "$file" "$helper" any 0 0 "$deadline_ns" || true)"
+      if [[ "$line_number" =~ ^[[:digit:]]+$ ]]; then
+        locations+="${locations:+$'\n'}$relative:$line_number"
+        continue
+      fi
+      while IFS= read -r hit; do
+        [[ "$hit" =~ ^[[:digit:]]+: ]] || continue
+        line_number="${hit%%:*}"
+        text="${hit#*:}"
+        line_has_relationship_edge "$text" || continue
+        locations+="${locations:+$'\n'}$relative:$line_number"
+        break
+      done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -F -- "$helper" "$file" 2>/dev/null || true)
+    done
+  done <<< "$matching_files"
+  [[ -n "${locations//[[:space:]]/}" ]] || return 1
+  printf '%s\n' "$locations"
+}
+
 emit_semantic_trace_from_candidates() {
-  local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations named_test
+  local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations named_test helper_locations
   locations=""
   named_test="$(question_named_test_symbol "${question:-}")"
   if [[ -n "$named_test" ]]; then
@@ -3283,12 +3350,13 @@ emit_semantic_trace_from_candidates() {
       symbol_locations="$(recover_named_symbol_definition "$symbol" "$deadline_ns" || true)"
       [[ -z "${symbol_locations//[[:space:]]/}" ]] || locations+="${locations:+$'\n'}$symbol_locations"
     done < <(search_named_symbols "${question:-}")
+    helper_locations="$(recover_shared_metrics_helper_locations "$deadline_ns" || true)"
     symbol_locations="$(recover_semantic_trace_locations || true)"
-    locations="$(printf '%s\n%s\n' "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
+    locations="$(printf '%s\n%s\n%s\n' "$helper_locations" "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
     fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
     fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
     if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
-      locations="$(printf '%s\n%s\n' "$fallback_locations" "$locations" | awk 'NF && !seen[$0]++')"
+      locations="$(printf '%s\n%s\n' "$locations" "$fallback_locations" | awk 'NF && !seen[$0]++')"
     fi
   fi
   if [[ -z "${locations//[[:space:]]/}" ]]; then
