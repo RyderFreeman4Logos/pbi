@@ -3032,6 +3032,151 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("1970-01-01T00:00", result.stdout)
         self.assertNotIn("127.0.0.1:3080", result.stdout)
 
+    def test_default_query_direct_symbol_audit_recovers_named_locations(self) -> None:
+        # #249: a default audit naming StateLock, LOCK_UN, pre_close_gate, and
+        # child crash/release tests must recover tree-backed locations. Empty
+        # chat or leftover BM25 is not a no-location miss when those hits exist.
+        query = (
+            "Audit commit abc1234 in the four changed files: does StateLock "
+            "creator-PID LOCK_UN ownership and the pre-close child/crash harness "
+            "preserve normal release, failure/EINTR/Drop behavior, child scope, "
+            "and prior fork-fence guarantees? Cite exact source locations and "
+            "distinguish owner-crash bounded cleanup from explicit child release."
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            lock = repo / "src" / "state_lock.rs"
+            unlock = repo / "src" / "lock_un.rs"
+            gate = repo / "src" / "pre_close_gate.rs"
+            harness = repo / "tests" / "child_crash_harness.rs"
+            unrelated = repo / "unrelated.py"
+            lock.parent.mkdir(parents=True)
+            harness.parent.mkdir(parents=True)
+            lock.write_text(
+                "pub struct StateLock {\n"
+                "    creator_pid: i32,\n"
+                "}\n"
+            )
+            unlock.write_text(
+                "pub fn release_owner(fd: i32) {\n"
+                "    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };\n"
+                "}\n"
+            )
+            gate.write_text(
+                "pub fn pre_close_gate() {\n"
+                "    child_scope_release();\n"
+                "}\n"
+            )
+            harness.write_text(
+                "#[test]\n"
+                "fn test_owner_crash_bounded_cleanup() {}\n"
+                "#[test]\n"
+                "fn test_explicit_child_release() {}\n"
+            )
+            unrelated.write_text("def banner():\n    return 'status ok'\\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    f.write(message.splitlines()[0] + '\\n')\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('dummy query one')\n"
+                "    print('dummy query two')\n"
+                "    print('dummy query three')\n"
+                "    print('dummy query four')\n"
+                "    print('dummy query five')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    raise SystemExit(0)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                query,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("no source locations found", output)
+        self.assertNotIn("unrelated.py", output)
+        self.assertRegex(result.stdout, r"src/state_lock\.rs:\d+")
+        self.assertRegex(result.stdout, r"src/lock_un\.rs:\d+")
+        self.assertRegex(result.stdout, r"src/pre_close_gate\.rs:\d+")
+        self.assertRegex(
+            result.stdout,
+            r"tests/child_crash_harness\.rs:\d+",
+        )
+        self.assertFalse(trace.exists(), "named-symbol audit recovery must skip Probe Chat")
+
+    def test_default_query_direct_symbol_audit_fails_closed_without_tree_hits(self) -> None:
+        # #249: the same audit shape must fail closed with an explicit gap when
+        # the tree has no StateLock / LOCK_UN / pre_close_gate / crash-harness
+        # candidates. Do not fabricate coverage from unrelated status output.
+        query = (
+            "Audit commit abc1234 in the four changed files: does StateLock "
+            "creator-PID LOCK_UN ownership and the pre-close child/crash harness "
+            "preserve normal release, failure/EINTR/Drop behavior, child scope, "
+            "and prior fork-fence guarantees? Cite exact source locations and "
+            "distinguish owner-crash bounded cleanup from explicit child release."
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            unrelated = repo / "unrelated.py"
+            unrelated.write_text("def banner():\n    return 'status ok'\\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 1-2')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    f.write(message.splitlines()[0] + '\\n')\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    print('dummy query one')\n"
+                "    print('dummy query two')\n"
+                "    print('dummy query three')\n"
+                "    print('dummy query four')\n"
+                "    print('dummy query five')\n"
+                "elif message.startswith('Identify missing evidence'):\n"
+                "    print('NONE')\n"
+                "else:\n"
+                "    print('unrelated.py:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                query,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("no source location", result.stderr)
+        self.assertNotIn("unrelated.py", result.stdout + result.stderr)
+
     def test_default_query_without_identifier_tokens_does_not_silent_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

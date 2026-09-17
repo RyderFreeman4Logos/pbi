@@ -720,22 +720,7 @@ emit_bm25_locations_or_fail_closed() {
     exit 0
   fi
   locations="$(compact_search_locations "$bm25_candidates")"
-  recovered_named_locations=""
-  while IFS= read -r candidate_symbol; do
-    [[ -n "$candidate_symbol" ]] || continue
-    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" || true)"
-    if [[ -n "$candidate_locations" ]]; then
-      [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
-      recovered_named_locations+="$candidate_locations"
-    fi
-  done < <(search_named_symbols "${question:-}")
-  hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
-  if [[ -n "$hyphen_locations" ]]; then
-    recovered_named_locations="$hyphen_locations"
-  fi
-  if [[ -n "$recovered_named_locations" ]]; then
-    recovered_named_locations="$(select_query_relevant_locations "$recovered_named_locations" || true)"
-  fi
+  recovered_named_locations="$(collect_named_symbol_locations || true)"
   if [[ -n "$recovered_named_locations" ]] && emit_source_locations "$recovered_named_locations"; then
     exit 0
   fi
@@ -821,6 +806,15 @@ emit_search_final_selection_or_fail_closed() {
 search_named_symbols() {
   printf '%s\n' "$1" | awk '
     {
+      remaining = $0
+      while (match(remaining, /[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)+/)) {
+        token = substr(remaining, RSTART, RLENGTH)
+        gsub(/-/, "_", token)
+        if ((token ~ /_/ || substr(token, 2) ~ /[A-Z]/) &&
+            (token ~ /_/ || token ~ /[a-z]/) && !seen[token]++)
+          print length(token) "\t" token
+        remaining = substr(remaining, RSTART + RLENGTH)
+      }
       remaining = $0
       while (match(remaining, /[A-Za-z_][A-Za-z0-9_]*/)) {
         token = substr(remaining, RSTART, RLENGTH)
@@ -1883,12 +1877,6 @@ run_default_bm25_fast_path() {
   # 8s bounds BM25 recovery reads only. In-hand answers emit; otherwise
   # fall through to planner/chat instead of aborting the whole command.
   search_fallback_locations="$(compact_search_locations "$bm25_candidates" "" false "$deadline_ns")"
-  if question_requires_semantic_trace "${question:-}"; then
-    if emit_semantic_trace_from_candidates "$deadline_ns"; then
-      return 0
-    fi
-    [[ "${semantic_trace_partial_emitted:-false}" == true ]] && return 1
-  fi
   recovered_named_locations=""
   if recovered_named_locations="$(recover_unknown_route_wrap_location "${question:-}" "$deadline_ns")" &&
       [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
@@ -1903,28 +1891,16 @@ run_default_bm25_fast_path() {
     fi
   fi
   candidate_symbols="$(search_named_symbols "${question:-}")"
-  while IFS= read -r candidate_symbol; do
-    fast_path_deadline_reached "$deadline_ns" && break
-    [[ -n "$candidate_symbol" ]] || continue
-    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" "$deadline_ns" || true)"
-    if [[ -n "$candidate_locations" ]]; then
-      [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
-      recovered_named_locations+="$candidate_locations"
-    fi
-  done <<<"$candidate_symbols"
+  recovered_named_locations="$(collect_named_symbol_locations "$deadline_ns" || true)"
   if [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
-    recovered_named_locations="$(select_query_relevant_locations "$recovered_named_locations" "$deadline_ns" || true)"
+    printf '%s\n' "$recovered_named_locations"
+    return 0
   fi
-  if [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
-    if question_allows_compact_stamp "${question:-}"; then
-      printf '%s\n' "$recovered_named_locations"
+  if question_requires_semantic_trace "${question:-}"; then
+    if emit_semantic_trace_from_candidates "$deadline_ns"; then
       return 0
     fi
-    if output="$(format_located_answer "$recovered_named_locations" "$deadline_ns")" &&
-        [[ -n "${output//[[:space:]]/}" ]]; then
-      printf '%s' "$output"
-      return 0
-    fi
+    [[ "${semantic_trace_partial_emitted:-false}" == true ]] && return 1
   fi
   if ! question_allows_compact_stamp "${question:-}"; then
     if output="$(emit_synthesized_source_answer "$deadline_ns")" &&
@@ -2013,6 +1989,7 @@ query_location_relevance_score() {
     rg -q -F -- "$token" "$file" 2>/dev/null && score=$((score + 3))
   done <<< "$named_symbols"
   if ! question_is_test_coverage "${question:-}" &&
+      ! question_admits_named_test_files "${question:-}" &&
       [[ "$file" == */tests/* || "$file" == */test/* ]]; then
     score=0
   else
@@ -2045,6 +2022,34 @@ select_query_relevant_locations() {
   printf '%s' "$ranked" | awk -F '\t' -v best="$best" 'NF >= 2 && $1 + 0 == best + 0 && !seen[$2]++ { print $2 }'
 }
 
+# Keep every tree-backed named-symbol hit. Best-score collapse hid sibling
+# symbols in the same audit query (#249 / #256 admission).
+collect_named_symbol_locations() {
+  local deadline_ns="${1:-}" recovered="" candidate_symbol candidate_locations hyphen_locations loc
+  local -A seen_named_locations=()
+  while IFS= read -r candidate_symbol; do
+    fast_path_deadline_reached "$deadline_ns" && break
+    [[ -n "$candidate_symbol" ]] || continue
+    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" "$deadline_ns" || true)"
+    [[ -n "$candidate_locations" ]] || continue
+    while IFS= read -r loc; do
+      [[ -n "$loc" ]] || continue
+      [[ -z "${seen_named_locations[$loc]+seen}" ]] || continue
+      seen_named_locations["$loc"]=1
+      recovered+="${recovered:+$'\n'}$loc"
+    done <<< "$candidate_locations"
+  done < <(search_named_symbols "${question:-}")
+  hyphen_locations="$(recover_hyphen_compound_named_locations "$deadline_ns" || true)"
+  while IFS= read -r loc; do
+    [[ -n "$loc" ]] || continue
+    [[ -z "${seen_named_locations[$loc]+seen}" ]] || continue
+    seen_named_locations["$loc"]=1
+    recovered+="${recovered:+$'\n'}$loc"
+  done <<< "$hyphen_locations"
+  [[ -n "${recovered//[[:space:]]/}" ]] || return 1
+  printf '%s\n' "$recovered"
+}
+
 recover_named_symbol_definition() {
   local symbol="$1" deadline_ns="${2:-}" mode="${3:-definition}"
   local file locations line_number rg_command matching_files rg_status
@@ -2072,6 +2077,7 @@ recover_named_symbol_definition() {
       fast_path_deadline_reached "$deadline_ns" && break
       [[ -n "$file" && -f "$file" ]] || continue
       if ! question_is_test_coverage "${question:-}" &&
+          ! question_admits_named_test_files "${question:-}" &&
           [[ "$symbol" != test_* ]] &&
           [[ "$file" == */tests/* || "$file" == */test/* ]]; then
         continue
@@ -2083,6 +2089,13 @@ recover_named_symbol_definition() {
         line_number="${locations##*:}"
       else
         line_number="$(named_symbol_definition_line "$file" "$symbol" "$mode" 0 0 "$deadline_ns")"
+        if [[ -z "$line_number" && "$mode" == definition ]]; then
+          if [[ "$symbol" =~ ^[A-Z][A-Z0-9_]*$ ]] ||
+              { question_admits_named_test_files "${question:-}" &&
+                [[ "$file" == */tests/* || "$file" == */test/* ]]; }; then
+            line_number="$(named_symbol_definition_line "$file" "$symbol" any 0 0 "$deadline_ns")"
+          fi
+        fi
         fast_path_deadline_reached "$deadline_ns" && break
         [[ -n "$line_number" ]] || continue
         locations="$(compact_search_locations "File: $file, Lines: $line_number-$line_number" "$symbol" false "$deadline_ns")"
@@ -2117,17 +2130,14 @@ recover_hyphen_compound_named_locations() {
     while IFS= read -r file; do
       [[ -f "$file" ]] || continue
       if ! question_is_test_coverage "${question:-}" &&
+          ! question_admits_named_test_files "${question:-}" &&
           [[ "$file" == */tests/* || "$file" == */test/* || "$file" == *_tests.rs ]]; then
         continue
       fi
       relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
       [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || continue
       line_number="$(named_symbol_definition_line "$file" "$token" any 0 0 "$deadline_ns" || true)"
-      if ! [[ "$line_number" =~ ^[[:digit:]]+$ ]]; then
-        line_number="$(run_rg_with_deadline "$deadline_ns" "$rg_command" -n -m 1 \
-            -e "$token" -e "_$token" -- "$file" 2>/dev/null | awk -F: 'NR == 1 { print $1 }')"
-      fi
-      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || line_number=1
+      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
       locations+="${locations:+$'\n'}$relative:$line_number"
       break
     done < <(run_rg_with_deadline "$deadline_ns" "$rg_command" --files \
@@ -2243,6 +2253,12 @@ question_is_test_coverage() {
   local q="${1,,}"
   [[ "$q" =~ (^|[[:space:]])which[[:space:]]+test[[:space:]]+module([[:space:]]|$) ]] ||
     [[ "$q" =~ (^|[[:space:]])test-?coverage([[:space:]]|$) ]]
+}
+
+question_admits_named_test_files() {
+  local q="${1,,}"
+  question_is_test_coverage "$1" && return 0
+  [[ "$q" =~ (^|[^[:alnum:]])(crash|harness)([^[:alnum:]]|$) ]]
 }
 
 question_named_test_symbol() {
@@ -2486,7 +2502,13 @@ is_synthesis_junk_line() {
   # Type-name-only / import-list item is not a behavior or test-module answer.
   [[ "$1" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*,[[:space:]]*$ ]] && return 0
   if question_requires_semantic_trace "${question:-}"; then
-    [[ "$1" =~ ^[[:space:]]*(pub[[:space:]]+)?(struct|type|class|enum|interface)[[:space:]]+[A-Za-z_][A-Za-z0-9_]* ]] && return 0
+    if [[ "$1" =~ ^[[:space:]]*(pub[[:space:]]+)?(struct|type|class|enum|interface)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*) ]]; then
+      declared="${BASH_REMATCH[3]}"
+      while IFS= read -r symbol; do
+        [[ "$symbol" == "$declared" ]] && return 1
+      done < <(search_named_symbols "${question:-}")
+      return 0
+    fi
     [[ "$1" =~ ^[[:space:]]*(pub[[:space:]]+)?use[[:space:]] ]] && return 0
   fi
   question_rejects_lone_type_declaration "${question:-}" || return 1
@@ -4118,29 +4140,10 @@ else
       --max-iterations 1
   generated_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
   if planner_timeout_or_kill "$planner_status"; then
-    recovered_named_locations=""
-    while IFS= read -r candidate_symbol; do
-      [[ -n "$candidate_symbol" ]] || continue
-      candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" || true)"
-      if [[ -n "$candidate_locations" ]]; then
-        [[ -z "$recovered_named_locations" ]] || recovered_named_locations+=$'\n'
-        recovered_named_locations+="$candidate_locations"
-      fi
-    done < <(search_named_symbols "$question")
-    hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
-    if [[ -n "$hyphen_locations" ]]; then
-      recovered_named_locations="$hyphen_locations"
-    fi
+    recovered_named_locations="$(collect_named_symbol_locations || true)"
     if [[ -n "$recovered_named_locations" ]]; then
-      if question_allows_compact_stamp "$question"; then
-        printf '%s\n' "$recovered_named_locations"
-        exit 0
-      fi
-      if output="$(format_located_answer "$recovered_named_locations")" &&
-          [[ -n "${output//[[:space:]]/}" ]]; then
-        printf '%s' "$output"
-        exit 0
-      fi
+      printf '%s\n' "$recovered_named_locations"
+      exit 0
     fi
     if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
       hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
@@ -4429,7 +4432,11 @@ if [[ "$search_uses_local_model" == true ]]; then
 fi
 if [[ "$message_mode" != true &&
       ( -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ) ]]; then
-  if output="$(emit_synthesized_source_answer)" && [[ -n "$(compact_search_locations "$output")" ]]; then
+  if recovered_named_locations="$(collect_named_symbol_locations || true)" &&
+      [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
+    output="$recovered_named_locations"
+    recovered_from_candidates=true
+  elif output="$(emit_synthesized_source_answer)" && [[ -n "$(compact_search_locations "$output")" ]]; then
     :
   else
     printf '%s\n' 'pbi: no source locations found' >&2
