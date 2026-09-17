@@ -592,8 +592,23 @@ compact_search_locations() {
   local line file location suffix relative symbol line_start line_end line_number
   local allow_outside definition_line first_symbol_line deadline_ns="${4:-}"
   local -A seen_compact_locations=()
+  local input="$1"
   symbol="${2:-}"
   allow_outside="${3:-false}"
+  # Named-symbol compact `path:N` stamps use the same File: remap as snippets.
+  if [[ -n "$symbol" ]]; then
+    input="$(printf '%s\n' "$1" | awk '
+      /^File:[[:space:]]+/ { print; next }
+      /^[[:alnum:]_./-]+:[[:digit:]]+$/ {
+        n = split($0, parts, ":")
+        line = parts[n]
+        file = substr($0, 1, length($0) - length(line) - 1)
+        print "File: " file ", Lines: " line "-" line
+        next
+      }
+      { print }
+    ')"
+  fi
   while IFS= read -r line; do
     if [[ "$line" =~ ^File:[[:space:]]+(.+)$ ]]; then
       file="${BASH_REMATCH[1]}"
@@ -619,7 +634,16 @@ compact_search_locations() {
           if [[ -n "$definition_line" ]] && ((definition_line >= line_start && (line_end == 0 || definition_line <= line_end))); then
             line_number="$definition_line"
           elif [[ -n "$first_symbol_line" ]] && ((first_symbol_line >= line_start && (line_end == 0 || first_symbol_line <= line_end))); then
-            line_number="$first_symbol_line"
+            in_range_definition="$(named_symbol_definition_line "$file" "$symbol" definition "$line_start" "$line_end" "$deadline_ns")"
+            fast_path_deadline_reached "$deadline_ns" && return 1
+            if [[ -n "$in_range_definition" ]]; then
+              line_number="$in_range_definition"
+            elif [[ -n "$definition_line" ]]; then
+              # Snippet mention (docstring :class:`Symbol`) is not the definition.
+              line_number="$definition_line"
+            else
+              line_number="$first_symbol_line"
+            fi
           elif [[ "$allow_outside" == true && -n "$definition_line" ]]; then
             line_number="$definition_line"
           elif [[ "$allow_outside" == true && ( -n "${candidates:-}" || -n "${bm25_candidates:-}" ) ]]; then
@@ -663,7 +687,7 @@ compact_search_locations() {
       seen_compact_locations["$location"]=1
       printf '%s\n' "$location"
     fi
-  done <<<"$1"
+  done <<<"$input"
 }
 
 emit_bm25_locations_or_fail_closed() {
@@ -3856,7 +3880,7 @@ case "${1:-}" in
     if [[ -n "$symbol" ]]; then
       supplemental_candidates="$(remaining_file_candidates "$candidates" "${search_pattern_parts[*]}")"
       if [[ -n "$supplemental_candidates" ]]; then
-        supplemental_locations="$(compact_search_locations "$supplemental_candidates")"
+        supplemental_locations="$(compact_search_locations "$supplemental_candidates" "$symbol")"
         if [[ -n "$supplemental_locations" ]]; then
           search_fallback_locations="$({
             printf '%s\n' "$search_fallback_locations"
