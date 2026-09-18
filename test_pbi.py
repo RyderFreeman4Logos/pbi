@@ -204,6 +204,89 @@ class PbiTest(unittest.TestCase):
         self.assertIn("cleanup_deadline", result.stderr)
         self.assertIn("Missing: requested relationship edge", result.stderr)
 
+    def test_default_lifecycle_versus_rejects_definition_only(self) -> None:
+        # #244: a where-does descendant-versus-owner shutdown query must not
+        # treat a named-symbol definition as complete source success.
+        question = (
+            "Where does ProcessRegistry _terminate_host_pid handle descendant "
+            "termination versus owner SIGTERM?"
+        )
+        sources = {
+            "tools/process_registry.py": (
+                "class ProcessRegistry:\n"
+                "    def _terminate_host_pid(self, host_pid):\n"
+                "        return host_pid\n"
+            ),
+            "apps/bootstrap-installer/src-tauri/src/update.rs": (
+                "fn unrelated_update() { let _ = 899; }\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), question, sources
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(trace.exists(), "definition-only versus queries must skip Probe Chat")
+        self.assertNotRegex(result.stdout, r"(?m)^The source shows def _terminate_host_pid")
+        self.assertNotIn("apps/bootstrap-installer", output)
+        self.assertRegex(
+            result.stderr,
+            r"pbi: (?:partial source answer|no source locations found)|Missing: requested (?:target groups|relationship edge|lifecycle stage coverage)",
+        )
+
+    def test_search_lifecycle_symbol_bag_rejects_first_symbol_definition_only(self) -> None:
+        # #244: a multi-symbol terminate/kill bag must not succeed from the
+        # first definition when descendant/kill/consume relationship sites
+        # are absent.
+        query = "_terminate_host_pid denied_descendant_pids kill_process consume_output"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "tools").mkdir()
+            (repo / "tools" / "process_registry.py").write_text(
+                "class ProcessRegistry:\n"
+                "    def _terminate_host_pid(self, host_pid):\n"
+                "        return host_pid\n"
+                "    def denied_descendant_pids(self):\n"
+                "        return ()\n"
+                "    def kill_process(self, pid):\n"
+                "        return pid\n"
+                "    def consume_output(self, proc):\n"
+                "        return b''\n"
+            )
+            (repo / "apps").mkdir()
+            update = repo / "apps" / "update.rs"
+            update.parent.mkdir(parents=True, exist_ok=True)
+            update.write_text("fn unrelated_update() { let _ = 899; }\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {update}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                "search",
+                query,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(trace.exists(), "incomplete lifecycle bags must skip Probe Chat")
+        self.assertNotIn("apps/update.rs", output)
+        self.assertNotRegex(result.stdout, r"(?m)^tools/process_registry\.py:\d+")
+        self.assertRegex(
+            result.stderr,
+            r"pbi: (?:partial source answer|no source locations found)|Missing: requested (?:target groups|relationship edge|lifecycle stage coverage)",
+        )
+
     def test_default_named_file_query_rejects_unrelated_stamps(self) -> None:
         sources = {
             "install.sh": (
