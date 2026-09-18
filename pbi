@@ -13,6 +13,8 @@ readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"
 readonly DEFAULT_SEARCH_MAX_RESULTS="8"
 readonly DEFAULT_PLANNER_TIMEOUT_SECONDS="45"
 readonly DEFAULT_CHAT_TIMEOUT_SECONDS="30"
+# Leave 10s under the caller's 180s outer timeout for TERM/KILL/reap.
+readonly DEFAULT_QUERY_DEADLINE_SECONDS="170"
 
 usage() {
   printf '%s\n' "pbi ${PBI_VERSION} — Probe Chat wrapper"
@@ -252,6 +254,7 @@ normalize_probe_exit() {
 
 active_timeout_pid=
 active_timeout_diagnostic=
+query_deadline_ns=
 # Default TERM grace for run_timed_command; the fast path shortens it so the
 # KILL/reap fits inside its absolute deadline.
 fast_path_kill_after="1s"
@@ -315,6 +318,25 @@ run_timed_command() {
     wait "$timed_pid" 2>/dev/null || true
   fi
   return "$status"
+}
+
+emit_query_deadline_timeout() {
+  printf '%s\n' 'pbi: timed out before producing a source answer' >&2
+  exit 1
+}
+
+capped_timeout_or_deadline() {
+  local requested="$1" remaining_ns requested_ns
+  [[ "$requested" =~ ^[1-9][0-9]*$ ]] || return 1
+  if [[ ! "$query_deadline_ns" =~ ^[[:digit:]]+$ ]]; then
+    printf '%s' "$requested"
+    return 0
+  fi
+  remaining_ns=$((query_deadline_ns - $(fast_path_now_ns) - 1100000000))
+  ((remaining_ns > 0)) || return 1
+  requested_ns=$((requested * 1000000000))
+  ((remaining_ns < requested_ns)) && requested_ns=$remaining_ns
+  printf '%d.%03d' "$((requested_ns / 1000000000))" "$((requested_ns % 1000000000 / 1000000))"
 }
 
 fast_path_remaining_timeout() {
@@ -3671,11 +3693,12 @@ planner_status=0
 planner_had_system_message_warning=false
 
 run_planner() {
-  local stderr_file planner_stdout_file
+  local stderr_file planner_stdout_file timeout_seconds
+  timeout_seconds="$(capped_timeout_or_deadline "$planner_timeout_seconds")" || emit_query_deadline_timeout
   allocate_temp_file stderr_file
   allocate_temp_file planner_stdout_file
   active_timeout_diagnostic='pbi: planner timed out before producing a source answer'
-  if run_timed_command "$planner_timeout_seconds" "$planner_stdout_file" "$stderr_file" "$agent_command" "$@"; then
+  if run_timed_command "$timeout_seconds" "$planner_stdout_file" "$stderr_file" "$agent_command" "$@"; then
     planner_status=0
   else
     planner_status=$?
@@ -3689,6 +3712,27 @@ run_planner() {
   fi
   planner_stdout="$(strip_probe_chrome "$planner_stdout")"
   planner_stderr="$(strip_probe_chrome "$planner_stderr")"
+}
+
+run_bounded_probe_search() {
+  local planned_query="$1" output_file timeout_seconds status
+  timeout_seconds="$(capped_timeout_or_deadline "$DEFAULT_SEARCH_TIMEOUT_SECONDS")" || emit_query_deadline_timeout
+  allocate_temp_file output_file
+  active_timeout_diagnostic='pbi: timed out before producing a source answer'
+  if run_timed_command "$timeout_seconds" "$output_file" "$output_file" \
+      "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
+      --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
+      --reranker bm25 --format plain -- "$planned_query"; then
+    status=0
+  else
+    status=$?
+  fi
+  active_timeout_diagnostic=
+  candidate_batch="$(<"$output_file")"
+  if planner_timeout_or_kill "$status"; then
+    emit_query_deadline_timeout
+  fi
+  ((status == 0))
 }
 
 configure_local_routing() {
@@ -4110,6 +4154,7 @@ else
     exit 2
   fi
   question="${message_parts[*]}"
+  query_deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_QUERY_DEADLINE_SECONDS * 1000000000 ))
   if output="$(explicit_removed_or_renamed_symbol_history "$question")"; then
     printf '%s' "$output"
     exit 0
@@ -4208,9 +4253,7 @@ else
   fi
   candidates=""
   while IFS= read -r planned_query; do
-    if ! candidate_batch="$("$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
-        --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
-        --reranker bm25 --format plain -- "$planned_query" 2>&1)"; then
+    if ! run_bounded_probe_search "$planned_query"; then
       printf '%s\n' "$candidate_batch" >&2
       exit 1
     fi
@@ -4265,9 +4308,7 @@ else
       break
     fi
     while IFS= read -r planned_query; do
-      if candidate_batch="$("$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
-          --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
-          --reranker bm25 --format plain -- "$planned_query" 2>&1)" && \
+      if run_bounded_probe_search "$planned_query" && \
           [[ -n "$(compact_search_locations "$candidate_batch")" ]]; then
         candidates+=$'\n\n'"$candidate_batch"
       fi
@@ -4323,8 +4364,9 @@ configure_local_routing
 
 allocate_temp_file probe_stdout_file
 allocate_temp_file probe_stderr_file
+remaining_chat_timeout="$(capped_timeout_or_deadline "$chat_timeout_seconds")" || emit_query_deadline_timeout
 active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
-if run_timed_command "$chat_timeout_seconds" "$probe_stdout_file" "$probe_stderr_file" \
+if run_timed_command "$remaining_chat_timeout" "$probe_stdout_file" "$probe_stderr_file" \
     "$agent_command" --force-provider openai --model-name "$primary_model" "${chat_args[@]}"; then
   status=0
 else
@@ -4394,7 +4436,8 @@ if [[ "$explore_uses_local_model" == true ]]; then
   )
   allocate_temp_file reviewed_output_file
   active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
-  if run_timed_command "$chat_timeout_seconds" "$reviewed_output_file" "$reviewed_output_file" \
+  if remaining_chat_timeout="$(capped_timeout_or_deadline "$chat_timeout_seconds")" &&
+      run_timed_command "$remaining_chat_timeout" "$reviewed_output_file" "$reviewed_output_file" \
       "$agent_command" --force-provider openai --model-name "$primary_model" "${review_args[@]}"; then
     reviewed_output="$(<"$reviewed_output_file")"
     reviewed_output="$(strip_probe_chrome "$reviewed_output")"
@@ -4410,7 +4453,8 @@ if [[ "$explore_uses_local_model" == true ]]; then
   )
   allocate_temp_file audited_output_file
   active_timeout_diagnostic='pbi: probe-chat timed out answering the question'
-  if run_timed_command "$chat_timeout_seconds" "$audited_output_file" "$audited_output_file" \
+  if remaining_chat_timeout="$(capped_timeout_or_deadline "$chat_timeout_seconds")" &&
+      run_timed_command "$remaining_chat_timeout" "$audited_output_file" "$audited_output_file" \
       "$agent_command" --force-provider openai --model-name "$primary_model" "${audit_args[@]}"; then
     audited_output="$(<"$audited_output_file")"
     audited_output="$(strip_probe_chrome "$audited_output")"

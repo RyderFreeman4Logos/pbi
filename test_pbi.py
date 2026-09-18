@@ -2929,6 +2929,69 @@ class PbiTest(unittest.TestCase):
         self.assertTrue(planner_started, "unrelated BM25 leftovers must fall through")
         self.assertNotIn("unrelated.py:", result.stdout + result.stderr)
 
+    def test_default_query_deadline_fails_closed_before_caller_timeout(self) -> None:
+        # #268: leftover BM25 that falls through to planner must not hang on
+        # unbounded probe search past the caller's 180s deadline.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            unrelated = source_dir / "unrelated.py"
+            unrelated.write_text("# unrelated candidate\n" * 7)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "if '--dry-run' in sys.argv:\n"
+                f"    print('File: {unrelated}, Lines: 5-5')\n"
+                f"    print('File: {unrelated}, Lines: 7-7')\n"
+                "else:\n"
+                "    time.sleep(30)\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    for query in ('query one', 'query two', 'query three', 'query four', 'query five'):\n"
+                "        print(query)\n"
+                "else:\n"
+                "    print('NONE')\n"
+            )
+            fake_chat.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(
+                binary.read_text().replace(
+                    'readonly DEFAULT_QUERY_DEADLINE_SECONDS="170"',
+                    'readonly DEFAULT_QUERY_DEADLINE_SECONDS="2"',
+                )
+            )
+            binary.chmod(0o755)
+            started = time.monotonic()
+            try:
+                result = self.run_pbi(
+                    "where is compression publication and cache key assembly?",
+                    env=env,
+                    cwd=repo,
+                    binary=binary,
+                    timeout=8,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(
+                    f"default query must fail closed before the caller deadline: {error}"
+                )
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, "pbi: timed out before producing a source answer\n"
+        )
+        self.assertLess(elapsed, 6)
+
     def test_default_query_timeout_recovers_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
