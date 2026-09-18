@@ -3260,6 +3260,71 @@ class PbiTest(unittest.TestCase):
         self.assertIn("no source location", result.stderr)
         self.assertNotIn("unrelated.py", result.stdout + result.stderr)
 
+    def test_default_where_is_full_symbol_rejects_budget_tail_false_positive(self) -> None:
+        # #265: default compact must not rc0 an unrelated BM25 stamp that only
+        # matches a 6-char tail of the queried symbol. Named recovery skips
+        # the real non-test Rust fn under tests/.
+        question = (
+            "Where is rest_gate_fuser_diagnostic_cannot_outlive_lock_budget defined?"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            unrelated = repo / "src" / "core" / "db_admission_budget.rs"
+            real = repo / "tests" / "support" / "rest_gate.rs"
+            unrelated.parent.mkdir(parents=True)
+            real.parent.mkdir(parents=True)
+            unrelated.write_text("\n" * 55 + "fn budget_exceeded_reason() {}\n")
+            real.write_text(
+                "fn rest_gate_fuser_diagnostic_cannot_outlive_lock_budget() {}\n"
+            )
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {unrelated}, Lines: 56-56')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys, time\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'a') as f:\n"
+                "    f.write(message.splitlines()[0] + '\\n')\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    time.sleep(30)\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=8,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotRegex(
+            result.stdout,
+            r"(?m)^src/core/db_admission_budget\.rs:56$",
+            output,
+        )
+        if result.returncode == 0:
+            self.assertIn(
+                "rest_gate_fuser_diagnostic_cannot_outlive_lock_budget",
+                result.stdout,
+            )
+            self.assertNotIn("budget_exceeded_reason", result.stdout)
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertEqual(result.stdout, "")
+            self.assertRegex(
+                result.stderr,
+                r"pbi: (?:no source locations found|no source location contains the queried symbol|model returned only BM25 location stamps; no source answer)",
+            )
+        self.assertFalse(trace.exists(), "full-symbol miss must skip Probe Chat")
+
     def test_default_query_without_identifier_tokens_does_not_silent_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

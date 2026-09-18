@@ -2487,9 +2487,13 @@ source_answer_has_semantic_evidence() {
 }
 
 emit_source_locations() {
-  local locations="$1" answer
+  local locations="$1" answer symbol
   locations="$(compact_search_locations "$locations")" || return 1
   [[ -n "${locations//[[:space:]]/}" ]] || return 1
+  symbol="$(search_named_symbol "${question:-}")"
+  if [[ -n "$symbol" ]] && ! search_output_contains_symbol "$locations" "$symbol"; then
+    return 1
+  fi
   if question_requests_semantic_evidence "${question:-}" ||
       question_is_multi_target_where "${question:-}" ||
       question_is_keyword_bag "${question:-}"; then
