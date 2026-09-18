@@ -698,6 +698,8 @@ emit_bm25_locations_or_fail_closed() {
       exit 0
     fi
     [[ "${semantic_trace_partial_emitted:-false}" == true ]] && exit 1
+    printf '%s\n' 'pbi: no source locations found' >&2
+    exit 1
   fi
   mapfile -t named_files < <(named_query_files "${question:-}")
   if ((${#named_files[@]} > 0)) && ! question_requires_semantic_trace "${question:-}"; then
@@ -761,7 +763,8 @@ emit_bm25_locations_or_fail_closed() {
 emit_search_locations_or_fail_closed() {
   local recovered_locations
   search_final_selection=true
-  if recovered_locations="$(recover_distinctive_source_locations "" false || true)" &&
+  if ! question_requires_semantic_trace "${question:-}" &&
+      recovered_locations="$(recover_distinctive_source_locations "" false || true)" &&
       [[ -n "${recovered_locations//[[:space:]]/}" ]] &&
       emit_source_locations "$recovered_locations"; then
     exit 0
@@ -2027,6 +2030,9 @@ select_query_relevant_locations() {
 collect_named_symbol_locations() {
   local deadline_ns="${1:-}" recovered="" candidate_symbol candidate_locations hyphen_locations loc
   local -A seen_named_locations=()
+  # Definition stamps are not relationship evidence. Semantic-trace callers
+  # recover named symbols themselves and fail closed on a missing edge.
+  question_requires_semantic_trace "${question:-}" && return 1
   while IFS= read -r candidate_symbol; do
     fast_path_deadline_reached "$deadline_ns" && break
     [[ -n "$candidate_symbol" ]] || continue
@@ -2357,7 +2363,11 @@ question_describes_lifecycle_investigation() {
   for phase in 'setup|initiali[sz]' 'spawn|start|launch|daemon' 'ready|readiness|wait' 'teardown|cleanup|shutdown|stop'; do
     [[ "$q" =~ (^|[^[:alnum:]])($phase)([^[:alnum:]]|$) ]] && phase_count=$((phase_count + 1))
   done
-  ((phase_count >= 3))
+  ((phase_count >= 3)) && return 0
+  # Shutdown ownership contrast: descendant/SIGTERM versus terminate/kill.
+  # Ordinary one-target named-symbol lookups do not match this pair.
+  [[ "$q" =~ (^|[^[:alnum:]])(descendant|sigterm)([^[:alnum:]]|$) ]] || return 1
+  [[ "$q" =~ (^|[^[:alnum:]])(terminate|termination|kill|shutdown|stop)([^[:alnum:]]|$) ]]
 }
 
 question_requires_semantic_trace() {
@@ -4006,8 +4016,10 @@ case "${1:-}" in
       emit_search_locations_or_fail_closed
     fi
     if [[ -n "$symbol" ]] && search_output_contains_symbol "$search_fallback_locations" "$symbol"; then
-      printf '%s\n' "$search_fallback_locations"
-      exit 0
+      if ! question_requires_semantic_trace "${question:-}"; then
+        printf '%s\n' "$search_fallback_locations"
+        exit 0
+      fi
     fi
     emit_search_locations_or_fail_closed
     ;;
