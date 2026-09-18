@@ -5946,6 +5946,80 @@ class PbiTest(unittest.TestCase):
         self.assertFalse(trace.exists(), "an absent named symbol must not invoke Probe Chat")
         self.assertLess(elapsed, 5)
 
+    def test_search_hyphen_prose_does_not_fail_closed_when_supervisor_cleanup_exists(self) -> None:
+        # #271: "early-success" is hyphen-rewritten to early_success and must
+        # not exclusive-fail when Supervisor.cleanup is present in source.
+        query = "Supervisor cleanup early-success snapshots"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "scripts" / "gates" / "cargo-test-with-timeout.py"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "class Supervisor:\n"
+                "    def cleanup(self):\n"
+                "        return True\n"
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-3')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "exit 23\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", *query.split(), env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        combined = result.stdout + result.stderr
+        self.assertNotIn("pbi: no source location contains the queried symbol", combined)
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn("cargo-test-with-timeout.py:", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "present source must skip Probe Chat")
+
+    def test_search_present_filename_stem_does_not_fail_closed(self) -> None:
+        # #270: a present integration-test filename must return a path stamp,
+        # not exclusive-fail because the stem is absent from file contents.
+        filename = "local_gate_cleanup_streaming.rs"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / filename
+            source.write_text("fn present() {\n    let _ = 1;\n}\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-3')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$PBI_TEST_TRACE\"\n"
+                "exit 23\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", filename, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=5,
+            )
+        combined = result.stdout + result.stderr
+        self.assertNotIn("pbi: no source location contains the queried symbol", combined)
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn(f"{filename}:", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "present filename must skip Probe Chat")
+
     def test_search_prefers_named_symbol_definition_over_import_mention(self) -> None:
         symbol = "TargetSymbol"
         with tempfile.TemporaryDirectory() as temporary:

@@ -1748,6 +1748,35 @@ search_named_symbol() {
   search_named_symbols "$1" | awk 'NR == 1 { first = $0 } END { print first }'
 }
 
+# Hyphen-rewritten prose and filename stems are not exclusive identifiers.
+# Keep fail-closed for real identifiers that were present as such in the query.
+named_symbol_is_exclusive() {
+  local symbol="$1" query="$2"
+  [[ -n "$symbol" ]] || return 1
+  [[ "$query" == *.* && "$query" == *"$symbol"* ]] && return 1
+  [[ "$query" == *"$symbol"* ]]
+}
+
+# TitleCase words are identifiers in source even when search_named_symbols
+# skipped them. Recover them only after a non-exclusive hyphen/filename miss.
+recover_titlecase_named_locations() {
+  local deadline_ns="${1:-}" recovered="" candidate_symbol candidate_locations loc
+  local -A seen_titlecase_locations=()
+  while IFS= read -r candidate_symbol; do
+    [[ "$candidate_symbol" =~ ^[A-Z][a-z][A-Za-z0-9]*$ ]] || continue
+    candidate_locations="$(recover_named_symbol_definition "$candidate_symbol" "$deadline_ns" || true)"
+    [[ -n "$candidate_locations" ]] || continue
+    while IFS= read -r loc; do
+      [[ -n "$loc" ]] || continue
+      [[ -z "${seen_titlecase_locations[$loc]+seen}" ]] || continue
+      seen_titlecase_locations["$loc"]=1
+      recovered+="${recovered:+$'\n'}$loc"
+    done <<< "$candidate_locations"
+  done < <(printf '%s\n' "${question:-}" | awk '{ for (i = 1; i <= NF; i++) print $i }')
+  [[ -n "${recovered//[[:space:]]/}" ]] || return 1
+  printf '%s\n' "$recovered"
+}
+
 # True iff any location line in $1 references a file that actually contains
 # the given token (i.e. the returned path is not an unrelated wrong file).
 search_output_contains_symbol() {
@@ -2513,7 +2542,8 @@ emit_source_locations() {
   locations="$(compact_search_locations "$locations")" || return 1
   [[ -n "${locations//[[:space:]]/}" ]] || return 1
   symbol="$(search_named_symbol "${question:-}")"
-  if [[ -n "$symbol" ]] && ! search_output_contains_symbol "$locations" "$symbol"; then
+  if named_symbol_is_exclusive "$symbol" "${question:-}" &&
+      ! search_output_contains_symbol "$locations" "$symbol"; then
     return 1
   fi
   if question_requests_semantic_evidence "${question:-}" ||
@@ -4025,12 +4055,21 @@ case "${1:-}" in
       if [[ -z "$search_fallback_locations" && -n "${candidates//[[:space:]]/}" ]]; then
         search_fallback_locations="$(recover_named_symbol_definition "$symbol" "" occurrence || true)"
       fi
-      if [[ -z "$search_fallback_locations" ]]; then
+      if [[ -z "$search_fallback_locations" ]] &&
+          named_symbol_is_exclusive "$symbol" "${search_pattern_parts[*]}"; then
         symbol_scan_status=0
         repo_contains_named_symbol "$symbol" || symbol_scan_status=$?
         if [[ "$symbol_scan_status" -eq 1 ]]; then
           printf "%s\n" "pbi: no source location contains the queried symbol" >&2
           exit 1
+        fi
+      fi
+      if [[ -z "$search_fallback_locations" ]] &&
+          ! named_symbol_is_exclusive "$symbol" "${search_pattern_parts[*]}"; then
+        search_fallback_locations="$(recover_titlecase_named_locations || true)"
+        if [[ -n "$search_fallback_locations" ]]; then
+          printf '%s\n' "$search_fallback_locations"
+          exit 0
         fi
       fi
     fi
@@ -4533,8 +4572,11 @@ if [[ "$explore_uses_local_model" == true ]]; then
         recovered_from_candidates=true
       else
         symbol_scan_status=1
+        exclusive_absent=false
         while IFS= read -r candidate_symbol; do
           [[ -n "$candidate_symbol" ]] || continue
+          named_symbol_is_exclusive "$candidate_symbol" "$question" || continue
+          exclusive_absent=true
           candidate_scan_status=0
           repo_contains_named_symbol "$candidate_symbol" || candidate_scan_status=$?
           if [[ "$candidate_scan_status" -eq 2 ]]; then
@@ -4543,7 +4585,9 @@ if [[ "$explore_uses_local_model" == true ]]; then
             symbol_scan_status=0
           fi
         done <<<"$named_symbols"
-        if [[ "$symbol_scan_status" -eq 1 ]]; then
+        if [[ "$exclusive_absent" != true ]]; then
+          printf '%s\n' 'pbi: no source locations found' >&2
+        elif [[ "$symbol_scan_status" -eq 1 ]]; then
           printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
         else
           printf '%s\n' 'pbi: no source locations found' >&2
@@ -4584,7 +4628,8 @@ if [[ "${recovered_from_candidates:-false}" != true ]]; then
 fi
 if [[ "$search_uses_local_model" == true ]]; then
   symbol="$(search_named_symbol "${search_pattern_parts[*]}")"
-  if [[ -n "$symbol" ]] && ! search_output_contains_symbol "$output" "$symbol"; then
+  if named_symbol_is_exclusive "$symbol" "${search_pattern_parts[*]}" &&
+      ! search_output_contains_symbol "$output" "$symbol"; then
     printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
     exit 1
   fi
