@@ -1045,7 +1045,6 @@ question_is_keyword_bag() {
   [[ "$q" =~ ^[[:alnum:]_-]+:[[:alnum:]_-]+$ ]] && return 0
   # Identifier-free keyword bags need a quoted line. Hyphenated tokens stay compact.
   [[ "$q" =~ (^|[[:space:]])(why|how|explain|where|find|locate|which|show|classify)([[:space:]]|$) ]] && return 1
-  [[ -n "$(search_named_symbols "$1")" ]] && return 1
   [[ -n "$(named_query_files "$1")" ]] && return 1
   while IFS= read -r token; do
     token="${token,,}"
@@ -1947,8 +1946,10 @@ run_default_bm25_fast_path() {
   candidate_symbols="$(search_named_symbols "${question:-}")"
   recovered_named_locations="$(collect_named_symbol_locations "$deadline_ns" || true)"
   if [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
-    printf '%s\n' "$recovered_named_locations"
-    return 0
+    if question_allows_compact_stamp "${question:-}"; then
+      printf '%s\n' "$recovered_named_locations"
+      return 0
+    fi
   fi
   if question_requires_semantic_trace "${question:-}"; then
     if emit_semantic_trace_from_candidates "$deadline_ns"; then
