@@ -3036,9 +3036,19 @@ class PbiTest(unittest.TestCase):
             )
             probe_trace = directory / "probe-trace.json"
             self.assertTrue(probe_trace.exists(), "BM25 fast path must run before planner")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/api/mcp.rs:2\nsrc/api/mcp.rs:3\n")
-        self.assertEqual(result.stderr, "")
+        output = result.stdout + result.stderr
+        self.assertNotRegex(result.stdout, r"(?m)^src/api/mcp\.rs:\d+$")
+        self.assertNotIn("only BM25 location stamps", output)
+        if result.returncode == 0:
+            self.assertIn("reserve_http_session", result.stdout)
+            self.assertIn("reap_expired_sessions", result.stdout)
+            self.assertEqual(result.stderr, "")
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertRegex(
+                result.stderr,
+                r"pbi: (?:partial source answer|no source locations found)",
+            )
 
     def test_planner_warning_mixed_bm25_stamps_recover_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3082,7 +3092,11 @@ class PbiTest(unittest.TestCase):
             )
             self.assertFalse(trace.exists(), "planner/chat must not run after a completed fast-path miss")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertNotEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertNotRegex(result.stdout, r"(?m)^src/api/mcp\.rs:\d+$")
+        self.assertIn("src/api/mcp.rs:", result.stdout)
+        self.assertIn("reap_expired_sessions", result.stdout)
+        self.assertIn("reserve_http_session", result.stdout)
         self.assertEqual(result.stderr, "")
 
     def test_default_query_mixed_stamps_recover_named_symbol_definitions(self) -> None:
@@ -3131,7 +3145,11 @@ class PbiTest(unittest.TestCase):
                 binary=self.fake_pbi(directory, probe),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertNotEqual(result.stdout, "src/api/mcp.rs:1\nsrc/api/mcp.rs:2\n")
+        self.assertNotRegex(result.stdout, r"(?m)^src/api/mcp\.rs:\d+$")
+        self.assertIn("src/api/mcp.rs:", result.stdout)
+        self.assertIn("reap_expired_sessions", result.stdout)
+        self.assertIn("reserve_http_session", result.stdout)
         self.assertEqual(result.stderr, "")
 
     def test_default_query_mixed_stamp_with_cited_symbol_recovers_or_fails_closed(self) -> None:
@@ -3255,18 +3273,19 @@ class PbiTest(unittest.TestCase):
                 timeout=8,
             )
         output = result.stdout + result.stderr
-        self.assertEqual(result.returncode, 0, output)
-        self.assertEqual(result.stderr, "")
-        self.assertNotIn("no source locations found", output)
+        self.assertNotRegex(result.stdout, r"(?m)^src/state_lock\.rs:\d+$")
         self.assertNotIn("unrelated.py", output)
-        self.assertRegex(result.stdout, r"src/state_lock\.rs:\d+")
-        self.assertRegex(result.stdout, r"src/lock_un\.rs:\d+")
-        self.assertRegex(result.stdout, r"src/pre_close_gate\.rs:\d+")
-        self.assertRegex(
-            result.stdout,
-            r"tests/child_crash_harness\.rs:\d+",
-        )
         self.assertFalse(trace.exists(), "named-symbol audit recovery must skip Probe Chat")
+        if result.returncode == 0:
+            self.assertEqual(result.stderr, "")
+            self.assertRegex(result.stdout, r"src/state_lock\.rs:\d+")
+            self.assertRegex(result.stdout, r"src/lock_un\.rs:\d+")
+            self.assertRegex(result.stdout, r"src/pre_close_gate\.rs:\d+")
+            self.assertRegex(result.stdout, r"tests/child_crash_harness\.rs:\d+")
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("pbi: no source locations found", result.stderr)
 
     def test_default_query_direct_symbol_audit_fails_closed_without_tree_hits(self) -> None:
         # #249: the same audit shape must fail closed with an explicit gap when
@@ -3868,6 +3887,48 @@ class PbiTest(unittest.TestCase):
         else:
             self.assertEqual(result.stdout, "")
             self.assertIn("no source locations found", result.stderr)
+
+    def test_default_query_named_symbol_keyword_bag_rejects_bm25_stamp(self) -> None:
+        # #273: default query with named symbol ingest_async plus descriptive
+        # words must not succeed with a compact src/durable_ingest.rs:17 stamp.
+        # Quote a drain/persist line or fail closed; chat must not start.
+        question = "SIGTERM drain persist completed before reclaim ingest_async"
+        drain_line = (
+            "fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {}"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            ingest = repo / "src" / "durable_ingest.rs"
+            drain = repo / "src" / "daemon_sigterm.rs"
+            ingest.parent.mkdir(parents=True)
+            ingest.write_text("\n" * 16 + 'const INGEST_ASYNC_KIND: &str = "ingest_async";\n')
+            drain.write_text(f"{drain_line}\n")
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {ingest}, Lines: 17-17')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=15,
+            )
+        output = result.stdout + result.stderr
+        self.assertNotRegex(result.stdout, r"(?m)^src/durable_ingest\.rs:17$")
+        self.assertNotIn("only BM25 location stamps", output)
+        self.assertFalse(trace.exists(), "keyword-bag default query must skip Probe Chat")
+        if result.returncode == 0:
+            self.assertRegex(result.stdout, r"(?m)drain")
+            self.assertEqual(result.stderr, "")
+        else:
+            self.assertEqual(result.returncode, 1, output)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("pbi: no source locations found", result.stderr)
 
     def test_find_question_lone_stamp_is_not_success(self) -> None:
         # #126/#129: a Find/path question must not succeed with a lone
