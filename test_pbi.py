@@ -3032,6 +3032,85 @@ class PbiTest(unittest.TestCase):
         )
         self.assertLess(elapsed, 6)
 
+    def test_default_query_expired_recovery_skips_planner_and_second_search(self) -> None:
+        # #277: default-mode recovery after a fast-path miss must honor the
+        # existing overall deadline instead of starting planner or a second search.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source_dir = repo / "src"
+            source_dir.mkdir(parents=True)
+            unrelated = source_dir / "unrelated.py"
+            unrelated.write_text("# unrelated candidate\n" * 7)
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys, time\n"
+                "if '--dry-run' in sys.argv:\n"
+                f"    print('File: {unrelated}, Lines: 5-5')\n"
+                f"    print('File: {unrelated}, Lines: 7-7')\n"
+                "else:\n"
+                "    with open(os.environ['PBI_TEST_PROBE_TRACE'], 'w') as trace:\n"
+                "        trace.write('second-search')\n"
+                "    time.sleep(30)\n"
+            )
+            probe.chmod(0o755)
+            blocked_rg = directory / "rg"
+            blocked_rg.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            blocked_rg.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "with open(os.environ['PBI_TEST_TRACE'], 'w') as trace:\n"
+                "    trace.write('planner')\n"
+                "message = sys.argv[sys.argv.index('--message') + 1]\n"
+                "if message.startswith('Convert the code question'):\n"
+                "    for query in ('query one', 'query two', 'query three', 'query four', 'query five'):\n"
+                "        print(query)\n"
+                "else:\n"
+                "    print('NONE')\n"
+            )
+            fake_chat.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(
+                binary.read_text()
+                .replace(
+                    'readonly DEFAULT_QUERY_DEADLINE_SECONDS="170"',
+                    'readonly DEFAULT_QUERY_DEADLINE_SECONDS="2"',
+                )
+                .replace(
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                    'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="1"',
+                )
+            )
+            binary.chmod(0o755)
+            started = time.monotonic()
+            try:
+                result = self.run_pbi(
+                    "where does compression publication and cache key assembly happen?",
+                    env=env,
+                    cwd=repo,
+                    binary=binary,
+                    timeout=8,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(
+                    f"expired recovery must honor the overall deadline: {error}"
+                )
+            elapsed = time.monotonic() - started
+            planner_trace = directory / "trace.json"
+            second_search_trace = directory / "probe-trace.json"
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(planner_trace.exists(), "expired recovery must not start planner")
+        self.assertFalse(second_search_trace.exists(), "expired recovery must not start a second search")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, "pbi: timed out before producing a source answer\n"
+        )
+        self.assertLess(elapsed, 6)
+
     def test_default_query_timeout_recovers_named_symbol_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -6949,6 +7028,51 @@ class PbiTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "pbi: no source locations found\n")
+
+    def test_search_timeout_partial_stamp_blocks_unbounded_recovery(self) -> None:
+        # #276: a timed-out search with leftover BM25 stamps must not escape
+        # the existing search budget into unbounded source recovery.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            source = repo / "stamp.py"
+            source.write_text("unrelated = True\n")
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env bash\n"
+                f"printf 'File: {source}, Lines: 1-1\\n'\n"
+                "sleep 30\n"
+            )
+            probe.chmod(0o755)
+            blocked_rg = directory / "rg"
+            blocked_rg.write_text("#!/usr/bin/env bash\nsleep 30\n")
+            blocked_rg.chmod(0o755)
+            binary = self.fake_pbi(directory, probe)
+            binary.write_text(binary.read_text().replace(
+                'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="8"',
+                'readonly DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS="1"',
+            ))
+            binary.chmod(0o755)
+            started = time.monotonic()
+            try:
+                result = self.run_pbi(
+                    "search", "find", "breaker-open", "receipt", "#927",
+                    env=env,
+                    cwd=repo,
+                    binary=binary,
+                    timeout=5,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(f"timed-out search must not enter unbounded recovery: {error}")
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, "pbi: search timed out before producing source locations\n"
+        )
+        self.assertLess(elapsed, 4)
 
     def test_search_hang_fails_closed_when_candidates_lack_named_symbol(self) -> None:
         # #22: a named-symbol miss must fail closed with one exact outcome and
