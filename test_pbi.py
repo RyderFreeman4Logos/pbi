@@ -655,6 +655,46 @@ class PbiTest(unittest.TestCase):
         self.assertNotIn("only BM25 location stamps", output)
         self.assertIn("no source", result.stderr)
 
+    def test_default_keyword_query_rejects_generic_bm25_source_fragments(self) -> None:
+        # #275: generic comments and imports are not semantic source evidence.
+        query = "What are FairLance roles, dispute flow, roadmap, and MVP scope?"
+        sources = {
+            "crates/client/src/client.rs": (
+                "/// Core headless client for FairLance protocol interactions.\n"
+            ),
+            "scripts/setup-localnet.sh": (
+                "# setup-localnet.sh — Bootstrap a Solana localnet for FairLance E2E testing.\n"
+            ),
+            "crates/cli/src/commands/dispute.rs": (
+                "use fairlance_client::dispute::{AppealResolveRequest, CrankAutoApproveRequest};\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), query, sources
+            )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(trace.exists(), "generic fragments must fail closed before Probe Chat")
+        self.assertNotIn("The source shows", output)
+        self.assertNotRegex(output, r"Core headless client|setup-localnet|AppealResolveRequest")
+        self.assertIn("pbi: no source locations found", result.stderr)
+
+    def test_default_keyword_query_keeps_relevant_documentation_evidence(self) -> None:
+        # #275: a documentation line that answers the query remains admissible.
+        query = "What are FairLance roles, dispute flow, roadmap, and MVP scope?"
+        line = "/// FairLance roles define dispute flow; roadmap covers MVP scope."
+        sources = {"src/fairlance.rs": f"{line}\n"}
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), query, sources
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(trace.exists(), "relevant source evidence must not invoke Probe Chat")
+        self.assertIn(line, result.stdout)
+
     def test_search_compression_keyword_query_rejects_unrelated_hint_cap_source(self) -> None:
         # #199: leftover hint/cap overlap is not a compression location.
         with tempfile.TemporaryDirectory() as temporary:

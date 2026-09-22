@@ -2500,8 +2500,11 @@ line_has_relationship_edge() {
 
 source_answer_has_semantic_evidence() {
   local answer="$1" deadline_ns="${2:-}" locations file line_number text symbol named_symbols q location_count requires_named_test_evidence=false
-  question_requests_semantic_evidence "${question:-}" ||
-    question_is_multi_target_where "${question:-}" || return 0
+  if ! question_requests_semantic_evidence "${question:-}" &&
+      ! question_is_multi_target_where "${question:-}" &&
+      ! question_is_keyword_bag "${question:-}"; then
+    return 0
+  fi
   q="${question,,}"
   locations="$(compact_search_locations "$answer" "" false "")"
   [[ -n "${locations//[[:space:]]/}" ]] || return 1
@@ -2559,12 +2562,26 @@ emit_source_locations() {
 }
 
 is_synthesis_junk_line() {
+  local concept_score
   if question_requests_stall_holder_evidence "${question:-}"; then
     line_has_stall_holder_evidence "$1" || return 0
   fi
   [[ -n "$(question_named_test_symbol "${question:-}")" && "$1" =~ ^[[:space:]]*# ]] && return 0
-  question_requests_semantic_evidence "${question:-}" &&
-    [[ "$1" =~ ^[[:space:]]*(//!|///|/\*|\*|\"\"\"|\'\'\') ]] && return 0
+  if question_requests_semantic_evidence "${question:-}" ||
+      question_is_keyword_bag "${question:-}"; then
+    if [[ "$1" =~ ^[[:space:]]*(\#|//!|///|/\*|\*|\"\"\"|\'\'\') ]]; then
+      if question_is_keyword_bag "${question:-}"; then
+        # Keyword-bag comments need two independent query concepts; one hit is a generic fragment.
+        concept_score="$(search_independent_concept_score "$1" "$(search_distinctive_tokens "${question:-}")")"
+        [[ "$concept_score" =~ ^[[:digit:]]+$ ]] || return 0
+        ((concept_score >= 2)) || return 0
+      else
+        return 0
+      fi
+    fi
+  fi
+  question_is_keyword_bag "${question:-}" &&
+    [[ "$1" =~ ^[[:space:]]*(pub[[:space:]]+)?use[[:space:]] ]] && return 0
   [[ "$1" =~ ^[[:space:]]*(import|from)[[:space:]] ]] && return 0
   # Type-name-only / import-list item is not a behavior or test-module answer.
   [[ "$1" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*,[[:space:]]*$ ]] && return 0
