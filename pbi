@@ -735,7 +735,7 @@ emit_bm25_locations_or_fail_closed() {
       -z "$(search_named_symbol "${question:-}")" &&
       ! "${question,,}" =~ (^|[[:space:]])(find|locate|which|where)[[:space:]] ]] &&
       ! question_is_keyword_bag "${question:-}" &&
-      source_answer="$(emit_synthesized_source_answer)" && [[ -n "${source_answer//[[:space:]]/}" ]]; then
+      source_answer="$(emit_synthesized_source_answer "${query_deadline_ns:-}")" && [[ -n "${source_answer//[[:space:]]/}" ]]; then
     printf '%s\n' "$source_answer"
     exit 0
   fi
@@ -783,13 +783,21 @@ emit_bm25_locations_or_fail_closed() {
 }
 
 emit_search_locations_or_fail_closed() {
-  local recovered_locations
+  local recovered_locations deadline_ns="${1:-}"
   search_final_selection=true
+  if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] && fast_path_deadline_reached "$deadline_ns"; then
+    printf '%s\n' "${search_timeout_diagnostic:-pbi: search timed out before producing source locations}" >&2
+    exit 124
+  fi
   if ! question_requires_semantic_trace "${question:-}" &&
-      recovered_locations="$(recover_distinctive_source_locations "" false || true)" &&
+      recovered_locations="$(recover_distinctive_source_locations "$deadline_ns" false || true)" &&
       [[ -n "${recovered_locations//[[:space:]]/}" ]] &&
       emit_source_locations "$recovered_locations"; then
     exit 0
+  fi
+  if [[ "$deadline_ns" =~ ^[[:digit:]]+$ ]] && fast_path_deadline_reached "$deadline_ns"; then
+    printf '%s\n' "${search_timeout_diagnostic:-pbi: search timed out before producing source locations}" >&2
+    exit 124
   fi
   emit_bm25_locations_or_fail_closed
 }
@@ -4027,8 +4035,7 @@ case "${1:-}" in
       if planner_timeout_or_kill "$search_status"; then
         # timeout shares 124/137 with a child that exits by timeout status;
         # elapsed time identifies the deadline owned by this search phase.
-        if ((search_elapsed_ns >= DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000)) &&
-            [[ -z "${candidates//[[:space:]]/}" ]]; then
+        if ((search_elapsed_ns >= DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000)); then
           printf '%s\n' "$search_timeout_diagnostic" >&2
           exit 124
         fi
@@ -4036,7 +4043,7 @@ case "${1:-}" in
           printf '%s\n' 'pbi: no source locations found' >&2
           exit 1
         fi
-        emit_search_locations_or_fail_closed
+        emit_search_locations_or_fail_closed "$((search_started_ns + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000))"
       else
         printf "%s\n" "$candidates" >&2
         exit "$search_status"
@@ -4222,32 +4229,34 @@ else
   fi
   [[ "${semantic_trace_partial_emitted:-false}" == true ]] && exit 1
   if [[ "$search_fast_path_miss" == true ]]; then
-    hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
+    hyphen_locations="$(recover_hyphen_compound_named_locations "$query_deadline_ns" || true)"
     if [[ -n "$hyphen_locations" ]]; then
       if question_allows_compact_stamp "$question"; then
         printf '%s\n' "$hyphen_locations"
         exit 0
       fi
-      if output="$(format_located_answer "$hyphen_locations")" &&
+      if output="$(format_located_answer "$hyphen_locations" "$query_deadline_ns")" &&
           [[ -n "${output//[[:space:]]/}" ]]; then
         printf '%s' "$output"
         exit 0
       fi
     fi
     if ! question_allows_compact_stamp "$question" &&
-        output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+        output="$(emit_synthesized_source_answer "$query_deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
       printf '%s' "$output"
       exit 0
     fi
+    fast_path_deadline_reached "$query_deadline_ns" && emit_query_deadline_timeout
     printf '%s\n' 'pbi: no source locations found' >&2
     exit 1
   fi
   if ! question_allows_compact_stamp "$question"; then
-    if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+    if output="$(emit_synthesized_source_answer "$query_deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
       printf '%s' "$output"
       exit 0
     fi
   fi
+  fast_path_deadline_reached "$query_deadline_ns" && emit_query_deadline_timeout
   planner_timed_out=false
   if question_needs_synthesized_answer "$question"; then
     planned_queries="$(search_distinctive_tokens "$question")"
@@ -4258,23 +4267,23 @@ else
       --max-iterations 1
   generated_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
   if planner_timeout_or_kill "$planner_status"; then
-    recovered_named_locations="$(collect_named_symbol_locations || true)"
+    recovered_named_locations="$(collect_named_symbol_locations "$query_deadline_ns" || true)"
     if [[ -n "$recovered_named_locations" ]]; then
       printf '%s\n' "$recovered_named_locations"
       exit 0
     fi
     if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
-      hyphen_locations="$(recover_hyphen_compound_named_locations || true)"
+      hyphen_locations="$(recover_hyphen_compound_named_locations "$query_deadline_ns" || true)"
       if [[ -n "$hyphen_locations" ]]; then
         printf '%s\n' "$hyphen_locations"
         exit 0
       fi
-      if output="$(recover_timeout_location_from_bm25)" &&
+      if output="$(recover_timeout_location_from_bm25 false "$query_deadline_ns")" &&
           [[ -n "${output//[[:space:]]/}" ]] && emit_source_locations "$output"; then
         exit 0
       fi
       if ! question_allows_compact_stamp "$question" &&
-          output="$(emit_synthesized_source_answer)" &&
+          output="$(emit_synthesized_source_answer "$query_deadline_ns")" &&
           [[ -n "${output//[[:space:]]/}" ]]; then
         printf '%s' "$output"
         exit 0
@@ -4382,12 +4391,12 @@ else
   if [[ "$planner_timed_out" == true ]]; then
     if planner_timeout_or_kill "$planner_status"; then
       if [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
-        if output="$(recover_timeout_location_from_bm25)" &&
+        if output="$(recover_timeout_location_from_bm25 false "$query_deadline_ns")" &&
             [[ -n "${output//[[:space:]]/}" ]] && emit_source_locations "$output"; then
           exit 0
         fi
         if ! question_allows_compact_stamp "$question" &&
-            output="$(emit_synthesized_source_answer)" &&
+            output="$(emit_synthesized_source_answer "$query_deadline_ns")" &&
             [[ -n "${output//[[:space:]]/}" ]]; then
           printf '%s' "$output"
           exit 0
@@ -4404,7 +4413,7 @@ else
   fi
   fi
   if question_needs_synthesized_answer "$question"; then
-    if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+    if output="$(emit_synthesized_source_answer "$query_deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
       printf '%s' "$output"
       exit 0
     fi
@@ -4443,7 +4452,7 @@ if ((status != 0)); then
   fi
   if planner_timeout_or_kill "$status"; then
     if question_needs_synthesized_answer "${question:-}"; then
-      if output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+      if output="$(emit_synthesized_source_answer "$query_deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
         :
       elif [[ -n "${bm25_candidates//[[:space:]]/}" ]]; then
         emit_bm25_locations_or_fail_closed
@@ -4453,7 +4462,7 @@ if ((status != 0)); then
       fi
     elif recover_timeout_search_from_candidates; then
       :
-    elif output="$(emit_synthesized_source_answer)" && [[ -n "${output//[[:space:]]/}" ]]; then
+    elif output="$(emit_synthesized_source_answer "$query_deadline_ns")" && [[ -n "${output//[[:space:]]/}" ]]; then
       :
     else
       printf '%s\n' 'pbi: probe-chat timed out answering the question' >&2
@@ -4549,11 +4558,11 @@ if [[ "$search_uses_local_model" == true ]]; then
 fi
 if [[ "$message_mode" != true &&
       ( -z "${output//[[:space:]]/}" || -z "$(compact_search_locations "$output")" ) ]]; then
-  if recovered_named_locations="$(collect_named_symbol_locations || true)" &&
+  if recovered_named_locations="$(collect_named_symbol_locations "$query_deadline_ns" || true)" &&
       [[ -n "${recovered_named_locations//[[:space:]]/}" ]]; then
     output="$recovered_named_locations"
     recovered_from_candidates=true
-  elif output="$(emit_synthesized_source_answer)" && [[ -n "$(compact_search_locations "$output")" ]]; then
+  elif output="$(emit_synthesized_source_answer "$query_deadline_ns")" && [[ -n "$(compact_search_locations "$output")" ]]; then
     :
   else
     printf '%s\n' 'pbi: no source locations found' >&2
