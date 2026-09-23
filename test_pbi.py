@@ -6033,6 +6033,82 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertFalse(trace.exists(), "verified definition should skip Probe Chat")
 
+    def test_search_recovers_verified_exported_test_fixture_definition(self) -> None:
+        symbol = "setupTestContext"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "tests" / "context.ts"
+            source.parent.mkdir(parents=True)
+            source.write_text(chr(10).join([
+                "// BM25 candidate context; not the definition",
+                "",
+                "export function setupTestContext() { return {}; }",
+                "",
+            ]))
+            candidate = repo / "src" / "notes.ts"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text("export function unrelatedNote() { return {}; }" + chr(10))
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(chr(10).join([
+                "#!/usr/bin/env python3",
+                f'print("File: {candidate}, Lines: 1-1")',
+                "",
+            ]))
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(chr(10).join([
+                "#!/usr/bin/env bash",
+                f"echo '{candidate.relative_to(repo)}:1'",
+                "",
+            ]))
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"tests/context.ts:3{chr(10)}")
+        self.assertEqual(result.stderr, "")
+
+    def test_search_fails_closed_for_unrelated_test_candidate(self) -> None:
+        symbol = "setupTestContext"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "tests" / "context.ts"
+            source.parent.mkdir(parents=True)
+            source.write_text(chr(10).join([
+                "export function unrelatedFixture() { return {}; }",
+                "",
+            ]))
+            env, _ = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(chr(10).join([
+                "#!/usr/bin/env python3",
+                f'print("File: {source}, Lines: 1-1")',
+                "",
+            ]))
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(chr(10).join([
+                "#!/usr/bin/env bash",
+                f"echo '{source.relative_to(repo)}:1'",
+                "",
+            ]))
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                "search", symbol, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            f"pbi: no source location contains the queried symbol{chr(10)}",
+        )
+
     def test_search_recovers_shorter_named_symbol_from_dual_symbol_candidates(self) -> None:
         query = "WriteSpool _replay_operation"
         with tempfile.TemporaryDirectory() as temporary:
