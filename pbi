@@ -439,6 +439,7 @@ named_symbol_definition_line() {
     BEGIN {
       declaration = "^[[:space:]]*((async|export|default|public|private|protected|static|abstract|pub(\\([^)]*\\))?|const|unsafe|extern|inline)[[:space:]]+)*(class|def|fn|func|function|interface|struct|enum|type|const)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:](<{:]|$)"
       assignment = "^[[:space:]]*(readonly|const|let|var|val)[[:space:]]+" symbol "([[:alnum:]_]*)([[:space:]]*=)"
+      shell_function = "^[[:space:]]*" symbol "[[:space:]]*\\(\\)[[:space:]]*\\{"
       # ponytail: Python ALL_CAPS / YAML mapping keys; leading _ / attr prefix for class memos.
       bare_assignment = "^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*\\.)?_?" symbol "[[:space:]]*=([^=]|$)"
       yaml_key = "^[[:space:]]*(-[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*\\.)?_?" symbol "[[:space:]]*:"
@@ -582,7 +583,7 @@ named_symbol_definition_line() {
       gsub(/[^[:alnum:]]/, "", normalized_symbol)
       compound_match = index(tolower(normalized_code), tolower(normalized_symbol))
       if (in_range && (code ~ declaration || code ~ assignment ||
-          code ~ bare_assignment || code ~ yaml_key ||
+          code ~ shell_function || code ~ bare_assignment || code ~ yaml_key ||
           (mode == "definition" &&
            (code ~ variant_qualified || (enum_body_open && code ~ variant_lone))) ||
           (mode == "any" &&
@@ -2142,10 +2143,13 @@ recover_named_symbol_definition() {
     while IFS= read -r file; do
       fast_path_deadline_reached "$deadline_ns" && break
       [[ -n "$file" && -f "$file" ]] || continue
+      # A verified shell helper in tests is a definition, not incidental test prose.
       if ! question_is_test_coverage "${question:-}" &&
           ! question_admits_named_test_files "${question:-}" &&
           [[ "$symbol" != test_* ]] &&
-          [[ "$file" == */tests/* || "$file" == */test/* ]]; then
+          [[ "$file" == */tests/* || "$file" == */test/* ]] &&
+          { [[ "$file" != *.sh ]] ||
+            [[ -z "$(named_symbol_definition_line "$file" "$symbol" definition 0 0 "$deadline_ns")" ]]; }; then
         continue
       fi
       file_count=$((file_count + 1))
