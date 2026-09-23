@@ -2148,8 +2148,7 @@ recover_named_symbol_definition() {
           ! question_admits_named_test_files "${question:-}" &&
           [[ "$symbol" != test_* ]] &&
           [[ "$file" == */tests/* || "$file" == */test/* ]] &&
-          { [[ "$file" != *.sh ]] ||
-            [[ -z "$(named_symbol_definition_line "$file" "$symbol" definition 0 0 "$deadline_ns")" ]]; }; then
+          [[ -z "$(named_symbol_definition_line "$file" "$symbol" definition 0 0 "$deadline_ns")" ]]; then
         continue
       fi
       file_count=$((file_count + 1))
