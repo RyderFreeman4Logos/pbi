@@ -5218,6 +5218,114 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "b.rs:2\n")
         self.assertEqual(result.stderr, "")
 
+    def test_search_recovers_shell_function_on_probe_miss(self) -> None:
+        symbol = "run_checker_bounded"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "scripts" / "tests" / "monolith-check-tests.sh"
+            source.parent.mkdir(parents=True)
+            script = (
+                "#!/usr/bin/env bash\n"
+                "run_checker_clean() {\n"
+                "    local repo=\"$1\"\n"
+                "    local bin_dir=\"$2\"\n"
+                "    local scope=\"$3\"\n"
+                "    shift 3\n"
+                "    ( cd \"$repo\"; \"$checker\" --scope \"$scope\" \"$@\" )\n"
+                "}\n"
+                "# Preserve the actual Verbatim shell function declaration/body from\n"
+                "# scripts/tests/monolith-check-tests.sh at reported line 155.\n"
+                "run_checker_bounded() {\n"
+                "    local repo=\"$1\"\n"
+                "    local bin_dir=\"$2\"\n"
+                "    local scope=\"$3\"\n"
+                "    shift 3\n"
+                "    (\n"
+                "        cd \"$repo\"\n"
+                "        PATH=\"$bin_dir:$PATH\" \\\n"
+                "            BASE_REF=base \\\n"
+                "            TOKUIN_FAKE_MODE=\"${TOKUIN_FAKE_MODE:-normal}\" \\\n"
+                "            TOKUIN_FAKE_CHILD_PID_FILE=\"${TOKUIN_FAKE_CHILD_PID_FILE:-}\" \\\n"
+                "            TOKUIN_FAKE_OUTPUT_HEX=\"${TOKUIN_FAKE_OUTPUT_HEX:-}\" \\\n"
+                "            TOKUIN_FAKE_STDERR_HEX=\"${TOKUIN_FAKE_STDERR_HEX:-}\" \\\n"
+                "            TOKUIN_FAKE_TARGET=\"${TOKUIN_FAKE_TARGET:-}\" \\\n"
+                "            TOKUIN_FAKE_LIFECYCLE_MODE=\"${TOKUIN_FAKE_LIFECYCLE_MODE:-}\" \\\n"
+                "            TOKUIN_FAKE_EXIT_STATUS=\"${TOKUIN_FAKE_EXIT_STATUS:-}\" \\\n"
+                "            TOKUIN_FAKE_STREAM=\"${TOKUIN_FAKE_STREAM:-}\" \\\n"
+                "            TOKUIN_FAKE_PID_FILE=\"${TOKUIN_FAKE_PID_FILE:-}\" \\\n"
+                "            MONOLITH_TOKENIZER_TIMEOUT_SECONDS=\"${MONOLITH_TOKENIZER_TIMEOUT_SECONDS:-}\" \\\n"
+                "            MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES=\"${MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES:-}\" \\\n"
+                "            run_without_git_env timeout --kill-after=1s \\\n"
+                "            \"${checker_outer_timeout_seconds}s\" \\\n"
+                "            \"$checker\" --scope \"$scope\" \"$@\"\n"
+                "    )\n"
+                "}\n"
+                "run_registered_case() {\n"
+                "    local name=\"$1\"\n"
+                "    shift\n"
+                "    printf 'CASE: %s\\n' \"$name\"\n"
+                "    \"$@\"\n"
+                "}\n"
+                ""
+            )
+            source.write_text(script)
+            (repo / "README.md").write_text(
+                "The run_checker_bounded wrapper is documented here, not defined.\n"
+            )
+            (repo / "noise.sh").write_text(
+                "unrelated_checker() { printf '%s\\n' nope; }\n"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "shell search fixture"],
+                cwd=repo, check=True,
+            )
+            env, trace = self.fake_environment(directory)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "if os.environ.get('PBI286_STAMP') == '1':\n"
+                "    print(f\"File: {os.environ['PBI286_SOURCE']}, Lines: "
+                "{os.environ['PBI286_LINE']}-{os.environ['PBI286_LINE']}\")\n"
+            )
+            probe.chmod(0o755)
+            env["PBI286_SOURCE"] = str(source)
+            env["PBI286_LINE"] = str(script.splitlines().index("run_checker_bounded() {") + 1)
+            binary = self.fake_pbi(directory, probe)
+
+            # Indexed-hit positive control: a BM25 stamp still verifies.
+            env["PBI286_STAMP"] = "1"
+            control = self.run_pbi(
+                "search", symbol, env=env, cwd=repo, binary=binary, timeout=5
+            )
+            env.pop("PBI286_STAMP")
+            # Regression: lexical recovery should find the same real function
+            # after the index/probe returns no candidates.
+            recovered = self.run_pbi(
+                "search", symbol, env=env, cwd=repo, binary=binary, timeout=5
+            )
+            absent = self.run_pbi(
+                "search", "definitely_missing_checker_function",
+                env=env, cwd=repo, binary=binary, timeout=5,
+            )
+        expected = f"scripts/tests/monolith-check-tests.sh:{env['PBI286_LINE']}\n"
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(control.stdout, expected)
+        self.assertEqual(control.stderr, "")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(recovered.stdout, expected)
+        self.assertEqual(recovered.stderr, "")
+        self.assertEqual(absent.returncode, 1, absent.stderr)
+        self.assertEqual(absent.stdout, "")
+        self.assertEqual(
+            absent.stderr, "pbi: no source location contains the queried symbol\n"
+        )
+        self.assertFalse(trace.exists(), "search must not invoke Probe Chat")
+
     def test_search_named_symbol_does_not_succeed_with_unrelated_file(self) -> None:
         # #8: a search whose query names a real symbol must not print an
         # unrelated compact location (wrong file) as success. The completed
