@@ -10682,6 +10682,149 @@ fi
         )
         self.assertNotIn("src/bench_matrix.rs", output)
 
+    def test_default_query_recovers_extensionless_justfile_recipes(self) -> None:
+        question = "What Just recipes run focused Rust lib tests and fast pre-commit checks?"
+        noise = {
+            "src/daemon_status.rs": "fn unrelated_status() { let _ = 1; }",
+            "src/daemon_bootstrap.rs": "fn unrelated_bootstrap() { let _ = 2; }",
+            "src/core/db_admission_test_process/spawn.rs": "fn unrelated_spawn() { let _ = 3; }",
+            "recipe-noise": "# pre-commit-fast and Rust lib tests occur only in this comment",
+        }
+
+        def justfile(include_lib_recipe: bool) -> str:
+            lines = ["# fixture filler"] * 267
+            lines[37:41] = [
+                "pre-commit-fast:",
+                "    just fmt-check",
+                "    just find-monolith-files",
+                "    just clippy-fast",
+            ]
+            lines[236:239] = [
+                "# Usage: just test-f name",
+                "test-f pattern:",
+                "    {{cargo}} test {{pattern}}",
+            ]
+            if include_lib_recipe:
+                lines[243] = "test-rest-feature-contract:"
+                lines[244:259] = ["    # recipe body setup"] * 15
+                lines[259] = (
+                    '    MEMPAL_EXPECT_REST="${expected}" {{cargo}} test "$@" --lib '
+                    "rest_feature_contract_tests::rest_feature_matches_invocation_expectation "
+                    "-- --ignored --exact --nocapture"
+                )
+            return chr(10).join(lines) + chr(10)
+
+        def run_fixture(content: str) -> tuple[subprocess.CompletedProcess[str], bool, str, str]:
+            with tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repo = directory / "repo"
+                repo.mkdir()
+                sources = {**noise, "justfile": content}
+                for relative, source in sources.items():
+                    path = repo / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(source + chr(10))
+                node = directory / "node"
+                node.write_text(
+                    "#!/usr/bin/env python3" + chr(10)
+                    + "import sys" + chr(10)
+                    + "sys.stdin.read()" + chr(10)
+                    + "print('[]')" + chr(10)
+                )
+                node.chmod(0o755)
+                env, trace = self.fake_environment(directory)
+                calls = directory / "probe-calls"
+                env["PBI_TEST_PROBE_CALLS"] = str(calls)
+                probe = directory / "probe"
+                probe.write_text(
+                    """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+separator = args.index("--")
+pattern = args[separator + 1]
+paths = args[separator + 2:]
+with open(os.environ["PBI_TEST_PROBE_CALLS"], "a", encoding="utf-8") as calls:
+    calls.write(pattern + chr(9) + chr(9).join(paths) + chr(10))
+print(f"Pattern: {pattern}")
+print(f"Path: {Path.cwd()}")
+if not paths:
+    for relative in (
+        "src/daemon_status.rs",
+        "src/daemon_bootstrap.rs",
+        "src/core/db_admission_test_process/spawn.rs",
+    ):
+        if Path(relative).is_file():
+            print(f"File: {relative}, Lines: 1-8")
+    print("Remaining files not shown:")
+    for index in range(100):
+        print(f"  src/footer_{index:03d}.rs 1 500")
+else:
+    terms = ("pre-commit", "fast", "test", "tests", "--lib", "just", "check")
+    for path in paths:
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for index, line in enumerate(lines):
+            if any(term in line.lower() for term in terms):
+                print(f"File: {path}, Lines: {index + 1}-{index + 1}")
+"""
+                )
+                probe.chmod(0o755)
+                unscoped = subprocess.run(
+                    [str(probe), "search", "--", question],
+                    cwd=repo,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                result = self.run_pbi(
+                    question,
+                    env=env,
+                    cwd=repo,
+                    binary=self.fake_pbi(directory, probe),
+                    timeout=15,
+                )
+                chat_started = trace.exists()
+                probe_calls = calls.read_text() if calls.exists() else ""
+                return result, chat_started, unscoped.stdout, probe_calls
+
+        positive, chat_started, unscoped, probe_calls = run_fixture(justfile(True))
+        self.assertNotIn("justfile", unscoped.lower())
+        self.assertEqual(sum(line.startswith("File:") for line in unscoped.splitlines()), 3)
+        footer = unscoped.split("Remaining files not shown:", 1)[1].splitlines()
+        self.assertEqual(sum(line.startswith("  src/footer_") for line in footer), 100)
+        self.assertEqual(positive.returncode, 0, positive.stdout + "\\n" + positive.stderr)
+        self.assertIn("Coverage: complete", positive.stdout)
+        for evidence in (
+            "justfile:38",
+            "pre-commit-fast",
+            "justfile:39",
+            "justfile:40",
+            "justfile:41",
+            "justfile:244",
+            "test-rest-feature-contract",
+            "justfile:260",
+            "{{cargo}} test",
+            "--lib",
+        ):
+            self.assertIn(evidence, positive.stdout)
+        self.assertNotIn("test-f pattern", positive.stdout)
+        self.assertNotIn("recipe-noise", positive.stdout)
+        self.assertNotIn("unrelated_spawn", positive.stdout)
+        self.assertFalse(chat_started, "local recipe retrieval must not use Probe Chat")
+        scoped_call = probe_calls.splitlines()[-1].split(chr(9))
+        self.assertEqual(set(scoped_call[1:]), {"justfile"})
+
+        negative, _, _, _ = run_fixture(justfile(False))
+        self.assertNotEqual(negative.returncode, 0, negative.stdout + "\\n" + negative.stderr)
+        self.assertNotIn("Coverage: complete", negative.stdout)
+        self.assertNotIn("test-f pattern", negative.stdout)
+
     def test_no_result_path_does_not_emit_awk_escape_warning(self) -> None:
         question = (
             "Where does just local-gates define its literal feature and "
