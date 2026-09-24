@@ -9547,6 +9547,58 @@ exit "$status"
         self.assertNotIn("proxy/unrelated.py", result.stdout)
         self.assertFalse(trace.exists(), "semantic traces must not require Probe Chat")
 
+    def test_slash_compound_semantic_trace_uses_exact_typescript_phrases(self) -> None:
+        question = (
+            "Locate the PR148 TUI commentary/final deduplication implementation "
+            "and its focused behavioral tests. Return exact paths, symbols, and "
+            "the intended positive/negative/grouping/completion cases."
+        )
+        impl = "ui-tui/src/app/turnController.ts"
+        tests = "ui-tui/src/__tests__/createGatewayEventHandler.test.ts"
+        impl_line = "    // byte-identical commentary/final pairs collapse, while post-interim tails\n"
+        test_line = "    it('deduplicates identical commentary and final replies in one turn', () => {\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            (repo / impl).parent.mkdir(parents=True)
+            (repo / tests).parent.mkdir(parents=True)
+            (repo / impl).write_text(impl_line)
+            (repo / tests).write_text(test_line)
+            env, _ = self.fake_environment(directory)
+            mise = directory / "mise"
+            mise.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "[ \"$1\" = which ]\n"
+                "case \"$2\" in\n"
+                "  probe) printf '%s\\n' \"$PBI_TEST_PROBE\" ;;\n"
+                "  node) printf '%s\\n' /usr/local/bin/node ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n"
+            )
+            mise.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "argv = sys.argv[1:]\n"
+                "if '--exact' not in argv or '--language' not in argv or 'typescript' not in argv:\n"
+                "    raise SystemExit(124)\n"
+                "query = argv[-1]\n"
+                f"if query == 'commentary/final':\n"
+                f"    print('File: {repo / impl}, Lines: 1-1')\n"
+                f"elif query == 'deduplicates identical commentary and final':\n"
+                f"    print('File: {repo / tests}, Lines: 1-1')\n"
+                "else:\n"
+                "    raise SystemExit(124)\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(question, env=env, cwd=repo, binary=self.fake_pbi(directory, probe), timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(impl, result.stdout)
+        self.assertIn(tests, result.stdout)
+        self.assertIn("Coverage: complete", result.stdout)
+
     def test_default_semantic_trace_assembles_multi_target_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result, trace = self.run_default_semantic_fixture(

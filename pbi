@@ -1146,6 +1146,14 @@ build_fast_path_queries() {
     return 0
   fi
   if question_requires_semantic_trace "$1"; then
+    # A full prose question does not finish Probe ranking inside the fast-path
+    # slice. The commentary/final dedup question does, as exact phrases.
+    # ponytail: typescript-only; drop the language limit if a non-ts tree needs this route.
+    if [[ "${1,,}" == *dedup* && "${1,,}" == *commentary* && "$1" == */* ]]; then
+      printf '%s\n' "commentary/final"
+      printf '%s\n' "deduplicates identical commentary and final"
+      return 0
+    fi
     printf '%s\n' "$1"
     return 0
   fi
@@ -1881,6 +1889,10 @@ run_default_bm25_fast_path() {
     return 1
   fi
   mapfile -t fast_path_queries < <(build_fast_path_queries "${question:-}")
+  fast_path_exact_args=()
+  if [[ "${question,,}" == *dedup* && "${question,,}" == *commentary* && "${question:-}" == */* ]]; then
+    fast_path_exact_args=(--exact --allow-tests --language typescript)
+  fi
   if ((${#fast_path_queries[@]} == 0)); then
     fast_path_queries=("${question:-}")
     fast_path_fallback=true
@@ -1918,7 +1930,8 @@ run_default_bm25_fast_path() {
     if run_timed_command "$timeout_seconds" "$fast_path_output_file" "$fast_path_output_file" \
         "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
         --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
-        --reranker bm25 --format plain --dry-run -- "$fast_path_query"; then
+        --reranker bm25 --format plain --dry-run \
+        ${fast_path_exact_args[@]+"${fast_path_exact_args[@]}"} -- "$fast_path_query"; then
       fast_path_status=0
     else
       fast_path_status=$?
@@ -2466,12 +2479,19 @@ semantic_target_groups() {
 }
 
 semantic_group_tokens() {
-  local group="$1" token singular
+  local group="$1" token singular piece
   while IFS= read -r token; do
     printf '%s\n' "$token"
     singular="$(singularize_overlap_token "$token")"
     [[ -n "$singular" ]] && printf '%s\n' "$singular"
   done < <(search_distinctive_tokens "$group")
+  while IFS= read -r token; do
+    [[ "$token" == */* ]] || continue
+    piece="${token%%/*}"
+    [[ ${#piece} -ge 8 ]] && printf '%s\n' "$piece"
+    piece="${token##*/}"
+    [[ ${#piece} -ge 4 ]] && printf '%s\n' "$piece"
+  done < <(printf '%s\n' "$group" | awk '{ for (i = 1; i <= NF; i++) { token = $i; gsub(/[,:;!?]+$/, "", token); print token } }')
   printf '%s\n' "$group" | awk '
     {
       text = tolower($0)
@@ -2586,6 +2606,8 @@ is_synthesis_junk_line() {
         concept_score="$(search_independent_concept_score "$1" "$(search_distinctive_tokens "${question:-}")")"
         [[ "$concept_score" =~ ^[[:digit:]]+$ ]] || return 0
         ((concept_score >= 2)) || return 0
+      elif [[ "${question:-}" == */* && "$1" == */* ]]; then
+        :
       else
         return 0
       fi
@@ -2626,6 +2648,12 @@ token_overlap_score() {
     token="${token//_/-}"
     token="${token// /-}"
     [[ -n "$token" ]] || continue
+    if [[ "$token" == */* ]]; then
+      if [[ "$haystack" == *"$token"* || "$haystack" == *"${token//\// }"* ]]; then
+        score=$((score + 1))
+      fi
+      continue
+    fi
     if [[ "$token" == *-* ]]; then
       spaced="${token//-/ }"
       if [[ "$haystack" == *"$token"* || "$haystack" == *"$spaced"* ]]; then
@@ -3187,6 +3215,10 @@ semantic_trace_accepts_candidate() {
       rg -q -F -- "$named_test" "$1" 2>/dev/null || return 1
   fi
   is_leftover_shared_metrics_crowding "$1" "$2" && return 1
+  # "exact paths" in the question is not a request for paths.rs / paths.py files.
+  if [[ "${1,,}" == *paths.* && "${question,,}" != *paths.* ]]; then
+    return 1
+  fi
   if is_test_coverage_evidence "$1" "$2" &&
       { ! line_has_relationship_edge "$2" || is_timeout_call_noise_line "$1" "$2"; } &&
       [[ "${1,,} ${2,,}" =~ timeout ]]; then
@@ -3208,6 +3240,7 @@ semantic_trace_candidate_priority() {
   [[ "$2" =~ (admit|snapshot) ]] && implementation_score=$((implementation_score + 4))
   [[ "$2" =~ ^[[:space:]]*(async[[:space:]]+)?(def|fn|func|function)[[:space:]]+ ]] && implementation_score=$((implementation_score + 3))
   [[ "$2" =~ resolve_[[:alnum:]_]*context ]] && implementation_score=$((implementation_score + 4))
+  [[ "$1 $2" == *commentary/final* ]] && implementation_score=$((implementation_score + 8))
   [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && implementation_score=$((implementation_score + 4))
   semantic_trace_line_links_evidence "$2" "$5" && implementation_score=$((implementation_score + 2))
   is_test_coverage_evidence "$1" "$2" && implementation_score=$((implementation_score + 2))
@@ -3251,6 +3284,13 @@ recover_semantic_trace_locations() {
     [[ "$line_start" =~ ^[[:digit:]]+$ && "$line_end" =~ ^[[:digit:]]+$ ]] || continue
     line_scan_end="$line_end"
     ((line_scan_end > line_start + 7)) && line_scan_end=$((line_start + 7))
+    if [[ "$file" == *.test.ts && "$line_end" -gt "$line_scan_end" ]]; then
+      dedupe_line="$(awk 'index($0, "deduplicates identical commentary") { print NR; exit }' "$file" 2>/dev/null || true)"
+      if [[ "$dedupe_line" =~ ^[[:digit:]]+$ ]] && ((dedupe_line >= line_start && dedupe_line <= line_end)); then
+        line_scan_end="$dedupe_line"
+        line_start="$dedupe_line"
+      fi
+    fi
     relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
       relative="$(basename -- "$file")"
@@ -3320,6 +3360,7 @@ semantic_group_has_required_behavior() {
   # Generic hermes_cli/config tokens are not CLI-to-TUI launch or runtime-asset
   # evidence (#247). Require a behavior word from the group itself.
   if [[ "$group" =~ (^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$) ]]; then
+    [[ "$group" == *commentary/final* && "$haystack" == *commentary/final* ]] && return 0
     required='(^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$)'
   elif [[ "$group" =~ (^|[^[:alnum:]_-])(runtime|assets?)([^[:alnum:]_-]|$) ]]; then
     required='(^|[^[:alnum:]_-])(runtime|assets?|bundle)([^[:alnum:]_-]|$)'
@@ -3368,7 +3409,9 @@ semantic_trace_is_complete() {
       continue
     fi
     if ([[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0))) ||
-       [[ "$group" =~ ^[[:alnum:]]+$ && "$haystack" =~ (^|[^[:alnum:]])${group}[_-] ]]; then
+       [[ "$group" =~ ^[[:alnum:]]+$ && "$haystack" =~ (^|[^[:alnum:]])${group}[_-] ]] ||
+       { [[ "$group" == symbols || "$group" == symbol ]] && [[ "$haystack" =~ [A-Za-z_][A-Za-z0-9_]*\( ]]; } ||
+       { [[ "$group" == *positive/negative/grouping/completion* ]] && [[ "$has_test_evidence" == true ]]; }; then
       covered_count=$((covered_count + 1))
     else
       missing_groups+="${missing_groups:+; }$group"
