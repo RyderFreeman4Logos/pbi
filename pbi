@@ -1699,7 +1699,7 @@ remaining_file_candidates() {
             }
             NR < target { next }
             NR == target { last = NR; next }
-            is_header($0) || $0 ~ /^[[:space:]]*$/ || $0 ~ /^#/ { exit }
+            is_header($0) || $0 ~ /^#/ || (NF && $0 !~ /^[[:space:]]/) { exit }
             { last = NR }
             END { if (last) print last }
           ' "$path")"
@@ -3348,7 +3348,8 @@ recipe_block_for_line() {
       return line ~ /^[[:alnum:]_-]+([^:]*)?:[[:space:]]*([^=[:space:]]|$)/
     }
     {
-      if (NR > target && found && (is_recipe_header($0) || $0 ~ /^[[:space:]]*$/ || $0 ~ /^#/)) exit
+      if (NR > target && found &&
+          (is_recipe_header($0) || $0 ~ /^#/ || (NF && $0 !~ /^[[:space:]]/))) exit
       if (NR <= target && is_recipe_header($0)) {
         start = NR
         count = 0
@@ -3360,6 +3361,18 @@ recipe_block_for_line() {
       if (!start || !found) exit 1
       for (i = 1; i <= count; i++) print lines[i]
     }
+  ' "$file"
+}
+
+recipe_block_start_line() {
+  local file="$1" target="$2"
+  awk -v target="$target" '
+    function is_recipe_header(line) {
+      return line ~ /^[[:alnum:]_-]+([^:]*)?:[[:space:]]*([^=[:space:]]|$)/
+    }
+    NR > target { exit }
+    is_recipe_header($0) { start = NR }
+    END { if (start) print start }
   ' "$file"
 }
 
@@ -3460,7 +3473,7 @@ semantic_trace_candidate_priority() {
 }
 
 recover_semantic_trace_locations() {
-  local candidate file line_start line_end line_number line_scan_end text relative location score recipe_context
+  local candidate file line_start line_end line_number line_scan_end text relative location score recipe_context recipe_start recipe_offset recipe_line recipe_text recipe_location
   local distinctive_tokens phrase_tokens accepted_haystack="" ranked="" footer_candidates
   local scope_lines scan_lines scope_line scope_kind scope_parent matched=false
   local -A seen=() matched_suites=()
@@ -3523,8 +3536,24 @@ recover_semantic_trace_locations() {
       if question_requests_recipe_scope "${question:-}"; then
         recipe_context="$(recipe_block_for_line "$file" "$line_number" 2>/dev/null || true)"
         [[ -n "$recipe_context" ]] || continue
-        is_recipe_header_line "$text" || is_recipe_action_line "$text" || continue
         recipe_block_matches_any_target_group "$recipe_context" "$relative" "${question:-}" || continue
+        recipe_start="$(recipe_block_start_line "$file" "$line_number")"
+        [[ "$recipe_start" =~ ^[[:digit:]]+$ ]] || continue
+        recipe_offset=0
+        while IFS= read -r recipe_line; do
+          recipe_text="${recipe_line#"${recipe_line%%[![:space:]]*}"}"
+          if ((recipe_offset == 0)) || is_recipe_action_line "$recipe_text"; then
+            recipe_location="$relative:$((recipe_start + recipe_offset))"
+            if [[ -z "${seen[$recipe_location]+seen}" ]]; then
+              seen["$recipe_location"]=1
+              score="$(semantic_trace_candidate_priority "$relative" "$recipe_text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack")"
+              accepted_haystack+="${accepted_haystack:+ }$relative $recipe_text"
+              ranked+="$score"$'\t'"$recipe_location"$'\n'
+            fi
+          fi
+          recipe_offset=$((recipe_offset + 1))
+        done <<< "$recipe_context"
+        continue
       elif ! semantic_trace_accepts_candidate "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack"; then
         continue
       fi
@@ -3802,7 +3831,7 @@ emit_semantic_trace_from_candidates() {
   local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations named_test helper_locations=""
   locations=""
   named_test="$(question_named_test_symbol "${question:-}")"
-  if [[ -n "$named_test" ]]; then
+  if [[ -n "$named_test" ]] && ! question_requests_recipe_scope "${question:-}"; then
     locations="$(recover_named_test_body_locations "$deadline_ns" || true)"
   else
     if ! question_requests_recipe_scope "${question:-}"; then

@@ -10705,13 +10705,25 @@ fi
                 "    {{cargo}} test {{pattern}}",
             ]
             if include_lib_recipe:
-                lines[243] = "test-rest-feature-contract:"
-                lines[244:259] = ["    # recipe body setup"] * 15
-                lines[259] = (
-                    '    MEMPAL_EXPECT_REST="${expected}" {{cargo}} test "$@" --lib '
-                    "rest_feature_contract_tests::rest_feature_matches_invocation_expectation "
-                    "-- --ignored --exact --nocapture"
-                )
+                lines[243:260] = [
+                    "test-rest-feature-contract:",
+                    "    #!/usr/bin/env bash",
+                    "    set -euo pipefail",
+                    "    run_contract() {",
+                    '        local expected="$1"',
+                    "        shift",
+                    '        case "${expected}" in',
+                    "            0|1) ;;",
+                    "            *)",
+                    '                echo "ERROR: MEMPAL_EXPECT_REST must be 0 or 1, got ${expected:-missing}" >&2',
+                    "                exit 1",
+                    "                ;;",
+                    "        esac",
+                    "        local log rc",
+                    '        log="$(mktemp)"',
+                    "        set +e",
+                    '        MEMPAL_EXPECT_REST="${expected}" {{cargo}} test "$@" --lib rest_feature_contract_tests::rest_feature_matches_invocation_expectation -- --ignored --exact --nocapture',
+                ]
             return chr(10).join(lines) + chr(10)
 
         def run_fixture(content: str) -> tuple[subprocess.CompletedProcess[str], bool, str, str]:
