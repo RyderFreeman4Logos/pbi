@@ -3457,9 +3457,11 @@ semantic_trace_is_complete() {
       has_test_evidence=true
       [[ "$text" =~ ^[[:space:]]*(it|test)[[:space:]]*\( ]] && test_cases+="${test_cases:+$'\n'}${text,,}"
     elif question_requests_behavioral_cases "${question:-}"; then
+      # Coverage classifies in-hand evidence, not another deadline-bound recovery
+      # scan. A containing class alone does not identify the behavior's method.
       while IFS=$'\t' read -r scope_line kind parent; do
-        [[ "$scope_line" == "$line_number" && "$kind" == symbol ]] && has_source_symbol=true
-      done < <(named_symbol_definition_line "$file" "" scopes "$line_number" "$line_number" "${deadline_ns:-}")
+        [[ "$kind" == symbol && "$text" == *'('* ]] && has_source_symbol=true
+      done < <(named_symbol_definition_line /dev/stdin "" scopes 1 1 <<< "$text")
     fi
     if line_has_relationship_edge "$text"; then
       relationship_count=$((relationship_count + 1))

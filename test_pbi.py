@@ -9610,7 +9610,7 @@ exit "$status"
         )
         impl = 'ui-tui/src/app/turnController.ts'
         tests = 'ui-tui/src/__tests__/createGatewayEventHandler.test.ts'
-        implementation = "\n" * 595 + (
+        implementation = "\n" * 141 + 'class TurnController {\n' + "\n" * 453 + (
             '  recordMessageComplete(payload: MessageCompletePayload) {\n'
             '    this.closeReasoningSegment()\n'
             '\n'
@@ -9799,7 +9799,12 @@ exit "$status"
                 sources[tests] = "".join(lines)
                 if missing == "symbol":
                     sources[impl] = implementation.replace(
-                        "  recordMessageComplete(payload: MessageCompletePayload) {", ""
+                        "  recordMessageComplete(payload: MessageCompletePayload) {",
+                        "  // recordMessageComplete(payload: MessageCompletePayload)",
+                    )
+                    sources[impl] = sources[impl].replace("\n", "function unrelatedSymbol() {}\n", 1)
+                    sources[tests] = sources[tests].replace(
+                        "replies in one turn", "replies in one turn via recordMessageComplete(payload)",
                     )
                 for relative, content in sources.items():
                     path = repo / relative
@@ -9817,6 +9822,33 @@ exit "$status"
                     f"File: {repo / path}, Lines: {start}-{end}"
                     for path, start, end in ranges
                 )
+                # Exercise the shared coverage boundary after real range admission.
+                # The live run already emitted these anchors when recovery expired;
+                # do not inject locations or make a clock-sensitive sleep fixture.
+                if missing in ("complete", "renamed", "symbol"):
+                    helpers = PBI.read_text().partition('\ncase "${1:-}" in\n')[0]
+                    check = subprocess.run(
+                        ["bash", "-s", "--", question, captured],
+                        input=helpers + '\nquestion="$1"\nbm25_candidates="$2"\n' + r'''
+locations="$(recover_semantic_trace_locations)"
+format_semantic_trace_evidence "$locations"
+deadline_ns=1
+if semantic_trace_is_complete "$locations"; then
+  printf '%s\n' 'Coverage: complete'
+else
+  printf 'Missing: %s\n' "$semantic_trace_missing"
+  exit 1
+fi
+''',
+                        cwd=repo, env=env, text=True, capture_output=True, check=False, timeout=15,
+                    )
+                    with self.subTest(boundary="expired recovery", missing=missing):
+                        self.assertEqual(check.returncode, 1 if missing == "symbol" else 0, check.stdout + check.stderr)
+                        self.assertIn(f"{impl}:142 — class TurnController", check.stdout)
+                        if missing == "symbol":
+                            self.assertIn("Missing: requested target groups: symbols", check.stdout)
+                        else:
+                            self.assertIn(f"{impl}:596 — recordMessageComplete", check.stdout)
                 probe = directory / "probe"
                 probe.write_text("#!/usr/bin/env python3\n" + f"print({captured!r})\n")
                 probe.chmod(0o755)
