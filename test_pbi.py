@@ -10682,6 +10682,104 @@ fi
         )
         self.assertNotIn("src/bench_matrix.rs", output)
 
+    def test_default_query_recovers_plain_footer_justfile_without_file_header(self) -> None:
+        question = "What Just recipes run focused Rust lib tests and fast pre-commit checks?"
+        lines = ["# fixture filler"] * 267
+        lines[37:41] = [
+            "pre-commit-fast:",
+            "    just fmt-check",
+            "    just find-monolith-files",
+            "    just clippy-fast",
+        ]
+        lines[236:239] = [
+            "# Usage: just test-f name",
+            "test-f pattern:",
+            "    {{cargo}} test {{pattern}}",
+        ]
+        lines[243:260] = [
+            "test-rest-feature-contract:",
+            "    #!/usr/bin/env bash",
+            "    set -euo pipefail",
+            "    run_contract() {",
+            '        local expected="$1"',
+            "        shift",
+            '        case "${expected}" in',
+            "            0|1) ;;",
+            "            *)",
+            '                echo "ERROR: MEMPAL_EXPECT_REST must be 0 or 1, got ${expected:-missing}" >&2',
+            "                exit 1",
+            "                ;;",
+            "        esac",
+            "        local log rc",
+            '        log="$(mktemp)"',
+            "        set +e",
+            '        MEMPAL_EXPECT_REST="${expected}" {{cargo}} test "$@" --lib rest_feature_contract_tests::rest_feature_matches_invocation_expectation -- --ignored --exact --nocapture',
+        ]
+        content = chr(10).join(lines) + chr(10)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            (repo / "justfile").write_text(content)
+            noise = repo / "src/core/db_admission_test_process/spawn.rs"
+            noise.parent.mkdir(parents=True)
+            noise.write_text("fn unrelated_spawn() { let _ = 3; }\n")
+            env, trace = self.fake_environment(directory)
+            calls = directory / "probe-calls"
+            env["PBI_TEST_PROBE_CALLS"] = str(calls)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "separator = args.index('--')\n"
+                "pattern = args[separator + 1]\n"
+                "paths = args[separator + 2:]\n"
+                "with open(os.environ['PBI_TEST_PROBE_CALLS'], 'a', encoding='utf-8') as handle:\n"
+                "    handle.write(pattern + chr(9) + chr(9).join(paths) + chr(10))\n"
+                "if not paths:\n"
+                "    print(f'Pattern: {pattern}')\n"
+                "    print('File: src/core/db_admission_test_process/spawn.rs, Lines: 1-1')\n"
+                "    print('Remaining files not shown:')\n"
+                "    print('  justfile 239 500')\n"
+                "    for index in range(99):\n"
+                "        print(f'  src/footer_{index:03d}.rs 1 500')\n"
+                "    raise SystemExit(0)\n"
+                "terms = ('pre-commit', 'fast', 'test', 'tests', '--lib', 'just', 'check')\n"
+                "for path in paths:\n"
+                "    if path != 'justfile':\n"
+                "        raise SystemExit('scoped search left the footer path')\n"
+                "    for index, line in enumerate(open(path, encoding='utf-8')):\n"
+                "        if any(term in line.lower() for term in terms):\n"
+                "            print(f'File: {path}, Lines: {index + 1}-{index + 1}')\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=15,
+            )
+            output = result.stdout + result.stderr
+            chat_started = trace.exists()
+            probe_calls = calls.read_text() if calls.exists() else ""
+        self.assertEqual(result.returncode, 0, output)
+        self.assertFalse(chat_started, "plain footer recovery must skip Probe Chat")
+        self.assertEqual(probe_calls.splitlines()[0].split(chr(9))[1:], ["justfile"])
+        for evidence in (
+            "justfile:38",
+            "pre-commit-fast",
+            "justfile:244",
+            "test-rest-feature-contract",
+            "justfile:260",
+            "--lib",
+        ):
+            self.assertIn(evidence, result.stdout)
+        self.assertNotIn("test-f pattern", result.stdout)
+        self.assertNotIn("unrelated_spawn", result.stdout)
+
     def test_default_query_recovers_extensionless_justfile_recipes(self) -> None:
         question = "What Just recipes run focused Rust lib tests and fast pre-commit checks?"
         noise = {

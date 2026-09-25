@@ -1571,7 +1571,7 @@ remaining_file_candidates() {
       continue
     fi
     [[ "$in_footer" == true ]] || continue
-    [[ "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]+\<[[:digit:]]+\>[[:space:]]+\<[[:digit:]]+\>[[:space:]]*$ ]] || continue
+    [[ "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]+(\<[[:digit:]]+\>|[[:digit:]]+)[[:space:]]+(\<[[:digit:]]+\>|[[:digit:]]+)[[:space:]]*$ ]] || continue
     path="${BASH_REMATCH[1]}"
     case "$path" in
       */PATTERN.md|*/workflow.toml|*/Cargo.toml|*.md) continue ;;
@@ -1585,7 +1585,9 @@ remaining_file_candidates() {
       footer_source_path_seen["$path"]=1
     fi
     if ! fast_path_requires_cache_key "$query" &&
-       fast_path_footer_path_matches_query "$path" "$footer_tokens" &&
+       { fast_path_footer_path_matches_query "$path" "$footer_tokens" ||
+         { question_requests_recipe_scope "$query" &&
+           [[ "${path##*/}" == [Jj]ustfile || "${path##*/}" == *.justfile ]]; }; } &&
        [[ -z "${footer_path_seen[$path]+seen}" ]]; then
       footer_path_matches+=("$path")
       footer_path_seen["$path"]=1
