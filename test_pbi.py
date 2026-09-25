@@ -18,9 +18,9 @@ import unittest
 ROOT = Path(__file__).resolve().parent
 PBI = ROOT / "pbi"
 INSTALLER = ROOT / "install.sh"
-PRIMARY = "qwen3.6-27b-decensor-by-aeon"
-FALLBACK = "opencode/deepseek-v4-flash"
-BASE_URL = "http://localhost:8317/v1"
+PRIMARY = "abliterated-qwen-latest-27b-none"
+FALLBACK = PRIMARY
+BASE_URL = "http://gb10:18009/v1"
 PROBE_SHIM = "/usr/local/share/mise/shims/probe"
 
 
@@ -3868,17 +3868,17 @@ class PbiTest(unittest.TestCase):
             ):
                 env.pop(name, None)
             (directory / ".env").write_text(
-                "LOCAL_ROUTER_BASEURL=http://router.invalid/v1\n"
+                "LOCAL_ROUTER_BASEURL=http://gb10:18009/v1\n"
                 "LOCAL_ROUTER_API_KEY=dummy-dotenv-key\n"
-                "LLM_MODEL=dummy-primary\n"
-                "FALLBACK_MODEL=dummy-fallback\n"
+                "LLM_MODEL=abliterated-qwen-latest-27b-none\n"
+                "FALLBACK_MODEL=abliterated-qwen-latest-27b-low\n"
             )
             result = self.run_pbi("--message", "hello", env=env, cwd=directory, binary=self.fake_pbi(directory, directory / "probe"))
             recorded = json.loads(trace.read_text())
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(recorded["env"]["OPENAI_API_KEY"], "dummy-dotenv-key")
-        self.assertEqual(recorded["env"]["OPENAI_API_URL"], "http://router.invalid/v1")
-        self.assertEqual(recorded["env"]["MODEL_NAME"], "dummy-primary")
+        self.assertEqual(recorded["env"]["OPENAI_API_URL"], "http://gb10:18009/v1")
+        self.assertEqual(recorded["env"]["MODEL_NAME"], "abliterated-qwen-latest-27b-none")
         self.assertNotIn("dummy-dotenv-key", result.stdout + result.stderr)
 
     def test_process_environment_overrides_cwd_dotenv(self) -> None:
@@ -3889,10 +3889,10 @@ class PbiTest(unittest.TestCase):
             env.pop("OPENAI_API_KEY", None)
             env.update(
                 {
-                    "LOCAL_ROUTER_BASEURL": "http://process.invalid/v1",
+                    "LOCAL_ROUTER_BASEURL": "http://gb10:18009/v1",
                     "LOCAL_ROUTER_API_KEY": "dummy-process-key",
-                    "LLM_MODEL": "process-primary",
-                    "FALLBACK_MODEL": "process-fallback",
+                    "LLM_MODEL": "abliterated-qwen-latest-27b-medium",
+                    "FALLBACK_MODEL": "abliterated-qwen-latest-27b-low",
                 }
             )
             (directory / ".env").write_text(
@@ -3905,11 +3905,11 @@ class PbiTest(unittest.TestCase):
             recorded = json.loads(trace.read_text())
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(recorded["env"]["OPENAI_API_KEY"], "dummy-process-key")
-        self.assertEqual(recorded["env"]["OPENAI_API_URL"], "http://process.invalid/v1")
-        self.assertEqual(recorded["env"]["MODEL_NAME"], "process-primary")
+        self.assertEqual(recorded["env"]["OPENAI_API_URL"], "http://gb10:18009/v1")
+        self.assertEqual(recorded["env"]["MODEL_NAME"], "abliterated-qwen-latest-27b-medium")
         self.assertEqual(
             [provider["model"] for provider in json.loads(recorded["env"]["FALLBACK_PROVIDERS"])],
-            ["process-primary", "process-fallback"],
+            ["abliterated-qwen-latest-27b-medium", "abliterated-qwen-latest-27b-low"],
         )
 
     def test_default_query_symbol_less_range_stays_a_diagnostic(self) -> None:
@@ -7666,14 +7666,14 @@ exit "$status"
                 config_path.write_text(
                     '[[endpoints]]\n'
                     'provider = "openai"\n'
-                    'model = "first-model"\n'
-                    'base_url = "https://first.example/v1"\n'
+                    'model = "abliterated-qwen-latest-27b-none"\n'
+                    'base_url = "http://gb10:18009/v1"\n'
                     'api_key = "first-fixture-secret"\n'
                     '\n'
                     '[[endpoints]]\n'
                     'provider = "openai"\n'
-                    'model = "second-model"\n'
-                    'base_url = "https://second.example/v1"\n'
+                    'model = "abliterated-qwen-latest-27b-low"\n'
+                    'base_url = "http://gb10:18009/v1"\n'
                     'api_key = "second-fixture-secret"\n'
                 )
                 fake_chat = directory / "probe-chat"
@@ -7853,11 +7853,11 @@ exit "$status"
             env, trace = self.fake_environment(directory)
             config_path = directory / ".config" / "pbi" / "config.toml"
             config_path.parent.mkdir(parents=True)
-            config_path.write_text('primary_model = "spark"\n')
+            config_path.write_text('primary_model = "abliterated-qwen-latest-27b-low"\n')
             result = self.run_pbi("--debug-config", env=env)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("primary_model=spark", result.stdout)
+        self.assertIn("primary_model=abliterated-qwen-latest-27b-low", result.stdout)
 
 
     def test_config_toml_rejects_relative_xdg_config_home(self) -> None:
@@ -7867,7 +7867,7 @@ exit "$status"
             home = directory / "home"
             home_config = home / ".config" / "pbi" / "config.toml"
             home_config.parent.mkdir(parents=True)
-            home_config.write_text('primary_model = "spark"\n')
+            home_config.write_text('primary_model = "abliterated-qwen-latest-27b-low"\n')
             for xdg_config_home in (".", "relative/config"):
                 relative_config = directory / xdg_config_home / "pbi" / "config.toml"
                 relative_config.parent.mkdir(parents=True, exist_ok=True)
@@ -7876,7 +7876,7 @@ exit "$status"
                 env["XDG_CONFIG_HOME"] = xdg_config_home
                 result = self.run_pbi("--debug-config", env=env, cwd=directory)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("primary_model=spark", result.stdout)
+                self.assertIn("primary_model=abliterated-qwen-latest-27b-low", result.stdout)
                 self.assertNotIn("primary_model=shadow", result.stdout)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
 
@@ -7888,7 +7888,7 @@ exit "$status"
             config_path = directory / ".config" / "pbi" / "config.toml"
             config_path.parent.mkdir(parents=True)
             config_path.write_text(
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 'description = """\n'
                 'primary_model = "shadow"\n'
                 '"""\n'
@@ -7903,22 +7903,22 @@ exit "$status"
     def test_config_toml_comments_do_not_trigger_multiline_string_guard(self) -> None:
         cases = (
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 '# example: description = """\n'
                 '# primary_model = "shadow"\n'
                 '# """\n'
             ),
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 '# example: description = ' + (chr(39) * 3) + '\n'
                 '# primary_model = "shadow"\n'
                 '# ' + (chr(39) * 3) + '\n'
             ),
             (
-                'primary_model = "spark" # multiline example: """\n'
+                'primary_model = "abliterated-qwen-latest-27b-low" # multiline example: """\n'
             ),
             (
-                'primary_model = "spark" # multiline example: ' + (chr(39) * 3) + '\n'
+                'primary_model = "abliterated-qwen-latest-27b-low" # multiline example: ' + (chr(39) * 3) + '\n'
             ),
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -7931,41 +7931,41 @@ exit "$status"
                     config_path.write_text(config_text)
                     result = self.run_pbi("--debug-config", env=env)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("primary_model=spark", result.stdout)
+                    self.assertIn("primary_model=abliterated-qwen-latest-27b-low", result.stdout)
                     self.assertNotIn("primary_model=shadow", result.stdout)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
 
 
-    def test_config_toml_endpoints_are_loaded_in_file_order(self) -> None:
+    def test_config_toml_approved_endpoints_keep_fallback_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             env, trace = self.fake_environment(directory)
             config_path = directory / ".config" / "pbi" / "config.toml"
             config_path.parent.mkdir(parents=True)
             config_path.write_text(
-                'primary_model = "ignored-by-endpoint-primary"\n'
+                'primary_model = "abliterated-qwen-latest-27b-none"\n'
                 '[[endpoints]]\n'
                 'provider = "openai"\n'
-                'model = "endpoint-primary"\n'
-                'base_url = "http://primary.invalid/v1"\n'
+                'model = "abliterated-qwen-latest-27b-none"\n'
+                'base_url = "http://gb10:18009/v1"\n'
                 'api_key = "endpoint-primary-secret"\n'
                 'reasoning_effort = "medium"\n'
                 '\n'
                 '[[endpoints]]\n'
                 'provider = "openai"\n'
-                'model = "endpoint-fallback"\n'
-                'base_url = "http://fallback.invalid/v1"\n'
+                'model = "abliterated-qwen-latest-27b-medium"\n'
+                'base_url = "http://gb10:18009/v1"\n'
                 'api_key = "endpoint-fallback-secret"\n'
                 'reasoning_effort = false\n'
             )
             result = self.run_pbi("--debug-config", env=env)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("primary_model=endpoint-primary", result.stdout)
-        self.assertIn("endpoint_0_model=endpoint-primary", result.stdout)
-        self.assertIn("endpoint_0_base_url=http://primary.invalid/v1", result.stdout)
-        self.assertIn("endpoint_1_model=endpoint-fallback", result.stdout)
-        self.assertIn("endpoint_1_base_url=http://fallback.invalid/v1", result.stdout)
+        self.assertIn("primary_model=abliterated-qwen-latest-27b-none", result.stdout)
+        self.assertIn("endpoint_0_model=abliterated-qwen-latest-27b-none", result.stdout)
+        self.assertIn("endpoint_0_base_url=http://gb10:18009/v1", result.stdout)
+        self.assertIn("endpoint_1_model=abliterated-qwen-latest-27b-medium", result.stdout)
+        self.assertIn("endpoint_1_base_url=http://gb10:18009/v1", result.stdout)
 
 
     def test_config_toml_endpoint_chain_forwards_distinct_identities(self) -> None:
@@ -7979,15 +7979,15 @@ exit "$status"
             config_path.write_text(
                 '[[endpoints]]\n'
                 'provider = "openai"\n'
-                'model = "endpoint-primary"\n'
-                'base_url = "http://primary.invalid/v1"\n'
+                'model = "abliterated-qwen-latest-27b-none"\n'
+                'base_url = "http://gb10:18009/v1"\n'
                 'api_key = "endpoint-primary-secret"\n'
                 'reasoning_effort = "medium"\n'
                 '\n'
                 '[[endpoints]]\n'
                 'provider = "openai"\n'
-                'model = "endpoint-fallback"\n'
-                'base_url = "http://fallback.invalid/v1"\n'
+                'model = "abliterated-qwen-latest-27b-medium"\n'
+                'base_url = "http://gb10:18009/v1"\n'
                 'api_key = "endpoint-fallback-secret"\n'
                 'reasoning_effort = "low"\n'
             )
@@ -7999,24 +7999,24 @@ exit "$status"
         self.assertNotIn("endpoint-fallback-secret", result.stdout + result.stderr)
         configured = recorded["env"]
         self.assertEqual(configured["FORCE_PROVIDER"], "openai")
-        self.assertEqual(configured["MODEL_NAME"], "endpoint-primary")
+        self.assertEqual(configured["MODEL_NAME"], "abliterated-qwen-latest-27b-none")
         self.assertEqual(configured["OPENAI_API_KEY"], "endpoint-primary-secret")
-        self.assertEqual(configured["OPENAI_API_URL"], "http://primary.invalid/v1")
+        self.assertEqual(configured["OPENAI_API_URL"], "http://gb10:18009/v1")
         self.assertEqual(
             json.loads(configured["FALLBACK_PROVIDERS"]),
             [
                 {
                     "provider": "openai",
                     "apiKey": "endpoint-primary-secret",
-                    "baseURL": "http://primary.invalid/v1",
-                    "model": "endpoint-primary",
+                    "baseURL": "http://gb10:18009/v1",
+                    "model": "abliterated-qwen-latest-27b-none",
                     "maxRetries": 3,
                 },
                 {
                     "provider": "openai",
                     "apiKey": "endpoint-fallback-secret",
-                    "baseURL": "http://fallback.invalid/v1",
-                    "model": "endpoint-fallback",
+                    "baseURL": "http://gb10:18009/v1",
+                    "model": "abliterated-qwen-latest-27b-medium",
                     "maxRetries": 0,
                 },
             ],
@@ -8032,14 +8032,14 @@ exit "$status"
             config_path.write_text(
                 '[[endpoints]]\n'
                 'provider = "openai"\n'
-                'model = "endpoint-primary"\n'
-                'base_url = "http://primary.invalid/v1"\n'
+                'model = "abliterated-qwen-latest-27b-none"\n'
+                'base_url = "http://gb10:18009/v1"\n'
                 'api_key = "endpoint-primary-secret"\n'
                 '\n'
                 '[[endpoints]]\n'
                 'provider = "openai"\n'
-                'model = "endpoint-fallback"\n'
-                'base_url = "http://fallback.invalid/v1"\n'
+                'model = "abliterated-qwen-latest-27b-medium"\n'
+                'base_url = "http://gb10:18009/v1"\n'
                 'api_key = "endpoint-fallback-secret"\n'
             )
             result = self.run_pbi("--debug-config", env=env)
@@ -8054,12 +8054,12 @@ exit "$status"
     def test_config_toml_ordinary_tables_are_ignored_without_wiping_root(self) -> None:
         cases = (
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 '[other]\n'
                 'primary_model = "shadow"\n'
             ),
             (
-                'model = "spark"\n'
+                'model = "abliterated-qwen-latest-27b-low"\n'
                 '[other]\n'
                 'model = "shadow"\n'
             ),
@@ -8074,7 +8074,7 @@ exit "$status"
                     config_path.write_text(config_text)
                     result = self.run_pbi("--debug-config", env=env)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("primary_model=spark", result.stdout)
+                    self.assertIn("primary_model=abliterated-qwen-latest-27b-low", result.stdout)
                     self.assertNotIn("primary_model=shadow", result.stdout)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
 
@@ -8082,44 +8082,44 @@ exit "$status"
     def test_config_toml_unsafe_multiline_is_ignored_and_unknown_array_tables_are_skipped(self) -> None:
         cases = (
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 'description = """\n'
                 'escaped ' + chr(92) + '""" delimiter\n'
                 'primary_model = "shadow"\n'
                 '"""\n'
             ),
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 "description = '''\n"
                 'primary_model = "shadow"\n'
                 "'''\n"
             ),
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 '"description" = """\n'
                 'primary_model = "shadow"\n'
                 '"""\n'
             ),
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 'description = ["""\n'
                 'primary_model = "shadow"\n'
                 '"""]\n'
             ),
             (
-                'model = "spark"\n'
+                'model = "abliterated-qwen-latest-27b-low"\n'
                 '"description" = ' + (chr(39) * 3) + '\n'
                 'model = "shadow"\n'
                 + (chr(39) * 3) + '\n'
             ),
             (
-                'model = "spark"\n'
+                'model = "abliterated-qwen-latest-27b-low"\n'
                 'description = [' + (chr(39) * 3) + '\n'
                 'model = "shadow"\n'
                 + (chr(39) * 3) + ']\n'
             ),
             (
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 '[[providers]]\n'
                 'primary_model = "shadow"\n'
             ),
@@ -8134,7 +8134,7 @@ exit "$status"
                     config_path.write_text(config_text)
                     result = self.run_pbi("--debug-config", env=env)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    expected_model = "spark" if "[[providers]]" in config_text else PRIMARY
+                    expected_model = "abliterated-qwen-latest-27b-low" if "[[providers]]" in config_text else PRIMARY
                     self.assertIn(f"primary_model={expected_model}", result.stdout)
                     self.assertNotIn("primary_model=shadow", result.stdout)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
@@ -8160,12 +8160,12 @@ exit "$status"
             env, trace = self.fake_environment(directory)
             config_path = directory / ".config" / "pbi" / "config.toml"
             config_path.parent.mkdir(parents=True)
-            config_path.write_text('primary_model = "spark"\n')
-            env["LLM_MODEL"] = "from-env"
+            config_path.write_text('primary_model = "abliterated-qwen-latest-27b-low"\n')
+            env["LLM_MODEL"] = "abliterated-qwen-latest-27b-medium"
             result = self.run_pbi("--debug-config", env=env)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("primary_model=from-env", result.stdout)
+        self.assertIn("primary_model=abliterated-qwen-latest-27b-medium", result.stdout)
 
     def test_pbi_config_file_overrides_xdg_config_toml(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -8176,12 +8176,12 @@ exit "$status"
             xdg_path.write_text('primary_model = "xdg"\n')
             override_path = directory / "custom" / "model.toml"
             override_path.parent.mkdir()
-            override_path.write_text('primary_model = "override"\n')
+            override_path.write_text('primary_model = "abliterated-qwen-latest-27b-medium"\n')
             env["PBI_CONFIG_FILE"] = str(override_path)
             result = self.run_pbi("--debug-config", env=env)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("primary_model=override", result.stdout)
+        self.assertIn("primary_model=abliterated-qwen-latest-27b-medium", result.stdout)
 
     def test_api_key_diagnostic_names_environment_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -8205,13 +8205,13 @@ exit "$status"
             home.mkdir()
             config_path = xdg_config_home / "pbi" / "config.toml"
             config_path.parent.mkdir(parents=True)
-            config_path.write_text('primary_model = "spark"\n')
+            config_path.write_text('primary_model = "abliterated-qwen-latest-27b-low"\n')
             env["HOME"] = str(home)
             env["XDG_CONFIG_HOME"] = str(xdg_config_home)
             result = self.run_pbi("--debug-config", env=env, cwd=directory)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("primary_model=spark", result.stdout)
+        self.assertIn("primary_model=abliterated-qwen-latest-27b-low", result.stdout)
 
     def test_config_toml_ignores_unknown_keys_without_discarding_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -8220,7 +8220,7 @@ exit "$status"
             config_path = directory / ".config" / "pbi" / "config.toml"
             config_path.parent.mkdir(parents=True)
             config_path.write_text(
-                'primary_model = "spark"\n'
+                'primary_model = "abliterated-qwen-latest-27b-low"\n'
                 'description = "cost #1"\n'
                 "timeout = 1\n"
                 "tags = [\n"
@@ -8230,7 +8230,7 @@ exit "$status"
             result = self.run_pbi("--debug-config", env=env, cwd=directory)
             self.assertFalse(trace.exists(), "debug config must not launch Probe Chat")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("primary_model=spark", result.stdout)
+        self.assertIn("primary_model=abliterated-qwen-latest-27b-low", result.stdout)
 
 
     def test_non_executable_probe_chat_fails_preflight_without_launch(self) -> None:

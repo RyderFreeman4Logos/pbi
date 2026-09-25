@@ -3,9 +3,9 @@
 set -euo pipefail
 
 readonly PBI_VERSION="0.1.0"
-readonly DEFAULT_BASE_URL="http://localhost:8317/v1"
-readonly DEFAULT_PRIMARY_MODEL="qwen3.6-27b-decensor-by-aeon"
-readonly DEFAULT_FALLBACK_MODEL="opencode/deepseek-v4-flash"
+readonly DEFAULT_BASE_URL="http://gb10:18009/v1"
+readonly DEFAULT_PRIMARY_MODEL="abliterated-qwen-latest-27b-none"
+readonly DEFAULT_FALLBACK_MODEL="$DEFAULT_PRIMARY_MODEL"
 readonly DEFAULT_REQUEST_TIMEOUT_MS="1700000"
 readonly DEFAULT_OPERATION_TIMEOUT_MS="8500000"
 readonly DEFAULT_SEARCH_TIMEOUT_SECONDS="540"
@@ -3870,15 +3870,6 @@ else
   primary_model="$DEFAULT_PRIMARY_MODEL"
 fi
 primary_provider="openai"
-if ((config_endpoint_count > 0)); then
-  primary_provider="${config_endpoint_provider[0]}"
-  if [[ -z "${LOCAL_MODEL:-}" && -z "${LLM_MODEL:-}" && -n "${config_endpoint_model[0]}" ]]; then
-    primary_model="${config_endpoint_model[0]}"
-  fi
-  if [[ -z "${CLIPROXY_BASE_URL:-}" && -z "${LOCAL_ROUTER_BASEURL:-}" && -n "${config_endpoint_base_url[0]}" ]]; then
-    base_url="${config_endpoint_base_url[0]}"
-  fi
-fi
 fallback_model="${FALLBACK_MODEL:-$DEFAULT_FALLBACK_MODEL}"
 request_timeout="${REQUEST_TIMEOUT_MS:-$DEFAULT_REQUEST_TIMEOUT_MS}"
 operation_timeout="${MAX_OPERATION_TIMEOUT_MS:-$DEFAULT_OPERATION_TIMEOUT_MS}"
@@ -3901,6 +3892,7 @@ planner_status=0
 planner_had_system_message_warning=false
 
 run_planner() {
+  configure_local_routing
   local stderr_file planner_stdout_file timeout_seconds
   timeout_seconds="$(capped_timeout_or_deadline "$planner_timeout_seconds")" || emit_query_deadline_timeout
   allocate_temp_file stderr_file
@@ -3943,58 +3935,59 @@ run_bounded_probe_search() {
   ((status == 0))
 }
 
+approved_local_route() {
+  [[ "$1" == openai && "$3" == "$DEFAULT_BASE_URL" ]] || return 1
+  case "$2" in
+    abliterated-qwen-latest-27b-none|abliterated-qwen-latest-27b-low|abliterated-qwen-latest-27b-medium) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+reject_local_route() {
+  printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; approved GB10 model and base required' >&2
+  exit 78
+}
+
 configure_local_routing() {
   local environment_api_key="${CLIPROXY_API_KEY:-${OPENAI_API_KEY:-${LOCAL_ROUTER_API_KEY:-}}}"
   local endpoint_provider endpoint_model endpoint_base_url endpoint_api_key
-  local endpoint_index routing_count=0
+  local endpoint_index routing_count=0 selected_index=-1
   local -a routing_provider=() routing_model=() routing_base_url=() routing_api_key=()
+  approved_local_route openai "$primary_model" "$base_url" || { reject_local_route; return 78; }
+  approved_local_route openai "$fallback_model" "$base_url" || { reject_local_route; return 78; }
   if ((config_endpoint_count > 0)); then
+    # Match identity first; an environment base override applies to every slot.
     for ((endpoint_index = 0; endpoint_index < config_endpoint_count; endpoint_index += 1)); do
       endpoint_provider="${config_endpoint_provider[endpoint_index]}"
       endpoint_model="${config_endpoint_model[endpoint_index]}"
       endpoint_base_url="${config_endpoint_base_url[endpoint_index]}"
       endpoint_api_key="${config_endpoint_api_key[endpoint_index]}"
-      if ((endpoint_index == 0)); then
-        if [[ -n "${LOCAL_MODEL:-}" ]]; then
-          endpoint_model="$LOCAL_MODEL"
-        elif [[ -n "${LLM_MODEL:-}" ]]; then
-          endpoint_model="$LLM_MODEL"
-        elif [[ -z "$endpoint_model" ]]; then
-          endpoint_model="$primary_model"
-        fi
-        if [[ -n "${CLIPROXY_BASE_URL:-}" ]]; then
-          endpoint_base_url="$CLIPROXY_BASE_URL"
-        elif [[ -n "${LOCAL_ROUTER_BASEURL:-}" ]]; then
-          endpoint_base_url="$LOCAL_ROUTER_BASEURL"
-        elif [[ -z "$endpoint_base_url" ]]; then
-          endpoint_base_url="$base_url"
-        fi
-        if [[ -n "$environment_api_key" ]]; then
-          endpoint_api_key="$environment_api_key"
-        fi
+      endpoint_base_url="${CLIPROXY_BASE_URL:-${LOCAL_ROUTER_BASEURL:-$endpoint_base_url}}"
+      approved_local_route "$endpoint_provider" "$endpoint_model" "$endpoint_base_url" || continue
+      if [[ "$endpoint_model" == "$primary_model" && -n "$environment_api_key" ]]; then
+        endpoint_api_key="$environment_api_key"
       fi
-      case "$endpoint_provider" in
-        openai|anthropic|google|bedrock) ;;
-        *) continue ;;
-      esac
-      [[ -n "$endpoint_model" && -n "$endpoint_base_url" && -n "$endpoint_api_key" ]] || continue
+      [[ -n "$endpoint_api_key" ]] || continue
+      if [[ "$endpoint_model" == "$primary_model" && "$selected_index" == -1 ]]; then
+        selected_index="$routing_count"
+      fi
       routing_provider[routing_count]="$endpoint_provider"
       routing_model[routing_count]="$endpoint_model"
       routing_base_url[routing_count]="$endpoint_base_url"
       routing_api_key[routing_count]="$endpoint_api_key"
       ((routing_count += 1))
     done
-    if ((routing_count == 0)); then
-      printf '%s\n' 'pbi: no usable endpoint has a provider, model, base_url, and api_key' >&2
+    if ((selected_index < 0)); then
+      reject_local_route
       return 78
     fi
-    primary_provider="${routing_provider[0]}"
-    primary_model="${routing_model[0]}"
-    base_url="${routing_base_url[0]}"
-    api_key="${routing_api_key[0]}"
+    primary_provider="${routing_provider[selected_index]}"
+    primary_model="${routing_model[selected_index]}"
+    base_url="${routing_base_url[selected_index]}"
+    api_key="${routing_api_key[selected_index]}"
     node_command="$(resolve_node)"
     fallback_providers="$({
-      export PBI_ENDPOINT_COUNT="$routing_count"
+      export PBI_ENDPOINT_COUNT="$routing_count" PBI_SELECTED_ENDPOINT="$selected_index"
       for ((endpoint_index = 0; endpoint_index < routing_count; endpoint_index += 1)); do
         export "PBI_ENDPOINT_${endpoint_index}_PROVIDER=${routing_provider[endpoint_index]}"
         export "PBI_ENDPOINT_${endpoint_index}_MODEL=${routing_model[endpoint_index]}"
@@ -4011,16 +4004,17 @@ for (let index = 0; index < count; index += 1) {
     apiKey: process.env[`${prefix}API_KEY`],
     baseURL: process.env[`${prefix}BASE_URL`],
     model: process.env[`${prefix}MODEL`],
-    maxRetries: index === 0 ? 3 : 0,
+    maxRetries: index === Number(process.env.PBI_SELECTED_ENDPOINT) ? 3 : 0,
   });
 }
+providers.unshift(...providers.splice(Number(process.env.PBI_SELECTED_ENDPOINT), 1));
 process.stdout.write(JSON.stringify(providers));'
     })"
   else
     api_key="$environment_api_key"
     if [[ -z "$api_key" ]]; then
       printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment' >&2
-      return 78
+      exit 78
     fi
     node_command="$(resolve_node)"
     fallback_providers="$(
@@ -4040,20 +4034,6 @@ process.stdout.write(JSON.stringify([
   export OPENAI_API_KEY="$api_key"
   export OPENAI_API_URL="$base_url"
   export LLM_BASE_URL="$base_url"
-  case "$primary_provider" in
-    anthropic)
-      export ANTHROPIC_API_KEY="$api_key"
-      export ANTHROPIC_API_URL="$base_url"
-      ;;
-    google)
-      export GOOGLE_GENERATIVE_AI_API_KEY="$api_key"
-      export GOOGLE_API_URL="$base_url"
-      ;;
-    bedrock)
-      export AWS_BEDROCK_API_KEY="$api_key"
-      export AWS_BEDROCK_BASE_URL="$base_url"
-      ;;
-  esac
   export REQUEST_TIMEOUT="$request_timeout"
   export MAX_OPERATION_TIMEOUT="$operation_timeout"
   export MAX_RETRIES="$max_retries"
@@ -4307,23 +4287,22 @@ rg_command="$(command -v rg || true)"
 rg_ignores=(--glob '!drafts/**' --glob '!docs/plans/**' --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**')
 
 if [[ "${1:-}" == "--debug-config" ]]; then
+  configure_local_routing
   printf '%s\n' "probe_binary=$probe_path"
   printf '%s\n' "provider=$primary_provider"
   printf '%s\n' "primary_model=$primary_model"
-  printf '%s\n' "fallback_model=$fallback_model"
   printf '%s\n' "base_url=$base_url"
-  if ((config_endpoint_count > 0)); then
-    printf '%s\n' "endpoint_count=$config_endpoint_count"
-    for ((endpoint_index = 0; endpoint_index < config_endpoint_count; endpoint_index += 1)); do
-      printf '%s\n' "endpoint_${endpoint_index}_provider=${config_endpoint_provider[endpoint_index]}"
-      printf '%s\n' "endpoint_${endpoint_index}_model=${config_endpoint_model[endpoint_index]}"
-      printf '%s\n' "endpoint_${endpoint_index}_base_url=${config_endpoint_base_url[endpoint_index]}"
-      printf '%s\n' "endpoint_${endpoint_index}_api_key=[REDACTED]"
-      if [[ "${config_endpoint_reasoning_set[endpoint_index]}" == true ]]; then
-        printf '%s\n' "endpoint_${endpoint_index}_reasoning_effort=${config_endpoint_reasoning_effort[endpoint_index]}"
-      fi
-    done
-  fi
+  "$node_command" -e '
+const slots = JSON.parse(process.env.FALLBACK_PROVIDERS);
+console.log(`fallback_model=${slots[1]?.model || ""}`);
+console.log(`endpoint_count=${slots.length}`);
+slots.forEach((slot, index) => {
+  console.log(`endpoint_${index}_provider=${slot.provider}`);
+  console.log(`endpoint_${index}_model=${slot.model}`);
+  console.log(`endpoint_${index}_base_url=${slot.baseURL}`);
+  console.log(`endpoint_${index}_api_key=[REDACTED]`);
+});'
+
   printf '%s\n' "request_timeout_ms=$request_timeout"
   printf '%s\n' "max_operation_timeout_ms=$operation_timeout"
   printf '%s\n' "max_retries=$max_retries"
@@ -4344,7 +4323,15 @@ if [[ "$1" == "--message" ]]; then
   fi
   chat_args=(--message "$1")
   shift
-  chat_args+=("$@")
+  while (($#)); do
+    argument="$1"
+    shift
+    case "$argument" in
+      --model-name|--force-provider) (($#)) && shift ;;
+      --model-name=*|--force-provider=*) ;;
+      *) chat_args+=("$argument") ;;
+    esac
+  done
 else
   message_parts=()
   chat_args=()
@@ -4375,7 +4362,6 @@ else
     printf '%s' "$output"
     exit 0
   fi
-  configure_local_routing
   if run_default_bm25_fast_path; then
     exit 0
   fi
