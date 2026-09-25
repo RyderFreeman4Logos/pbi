@@ -10740,9 +10740,13 @@ fi
                 "    handle.write(pattern + chr(9) + chr(9).join(paths) + chr(10))\n"
                 "if not paths:\n"
                 "    print(f'Pattern: {pattern}')\n"
-                "    print('File: src/core/db_admission_test_process/spawn.rs, Lines: 1-1')\n"
+                "    print('Path: justfile')\n"
+                "    print('File: justfile, Lines: 1-50')\n"
+                "    print('File: justfile, Lines: 191-297')\n"
+                "    print('File: justfile, Lines: 308-325')\n"
+                "    print('File: justfile, Lines: 144-175')\n"
                 "    print('Remaining files not shown:')\n"
-                "    print('  justfile 239 500')\n"
+                "    print('  src/core/db_admission_test_process/spawn.rs 1 500')\n"
                 "    for index in range(99):\n"
                 "        print(f'  src/footer_{index:03d}.rs 1 500')\n"
                 "    raise SystemExit(0)\n"
@@ -10777,7 +10781,9 @@ fi
             "--lib",
         ):
             self.assertIn(evidence, result.stdout)
-        self.assertNotIn("test-f pattern", result.stdout)
+        self.assertIn("test-f pattern", result.stdout)
+        self.assertIn("justfile:238", result.stdout)
+        self.assertIn("{{pattern}}", result.stdout)
         self.assertNotIn("unrelated_spawn", result.stdout)
 
     def test_default_query_recovers_extensionless_justfile_recipes(self) -> None:
@@ -10791,6 +10797,11 @@ fi
 
         def justfile(include_lib_recipe: bool) -> str:
             lines = ["# fixture filler"] * 267
+            lines[31:34] = [
+                "pre-commit:",
+                "    just fmt",
+                "    just quality-gates",
+            ]
             lines[37:41] = [
                 "pre-commit-fast:",
                 "    just fmt-check",
@@ -10923,7 +10934,9 @@ else:
             "--lib",
         ):
             self.assertIn(evidence, positive.stdout)
-        self.assertNotIn("test-f pattern", positive.stdout)
+        self.assertIn("test-f pattern", positive.stdout)
+        self.assertIn("justfile:238", positive.stdout)
+        self.assertIn("{{pattern}}", positive.stdout)
         self.assertNotIn("recipe-noise", positive.stdout)
         self.assertNotIn("unrelated_spawn", positive.stdout)
         self.assertFalse(chat_started, "local recipe retrieval must not use Probe Chat")

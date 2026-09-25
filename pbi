@@ -3399,7 +3399,13 @@ recipe_block_has_action() {
 }
 
 recipe_block_matches_target_group() {
-  local group="$1" block="$2" file="$3"
+  local group="$1" block="$2" file="$3" strict="${4:-false}"
+  if [[ "$strict" != true ]] &&
+     [[ "${group,,}" =~ (^|[^[:alnum:]_-])(focused|tests?)([^[:alnum:]_-]|$) ]] &&
+     [[ "${block,,}" == *"{{cargo}} test"* || "${block,,}" == *"cargo test"* ]] &&
+     [[ "${block,,}" != *--lib* ]]; then
+    return 0
+  fi
   if [[ "${group,,}" =~ (^|[^[:alnum:]_-])lib([^[:alnum:]_-]|$) ]] &&
      [[ "${group,,}" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]]; then
     [[ "${block,,}" == *--lib* ]] || return 1
@@ -3443,7 +3449,7 @@ recipe_evidence_is_complete() {
     for key in "${!blocks[@]}"; do
       block="${blocks[$key]}"
       recipe_block_has_action "$block" || continue
-      if recipe_block_matches_target_group "$group" "$block" "${files[$key]}"; then
+      if recipe_block_matches_target_group "$group" "$block" "${files[$key]}" true; then
         recipe_key="$key"
         break
       fi
@@ -3542,9 +3548,14 @@ recover_semantic_trace_locations() {
         recipe_start="$(recipe_block_start_line "$file" "$line_number")"
         [[ "$recipe_start" =~ ^[[:digit:]]+$ ]] || continue
         recipe_offset=0
+        recipe_actions=0
         while IFS= read -r recipe_line; do
           recipe_text="${recipe_line#"${recipe_line%%[![:space:]]*}"}"
           if ((recipe_offset == 0)) || is_recipe_action_line "$recipe_text"; then
+            if ((recipe_offset > 0)); then
+              ((recipe_actions >= 4)) && break
+              recipe_actions=$((recipe_actions + 1))
+            fi
             recipe_location="$relative:$((recipe_start + recipe_offset))"
             if [[ -z "${seen[$recipe_location]+seen}" ]]; then
               seen["$recipe_location"]=1
