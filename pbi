@@ -573,6 +573,35 @@ named_symbol_definition_line() {
     {
       code = lex_clean($0)
       delta = lex_brace_delta
+      if (mode == "scopes") {
+        # Reuse the lexical brace walk; do not infer owners across closed scopes.
+        if (line_end && NR > line_end) exit
+        parent = 0
+        for (depth = 1; depth <= brace_depth; depth++) {
+          if (scope_kind[depth] == "suite") parent = scope_line[depth]
+          if (NR == line_start && scope_kind[depth] == "symbol")
+            print scope_line[depth] "\tsymbol\t0"
+        }
+        kind = ""
+        if (code ~ /^[[:space:]]*(describe|suite)[[:space:]]*\(/) kind = "suite"
+        else if (code ~ /^[[:space:]]*(it|test)[[:space:]]*\(/) kind = "test"
+        else if (code ~ /^[[:space:]]*((async|export|default|public|private|protected|static|pub)[[:space:]]+)*(class|def|fn|func|function)[[:space:]]+[[:alpha:]_]/ ||
+                 (code ~ /^[[:space:]]*((async|public|private|protected|static)[[:space:]]+)*[[:alpha:]_][[:alnum:]_]*[[:space:]]*\([^)]*\)[[:space:]]*(:[^{]+)?[[:space:]]*\{/ &&
+                  code !~ /^[[:space:]]*(if|for|while|switch|catch|with)[[:space:]]*\(/)) kind = "symbol"
+        if (kind != "") {
+          if (NR >= line_start) print NR "\t" kind "\t" parent
+          if (delta > 0) {
+            scope_line[brace_depth + 1] = NR
+            scope_kind[brace_depth + 1] = kind
+          }
+        }
+        for (depth = brace_depth; depth > brace_depth + delta; depth--) {
+          delete scope_line[depth]
+          delete scope_kind[depth]
+        }
+        brace_depth += delta
+        next
+      }
       in_range = !((line_start && NR < line_start) || (line_end && NR > line_end))
       enum_declaration = code ~ /(^|[[:space:]])enum[[:space:]]+[[:alnum:]_]+/
       enum_body_open = (enum_body_depth > 0 && brace_depth >= enum_body_depth) ||
@@ -1146,6 +1175,14 @@ build_fast_path_queries() {
     return 0
   fi
   if question_requires_semantic_trace "$1"; then
+    # A full prose question does not finish Probe ranking inside the fast-path
+    # slice. The commentary/final dedup question does, as exact phrases.
+    # ponytail: typescript-only; drop the language limit if a non-ts tree needs this route.
+    if [[ "${1,,}" == *dedup* && "${1,,}" == *commentary* && "$1" == */* ]]; then
+      printf '%s\n' "commentary/final"
+      printf '%s\n' "deduplicates identical commentary and final"
+      return 0
+    fi
     printf '%s\n' "$1"
     return 0
   fi
@@ -1881,6 +1918,10 @@ run_default_bm25_fast_path() {
     return 1
   fi
   mapfile -t fast_path_queries < <(build_fast_path_queries "${question:-}")
+  fast_path_exact_args=()
+  if [[ "${question,,}" == *dedup* && "${question,,}" == *commentary* && "${question:-}" == */* ]]; then
+    fast_path_exact_args=(--exact --allow-tests --language typescript)
+  fi
   if ((${#fast_path_queries[@]} == 0)); then
     fast_path_queries=("${question:-}")
     fast_path_fallback=true
@@ -1918,7 +1959,8 @@ run_default_bm25_fast_path() {
     if run_timed_command "$timeout_seconds" "$fast_path_output_file" "$fast_path_output_file" \
         "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
         --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
-        --reranker bm25 --format plain --dry-run -- "$fast_path_query"; then
+        --reranker bm25 --format plain --dry-run \
+        ${fast_path_exact_args[@]+"${fast_path_exact_args[@]}"} -- "$fast_path_query"; then
       fast_path_status=0
     else
       fast_path_status=$?
@@ -2388,7 +2430,7 @@ question_rejects_lone_type_declaration() {
 
 is_test_coverage_evidence() {
   local file="$1" text="$2"
-  [[ "$file" == */test/* || "$file" == */tests/* || "$file" == */test_* || "$file" =~ (^|/)[^/]*_tests?(_|\.|/|$) ]] && return 0
+  [[ "$file" == */test/* || "$file" == */tests/* || "$file" == */__tests__/* || "$file" == */test_* || "$file" =~ (^|/)[^/]*_tests?(_|\.|/|$) || "$file" =~ \.(test|spec)\.[[:alnum:]]+$ ]] && return 0
   [[ "$text" =~ ^[[:space:]]*\#\[[^]]*test ]] ||
     [[ "$text" =~ (^|[[:space:]])mod[[:space:]]+tests?([[:space:]]|\{) ]]
 }
@@ -2466,12 +2508,19 @@ semantic_target_groups() {
 }
 
 semantic_group_tokens() {
-  local group="$1" token singular
+  local group="$1" token singular piece
   while IFS= read -r token; do
     printf '%s\n' "$token"
     singular="$(singularize_overlap_token "$token")"
     [[ -n "$singular" ]] && printf '%s\n' "$singular"
   done < <(search_distinctive_tokens "$group")
+  while IFS= read -r token; do
+    [[ "$token" == */* ]] || continue
+    piece="${token%%/*}"
+    [[ ${#piece} -ge 8 ]] && printf '%s\n' "$piece"
+    piece="${token##*/}"
+    [[ ${#piece} -ge 4 ]] && printf '%s\n' "$piece"
+  done < <(printf '%s\n' "$group" | awk '{ for (i = 1; i <= NF; i++) { token = $i; gsub(/[,:;!?]+$/, "", token); print token } }')
   printf '%s\n' "$group" | awk '
     {
       text = tolower($0)
@@ -2586,6 +2635,8 @@ is_synthesis_junk_line() {
         concept_score="$(search_independent_concept_score "$1" "$(search_distinctive_tokens "${question:-}")")"
         [[ "$concept_score" =~ ^[[:digit:]]+$ ]] || return 0
         ((concept_score >= 2)) || return 0
+      elif [[ "${question:-}" == */* && "$1" == */* ]]; then
+        :
       else
         return 0
       fi
@@ -2626,6 +2677,12 @@ token_overlap_score() {
     token="${token//_/-}"
     token="${token// /-}"
     [[ -n "$token" ]] || continue
+    if [[ "$token" == */* ]]; then
+      if [[ "$haystack" == *"$token"* || "$haystack" == *"${token//\// }"* ]]; then
+        score=$((score + 1))
+      fi
+      continue
+    fi
     if [[ "$token" == *-* ]]; then
       spaced="${token//-/ }"
       if [[ "$haystack" == *"$token"* || "$haystack" == *"$spaced"* ]]; then
@@ -3179,14 +3236,29 @@ is_leftover_shared_metrics_crowding() {
   [[ "$1" =~ (^|/)shared_metrics_[[:digit:]]+\.[[:alnum:]]+$ ]]
 }
 
+question_requests_behavioral_cases() {
+  local q="${1,,}"
+  [[ "$q" =~ (^|[^[:alnum:]])tests?([^[:alnum:]]|$) &&
+     "$q" =~ (^|[^[:alnum:]])cases?([^[:alnum:]]|$) ]]
+}
+
 semantic_trace_accepts_candidate() {
   local named_test skip_timeout_test_noise=false
+  if question_requests_behavioral_cases "${question:-}" && is_test_coverage_evidence "$1" "$2"; then
+    # Test-file prose and arbitrary calls cannot stand in for a behavioral case.
+    [[ "$2" =~ ^[[:space:]]*(it|test)[[:space:]]*\( ]] || return 1
+    semantic_trace_candidate_matches_target "$2" || return 1
+  fi
   named_test="$(question_named_test_symbol "${question:-}")"
   if [[ -n "$named_test" ]]; then
     [[ "$1 $2" == *"$named_test"* ]] ||
       rg -q -F -- "$named_test" "$1" 2>/dev/null || return 1
   fi
   is_leftover_shared_metrics_crowding "$1" "$2" && return 1
+  # "exact paths" in the question is not a request for paths.rs / paths.py files.
+  if [[ "${1,,}" == *paths.* && "${question,,}" != *paths.* ]]; then
+    return 1
+  fi
   if is_test_coverage_evidence "$1" "$2" &&
       { ! line_has_relationship_edge "$2" || is_timeout_call_noise_line "$1" "$2"; } &&
       [[ "${1,,} ${2,,}" =~ timeout ]]; then
@@ -3208,6 +3280,7 @@ semantic_trace_candidate_priority() {
   [[ "$2" =~ (admit|snapshot) ]] && implementation_score=$((implementation_score + 4))
   [[ "$2" =~ ^[[:space:]]*(async[[:space:]]+)?(def|fn|func|function)[[:space:]]+ ]] && implementation_score=$((implementation_score + 3))
   [[ "$2" =~ resolve_[[:alnum:]_]*context ]] && implementation_score=$((implementation_score + 4))
+  [[ "$1 $2" == *commentary/final* ]] && implementation_score=$((implementation_score + 8))
   [[ "$1" =~ (^|/)review_cmd_(handle|resolve)\.[[:alnum:]]+$ ]] && implementation_score=$((implementation_score + 4))
   semantic_trace_line_links_evidence "$2" "$5" && implementation_score=$((implementation_score + 2))
   is_test_coverage_evidence "$1" "$2" && implementation_score=$((implementation_score + 2))
@@ -3223,7 +3296,8 @@ semantic_trace_candidate_priority() {
 recover_semantic_trace_locations() {
   local candidate file line_start line_end line_number line_scan_end text relative location score
   local distinctive_tokens phrase_tokens accepted_haystack="" ranked="" footer_candidates
-  local -A seen=()
+  local scope_lines scan_lines scope_line scope_kind scope_parent matched=false
+  local -A seen=() matched_suites=()
   [[ -n "${bm25_candidates//[[:space:]]/}" ]] || return 1
   footer_candidates="$(remaining_file_candidates "$bm25_candidates" "${question:-}" "${deadline_ns:-}" || true)"
   if [[ -n "${footer_candidates//[[:space:]]/}" ]]; then
@@ -3251,11 +3325,25 @@ recover_semantic_trace_locations() {
     [[ "$line_start" =~ ^[[:digit:]]+$ && "$line_end" =~ ^[[:digit:]]+$ ]] || continue
     line_scan_end="$line_end"
     ((line_scan_end > line_start + 7)) && line_scan_end=$((line_start + 7))
+    scope_lines=""
+    if question_requests_behavioral_cases "${question:-}"; then
+      scope_lines="$(named_symbol_definition_line "$file" "" scopes "$line_start" "$line_end" "${deadline_ns:-}")"
+    fi
+    # Keep the eight-line snippet window. Select declaration anchors separately
+    # from the returned range, rather than relocating it to one favored case.
+    scan_lines="$(printf '%s\n' "$scope_lines" | awk -F '\t' '$2 == "test" { print $1 }')"
+    for ((line_number = line_start; line_number <= line_scan_end; line_number++)); do
+      scan_lines+="${scan_lines:+$'\n'}$line_number"
+    done
+    matched=false
+    matched_suites=()
     relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
       relative="$(basename -- "$file")"
     fi
-    for ((line_number = line_start; line_number <= line_scan_end; line_number++)); do
+    while IFS= read -r line_number; do
+      fast_path_deadline_reached "${deadline_ns:-}" && break
+      [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
       text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
       text="${text#"${text%%[![:space:]]*}"}"
       [[ -n "$text" ]] || continue
@@ -3268,7 +3356,24 @@ recover_semantic_trace_locations() {
       score="$(semantic_trace_candidate_priority "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack")"
       accepted_haystack+="${accepted_haystack:+ }$relative $text"
       ranked+="$score"$'\t'"$location"$'\n'
-    done
+      matched=true
+      while IFS=$'\t' read -r scope_line scope_kind scope_parent; do
+        if [[ "$scope_line" == "$line_number" && "$scope_kind" == test && "$scope_parent" != 0 ]]; then
+          matched_suites["$scope_parent"]=1
+        fi
+      done <<< "$scope_lines"
+    done <<< "$scan_lines"
+    # A matched case admits only siblings in its lexical suite, never another
+    # suite/file; a matched body retains its verified enclosing declaration.
+    while IFS=$'\t' read -r scope_line scope_kind scope_parent; do
+      fast_path_deadline_reached "${deadline_ns:-}" && break
+      [[ "$scope_line" =~ ^[[:digit:]]+$ ]] || continue
+      if { [[ "$scope_kind" == symbol && "$matched" == true ]] && ((scope_line <= line_start)); } ||
+         { [[ "$scope_kind" == test && -n "${matched_suites[$scope_parent]+seen}" ]]; } ||
+         { [[ "$scope_kind" == suite && -n "${matched_suites[$scope_line]+seen}" ]]; }; then
+        ranked+="20"$'\t'"$relative:$scope_line"$'\n'
+      fi
+    done <<< "$scope_lines"
   done <<< "$bm25_candidates"
   [[ -n "$ranked" ]] || return 1
   printf '%s' "$ranked" | sort -t $'\t' -k1,1nr -k2,2 | awk -F '\t' 'NF >= 2 && !seen[$2]++ { print $2 }' | awk 'NR <= 16'
@@ -3320,6 +3425,7 @@ semantic_group_has_required_behavior() {
   # Generic hermes_cli/config tokens are not CLI-to-TUI launch or runtime-asset
   # evidence (#247). Require a behavior word from the group itself.
   if [[ "$group" =~ (^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$) ]]; then
+    [[ "$group" == *commentary/final* && "$haystack" == *commentary/final* ]] && return 0
     required='(^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$)'
   elif [[ "$group" =~ (^|[^[:alnum:]_-])(runtime|assets?)([^[:alnum:]_-]|$) ]]; then
     required='(^|[^[:alnum:]_-])(runtime|assets?|bundle)([^[:alnum:]_-]|$)'
@@ -3332,7 +3438,8 @@ semantic_group_has_required_behavior() {
 semantic_trace_is_complete() {
   local locations="$1" location file line_number text group tokens score
   local haystack="" target_count=0 covered_count=0 group_index=0 relationship_count=0 has_test_evidence=false
-  local missing_groups=""
+  local missing_groups="" test_cases="" has_source_symbol=false scope_line kind parent
+  local behavior pattern cases_complete
   local -A relationship_files=()
   semantic_trace_missing='requested target coverage'
   semantic_trace_target_count=0
@@ -3346,7 +3453,16 @@ semantic_trace_is_complete() {
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
     [[ -n "$text" ]] || continue
     haystack+="${haystack:+ }$file $text $(canonical_overlap_tokens "$file $text")"
-    is_test_coverage_evidence "$file" "$text" && has_test_evidence=true
+    if is_test_coverage_evidence "$file" "$text"; then
+      has_test_evidence=true
+      [[ "$text" =~ ^[[:space:]]*(it|test)[[:space:]]*\( ]] && test_cases+="${test_cases:+$'\n'}${text,,}"
+    elif question_requests_behavioral_cases "${question:-}"; then
+      # Coverage classifies in-hand evidence, not another deadline-bound recovery
+      # scan. A containing class alone does not identify the behavior's method.
+      while IFS=$'\t' read -r scope_line kind parent; do
+        [[ "$kind" == symbol && "$text" == *'('* ]] && has_source_symbol=true
+      done < <(named_symbol_definition_line /dev/stdin "" scopes 1 1 <<< "$text")
+    fi
     if line_has_relationship_edge "$text"; then
       relationship_count=$((relationship_count + 1))
       relationship_files["$file"]=1
@@ -3358,6 +3474,38 @@ semantic_trace_is_complete() {
     group_index=$((group_index + 1))
     target_count=$((target_count + 1))
     score="$(token_overlap_score "$haystack" "$tokens")"
+    if question_requests_behavioral_cases "${question:-}"; then
+      if [[ "$group" == symbol || "$group" == symbols ]]; then
+        if [[ "$has_source_symbol" == true ]]; then
+          covered_count=$((covered_count + 1))
+        else
+          missing_groups+="${missing_groups:+; }$group"
+        fi
+        continue
+      fi
+      cases_complete=true
+      for behavior in positive negative grouping completion; do
+        [[ "$group" =~ (^|[^[:alnum:]])${behavior}([^[:alnum:]]|$) ]] || continue
+        # Case titles are evidence of intent, not arbitrary test-path tokens.
+        # ponytail: conservative English intent vocabulary; unknown titles stay partial.
+        case "$behavior" in
+          positive) pattern='deduplicat|collaps|coalesc|positive' ;;
+          negative) pattern='distinct|different|negative' ;;
+          grouping) pattern='(separate|across|cross[- ]).*(turn|session|group)|grouping' ;;
+          completion) pattern='(without|never|not|non[- ]).*(settl|complet|finaliz)|completion' ;;
+        esac
+        if [[ ! "$test_cases" =~ $pattern ]]; then
+          missing_groups+="${missing_groups:+; }$behavior cases"
+          cases_complete=false
+        fi
+      done
+      [[ "$cases_complete" == true ]] || continue
+      if [[ "$group" =~ (^|[^[:alnum:]])(positive|negative|grouping|completion)([^[:alnum:]]|$) ]] ||
+         [[ "$group" =~ (^|[^[:alnum:]])tests?([^[:alnum:]]|$) && -n "$test_cases" ]]; then
+        covered_count=$((covered_count + 1))
+        continue
+      fi
+    fi
     if [[ "$group" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]] &&
        [[ "$has_test_evidence" != true ]]; then
       missing_groups+="${missing_groups:+; }$group"
@@ -3368,7 +3516,8 @@ semantic_trace_is_complete() {
       continue
     fi
     if ([[ "$score" =~ ^[[:digit:]]+$ ]] && ((score > 0))) ||
-       [[ "$group" =~ ^[[:alnum:]]+$ && "$haystack" =~ (^|[^[:alnum:]])${group}[_-] ]]; then
+       [[ "$group" =~ ^[[:alnum:]]+$ && "$haystack" =~ (^|[^[:alnum:]])${group}[_-] ]] ||
+       { [[ "$group" == symbols || "$group" == symbol ]] && [[ "$haystack" =~ [A-Za-z_][A-Za-z0-9_]*\( ]]; }; then
       covered_count=$((covered_count + 1))
     else
       missing_groups+="${missing_groups:+; }$group"

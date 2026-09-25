@@ -9547,6 +9547,341 @@ exit "$status"
         self.assertNotIn("proxy/unrelated.py", result.stdout)
         self.assertFalse(trace.exists(), "semantic traces must not require Probe Chat")
 
+    def test_slash_compound_semantic_trace_uses_exact_typescript_phrases(self) -> None:
+        question = (
+            "Locate the PR148 TUI commentary/final deduplication implementation "
+            "and its focused behavioral tests. Return exact paths, symbols, and "
+            "the intended positive/negative/grouping/completion cases."
+        )
+        impl = "ui-tui/src/app/turnController.ts"
+        tests = "ui-tui/src/__tests__/createGatewayEventHandler.test.ts"
+        impl_line = "    // byte-identical commentary/final pairs collapse, while post-interim tails\n"
+        test_line = "    it('deduplicates identical commentary and final replies in one turn', () => {\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            (repo / impl).parent.mkdir(parents=True)
+            (repo / tests).parent.mkdir(parents=True)
+            (repo / impl).write_text(impl_line)
+            (repo / tests).write_text(test_line)
+            env, _ = self.fake_environment(directory)
+            mise = directory / "mise"
+            mise.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "[ \"$1\" = which ]\n"
+                "case \"$2\" in\n"
+                "  probe) printf '%s\\n' \"$PBI_TEST_PROBE\" ;;\n"
+                "  node) printf '%s\\n' /usr/local/bin/node ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n"
+            )
+            mise.chmod(0o755)
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "argv = sys.argv[1:]\n"
+                "if '--exact' not in argv or '--language' not in argv or 'typescript' not in argv:\n"
+                "    raise SystemExit(124)\n"
+                "query = argv[-1]\n"
+                f"if query == 'commentary/final':\n"
+                f"    print('File: {repo / impl}, Lines: 1-1')\n"
+                f"elif query == 'deduplicates identical commentary and final':\n"
+                f"    print('File: {repo / tests}, Lines: 1-1')\n"
+                "else:\n"
+                "    raise SystemExit(124)\n"
+            )
+            probe.chmod(0o755)
+            result = self.run_pbi(question, env=env, cwd=repo, binary=self.fake_pbi(directory, probe), timeout=15)
+        # Phrase retrieval alone is not coverage of the requested cases/symbol.
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(impl, result.stderr)
+        self.assertIn(tests, result.stderr)
+        self.assertNotIn("Coverage: complete", result.stdout + result.stderr)
+
+    def test_behavioral_trace_preserves_scoped_cases_and_requires_each_case(self) -> None:
+        # #287: captured ranges at consumer 040c2aed, not injected final locations.
+        # Ranked lexical noise stays before the actual implementation/test ranges.
+        question = (
+            "Locate the PR148 TUI commentary/final deduplication implementation "
+            "and its focused behavioral tests. Return exact paths, symbols, and "
+            "the intended positive/negative/grouping/completion cases."
+        )
+        impl = 'ui-tui/src/app/turnController.ts'
+        tests = 'ui-tui/src/__tests__/createGatewayEventHandler.test.ts'
+        implementation = "\n" * 141 + 'class TurnController {\n' + "\n" * 453 + (
+            '  recordMessageComplete(payload: MessageCompletePayload) {\n'
+            '    this.closeReasoningSegment()\n'
+            '\n'
+            "    // Ink renders markdown via <Md>; the gateway's Rich-rendered ANSI\n"
+            "    // (`payload.rendered`) is for terminals that can't.  Prioritising\n"
+            '    // `rendered` here garbles output whenever a user opts into\n'
+            '    // `display.final_response_markdown: render` because raw ANSI escapes\n'
+            '    // pass through into the React tree.  Prefer raw text and fall back\n'
+            '    // only when the gateway elected not to send any (#16391).\n'
+            '    // `text` is `str | JsonValue` on the wire (structured parts stay possible); only a string renders here.\n'
+            "    const wireText = typeof payload.text === 'string' ? payload.text : undefined\n"
+            '    const finalTextProjection = wireText ?? payload.rendered ?? this.bufRef\n'
+            '    const rawText = finalTextProjection.trimStart()\n'
+            '    const split = splitReasoning(rawText)\n'
+            '    // Sealed commentary is separate from streamed post-interim segments: only\n'
+            '    // byte-identical commentary/final pairs collapse, while post-interim tails\n'
+            '    // retain their existing prefix handling.\n'
+            '    const interimBoundary = this.interimBoundaryIndex ?? 0\n'
+            '    const finalText = textSegments(this.segmentMessages.slice(0, interimBoundary)).includes(finalTextProjection)\n'
+            "      ? ''\n"
+            '      : finalTail(split.text, this.segmentMessages.slice(interimBoundary))\n'
+            "    const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()\n"
+            "    const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\\n\\n')\n"
+        )
+        behavior = "\n" * 2326 + (
+            "  describe('message.interim', () => {\n"
+            "    it('finalizes an interim segment without settling the turn', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { text: 'streaming text' }, type: 'message.delta' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'streaming text' }, type: 'message.interim' } as any)\n"
+            '\n'
+            '      // Turn is still active — busy stays true, no completion messages appended\n'
+            '      expect(getUiState().busy).toBe(true)\n'
+            '      expect(appended).toHaveLength(0)\n'
+            '    })\n'
+            '\n'
+            "    it('deduplicates identical commentary and final replies in one turn', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)\n"
+            "      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)\n"
+            '\n'
+            "      const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)\n"
+            "      expect(assistantMsgs).toEqual([{ role: 'assistant', text: 'same reply' }])\n"
+            '    })\n'
+            '\n'
+            "    it('preserves a prefix-distinct final after commentary', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'progress' }, type: 'message.interim' } as any)\n"
+            "      onEvent({ payload: { text: 'progress complete' }, type: 'message.complete' } as any)\n"
+            '\n'
+            "      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([\n"
+            "        'progress',\n"
+            "        'progress complete'\n"
+            '      ])\n'
+            '    })\n'
+            '\n'
+            "    it('preserves a trailing-whitespace-distinct final after commentary', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'same reply  ' }, type: 'message.interim' } as any)\n"
+            "      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)\n"
+            '\n'
+            "      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([\n"
+            "        'same reply  ',\n"
+            "        'same reply'\n"
+            '      ])\n'
+            '    })\n'
+            '\n'
+            "    it('preserves a final with trailing whitespace distinct from commentary', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)\n"
+            "      onEvent({ payload: { text: 'same reply  ' }, type: 'message.complete' } as any)\n"
+            '\n'
+            "      const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)\n"
+            '      expect(assistantMsgs).toHaveLength(2)\n'
+            "      expect(assistantMsgs.map(m => m.text)).toEqual(['same reply', 'same reply'])\n"
+            '    })\n'
+            '\n'
+            "    it('settles identical terminal reply onto interim when response_previewed', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)\n"
+            "      onEvent({ payload: { response_previewed: true, text: 'same reply' }, type: 'message.complete' } as any)\n"
+            '\n'
+            '      // With response_previewed, the terminal reply is the same model\n'
+            '      // response that was published provisionally — settle onto the\n'
+            '      // interim instead of duplicating. (#65919 review)\n'
+            "      const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)\n"
+            '      expect(assistantMsgs).toHaveLength(1)\n'
+            "      expect(assistantMsgs[0]?.text).toBe('same reply')\n"
+            '    })\n'
+            '\n'
+            "    it('keeps distinct commentary and final replies visible', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'interim answer' }, type: 'message.interim' } as any)\n"
+            "      onEvent({ payload: { text: 'final answer' }, type: 'message.delta' } as any)\n"
+            "      onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)\n"
+            '\n'
+            "      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([\n"
+            "        'interim answer',\n"
+            "        'final answer'\n"
+            '      ])\n'
+            '    })\n'
+            '\n'
+            "    it('does not suppress identical replies in separate turns', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)\n"
+            "      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)\n"
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            "      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)\n"
+            '\n'
+            "      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([\n"
+            "        'same reply',\n"
+            "        'same reply'\n"
+            '      ])\n'
+            '    })\n'
+            '\n'
+            "    it('ignores malformed message.interim payload', () => {\n"
+            '      const appended: Msg[] = []\n'
+            '      const onEvent = createGatewayEventHandler(buildCtx(appended))\n'
+            '\n'
+            "      onEvent({ payload: {}, type: 'message.start' } as any)\n"
+            '      // No payload at all\n'
+            "      onEvent({ type: 'message.interim' } as any)\n"
+            '      // Empty text\n'
+            "      onEvent({ payload: { text: '' }, type: 'message.interim' } as any)\n"
+            '      // Undefined text\n'
+            "      onEvent({ payload: { text: undefined }, type: 'message.interim' } as any)\n"
+            '\n'
+            '      // Turn continues without finalizing or throwing\n'
+            '      expect(getUiState().busy).toBe(true)\n'
+            '      expect(appended).toHaveLength(0)\n'
+            '    })\n'
+            '  })\n'
+        )
+        noise = {
+            "tests/gateway/test_media_spaced_paths_and_history_dedupe.py":
+                '"""Media paths\nand code-block-safe streaming display strip.\n"""\n',
+            "tests/hermes_state/test_session_db_read_path_split.py":
+                "\n" * 177 + "get_messages_as_conversation / get_resume_conversations /\n",
+            "tests/plugins/test_plugin_paths_follow_profile.py":
+                "\n\nSeveral plugins carried a ``~/.hermes`` fallback (guarding an ImportError of ``hermes_constants``\n",
+        }
+        missing_ranges = {
+            "complete": (),
+            "renamed": (),
+            "positive": ((2341, 2351), (2394, 2408)),
+            "negative": ((2353, 2393), (2410, 2423)),
+            "grouping": ((2425, 2439),),
+            "completion": ((2328, 2339), (2441, 2456)),
+            "symbol": (),
+        }
+        for missing, removed in missing_ranges.items():
+            impl = "src/runtime.ts" if missing == "renamed" else "ui-tui/src/app/turnController.ts"
+            tests = "spec/runtime.spec.ts" if missing == "renamed" else "ui-tui/src/__tests__/createGatewayEventHandler.test.ts"
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repo = directory / "repo"
+                sources = {**noise, impl: implementation, tests: behavior}
+                # Remove evidence without changing the surviving source locations.
+                lines = sources[tests].splitlines(keepends=True)
+                for start, end in removed:
+                    lines[start - 1:end] = ["\n"] * (end - start + 1)
+                sources[tests] = "".join(lines)
+                if missing == "symbol":
+                    sources[impl] = implementation.replace(
+                        "  recordMessageComplete(payload: MessageCompletePayload) {",
+                        "  // recordMessageComplete(payload: MessageCompletePayload)",
+                    )
+                    sources[impl] = sources[impl].replace("\n", "function unrelatedSymbol() {}\n", 1)
+                    sources[tests] = sources[tests].replace(
+                        "replies in one turn", "replies in one turn via recordMessageComplete(payload)",
+                    )
+                for relative, content in sources.items():
+                    path = repo / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content)
+                env, trace = self.fake_environment(directory)
+                ranges = [
+                    (next(iter(noise)), 1, 3),
+                    (list(noise)[1], 178, 180),
+                    (list(noise)[2], 1, 3),
+                    (impl, 611, 618),
+                    (tests, 2327, 2457),
+                ]
+                captured = "\n".join(
+                    f"File: {repo / path}, Lines: {start}-{end}"
+                    for path, start, end in ranges
+                )
+                # Exercise the shared coverage boundary after real range admission.
+                # The live run already emitted these anchors when recovery expired;
+                # do not inject locations or make a clock-sensitive sleep fixture.
+                if missing in ("complete", "renamed", "symbol"):
+                    helpers = PBI.read_text().partition('\ncase "${1:-}" in\n')[0]
+                    check = subprocess.run(
+                        ["bash", "-s", "--", question, captured],
+                        input=helpers + '\nquestion="$1"\nbm25_candidates="$2"\n' + r'''
+locations="$(recover_semantic_trace_locations)"
+format_semantic_trace_evidence "$locations"
+deadline_ns=1
+if semantic_trace_is_complete "$locations"; then
+  printf '%s\n' 'Coverage: complete'
+else
+  printf 'Missing: %s\n' "$semantic_trace_missing"
+  exit 1
+fi
+''',
+                        cwd=repo, env=env, text=True, capture_output=True, check=False, timeout=15,
+                    )
+                    with self.subTest(boundary="expired recovery", missing=missing):
+                        self.assertEqual(check.returncode, 1 if missing == "symbol" else 0, check.stdout + check.stderr)
+                        self.assertIn(f"{impl}:142 — class TurnController", check.stdout)
+                        if missing == "symbol":
+                            self.assertIn("Missing: requested target groups: symbols", check.stdout)
+                        else:
+                            self.assertIn(f"{impl}:596 — recordMessageComplete", check.stdout)
+                probe = directory / "probe"
+                probe.write_text("#!/usr/bin/env python3\n" + f"print({captured!r})\n")
+                probe.chmod(0o755)
+                result = self.run_pbi(
+                    question, env=env, cwd=repo,
+                    binary=self.fake_pbi(directory, probe), timeout=15,
+                )
+                output = result.stdout + result.stderr
+                self.assertFalse(trace.exists(), "source admission must not require chat")
+                if missing not in ("complete", "renamed"):
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertNotIn("Coverage: complete", output)
+                    self.assertIn(missing, output)
+                    continue
+                self.assertEqual(result.returncode, 0, output)
+                for fragment in (
+                    "recordMessageComplete", f"{impl}:596",
+                    "deduplicates identical commentary and final replies in one turn",
+                    "preserves a prefix-distinct final after commentary",
+                    "preserves a trailing-whitespace-distinct final after commentary",
+                    "preserves a final with trailing whitespace distinct from commentary",
+                    f"{tests}:2327",
+                    "keeps distinct commentary and final replies visible",
+                    "does not suppress identical replies in separate turns",
+                    "finalizes an interim segment without settling the turn",
+                    "ignores malformed message.interim payload",
+                ):
+                    self.assertIn(fragment, output)
+                for path in noise:
+                    self.assertNotIn(path, output)
+                self.assertIn("Coverage: complete", result.stdout)
+                self.assertLessEqual(output.count(" — "), 16)
+
     def test_default_semantic_trace_assembles_multi_target_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result, trace = self.run_default_semantic_fixture(
