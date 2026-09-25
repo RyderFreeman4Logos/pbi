@@ -3892,6 +3892,7 @@ planner_status=0
 planner_had_system_message_warning=false
 
 run_planner() {
+  configure_local_routing
   local stderr_file planner_stdout_file timeout_seconds
   timeout_seconds="$(capped_timeout_or_deadline "$planner_timeout_seconds")" || emit_query_deadline_timeout
   allocate_temp_file stderr_file
@@ -3944,7 +3945,7 @@ approved_local_route() {
 
 reject_local_route() {
   printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; approved GB10 model and base required' >&2
-  return 78
+  exit 78
 }
 
 configure_local_routing() {
@@ -4013,7 +4014,7 @@ process.stdout.write(JSON.stringify(providers));'
     api_key="$environment_api_key"
     if [[ -z "$api_key" ]]; then
       printf '%s\n' 'pbi: set LOCAL_ROUTER_API_KEY, CLIPROXY_API_KEY, or OPENAI_API_KEY in the environment' >&2
-      return 78
+      exit 78
     fi
     node_command="$(resolve_node)"
     fallback_providers="$(
@@ -4361,7 +4362,6 @@ else
     printf '%s' "$output"
     exit 0
   fi
-  configure_local_routing
   if run_default_bm25_fast_path; then
     exit 0
   fi
