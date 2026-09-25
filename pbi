@@ -105,17 +105,22 @@ probe_api_error_diagnostic() {
 let input = "";
 process.stdin.on("data", chunk => { input += chunk; });
 process.stdin.on("end", () => {
-  const safeToken = value => {
-    if (typeof value !== "string" && typeof value !== "number") return "";
-    const token = String(value);
-    return /^[A-Za-z0-9._:-]{1,128}$/.test(token) ? token : "";
+  // Only closed codes leave this boundary; token-shaped strings can be secrets.
+  const classes = {
+    provider: new Set(["invalid_request", "invalid_request_error", "model_not_found",
+      "rate_limit_exceeded", "insufficient_quota", "authentication_error",
+      "permission_denied", "server_error", "AI_APICallError"]),
+    transport: new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND",
+      "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"]),
+    protocol: new Set(["AI_TypeValidationError", "AI_JSONParseError",
+      "AI_InvalidResponseDataError", "AI_EmptyResponseBodyError", "AI_NoObjectGeneratedError"]),
   };
+  const errorClass = code => Object.keys(classes).find(name => classes[name].has(code));
   const objectValue = value => value && typeof value === "object" && !Array.isArray(value);
-  const fields = (value, names) => {
+  const fields = (value, names, accepts) => {
     if (!objectValue(value)) return "";
     for (const name of names) {
-      const token = safeToken(value[name]);
-      if (token) return token;
+      if (accepts(value[name])) return String(value[name]);
     }
     return "";
   };
@@ -129,30 +134,26 @@ process.stdin.on("end", () => {
     } catch {}
   }
   const isErrorResponse = value => value.error || value.errors || value.status === "error";
-  const response = responses.find(isErrorResponse) || responses[0];
+  const response = responses.find(isErrorResponse);
   let status = "";
   let request = "";
+  let httpStatus = "";
   if (response) {
-    status = fields(response.error, ["code", "status"]);
-    if (!status && Array.isArray(response.errors)) {
-      for (const error of response.errors) {
-        status = fields(error, ["code", "status"]);
-        if (status) break;
-      }
+    const errors = [response.error, ...(Array.isArray(response.errors) ? response.errors : []), response];
+    for (const value of errors) {
+      if (!status) status = fields(value, ["code", "name", "status"], errorClass);
+      // Never guess an HTTP status from prose, a request ID, or an errno.
+      if (!httpStatus) httpStatus = fields(value, ["statusCode", "status_code", "http_status", "status"],
+        code => (typeof code === "number" || typeof code === "string") && /^[45][0-9]{2}$/.test(String(code)));
     }
-    if (!status) status = fields(response, ["status"]);
-    for (const value of [response, response.error, ...(Array.isArray(response.errors) ? response.errors : [])]) {
-      request = fields(value, ["request_id", "requestId"]);
+    for (const value of [response, ...errors]) {
+      request = fields(value, ["request_id", "requestId"],
+        id => typeof id === "string" && /^req[_-][A-Za-z0-9_-]{1,96}$/.test(id));
       if (request) break;
     }
-    if (!request) {
-      for (const value of [response, response.error, ...(Array.isArray(response.errors) ? response.errors : [])]) {
-        request = fields(value, ["id", "session", "session_id"]);
-        if (request) break;
-      }
-    }
   }
-  process.stdout.write(`status=${status || "error"}${request ? ` request=${request}` : ""}`);
+  const category = errorClass(status) || (httpStatus ? "provider" : "unknown");
+  process.stdout.write(`class=${category} stage=answer status=${status || "error"}${httpStatus ? ` http_status=${httpStatus}` : ""}${request ? ` request=${request}` : ""}`);
 });'
   )"
   printf '%s\n' "pbi: probe-chat reported an API error ($diagnostic)" >&2
