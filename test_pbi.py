@@ -9478,6 +9478,44 @@ exit "$status"
         self.assertEqual(result.stdout, "audit.py:1\n")
         self.assertEqual(result.stderr, "")
 
+    def test_planner_timeout_stamp_only_absent_exclusive_symbols_is_no_hit(self) -> None:
+        question = (
+            "where does CLI daemon status mix disk api.enabled with "
+            "authenticated IPC runtime snapshot listen_bound http_ready?"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            source = repo / "src" / "daemon.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("fn run_loop() {\n    let enabled = config.api.enabled;\n}\n")
+            env, trace = self.fake_environment(directory)
+            env["PBI_PLANNER_TIMEOUT_SECONDS"] = "1"
+            probe = directory / "probe"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {source}, Lines: 1-1')\n"
+            )
+            probe.chmod(0o755)
+            (directory / "probe-chat").write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, time\n"
+                "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
+                "time.sleep(30)\n"
+            )
+            (directory / "probe-chat").chmod(0o755)
+            result = self.run_pbi(
+                question, env=env, cwd=repo,
+                binary=self.fake_pbi(directory, probe), timeout=20,
+            )
+            self.assertTrue(trace.exists(), "planner timeout must be exercised")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "pbi: no source location contains the queried symbol\n",
+        )
+
     def test_planner_timeout_recovers_hyphenated_write_reserve_source(self) -> None:
         # #246: SQLite is a decoy named symbol. Distinctive write-reserve
         # allocate/cleanup must still be recovered; leftover BM25 + hanging

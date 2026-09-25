@@ -795,6 +795,24 @@ emit_bm25_locations_or_fail_closed() {
       printf '%s\n' 'pbi: no source locations found' >&2
       exit 1
     fi
+    symbol_scan_status=1
+    exclusive_absent=false
+    while IFS= read -r candidate_symbol; do
+      [[ -n "$candidate_symbol" ]] || continue
+      named_symbol_is_exclusive "$candidate_symbol" "${question:-}" || continue
+      exclusive_absent=true
+      candidate_scan_status=0
+      repo_contains_named_symbol "$candidate_symbol" || candidate_scan_status=$?
+      if [[ "$candidate_scan_status" -eq 2 ]]; then
+        symbol_scan_status=2
+      elif [[ "$candidate_scan_status" -eq 0 ]]; then
+        symbol_scan_status=0
+      fi
+    done < <(search_named_symbols "${question:-}")
+    if [[ "$exclusive_absent" == true && "$symbol_scan_status" -eq 1 ]]; then
+      printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
+      exit 1
+    fi
     printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
     exit 1
   fi
