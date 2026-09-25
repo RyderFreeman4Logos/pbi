@@ -4996,11 +4996,11 @@ if [[ "$explore_uses_local_model" == true ]]; then
         done <<<"$named_symbols"
         if [[ "$exclusive_absent" != true ]]; then
           printf '%s\n' 'pbi: no source locations found' >&2
-        elif [[ "${named_symbol_recovery_required:-false}" == true ]]; then
-          # The model echoed location stamps. A missing symbol is not a no-hit.
-          printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
         elif [[ "$symbol_scan_status" -eq 1 ]]; then
           printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
+        elif [[ "${named_symbol_recovery_required:-false}" == true ]]; then
+          # A present symbol or an uncertain scan is still a stamp failure.
+          printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
         else
           printf '%s\n' 'pbi: no source locations found' >&2
         fi

@@ -156,12 +156,27 @@ class PbiTest(unittest.TestCase):
         fake_chat = directory / "probe-chat"
         fake_chat.write_text(
             "#!/usr/bin/env python3\n"
-            "import os\n"
+            "import os, sys\n"
+            "message = ' '.join(sys.argv[1:])\n"
+            "if 'Convert the code question' in message:\n"
+            "    print('daemon status api.enabled')\n"
+            "    raise SystemExit(0)\n"
             "open(os.environ['PBI_TEST_TRACE'], 'a').close()\n"
             + "\n".join(f"print({str(path.relative_to(repo)) + ':1'!r})" for path in candidates)
             + "\n"
         )
         fake_chat.chmod(0o755)
+        node = directory / "node"
+        node.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "sys.stdin.read()\n"
+            "if os.environ.get('PBI_BASE_URL'):\n"
+            "    sys.stdout.write('[]')\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        )
+        node.chmod(0o755)
         result = self.run_pbi(
             *extra_args,
             question,
@@ -173,9 +188,9 @@ class PbiTest(unittest.TestCase):
         return result, trace
 
     def test_default_grounded_stamp_only_is_not_no_hit(self) -> None:
-        # #292: ranked File headers plus a stamp-only model reply are a model
-        # failure, not "no source locations", even when the asked identifiers
-        # are absent from those files.
+        # #292: grounded File headers plus a stamp-only reply are not a blanket
+        # no-locations miss. When every exclusive symbol is absent, the
+        # diagnostic is a symbol no-hit even though api.enabled is present.
         question = (
             "where does CLI daemon status mix disk api.enabled with "
             "authenticated IPC runtime snapshot listen_bound http_ready?"
@@ -197,9 +212,116 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(
             result.stderr,
-            "pbi: model returned only BM25 location stamps; no source answer\n",
+            "pbi: no source location contains the queried symbol\n",
         )
         self.assertNotIn("no source locations found", result.stderr)
+        self.assertNotIn("location stamps", result.stderr)
+
+    def test_default_stamp_only_recovers_when_one_exclusive_symbol_present(self) -> None:
+        question = (
+            "where does CLI daemon status mix disk api.enabled with "
+            "authenticated IPC runtime snapshot listen_bound http_ready?"
+        )
+        sources = {
+            "src/daemon.rs": (
+                "fn run_loop() {\n"
+                "    let enabled = config.api.enabled;\n"
+                "    let bound = listen_bound;\n"
+                "}\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, trace = self.run_default_semantic_fixture(
+                Path(temporary), question, sources
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("src/daemon.rs:", result.stdout)
+        self.assertIn("listen_bound", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("no source location contains the queried symbol", result.stdout + result.stderr)
+        self.assertFalse(trace.exists())
+
+    def test_default_stamp_only_api_enabled_only_is_symbol_no_hit(self) -> None:
+        question = (
+            "where does CLI daemon status mix disk api.enabled with "
+            "authenticated IPC runtime snapshot listen_bound http_ready?"
+        )
+        sources = {
+            "src/daemon.rs": "fn run_loop() {\n    let enabled = config.api.enabled;\n}\n",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _trace = self.run_default_semantic_fixture(
+                Path(temporary), question, sources
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "pbi: no source location contains the queried symbol\n",
+        )
+
+    def test_default_stamp_only_keeps_stamp_when_symbol_scan_uncertain(self) -> None:
+        question = (
+            "where does CLI daemon status mix disk api.enabled with "
+            "authenticated IPC runtime snapshot listen_bound http_ready?"
+        )
+        sources = {
+            "src/daemon.rs": "fn run_loop() {\n    let enabled = config.api.enabled;\n}\n",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repo = directory / "repo"
+            repo.mkdir()
+            for relative, content in sources.items():
+                path = repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            env, _trace = self.fake_environment(directory)
+            node = directory / "node"
+            node.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "sys.stdin.read()\n"
+                "if os.environ.get('PBI_BASE_URL'):\n"
+                "    sys.stdout.write('[]')\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n"
+            )
+            node.chmod(0o755)
+            rg = directory / "rg"
+            rg.write_text("#!/usr/bin/env bash\nexit 2\n")
+            rg.chmod(0o755)
+            probe = directory / "probe"
+            daemon = repo / "src" / "daemon.rs"
+            probe.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print('File: {daemon}, Lines: 1-8')\n"
+            )
+            probe.chmod(0o755)
+            fake_chat = directory / "probe-chat"
+            fake_chat.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "message = ' '.join(sys.argv[1:])\n"
+                "if 'Convert the code question' in message:\n"
+                "    print('daemon status api.enabled')\n"
+                "    raise SystemExit(0)\n"
+                "print('src/daemon.rs:1')\n"
+            )
+            fake_chat.chmod(0o755)
+            result = self.run_pbi(
+                question,
+                env=env,
+                cwd=repo,
+                binary=self.fake_pbi(directory, probe),
+                timeout=15,
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "pbi: model returned only BM25 location stamps; no source answer\n",
+        )
 
     def test_default_lifecycle_trace_recovers_footer_source(self) -> None:
         candidates = {f"src/{name}.py": f"def unrelated_{name}():\n    return {index}\n" for index, name in enumerate("abcdefgh", 1)}
