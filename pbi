@@ -1856,9 +1856,13 @@ search_named_symbol() {
 # Hyphen-rewritten prose and filename stems are not exclusive identifiers.
 # Keep fail-closed for real identifiers that were present as such in the query.
 named_symbol_is_exclusive() {
-  local symbol="$1" query="$2"
+  local symbol="$1" query="$2" token
   [[ -n "$symbol" ]] || return 1
-  [[ "$query" == *.* && "$query" == *"$symbol"* ]] && return 1
+  # A dotted filename stem is not an exclusive identifier. A dotted field
+  # elsewhere in the query (api.enabled) must not hide a real underscore symbol.
+  while IFS= read -r token; do
+    [[ "$token" == *.* && "$token" == *"$symbol"* ]] && return 1
+  done < <(printf '%s\n' "$query" | awk '{ for (i = 1; i <= NF; i++) print $i }')
   [[ "$query" == *"$symbol"* ]]
 }
 
@@ -4992,6 +4996,9 @@ if [[ "$explore_uses_local_model" == true ]]; then
         done <<<"$named_symbols"
         if [[ "$exclusive_absent" != true ]]; then
           printf '%s\n' 'pbi: no source locations found' >&2
+        elif [[ "${named_symbol_recovery_required:-false}" == true ]]; then
+          # The model echoed location stamps. A missing symbol is not a no-hit.
+          printf '%s\n' 'pbi: model returned only BM25 location stamps; no source answer' >&2
         elif [[ "$symbol_scan_status" -eq 1 ]]; then
           printf '%s\n' 'pbi: no source location contains the queried symbol' >&2
         else

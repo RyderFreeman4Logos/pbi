@@ -172,6 +172,35 @@ class PbiTest(unittest.TestCase):
         )
         return result, trace
 
+    def test_default_grounded_stamp_only_is_not_no_hit(self) -> None:
+        # #292: ranked File headers plus a stamp-only model reply are a model
+        # failure, not "no source locations", even when the asked identifiers
+        # are absent from those files.
+        question = (
+            "where does CLI daemon status mix disk api.enabled with "
+            "authenticated IPC runtime snapshot listen_bound http_ready?"
+        )
+        sources = {
+            "src/daemon.rs": "fn run_loop() {\n    let enabled = config.api.enabled;\n}\n",
+            "src/daemon_readiness.rs": (
+                "fn wait() {\n"
+                "    // authenticated IPC readiness probe\n"
+                "    probe_readiness()\n"
+                "}\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _trace = self.run_default_semantic_fixture(
+                Path(temporary), question, sources
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "pbi: model returned only BM25 location stamps; no source answer\n",
+        )
+        self.assertNotIn("no source locations found", result.stderr)
+
     def test_default_lifecycle_trace_recovers_footer_source(self) -> None:
         candidates = {f"src/{name}.py": f"def unrelated_{name}():\n    return {index}\n" for index, name in enumerate("abcdefgh", 1)}
         target = "scripts/run_tests_parallel.py"
