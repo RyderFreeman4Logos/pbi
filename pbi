@@ -1164,6 +1164,20 @@ explicit_removed_or_renamed_symbol_history() {
   printf 'History: %s %s\n%s\nCurrent test imports:\n%s\n' "$commit" "$subject" "$change" "$imports"
 }
 
+question_requests_recipe_scope() {
+  local query="${1,,}"
+  [[ "$query" =~ (^|[^[:alnum:]_-])just([^[:alnum:]_-]|$) ]] &&
+    [[ "$query" =~ (^|[^[:alnum:]_-])recipes([^[:alnum:]_-]|$) ]]
+}
+
+extensionless_search_paths() {
+  local deadline_ns="${1:-}" rg_command
+  rg_command="$(command -v rg || true)"
+  [[ -n "$rg_command" ]] || return 0
+  # ponytail: justfile names only; widen if another extensionless recipe file is required.
+  run_rg_with_deadline "$deadline_ns" "$rg_command" --files --hidden --iglob '**/justfile' --glob '!.git/**' --sortr modified
+}
+
 build_fast_path_queries() {
   local token is_stem normalized fallback_token queries="" fallback_queries="" count=0 fallback_count=0
   if fast_path_requires_cache_key "$1"; then
@@ -1522,12 +1536,27 @@ fast_path_footer_path_matches_query() {
 remaining_file_candidates() {
   local line path resolved_path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
   local footer_rg_matches rg_command footer_rg_pattern footer_rg_status deadline_ns="${3:-}"
-  local footer_line_matches hit line_number fallback_path_tokens="" symbol normalized
+  local footer_line_matches hit line_number fallback_path_tokens="" symbol normalized file_name
   local path_kept footer_path_limit
   local -a footer_source_paths=() footer_path_matches=() footer_match_args=()
   local -A footer_source_path_seen=() footer_path_seen=()
   footer_tokens="$(fast_path_footer_tokens "$query")"
   fast_path_deadline_reached "$deadline_ns" && return 1
+  if question_requests_recipe_scope "$query"; then
+    while IFS= read -r line; do
+      [[ "$line" =~ ^File:[[:space:]]+(.+),[[:space:]]Lines:[[:space:]]+[[:digit:]]+(-[[:digit:]]+)?$ ]] || continue
+      path="${BASH_REMATCH[1]}"
+      file_name="${path##*/}"
+      [[ "${file_name,,}" == justfile || "${file_name,,}" == *.justfile ]] || continue
+      resolved_path="$path"
+      [[ "$resolved_path" != /* ]] && resolved_path="$PWD/$resolved_path"
+      [[ -f "$resolved_path" ]] || continue
+      if [[ -z "${footer_path_seen[$path]+seen}" ]]; then
+        footer_path_matches+=("$path")
+        footer_path_seen["$path"]=1
+      fi
+    done <<< "$1"
+  fi
   footer_rg_matches=""
   footer_rg_pattern=""
   if fast_path_requires_cache_key "$query"; then
@@ -1542,7 +1571,7 @@ remaining_file_candidates() {
       continue
     fi
     [[ "$in_footer" == true ]] || continue
-    [[ "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]+\<[[:digit:]]+\>[[:space:]]+\<[[:digit:]]+\>[[:space:]]*$ ]] || continue
+    [[ "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]+(\<[[:digit:]]+\>|[[:digit:]]+)[[:space:]]+(\<[[:digit:]]+\>|[[:digit:]]+)[[:space:]]*$ ]] || continue
     path="${BASH_REMATCH[1]}"
     case "$path" in
       */PATTERN.md|*/workflow.toml|*/Cargo.toml|*.md) continue ;;
@@ -1556,7 +1585,9 @@ remaining_file_candidates() {
       footer_source_path_seen["$path"]=1
     fi
     if ! fast_path_requires_cache_key "$query" &&
-       fast_path_footer_path_matches_query "$path" "$footer_tokens" &&
+       { fast_path_footer_path_matches_query "$path" "$footer_tokens" ||
+         { question_requests_recipe_scope "$query" &&
+           [[ "${path##*/}" == [Jj]ustfile || "${path##*/}" == *.justfile ]]; }; } &&
        [[ -z "${footer_path_seen[$path]+seen}" ]]; then
       footer_path_matches+=("$path")
       footer_path_seen["$path"]=1
@@ -1631,7 +1662,17 @@ remaining_file_candidates() {
     ((footer_path_limit > 0)) || footer_path_limit=1
     while IFS= read -r line; do
       [[ -n "$line" ]] && footer_match_args+=( -e "$line" )
-    done < <(fast_path_match_variants "$query" | awk 'NF && !seen[$0]++')
+    done < <(
+      {
+        fast_path_match_variants "$query"
+        if question_requests_recipe_scope "$query"; then
+          printf '%s\n' just
+          while IFS= read -r group; do
+            semantic_group_tokens "$group"
+          done < <(semantic_target_groups "$query")
+        fi
+      } | awk 'NF && !seen[$0]++'
+    )
     if ((${#footer_match_args[@]} > 0)); then
       footer_line_matches=""
       for path in "${footer_path_matches[@]}"; do
@@ -1652,7 +1693,24 @@ remaining_file_candidates() {
         path_kept="${footer_path_kept[$path]:-0}"
         ((path_kept < footer_path_limit)) || continue
         last_footer_line["$path"]="$line_number"
-        printf 'File: %s, Lines: %s-%s\n' "$path" "$line_number" "$((line_number + 2))"
+        if question_requests_recipe_scope "$query" &&
+           [[ "${path##*/}" == [Jj]ustfile || "${path##*/}" == *.justfile ]]; then
+          block_end="$(awk -v target="$line_number" '
+            function is_header(line) {
+              return line ~ /^[[:alnum:]_-]+([^:]*)?:[[:space:]]*([^=[:space:]]|$)/
+            }
+            NR < target { next }
+            NR == target { last = NR; next }
+            is_header($0) || $0 ~ /^#/ || (NF && $0 !~ /^[[:space:]]/) { exit }
+            { last = NR }
+            END { if (last) print last }
+          ' "$path")"
+          [[ "$block_end" =~ ^[[:digit:]]+$ ]] || block_end="$line_number"
+          ((block_end > line_number + 63)) && block_end=$((line_number + 63))
+          printf 'File: %s, Lines: %s-%s\n' "$path" "$line_number" "$block_end"
+        else
+          printf 'File: %s, Lines: %s-%s\n' "$path" "$line_number" "$((line_number + 2))"
+        fi
         footer_path_kept["$path"]=$((path_kept + 1))
         kept=$((kept + 1))
         ((kept < 16)) || break
@@ -1672,6 +1730,7 @@ remaining_file_candidates() {
     ((kept < 16)) || break
   done <<< "$footer_rg_matches"
   ((kept < 16)) || return 0
+  question_requests_recipe_scope "$query" && return 0
   for path in "${footer_path_matches[@]}"; do
     fast_path_deadline_reached "$deadline_ns" && break
     [[ -n "$path" && -z "${emitted_footer_paths[$path]+seen}" ]] || continue
@@ -1858,9 +1917,12 @@ run_default_bm25_fast_path() {
   local deadline_ns now_ns remaining_ns search_remaining_ns remaining_ms per_query_ns timeout_seconds
   local fast_path_query_index=0 remaining_queries
   local fast_path_fallback=false fast_path_timed_out=false
-  local -a fast_path_queries=() named_files=()
+  local -a fast_path_queries=() named_files=() recipe_search_paths=()
   deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
   mapfile -t named_files < <(named_query_files "${question:-}")
+  if question_requests_recipe_scope "${question:-}"; then
+    mapfile -t recipe_search_paths < <(extensionless_search_paths "$deadline_ns")
+  fi
   if ((${#named_files[@]} > 0)) && ! question_requires_semantic_trace "${question:-}"; then
     search_uses_local_model=true
     bm25_candidates=""
@@ -1960,7 +2022,7 @@ run_default_bm25_fast_path() {
         "$(resolve_probe)" search --timeout "$DEFAULT_SEARCH_TIMEOUT_SECONDS" \
         --max-results 4 --max-tokens 4000 --ignore drafts --ignore docs/plans \
         --reranker bm25 --format plain --dry-run \
-        ${fast_path_exact_args[@]+"${fast_path_exact_args[@]}"} -- "$fast_path_query"; then
+        ${fast_path_exact_args[@]+"${fast_path_exact_args[@]}"} -- "$fast_path_query" "${recipe_search_paths[@]}"; then
       fast_path_status=0
     else
       fast_path_status=$?
@@ -2536,6 +2598,7 @@ semantic_group_tokens() {
           print "test"
           print "test-"
         }
+        if (word == "lib") print word
         if (word ~ /^(admission|authority|caller|callers|consumer|consumers|contract|contracts|gate|schema|seam|snapshot|test|tests|validator|wiring)$/) {
           print word
           if (word ~ /^(callers|consumers|contracts|tests)$/) {
@@ -2685,9 +2748,8 @@ token_overlap_score() {
     fi
     if [[ "$token" == *-* ]]; then
       spaced="${token//-/ }"
-      if [[ "$haystack" == *"$token"* || "$haystack" == *"$spaced"* ]]; then
-        score=$((score + 1))
-      fi
+      [[ "$haystack" == *"$token"* || "$haystack" == *"$spaced"* ]] && ((score += 1))
+      continue
     else
       # ponytail: hyphen is a word char so leftover "identity" does not match azure-identity
       pat='(^|[^[:alnum:]-])'"$(ere_quote "$token")"'([^[:alnum:]-]|$)'
@@ -3273,6 +3335,131 @@ semantic_trace_accepts_candidate() {
   return 0
 }
 
+is_recipe_header_line() {
+  [[ "$1" =~ ^[[:alnum:]_-]+([^:]*)?:[[:space:]]*([^=[:space:]]|$) ]]
+}
+
+is_recipe_action_line() {
+  [[ "${1,,}" == just\ * || "${1,,}" == *"{{cargo}} test"* || "${1,,}" == *"cargo test"* ]]
+}
+
+recipe_block_for_line() {
+  local file="$1" target="$2"
+  awk -v target="$target" '
+    function is_recipe_header(line) {
+      return line ~ /^[[:alnum:]_-]+([^:]*)?:[[:space:]]*([^=[:space:]]|$)/
+    }
+    {
+      if (NR > target && found &&
+          (is_recipe_header($0) || $0 ~ /^#/ || (NF && $0 !~ /^[[:space:]]/))) exit
+      if (NR <= target && is_recipe_header($0)) {
+        start = NR
+        count = 0
+      }
+      if (start) lines[++count] = $0
+      if (NR == target) found = 1
+    }
+    END {
+      if (!start || !found) exit 1
+      for (i = 1; i <= count; i++) print lines[i]
+    }
+  ' "$file"
+}
+
+recipe_block_start_line() {
+  local file="$1" target="$2"
+  awk -v target="$target" '
+    function is_recipe_header(line) {
+      return line ~ /^[[:alnum:]_-]+([^:]*)?:[[:space:]]*([^=[:space:]]|$)/
+    }
+    NR > target { exit }
+    is_recipe_header($0) { start = NR }
+    END { if (start) print start }
+  ' "$file"
+}
+
+recipe_block_name() {
+  local header="${1%%$'\n'*}"
+  header="${header%%:*}"
+  header="${header%%[[:space:]]*}"
+  printf '%s\n' "$header"
+}
+
+recipe_block_has_action() {
+  local line first=true
+  while IFS= read -r line; do
+    if [[ "$first" == true ]]; then
+      first=false
+      continue
+    fi
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -n "${line//[[:space:]]/}" ]] && return 0
+  done <<< "$1"
+  return 1
+}
+
+recipe_block_matches_target_group() {
+  local group="$1" block="$2" file="$3" strict="${4:-false}"
+  if [[ "$strict" != true ]] &&
+     [[ "${group,,}" =~ (^|[^[:alnum:]_-])(focused|tests?)([^[:alnum:]_-]|$) ]] &&
+     [[ "${block,,}" == *"{{cargo}} test"* || "${block,,}" == *"cargo test"* ]] &&
+     [[ "${block,,}" != *--lib* ]]; then
+    return 0
+  fi
+  if [[ "${group,,}" =~ (^|[^[:alnum:]_-])lib([^[:alnum:]_-]|$) ]] &&
+     [[ "${group,,}" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]]; then
+    [[ "${block,,}" == *--lib* ]] || return 1
+    [[ "${block,,}" == *"{{cargo}} test"* || "${block,,}" == *"cargo test"* ]] || return 1
+    return 0
+  fi
+  semantic_trace_candidate_matches_target "$block" "$file" false
+}
+
+recipe_block_matches_any_target_group() {
+  local block="$1" file="$2" query="$3" group
+  while IFS= read -r group; do
+    recipe_block_matches_target_group "$group" "$block" "$file" && return 0
+  done < <(semantic_target_groups "$query")
+  return 1
+}
+
+recipe_evidence_is_complete() {
+  local locations="$1" query="$2" location file line_number block name key group recipe_key
+  local -a groups=()
+  local -A blocks=() files=() used=()
+  mapfile -t groups < <(semantic_target_groups "$query")
+  ((${#groups[@]} >= 2)) || return 1
+  while IFS= read -r location; do
+    [[ "$location" =~ ^(.+):([[:digit:]]+)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+    line_number="${BASH_REMATCH[2]}"
+    [[ "$file" != /* ]] && file="$PWD/$file"
+    [[ -f "$file" ]] || continue
+    block="$(recipe_block_for_line "$file" "$line_number" 2>/dev/null || true)"
+    [[ -n "$block" ]] || continue
+    name="$(recipe_block_name "$block")"
+    [[ -n "$name" ]] || continue
+    key="$file|$name"
+    blocks["$key"]="$block"
+    files["$key"]="$file"
+  done <<< "$locations"
+  ((${#blocks[@]} >= ${#groups[@]})) || return 1
+  for group in "${groups[@]}"; do
+    recipe_key=""
+    for key in "${!blocks[@]}"; do
+      block="${blocks[$key]}"
+      recipe_block_has_action "$block" || continue
+      if recipe_block_matches_target_group "$group" "$block" "${files[$key]}" true; then
+        recipe_key="$key"
+        break
+      fi
+    done
+    [[ -n "$recipe_key" && -z "${used[$recipe_key]+seen}" ]] || return 1
+    used["$recipe_key"]=1
+  done
+  return 0
+}
+
 semantic_trace_candidate_priority() {
   local score phrase_score compound_score=0 implementation_score=0 token token_score
   score="$(token_overlap_score "$1 $2" "$3")"
@@ -3294,7 +3481,7 @@ semantic_trace_candidate_priority() {
 }
 
 recover_semantic_trace_locations() {
-  local candidate file line_start line_end line_number line_scan_end text relative location score
+  local candidate file line_start line_end line_number line_scan_end text relative location score recipe_context recipe_start recipe_offset recipe_line recipe_text recipe_location
   local distinctive_tokens phrase_tokens accepted_haystack="" ranked="" footer_candidates
   local scope_lines scan_lines scope_line scope_kind scope_parent matched=false
   local -A seen=() matched_suites=()
@@ -3324,7 +3511,11 @@ recover_semantic_trace_locations() {
     [[ -f "$file" ]] || continue
     [[ "$line_start" =~ ^[[:digit:]]+$ && "$line_end" =~ ^[[:digit:]]+$ ]] || continue
     line_scan_end="$line_end"
-    ((line_scan_end > line_start + 7)) && line_scan_end=$((line_start + 7))
+    if question_requests_recipe_scope "${question:-}"; then
+      ((line_scan_end > line_start + 63)) && line_scan_end=$((line_start + 63))
+    else
+      ((line_scan_end > line_start + 7)) && line_scan_end=$((line_start + 7))
+    fi
     scope_lines=""
     if question_requests_behavioral_cases "${question:-}"; then
       scope_lines="$(named_symbol_definition_line "$file" "" scopes "$line_start" "$line_end" "${deadline_ns:-}")"
@@ -3349,7 +3540,36 @@ recover_semantic_trace_locations() {
       [[ -n "$text" ]] || continue
       is_synthesis_junk_source "$file" "$text" && continue
       is_synthesis_junk_line "$text" && continue
-      semantic_trace_accepts_candidate "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack" || continue
+      recipe_context=""
+      if question_requests_recipe_scope "${question:-}"; then
+        recipe_context="$(recipe_block_for_line "$file" "$line_number" 2>/dev/null || true)"
+        [[ -n "$recipe_context" ]] || continue
+        recipe_block_matches_any_target_group "$recipe_context" "$relative" "${question:-}" || continue
+        recipe_start="$(recipe_block_start_line "$file" "$line_number")"
+        [[ "$recipe_start" =~ ^[[:digit:]]+$ ]] || continue
+        recipe_offset=0
+        recipe_actions=0
+        while IFS= read -r recipe_line; do
+          recipe_text="${recipe_line#"${recipe_line%%[![:space:]]*}"}"
+          if ((recipe_offset == 0)) || is_recipe_action_line "$recipe_text"; then
+            if ((recipe_offset > 0)); then
+              ((recipe_actions >= 4)) && break
+              recipe_actions=$((recipe_actions + 1))
+            fi
+            recipe_location="$relative:$((recipe_start + recipe_offset))"
+            if [[ -z "${seen[$recipe_location]+seen}" ]]; then
+              seen["$recipe_location"]=1
+              score="$(semantic_trace_candidate_priority "$relative" "$recipe_text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack")"
+              accepted_haystack+="${accepted_haystack:+ }$relative $recipe_text"
+              ranked+="$score"$'\t'"$recipe_location"$'\n'
+            fi
+          fi
+          recipe_offset=$((recipe_offset + 1))
+        done <<< "$recipe_context"
+        continue
+      elif ! semantic_trace_accepts_candidate "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack"; then
+        continue
+      fi
       location="$relative:$line_number"
       [[ -z "${seen[$location]+seen}" ]] || continue
       seen["$location"]=1
@@ -3438,7 +3658,7 @@ semantic_group_has_required_behavior() {
 semantic_trace_is_complete() {
   local locations="$1" location file line_number text group tokens score
   local haystack="" target_count=0 covered_count=0 group_index=0 relationship_count=0 has_test_evidence=false
-  local missing_groups="" test_cases="" has_source_symbol=false scope_line kind parent
+  local missing_groups="" recipe_complete=false test_cases="" has_source_symbol=false scope_line kind parent
   local behavior pattern cases_complete
   local -A relationship_files=()
   semantic_trace_missing='requested target coverage'
@@ -3468,11 +3688,24 @@ semantic_trace_is_complete() {
       relationship_files["$file"]=1
     fi
   done <<< "$locations"
+  if question_requests_recipe_scope "${question:-}"; then
+    if recipe_evidence_is_complete "$locations" "${question:-}"; then
+      recipe_complete=true
+      has_test_evidence=true
+    else
+      semantic_trace_missing='requested recipe target coverage'
+      return 1
+    fi
+  fi
   while IFS= read -r group; do
     tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
     [[ -n "${tokens//[[:space:]]/}" ]] || continue
     group_index=$((group_index + 1))
     target_count=$((target_count + 1))
+    if [[ "$recipe_complete" == true ]]; then
+      covered_count=$((covered_count + 1))
+      continue
+    fi
     score="$(token_overlap_score "$haystack" "$tokens")"
     if question_requests_behavioral_cases "${question:-}"; then
       if [[ "$group" == symbol || "$group" == symbols ]]; then
@@ -3538,7 +3771,8 @@ semantic_trace_is_complete() {
     return 1
   fi
   if question_requires_semantic_trace "${question:-}" &&
-      ! question_is_multi_target_where "${question:-}"; then
+      ! question_is_multi_target_where "${question:-}" &&
+      [[ "$recipe_complete" != true ]]; then
     if [[ -n "$(question_named_test_symbol "${question:-}")" ]]; then
       if ((relationship_count < 2)); then
         semantic_trace_missing='requested relationship edge'
@@ -3607,20 +3841,25 @@ recover_shared_metrics_helper_locations() {
 }
 
 emit_semantic_trace_from_candidates() {
-  local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations named_test helper_locations
+  local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations named_test helper_locations=""
   locations=""
   named_test="$(question_named_test_symbol "${question:-}")"
-  if [[ -n "$named_test" ]]; then
+  if [[ -n "$named_test" ]] && ! question_requests_recipe_scope "${question:-}"; then
     locations="$(recover_named_test_body_locations "$deadline_ns" || true)"
   else
+    if ! question_requests_recipe_scope "${question:-}"; then
     while IFS= read -r symbol; do
       symbol_locations="$(recover_named_symbol_definition "$symbol" "$deadline_ns" || true)"
       [[ -z "${symbol_locations//[[:space:]]/}" ]] || locations+="${locations:+$'\n'}$symbol_locations"
     done < <(search_named_symbols "${question:-}")
-    helper_locations="$(recover_shared_metrics_helper_locations "$deadline_ns" || true)"
+      helper_locations="$(recover_shared_metrics_helper_locations "$deadline_ns" || true)"
+    fi
     symbol_locations="$(recover_semantic_trace_locations || true)"
     locations="$(printf '%s\n%s\n%s\n' "$helper_locations" "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
-    fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
+    fallback_locations=""
+    if ! question_requests_recipe_scope "${question:-}"; then
+      fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
+    fi
     fallback_locations="$(filter_semantic_trace_locations "$fallback_locations" || true)"
     if [[ -n "${fallback_locations//[[:space:]]/}" ]]; then
       locations="$(printf '%s\n%s\n' "$fallback_locations" "$locations" | awk 'NF && !seen[$0]++')"
