@@ -4147,6 +4147,7 @@ search_uses_local_model=false
 explore_uses_local_model=false
 search_fallback_locations=""
 search_fast_path_miss=false
+routing_rejected=false
 recovered_from_candidates=false
 planner_stdout=""
 planner_stderr=""
@@ -4154,7 +4155,15 @@ planner_status=0
 planner_had_system_message_warning=false
 
 run_planner() {
-  configure_local_routing
+  # A planner that cannot reach an approved route is a miss, not a hard stop.
+  # Chat and --debug-config still fail closed inside configure_local_routing.
+  if ! configure_local_routing; then
+    planner_status=78
+    planner_stdout=
+    planner_stderr=
+    planner_had_system_message_warning=false
+    return 0
+  fi
   local stderr_file planner_stdout_file timeout_seconds
   timeout_seconds="$(capped_timeout_or_deadline "$planner_timeout_seconds")" || emit_query_deadline_timeout
   allocate_temp_file stderr_file
@@ -4206,8 +4215,8 @@ approved_local_route() {
 }
 
 reject_local_route() {
-  printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; approved GB10 model and base required' >&2
-  exit 78
+  routing_rejected=true
+  return 78
 }
 
 configure_local_routing() {
@@ -4549,7 +4558,10 @@ rg_command="$(command -v rg || true)"
 rg_ignores=(--glob '!drafts/**' --glob '!docs/plans/**' --glob '!**/__pycache__/**' --glob '!target/**' --glob '!node_modules/**')
 
 if [[ "${1:-}" == "--debug-config" ]]; then
-  configure_local_routing
+  if ! configure_local_routing; then
+    printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; approved GB10 model and base required' >&2
+    exit 78
+  fi
   printf '%s\n' "probe_binary=$probe_path"
   printf '%s\n' "provider=$primary_provider"
   printf '%s\n' "primary_model=$primary_model"
@@ -4666,7 +4678,11 @@ else
       --message "Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: $question" \
       --max-iterations 1
   generated_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
-  if planner_timeout_or_kill "$planner_status"; then
+  if [[ "$routing_rejected" == true ]]; then
+    planned_queries="$(search_distinctive_tokens "$question")"
+    [[ -n "${planned_queries//[[:space:]]/}" ]] || planned_queries="$question"
+    planner_timed_out=true
+  elif planner_timeout_or_kill "$planner_status"; then
     recovered_named_locations="$(collect_named_symbol_locations "$query_deadline_ns" || true)"
     if [[ -n "$recovered_named_locations" ]]; then
       printf '%s\n' "$recovered_named_locations"
@@ -4729,6 +4745,13 @@ else
     fi
   done <<<"$planned_queries"
   bm25_candidates="$candidates"
+  if [[ "$routing_rejected" == true ]]; then
+    if [[ -n "$(compact_search_locations "$candidates")" ]]; then
+      emit_bm25_locations_or_fail_closed
+    fi
+    printf '%s\n' 'pbi: local query planning failed' >&2
+    exit 1
+  fi
   if [[ "$planner_timed_out" == true ]]; then
     if planner_timeout_or_kill "$planner_status"; then
       printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
@@ -4826,7 +4849,10 @@ else
   )
 fi
 
-configure_local_routing
+if ! configure_local_routing; then
+  printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; approved GB10 model and base required' >&2
+  exit 78
+fi
 
 allocate_temp_file probe_stdout_file
 allocate_temp_file probe_stderr_file
