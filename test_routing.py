@@ -138,6 +138,24 @@ def test_unapproved_route_fails_closed_before_chat(tmp_path, model, base, provid
     assert not trace.exists()
 
 
+def test_unapproved_route_allows_verified_named_file_fast_path(tmp_path):
+    """A source-verified no-model fast path precedes route admission."""
+    harness = test_pbi.PbiTest()
+    env, trace = harness.fake_environment(tmp_path)
+    (tmp_path / "README.md").write_text("evidence: route admission\n")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'primary_model = "abliterated-qwen-latest-27b-none"\n'
+        + endpoint("spark", "http://127.0.0.1:8317/v1")
+    )
+    env["PBI_CONFIG_FILE"] = str(config)
+    result = harness.run_pbi("where is README.md?", env=env, cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "README.md:1\n"
+    assert result.stderr == ""
+    assert not trace.exists()
+
+
 @pytest.mark.parametrize("name,value", [
     ("LOCAL_MODEL", "spark"), ("LLM_MODEL", "gpt-6-luna"),
     ("FALLBACK_MODEL", "opencode/deepseek-v4-flash"),
@@ -214,8 +232,8 @@ def test_hostile_dotenv_blocks_planner_before_model(tmp_path):
 def test_unapproved_planner_refusal_does_not_emit_unrelated_location(tmp_path):
     """Planner refusal is not a BM25 success, even when Probe has a coarse hit.
 
-    The fast path has nothing to verify here. The planner must run, refuse the
-    unapproved route, and leave both the relevant file and the decoy uncited.
+    The fast path has nothing to verify here. Probe may run, but the unapproved
+    route must be refused before planner/chat and both files stay uncited.
     """
     harness = test_pbi.PbiTest()
     env, trace = harness.fake_environment(tmp_path)
@@ -255,7 +273,7 @@ def test_unapproved_planner_refusal_does_not_emit_unrelated_location(tmp_path):
     assert "epub_inspect.rs" not in query.stdout + query.stderr
     assert "fixture-secret" not in query.stdout + query.stderr
     assert not trace.exists()
-    assert not calls.exists()
+    assert calls.exists()
     for args in (("--message", "hello"), ("--debug-config",)):
         blocked = harness.run_pbi(*args, env=env, cwd=tmp_path)
         assert blocked.returncode == 78

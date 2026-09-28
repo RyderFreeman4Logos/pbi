@@ -1941,9 +1941,6 @@ run_default_bm25_fast_path() {
   local fast_path_query_index=0 remaining_queries
   local fast_path_fallback=false fast_path_timed_out=false
   local -a fast_path_queries=() named_files=() recipe_search_paths=()
-  if ! configure_local_routing; then
-    emit_unapproved_route_guidance
-  fi
   deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
   mapfile -t named_files < <(named_query_files "${question:-}")
   if question_requests_recipe_scope "${question:-}"; then
@@ -4666,6 +4663,9 @@ else
       printf '%s' "$output"
       exit 0
     fi
+    if ! configure_local_routing; then
+      emit_unapproved_route_guidance
+    fi
     fast_path_deadline_reached "$query_deadline_ns" && emit_query_deadline_timeout
     printf '%s\n' 'pbi: no source locations found' >&2
     exit 1
@@ -4675,6 +4675,9 @@ else
       printf '%s' "$output"
       exit 0
     fi
+  fi
+  if ! configure_local_routing; then
+    emit_unapproved_route_guidance
   fi
   fast_path_deadline_reached "$query_deadline_ns" && emit_query_deadline_timeout
   planner_timed_out=false
