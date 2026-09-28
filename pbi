@@ -1941,6 +1941,9 @@ run_default_bm25_fast_path() {
   local fast_path_query_index=0 remaining_queries
   local fast_path_fallback=false fast_path_timed_out=false
   local -a fast_path_queries=() named_files=() recipe_search_paths=()
+  if ! configure_local_routing; then
+    emit_unapproved_route_guidance
+  fi
   deadline_ns=$(( $(fast_path_now_ns) + DEFAULT_FAST_PATH_SEARCH_TIMEOUT_SECONDS * 1000000000 ))
   mapfile -t named_files < <(named_query_files "${question:-}")
   if question_requests_recipe_scope "${question:-}"; then
@@ -4154,15 +4157,21 @@ planner_stderr=""
 planner_status=0
 planner_had_system_message_warning=false
 
+emit_unapproved_route_guidance() {
+  printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; set primary_model and fallback_model to abliterated-qwen-latest-27b-none, -low, or -medium, and base_url to http://gb10:18009/v1' >&2
+  exit 78
+}
+
 run_planner() {
-  # A planner that cannot reach an approved route is a miss, not a hard stop.
-  # Chat and --debug-config still fail closed inside configure_local_routing.
+  # Chat and --debug-config fail closed inside configure_local_routing.
+  # A bare lookup that cannot reach an approved route stops here too:
+  # BM25 must not report an unrelated location as a successful answer.
   if ! configure_local_routing; then
     planner_status=78
     planner_stdout=
     planner_stderr=
     planner_had_system_message_warning=false
-    return 0
+    emit_unapproved_route_guidance
   fi
   local stderr_file planner_stdout_file timeout_seconds
   timeout_seconds="$(capped_timeout_or_deadline "$planner_timeout_seconds")" || emit_query_deadline_timeout
@@ -4559,8 +4568,7 @@ rg_ignores=(--glob '!drafts/**' --glob '!docs/plans/**' --glob '!**/__pycache__/
 
 if [[ "${1:-}" == "--debug-config" ]]; then
   if ! configure_local_routing; then
-    printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; approved GB10 model and base required' >&2
-    exit 78
+    emit_unapproved_route_guidance
   fi
   printf '%s\n' "probe_binary=$probe_path"
   printf '%s\n' "provider=$primary_provider"
@@ -4678,11 +4686,7 @@ else
       --message "Convert the code question into exactly five complementary Probe BM25 code-search queries. Cover the user's terminology, likely identifiers, entry points and callers, data or control flow, and tests or configuration. Return exactly five plain lines, with no bullets, quotes, or explanation: $question" \
       --max-iterations 1
   generated_queries="$(printf '%s\n' "$planner_stdout" | sed -n '/./p' | head -n 5 || true)"
-  if [[ "$routing_rejected" == true ]]; then
-    planned_queries="$(search_distinctive_tokens "$question")"
-    [[ -n "${planned_queries//[[:space:]]/}" ]] || planned_queries="$question"
-    planner_timed_out=true
-  elif planner_timeout_or_kill "$planner_status"; then
+  if planner_timeout_or_kill "$planner_status"; then
     recovered_named_locations="$(collect_named_symbol_locations "$query_deadline_ns" || true)"
     if [[ -n "$recovered_named_locations" ]]; then
       printf '%s\n' "$recovered_named_locations"
@@ -4745,13 +4749,6 @@ else
     fi
   done <<<"$planned_queries"
   bm25_candidates="$candidates"
-  if [[ "$routing_rejected" == true ]]; then
-    if [[ -n "$(compact_search_locations "$candidates")" ]]; then
-      emit_bm25_locations_or_fail_closed
-    fi
-    printf '%s\n' 'pbi: local query planning failed' >&2
-    exit 1
-  fi
   if [[ "$planner_timed_out" == true ]]; then
     if planner_timeout_or_kill "$planner_status"; then
       printf '%s\n' 'pbi: planner timed out before producing a source answer' >&2
@@ -4850,8 +4847,7 @@ else
 fi
 
 if ! configure_local_routing; then
-  printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; approved GB10 model and base required' >&2
-  exit 78
+  emit_unapproved_route_guidance
 fi
 
 allocate_temp_file probe_stdout_file

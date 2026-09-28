@@ -129,8 +129,11 @@ def test_unapproved_route_fails_closed_before_chat(tmp_path, model, base, provid
         assert "fixture-secret" not in result.stderr
         assert not trace.exists()
     query = harness.run_pbi("where is router admission", env=env)
-    assert query.returncode != 78
-    assert "unapproved-local-route" not in query.stderr
+    assert query.returncode == 78
+    assert "phase=routing category=unapproved-local-route" in query.stderr
+    assert "abliterated-qwen-latest-27b-none" in query.stderr
+    assert "http://gb10:18009/v1" in query.stderr
+    assert query.stdout == ""
     assert "fixture-secret" not in query.stdout + query.stderr
     assert not trace.exists()
 
@@ -199,25 +202,36 @@ def test_hostile_dotenv_blocks_planner_before_model(tmp_path):
         env=env,
         cwd=tmp_path,
     )
-    assert result.returncode == 1
-    assert result.stderr == "pbi: local query planning failed\n"
-    assert "unapproved-local-route" not in result.stderr
+    assert result.returncode == 78
+    assert "phase=routing category=unapproved-local-route" in result.stderr
+    assert "abliterated-qwen-latest-27b-none" in result.stderr
+    assert "http://gb10:18009/v1" in result.stderr
+    assert result.stdout == ""
+    assert "dotenv-secret" not in result.stdout + result.stderr
     assert not trace.exists()
 
 
-def test_unapproved_config_does_not_block_read_only_lookup(tmp_path):
-    """A read-only where-is lookup must not exit 78 before search.
+def test_unapproved_planner_refusal_does_not_emit_unrelated_location(tmp_path):
+    """Planner refusal is not a BM25 success, even when Probe has a coarse hit.
 
-    Chat and --debug-config still fail closed on the same unapproved route.
+    The fast path has nothing to verify here. The planner must run, refuse the
+    unapproved route, and leave both the relevant file and the decoy uncited.
     """
     harness = test_pbi.PbiTest()
     env, trace = harness.fake_environment(tmp_path)
-    source = tmp_path / "canonical_jsonl.rs"
-    source.write_text("fn convert_parser_error() {}\nfn reject_unknown_field() {}\n")
+    relevant = tmp_path / "canonical_jsonl.rs"
+    relevant.write_text("fn convert_parser_error() {}\nfn reject_unknown_field() {}\n")
+    decoy = tmp_path / "epub_inspect.rs"
+    decoy.write_text("fn inspect_epub() {}\n" * 719)
+    calls = tmp_path / "probe-calls"
     probe = tmp_path / "probe"
     probe.write_text(
         "#!/usr/bin/env python3\n"
-        "print('File: " + str(source) + ", Lines: 1-2')\n"
+        "import sys\n"
+        "open(" + repr(str(calls)) + ", 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if '--dry-run' in sys.argv:\n"
+        "    raise SystemExit(0)\n"
+        "print('File: " + str(decoy) + ", Lines: 719-719')\n"
     )
     probe.chmod(0o755)
     env["PBI_TEST_PROBE"] = str(probe)
@@ -232,16 +246,23 @@ def test_unapproved_config_does_not_block_read_only_lookup(tmp_path):
         env=env,
         cwd=tmp_path,
     )
-    assert query.returncode == 0, query.stderr
-    assert "canonical_jsonl.rs:" in query.stdout
-    assert "unapproved-local-route" not in query.stderr
+    assert query.returncode == 78, query.stderr
+    assert query.stdout == ""
+    assert "phase=routing category=unapproved-local-route" in query.stderr
+    assert "abliterated-qwen-latest-27b-none" in query.stderr
+    assert "http://gb10:18009/v1" in query.stderr
+    assert "canonical_jsonl.rs" not in query.stdout + query.stderr
+    assert "epub_inspect.rs" not in query.stdout + query.stderr
     assert "fixture-secret" not in query.stdout + query.stderr
     assert not trace.exists()
+    assert not calls.exists()
     for args in (("--message", "hello"), ("--debug-config",)):
         blocked = harness.run_pbi(*args, env=env, cwd=tmp_path)
         assert blocked.returncode == 78
         assert "phase=routing category=unapproved-local-route" in blocked.stderr
+        assert "abliterated-qwen-latest-27b-none" in blocked.stderr
         assert "fixture-secret" not in blocked.stderr
+        assert blocked.stdout == ""
     assert not trace.exists()
 
 
