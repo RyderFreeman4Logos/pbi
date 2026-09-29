@@ -1,20 +1,19 @@
-# Replacement acceptance matrix
+# Source-pinned minimal CLI parity matrix
 
-Status values are **PASS** only after the command or test has actually run in this checkout. **GAP** means intentionally outside this milestone; it is not replacement-ready.
+Legacy source is read-only checkout `/home/obj/project/github/RyderFreeman4Logos/pbi`, HEAD `d239a1018cab3c441ca4ec7b394f7ec466442ee0`, tree `cd5115ef5dc9f810e9844266753fbfa7280467f3`. Its public help source (`pbi:23-27`) advertises `pbi <question...> [--json]`, `pbi search [--bm25] <query>`, `pbi --message <question>`, and `pbi --debug-config`; it states that normal `search` prints compact verified BM25 locations without chat and `--bm25` prints raw no-LLM output.
 
-## Existing CLI surface
+Parity status: **VERIFIED** = source-pinned behavior matches the current acceptance; **PARTIAL** = only the stated bounded slice is verified; **MISSING** = source-pinned behavior is not implemented; **UNVERIFIED** = evidence is blocked or absent. This table is the CLI parity claim; the following safety table retains its earlier PASS/GAP labels.
 
-| Contract from `pbi` | pbi-rs milestone behavior | Status |
+| Legacy contract and source pin | pbi-rs evidence | Status |
 |---|---|---|
-| `pbi <question...>` | Runs Probe BM25 first and prints compact verified evidence: exact source spans, target, relevance, and optional symbol. | PASS after `just acceptance` |
-| `pbi search <query>` | Same deterministic compact evidence path; incomplete target coverage is reported instead of claimed complete. | PASS after `just acceptance` |
-| `pbi search --bm25 <query>` | Relays raw Probe stdout/stderr; no model call. | PASS after `just acceptance` |
-| `pbi --message <question>` | Deterministic-first; incomplete coverage may use the opt-in approved-local single-binding ADK path, otherwise remains a deterministic alias. | PARTIAL |
-| `pbi --debug-config` | Safe diagnostic output; auth is always `[REDACTED]`. | PASS after `just acceptance` |
-| `--timeout`, `--max-results` | Validated and passed as Probe arguments. | PASS after `just acceptance` |
-| Probe option pass-through (`--reranker`, `--session`, `--format`, etc.) | Deliberately rejected until the compatibility surface is specified. | GAP |
-| `--json` output | Not implemented; no JSON contract is asserted. | GAP |
-| Interactive mode | Remains disabled; missing question returns status 2. | PASS by CLI parser test/manual check |
+| Normal positional question synthesizes a cited answer (`pbi/test_pbi.py:681-723`). | Bare positional input currently prints verified evidence only (`src/main.rs`, `semantic=false`); live model credentials were not probed. | **MISSING** — next functional gap. Acceptance: fake Probe returns an in-root source span; a deterministic injected local binding yields the exact source-backed answer, exit 0, empty stderr, with no live endpoint. |
+| `pbi search <query>` is BM25-only/no-chat (help; `pbi:4585-4607`). | Fixture and real-repository search pass `just acceptance`; verified snippets and coverage are emitted. | **VERIFIED** |
+| `pbi search --bm25 <query>` returns raw Probe output (help; `pbi:4562-4583`). | Raw fixture output is checked by `just acceptance`; `pbi-rs` writes raw streams without evidence parsing. | **VERIFIED** |
+| No source locations: exit 1, empty stdout, exact `pbi: no source locations found` (`pbi:4617-4619`; `test_pbi.py:661-679`). | Regression in `scripts/acceptance.sh` asserts exit 1, empty stdout, exact stderr on the fixture. | **VERIFIED** |
+| Search scope is the invocation directory (`pbi:4484`; help exposes no explicit `--file`/`--path`). | `pbi-rs` canonicalizes CWD and has a bounded 16-target fallback. Existing `probe-matrix.json` shows direct Probe root misses versus explicit `src/lib.rs` hits; real CWD search passes acceptance. | **PARTIAL** — CWD case verified; arbitrary per-file scope and fallback saturation are not. |
+| `--timeout`, `--max-results` are accepted on legacy `search` (`pbi:4517-4531`). | `pbi-rs` parses and forwards these options; this acceptance does not assert child argv or legacy default parity. | **PARTIAL** |
+| `--json` is advertised by the legacy help. | No JSON answer/output contract is implemented or tested in this slice. | **MISSING** |
+| `--message` semantic invocation. | Fake route/binding tests exist; live profile-binding smoke remains blocked. No new credential or environment probes were made for this slice. | **UNVERIFIED** |
 
 ## Deterministic safety and evidence
 

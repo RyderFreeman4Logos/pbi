@@ -17,9 +17,13 @@ printf '%s\n' "$raw" | grep -q '^File: '
 set +e
 unrelated=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "ghost evidence" 2>/dev/null)
 status=$?
+unrelated_error=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "ghost evidence" 2>&1 >/dev/null)
+error_status=$?
 set -e
 test "$status" -eq 1
+test "$error_status" -eq 1
 test -z "$unrelated"
+test "$unrelated_error" = "pbi: no source locations found"
 
 debug=$($binary --debug-config)
 printf '%s\n' "$debug" | grep -q '^api_key=\[REDACTED\]$'

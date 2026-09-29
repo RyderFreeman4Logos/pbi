@@ -37,7 +37,7 @@ fn main() {
     let code = match run(env::args().skip(1).collect()) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("pbi-rs: {}", error.message);
+            eprintln!("{}: {}", error.prefix, error.message);
             error.code
         }
     };
@@ -46,6 +46,7 @@ fn main() {
 
 struct CliError {
     code: i32,
+    prefix: &'static str,
     message: String,
 }
 
@@ -53,6 +54,7 @@ impl CliError {
     fn usage(message: impl Into<String>) -> Self {
         Self {
             code: 2,
+            prefix: "pbi-rs",
             message: message.into(),
         }
     }
@@ -60,6 +62,15 @@ impl CliError {
     fn failed(message: impl Into<String>) -> Self {
         Self {
             code: 1,
+            prefix: "pbi-rs",
+            message: message.into(),
+        }
+    }
+
+    fn compatibility_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: 1,
+            prefix: "pbi",
             message: message.into(),
         }
     }
@@ -256,6 +267,7 @@ fn semantic_cli_error(error: SemanticError) -> CliError {
 fn route_cli_error(error: SemanticRouteError) -> CliError {
     CliError {
         code: 78,
+        prefix: "pbi-rs",
         message: format!("semantic route denied: {error}"),
     }
 }
@@ -553,6 +565,7 @@ fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, 
     if Instant::now() >= deadline {
         return Err(CliError {
             code: 124,
+            prefix: "pbi-rs",
             message: "Probe query exceeded bounded deadline".to_owned(),
         });
     }
@@ -562,6 +575,7 @@ fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, 
         .spawn()
         .map_err(|_| CliError {
             code: 127,
+            prefix: "pbi-rs",
             message: "probe is unavailable on PATH".to_owned(),
         })?;
     let group_id = child.id();
@@ -607,6 +621,7 @@ fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, 
     if timed_out {
         return Err(CliError {
             code: 124,
+            prefix: "pbi-rs",
             message: "Probe query exceeded bounded deadline".to_owned(),
         });
     }
@@ -687,7 +702,11 @@ fn exit_status(output: &Output) -> i32 {
 }
 
 fn evidence_cli_error(error: EvidenceError) -> CliError {
-    CliError::failed(error.to_string())
+    if error == EvidenceError::NoSourceLocations {
+        CliError::compatibility_failed(error.to_string())
+    } else {
+        CliError::failed(error.to_string())
+    }
 }
 
 #[cfg(test)]
