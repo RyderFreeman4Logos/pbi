@@ -9,7 +9,7 @@ Status values are **PASS** only after the command or test has actually run in th
 | `pbi <question...>` | Runs Probe BM25 first and prints compact verified evidence: exact source spans, target, relevance, and optional symbol. | PASS after `just acceptance` |
 | `pbi search <query>` | Same deterministic compact evidence path; incomplete target coverage is reported instead of claimed complete. | PASS after `just acceptance` |
 | `pbi search --bm25 <query>` | Relays raw Probe stdout/stderr; no model call. | PASS after `just acceptance` |
-| `pbi --message <question>` | Accepted as a deterministic search alias; semantic model answer is not claimed. | PARTIAL |
+| `pbi --message <question>` | Deterministic-first; incomplete coverage may use the opt-in approved-local single-binding ADK path, otherwise remains a deterministic alias. | PARTIAL |
 | `pbi --debug-config` | Safe diagnostic output; auth is always `[REDACTED]`. | PASS after `just acceptance` |
 | `--timeout`, `--max-results` | Validated and passed as Probe arguments. | PASS after `just acceptance` |
 | Probe option pass-through (`--reranker`, `--session`, `--format`, etc.) | Deliberately rejected until the compatibility surface is specified. | GAP |
@@ -32,12 +32,12 @@ Status values are **PASS** only after the command or test has actually run in th
 
 | Requirement | Current live evidence | Status / next boundary |
 |---|---|---|
-| ADK model invocation | Kit exposes `OpenAiCompatibleProfile`, `ModelProfileRegistry`, `ModelBinding`, and bounded per-binding calls. | GAP: add the semantic caller through those primitives; do not add a second client |
+| ADK model invocation | Fake binding tests exercise `ModelProfileRegistry` → `ModelBinding` → `ModelInvocationSpec`; `--message` wires the same path behind explicit opt-in. | PARTIAL: single binding only; no approved-local real model smoke recorded yet |
 | Ordered local-first fallback | Kit registry is role-based, not an ordered route chain; one binding retries without switching endpoints. | GAP: dependency seam is an immutable ordered route-chain snapshot |
-| Explicitly authorized routes | Existing PBI has a narrow local route allowlist; kit validates URL shape only. | GAP: route admission policy must be explicit before binding |
-| Shared absolute deadline/cancellation | Kit binding timeout starts per binding; this does not cover fallback. | GAP: pass one invocation deadline/cancel token through every attempt |
+| Explicitly authorized routes | Single-binding opt-in admits only the existing approved local route/model allowlist before credential resolution; unsupported routes fail closed. | PASS for this slice; ordered fallback admission remains GAP |
+| Shared absolute deadline/cancellation | The CLI creates one absolute Probe/model deadline; semantic invocation also accepts cancellation and fails closed before/within the call. | PASS for single binding; shared fallback budget remains GAP |
 | Invalid hot reload retains last valid config | Kit hot reload covers development transform packages, not model route configuration. | GAP: atomic config publisher with last-valid retention and per-call snapshot |
-| Source-cited model output | No semantic path in this slice. | GAP: structured ADK response must pass this verifier before emission |
+| Source-cited model output | Structured ADK output requires answer, explicit uncertainty, and exact citations matching verifier-approved in-root spans; fake tests reject fabricated citations. | PASS for single binding |
 | Full old PBI parity | Existing tests include fail-closed compression/FairLance/provider-location cases and route-denial behavior (historical source lines recorded in the feasibility report). | GAP: port each contract with sanitized fixtures; keep existing PBI as fallback |
 
 ## Commands

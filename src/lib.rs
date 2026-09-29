@@ -2,6 +2,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+pub mod semantic;
+
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVIDENCE_LINES: usize = 4;
 

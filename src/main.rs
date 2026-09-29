@@ -1,9 +1,13 @@
+use pbi_rs::semantic::{
+    investigate, local_binding_from_environment, SemanticAnswer, SemanticError, SemanticRouteError,
+};
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,6 +16,7 @@ const VERSION: &str = "0.1.0";
 const DEFAULT_TIMEOUT: &str = "540";
 const DEFAULT_MAX_RESULTS: usize = 8;
 const PROBE_OUTER_DEADLINE_SECONDS: u64 = 8;
+const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 30;
 const PROBE_CLEANUP_GRACE_MILLIS: u64 = 100;
 const MAX_SCOPED_PROBE_TARGETS: usize = 16;
 const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
@@ -84,13 +89,16 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         println!("search_bm25_opt_in=--bm25_raw_no_llm_probe");
         println!("search_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}");
         println!("search_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}");
-        println!("model_path=not_configured_adk_workflow_kit_seam_pending");
+        println!("model_path=adk_workflow_kit_single_binding_opt_in");
+        println!("model_opt_in_env=PBI_RS_ADK_ENABLE");
+        println!("model_route_policy=approved_local_only");
         println!("api_key=[REDACTED]");
         return Ok(0);
     }
 
-    let (raw, query, timeout, max_results) = if arguments[0] == "search" {
-        parse_search(&arguments[1..])?
+    let (raw, semantic, query, timeout, max_results) = if arguments[0] == "search" {
+        let (raw, query, timeout, max_results) = parse_search(&arguments[1..])?;
+        (raw, false, query, timeout, max_results)
     } else if arguments[0] == "--message" {
         let query = arguments[1..].join(" ");
         if query.trim().is_empty() {
@@ -100,6 +108,7 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         }
         (
             false,
+            true,
             query,
             DEFAULT_TIMEOUT.to_owned(),
             DEFAULT_MAX_RESULTS,
@@ -113,6 +122,7 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         }
         (
             false,
+            false,
             query,
             DEFAULT_TIMEOUT.to_owned(),
             DEFAULT_MAX_RESULTS,
@@ -125,7 +135,13 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
             fs::canonicalize(root)
                 .map_err(|_| CliError::failed("cannot canonicalize repository root"))
         })?;
-    let output = invoke_probe(&root, &query, &timeout, max_results, raw)?;
+    let deadline = Instant::now()
+        + Duration::from_secs(if semantic {
+            MESSAGE_OUTER_DEADLINE_SECONDS
+        } else {
+            PROBE_OUTER_DEADLINE_SECONDS
+        });
+    let output = invoke_probe(&root, &query, &timeout, max_results, raw, deadline)?;
     if raw {
         io::stdout()
             .write_all(&output.stdout)
@@ -144,6 +160,27 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
     let probe_stdout = String::from_utf8_lossy(&output.stdout);
     let report = verify_probe_evidence(&probe_stdout, &root, &query, max_results)
         .map_err(evidence_cli_error)?;
+    if semantic && !report.is_complete() {
+        if let Some(binding) = local_binding_from_environment().map_err(route_cli_error)? {
+            let cancellation = AtomicBool::new(false);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| CliError::failed("semantic runtime could not be created"))?;
+            let answer = runtime
+                .block_on(investigate(
+                    &query,
+                    &root,
+                    &report,
+                    &binding,
+                    deadline,
+                    &cancellation,
+                ))
+                .map_err(semantic_cli_error)?;
+            print_semantic(answer, &root)?;
+            return Ok(0);
+        }
+    }
     print_evidence(report.evidence(), report.missing_targets(), &root)?;
     Ok(if report.is_complete() { 0 } else { 1 })
 }
@@ -162,6 +199,17 @@ fn print_evidence(
         }
     );
     println!("Verified source evidence:");
+    print_evidence_items(evidence, root)?;
+    if !missing_targets.is_empty() {
+        println!("Missing targets:");
+        for target in missing_targets {
+            println!("- {target}");
+        }
+    }
+    Ok(())
+}
+
+fn print_evidence_items(evidence: &[SourceEvidence], root: &Path) -> Result<(), CliError> {
     for item in evidence {
         let location = item
             .location()
@@ -180,13 +228,25 @@ fn print_evidence(
             println!("  {}: {}", item.location().start_line() + offset, line);
         }
     }
-    if !missing_targets.is_empty() {
-        println!("Missing targets:");
-        for target in missing_targets {
-            println!("- {target}");
-        }
-    }
     Ok(())
+}
+
+fn print_semantic(answer: SemanticAnswer, root: &Path) -> Result<(), CliError> {
+    println!("Answer: {}", answer.answer());
+    println!("Uncertainty: {}", answer.uncertainty());
+    println!("Verified source evidence:");
+    print_evidence_items(answer.citations(), root)
+}
+
+fn semantic_cli_error(error: SemanticError) -> CliError {
+    CliError::failed(error.to_string())
+}
+
+fn route_cli_error(error: SemanticRouteError) -> CliError {
+    CliError {
+        code: 78,
+        message: format!("semantic route denied: {error}"),
+    }
 }
 
 fn parse_search(arguments: &[String]) -> Result<(bool, String, String, usize), CliError> {
@@ -594,8 +654,8 @@ fn invoke_probe(
     timeout: &str,
     max_results: usize,
     raw: bool,
+    deadline: Instant,
 ) -> Result<Output, CliError> {
-    let deadline = Instant::now() + Duration::from_secs(PROBE_OUTER_DEADLINE_SECONDS);
     let output = run_probe_command(
         probe_command(root, query, timeout, max_results, raw),
         deadline,
