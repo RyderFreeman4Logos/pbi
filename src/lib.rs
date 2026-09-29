@@ -139,6 +139,7 @@ pub fn verify_probe_locations(
 
     let terms = distinctive_terms(query);
     let compact_query = compact_alphanumeric(query);
+    let compound_query = query_compound_symbol(query);
     let mut locations = Vec::new();
     for raw in raw_locations {
         let Ok(path) = fs::canonicalize(&raw.path) else {
@@ -159,7 +160,7 @@ pub fn verify_probe_locations(
         }
         let end_line = raw.end_line.min(source_lines.len());
         let span = source_lines[raw.start_line - 1..end_line].join("\n");
-        if !has_distinctive_evidence(&span, &terms, &compact_query) {
+        if !has_distinctive_evidence(&span, &terms, &compact_query, compound_query.as_deref()) {
             continue;
         }
         let location = SourceLocation::new(path, raw.start_line, end_line);
@@ -224,8 +225,16 @@ fn compact_alphanumeric(value: &str) -> String {
         .collect()
 }
 
-fn has_distinctive_evidence(span: &str, terms: &[String], compact_query: &str) -> bool {
+fn has_distinctive_evidence(
+    span: &str,
+    terms: &[String],
+    compact_query: &str,
+    compound_query: Option<&str>,
+) -> bool {
     let lower_span = span.to_lowercase();
+    if let Some(compound) = compound_query {
+        return compact_alphanumeric(&lower_span).contains(compound);
+    }
     let matching_terms = terms
         .iter()
         .filter(|term| lower_span.contains(term.as_str()))
@@ -236,6 +245,17 @@ fn has_distinctive_evidence(span: &str, terms: &[String], compact_query: &str) -
     }
     matching_terms >= 2
         || (!compact_query.is_empty() && compact_alphanumeric(span).contains(compact_query))
+}
+
+fn query_compound_symbol(query: &str) -> Option<String> {
+    query.split_whitespace().find_map(|token| {
+        if token.contains('_') {
+            let compact = compact_alphanumeric(token);
+            (!compact.is_empty()).then_some(compact)
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]
@@ -311,6 +331,41 @@ mod tests {
             ),
             Err(EvidenceError::NoSourceLocations)
         );
+    }
+
+    #[test]
+    fn source_evidence_rejects_partial_compound_symbol_match() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.root.join("src/lib.rs"),
+            "fn probe_api_error_diagnostic() {}\n",
+        )
+        .expect("fixture source");
+        let output = format!(
+            "File: {}, Lines: 1-1\n",
+            fixture.root.join("src/lib.rs").display()
+        );
+        assert_eq!(
+            verify_probe_locations(&output, &fixture.root, "probe_json_error", 8),
+            Err(EvidenceError::NoSourceLocations)
+        );
+    }
+
+    #[test]
+    fn source_evidence_accepts_exact_compound_symbol_match() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.root.join("src/lib.rs"),
+            "fn probe_json_error() {}\n",
+        )
+        .expect("fixture source");
+        let output = format!(
+            "File: {}, Lines: 1-1\n",
+            fixture.root.join("src/lib.rs").display()
+        );
+        let locations = verify_probe_locations(&output, &fixture.root, "probe_json_error", 8)
+            .expect("verified source");
+        assert_eq!(locations[0].start_line(), 1);
     }
 
     #[test]

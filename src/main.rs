@@ -1,12 +1,19 @@
 use pbi_rs::{verify_probe_locations, EvidenceError};
 use std::env;
-use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_TIMEOUT: &str = "540";
 const DEFAULT_MAX_RESULTS: usize = 8;
+const PROBE_OUTER_DEADLINE_SECONDS: u64 = 8;
+const PROBE_CLEANUP_GRACE_MILLIS: u64 = 100;
+const MAX_SCOPED_PROBE_TARGETS: usize = 16;
+const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
 
 fn usage() {
     println!(
@@ -74,6 +81,8 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         );
         println!("search_default=compact_verified_bm25_no_chat");
         println!("search_bm25_opt_in=--bm25_raw_no_llm_probe");
+        println!("search_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}");
+        println!("search_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}");
         println!("model_path=not_configured_adk_workflow_kit_seam_pending");
         println!("api_key=[REDACTED]");
         return Ok(0);
@@ -229,15 +238,60 @@ fn validate_decimal(value: &str, option: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn invoke_probe(
-    root: &PathBuf,
+const PROBE_SCOPE_EXCLUDED_NAMES: [&str; 5] =
+    [".git", "target", "drafts", "node_modules", "__pycache__"];
+
+fn probe_scope_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let entries = fs::read_dir(root)
+        .map_err(|_| CliError::failed("cannot enumerate repository files for Probe"))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|_| CliError::failed("cannot enumerate repository files for Probe"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| CliError::failed("cannot inspect repository files for Probe"))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| PROBE_SCOPE_EXCLUDED_NAMES.contains(&name))
+        {
+            continue;
+        }
+        paths.push(entry.path());
+        if paths.len() > MAX_SCOPED_PROBE_TARGETS {
+            return Err(CliError::failed(
+                "Probe scope exceeded the bounded target limit",
+            ));
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn probe_has_file_records(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .any(|line| line.trim_start().starts_with("File: "))
+}
+
+fn probe_command(
+    root: &Path,
     query: &str,
     timeout: &str,
     max_results: usize,
     raw: bool,
-) -> Result<Output, CliError> {
+) -> Command {
     let probe = env::var_os("PBI_RS_PROBE").unwrap_or_else(|| "probe".into());
     let mut command = Command::new(probe);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command.current_dir(root).args([
         "search",
         "--timeout",
@@ -253,10 +307,179 @@ fn invoke_probe(
         command.args(["--format", "plain", "--dry-run"]);
     }
     command.args(["--", query]);
-    command.output().map_err(|_| CliError {
-        code: 127,
-        message: "probe is unavailable on PATH".to_owned(),
+    command
+}
+
+#[cfg(unix)]
+fn signal_probe_group(child: &Child, signal: &str) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("/bin/kill")
+        .args([signal, "--", group.as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn signal_probe_group(_child: &Child, _signal: &str) {}
+
+fn wait_probe_child(child: &mut Child, deadline: Instant) -> Result<(ExitStatus, bool), CliError> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, false)),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                signal_probe_group(child, "-TERM");
+                let cleanup_deadline =
+                    Instant::now() + Duration::from_millis(PROBE_CLEANUP_GRACE_MILLIS);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => return Ok((status, true)),
+                        Ok(None) if Instant::now() < cleanup_deadline => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                signal_probe_group(child, "-KILL");
+                let _ = child.kill();
+                let status = child
+                    .wait()
+                    .map_err(|_| CliError::failed("cannot reap Probe after timeout"))?;
+                return Ok((status, true));
+            }
+            Err(_) => {
+                signal_probe_group(child, "-TERM");
+                signal_probe_group(child, "-KILL");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CliError::failed("cannot wait for Probe"));
+            }
+        }
+    }
+}
+
+fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, CliError> {
+    if Instant::now() >= deadline {
+        return Err(CliError {
+            code: 124,
+            message: "Probe query exceeded bounded deadline".to_owned(),
+        });
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| CliError {
+            code: 127,
+            message: "probe is unavailable on PATH".to_owned(),
+        })?;
+    let Some(mut stdout_pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CliError::failed("Probe stdout pipe was unavailable"));
+    };
+    let Some(mut stderr_pipe) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CliError::failed("Probe stderr pipe was unavailable"));
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout_pipe.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr_pipe.read_to_end(&mut output).map(|_| output)
+    });
+    let (status, timed_out) = wait_probe_child(&mut child, deadline)?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| CliError::failed("Probe stdout reader failed"))?
+        .map_err(|_| CliError::failed("cannot read Probe output"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| CliError::failed("Probe stderr reader failed"))?
+        .map_err(|_| CliError::failed("cannot read Probe diagnostics"))?;
+    if stdout.len().saturating_add(stderr.len()) > MAX_PROBE_OUTPUT_BYTES {
+        return Err(CliError::failed("Probe output exceeded the bounded limit"));
+    }
+    if timed_out {
+        return Err(CliError {
+            code: 124,
+            message: "Probe query exceeded bounded deadline".to_owned(),
+        });
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
     })
+}
+
+fn invoke_probe_scope(
+    root: &Path,
+    query: &str,
+    timeout: &str,
+    max_results: usize,
+    paths: &[PathBuf],
+    deadline: Instant,
+) -> Result<Output, CliError> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    for path in paths {
+        let mut command = probe_command(root, query, timeout, max_results, false);
+        command.arg(path);
+        let output = run_probe_command(command, deadline)?;
+        let success = output.status.success();
+        if stdout
+            .len()
+            .saturating_add(stderr.len())
+            .saturating_add(output.stdout.len())
+            .saturating_add(output.stderr.len())
+            > MAX_PROBE_OUTPUT_BYTES
+        {
+            return Err(CliError::failed("Probe output exceeded the bounded limit"));
+        }
+        stdout.extend_from_slice(&output.stdout);
+        stderr.extend_from_slice(&output.stderr);
+        status = Some(output.status);
+        if !success {
+            break;
+        }
+    }
+    let Some(status) = status else {
+        return Err(CliError::failed("Probe scope is empty"));
+    };
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn invoke_probe(
+    root: &Path,
+    query: &str,
+    timeout: &str,
+    max_results: usize,
+    raw: bool,
+) -> Result<Output, CliError> {
+    let deadline = Instant::now() + Duration::from_secs(PROBE_OUTER_DEADLINE_SECONDS);
+    let output = run_probe_command(
+        probe_command(root, query, timeout, max_results, raw),
+        deadline,
+    )?;
+    if raw || !output.status.success() || probe_has_file_records(&output.stdout) {
+        return Ok(output);
+    }
+
+    let paths = probe_scope_paths(root)?;
+    if paths.is_empty() {
+        return Ok(output);
+    }
+    invoke_probe_scope(root, query, timeout, max_results, &paths, deadline)
 }
 
 fn exit_status(output: &Output) -> i32 {
@@ -265,4 +488,25 @@ fn exit_status(output: &Output) -> i32 {
 
 fn evidence_cli_error(error: EvidenceError) -> CliError {
     CliError::failed(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_process_is_killed_at_outer_deadline() {
+        let mut command = Command::new("/usr/bin/sleep");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        command.arg("1");
+        let result = run_probe_command(command, Instant::now() + Duration::from_millis(20));
+        match result {
+            Err(error) => assert_eq!(error.code, 124),
+            Ok(_) => panic!("Probe exceeded its outer deadline"),
+        }
+    }
 }

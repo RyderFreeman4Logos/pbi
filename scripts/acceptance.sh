@@ -22,6 +22,6 @@ debug=$($binary --debug-config)
 printf '%s\n' "$debug" | grep -q '^api_key=\[REDACTED\]$'
 printf '%s\n' "$debug" | grep -q '^search_default=compact_verified_bm25_no_chat$'
 
-real=$(cd "$repo_root" && "$binary" search "verify probe locations")
+real=$(cd "$repo_root" && "$binary" search "SourceLocation src/lib.rs")
 printf '%s\n' "$real" | grep -Eq '^src/lib.rs:[0-9]+(-[0-9]+)?$'
 printf '%s\n' 'acceptance: deterministic fixture and real Probe passed'
