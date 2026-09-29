@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use workflow_adk::model_profiles::{
-    CredentialBroker, CredentialHandle, ModelBinding, ModelProfileRegistry, ModelRuntimeConfig,
-    OpenAiCompatibleProfile,
+    CredentialBroker, CredentialHandle, ModelBinding, ModelProfileErrorKind, ModelProfileRegistry,
+    ModelRuntimeConfig, OpenAiCompatibleProfile,
 };
 use workflow_adk::{
     EscalationPolicy, InferenceBudget, ModelInvocationErrorKind, ModelInvocationSpec,
@@ -91,15 +91,33 @@ pub enum SemanticError {
     Protocol,
     Cancelled,
     DeadlineExceeded,
-    Invocation(ModelInvocationErrorKind),
+    Invocation {
+        kind: ModelInvocationErrorKind,
+        model_error: Option<ModelProfileErrorKind>,
+        attempts: u8,
+    },
     InvalidOutput,
     CitationMismatch,
 }
 
 impl fmt::Display for SemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Self::Invocation(kind) = self {
-            return write!(formatter, "semantic model invocation failed: {kind:?}");
+        if let Self::Invocation {
+            kind,
+            model_error,
+            attempts,
+        } = self
+        {
+            return match model_error {
+                Some(model_error) => write!(
+                    formatter,
+                    "semantic model invocation failed: {kind:?}; model_error={model_error:?}; attempts={attempts}"
+                ),
+                None => write!(
+                    formatter,
+                    "semantic model invocation failed: {kind:?}; attempts={attempts}"
+                ),
+            };
         }
         formatter.write_str(match self {
             Self::EmptyQuestion => "semantic question is empty",
@@ -109,7 +127,7 @@ impl fmt::Display for SemanticError {
             Self::Protocol => "semantic invocation protocol could not be built",
             Self::Cancelled => "semantic investigation was cancelled",
             Self::DeadlineExceeded => "semantic investigation exceeded its bounded deadline",
-            Self::Invocation(_) => unreachable!("invocation errors are formatted above"),
+            Self::Invocation { .. } => unreachable!("invocation errors are formatted above"),
             Self::InvalidOutput => "semantic model output failed validation",
             Self::CitationMismatch => "semantic model returned an unverified citation",
         })
@@ -310,7 +328,11 @@ pub async fn investigate(
 
     let invocation = async {
         tokio::select! {
-            result = spec.invoke(binding) => result.map_err(|error| SemanticError::Invocation(error.kind())),
+            result = spec.invoke(binding) => result.map_err(|error| SemanticError::Invocation {
+                kind: error.kind(),
+                model_error: error.model_error(),
+                attempts: error.attempts(),
+            }),
             _ = wait_for_cancellation(cancellation) => Err(SemanticError::Cancelled),
         }
     };
@@ -519,10 +541,15 @@ mod tests {
     }
 
     #[test]
-    fn semantic_invocation_error_display_is_safe_and_typed() {
+    fn semantic_invocation_error_display_exposes_safe_typed_metadata() {
         assert_eq!(
-            SemanticError::Invocation(ModelInvocationErrorKind::ModelProfile).to_string(),
-            "semantic model invocation failed: ModelProfile"
+            SemanticError::Invocation {
+                kind: ModelInvocationErrorKind::ModelProfile,
+                model_error: Some(ModelProfileErrorKind::Provider),
+                attempts: 1,
+            }
+            .to_string(),
+            "semantic model invocation failed: ModelProfile; model_error=Provider; attempts=1"
         );
     }
 
