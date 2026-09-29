@@ -14,8 +14,8 @@ path = "src/lib.rs"
 [dependencies]
 serde_json = "=1.0.149"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
-workflow-adk = { path = "../adk-workflow-kit/crates/workflow-adk" }
-workflow-runtime = { path = "../adk-workflow-kit/crates/workflow-runtime" }
+workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "41722ebac602639baad97e36170b83135172b766" }
+workflow-runtime = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "41722ebac602639baad97e36170b83135172b766" }
 
 [[bin]]
 name = "pbi-rs"

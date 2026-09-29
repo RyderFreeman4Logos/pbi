@@ -10,6 +10,9 @@ fmt-fix:
 lock:
     ionice -c 3 cargo generate-lockfile --offline
 
+lock-online:
+    ionice -c 3 cargo generate-lockfile
+
 test:
     ionice -c 3 cargo test --locked
 
