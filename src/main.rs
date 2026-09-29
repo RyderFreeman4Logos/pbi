@@ -3,6 +3,7 @@ use pbi_rs::semantic::{
     DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, MODEL_CREDENTIAL_HANDLES,
 };
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
+use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -27,9 +28,9 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
 fn usage() {
     println!(
         "pbi-rs {VERSION} — Probe-backed source evidence\n\
-         Usage: pbi-rs <question...>\n\
+         Usage: pbi-rs <question...> [--json]\n\
                 pbi-rs search [--bm25] <query>\n\
-                pbi-rs --message <question>\n\
+                pbi-rs --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
          Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only; --bm25 relays raw Probe output."
     );
@@ -128,11 +129,17 @@ fn run(
         return Ok(0);
     }
 
+    let json_output = arguments[0] != "search" && arguments.iter().any(|arg| arg == "--json");
     let (raw, semantic, query, timeout, max_results) = if arguments[0] == "search" {
         let (raw, query, timeout, max_results) = parse_search(&arguments[1..])?;
         (raw, false, query, timeout, max_results)
     } else if arguments[0] == "--message" {
-        let query = arguments[1..].join(" ");
+        let query = arguments[1..]
+            .iter()
+            .filter(|arg| arg.as_str() != "--json")
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         if query.trim().is_empty() {
             return Err(CliError::usage(
                 "question is required; interactive mode is disabled",
@@ -146,7 +153,12 @@ fn run(
             DEFAULT_MAX_RESULTS,
         )
     } else {
-        let query = arguments.join(" ");
+        let query = arguments
+            .iter()
+            .filter(|arg| arg.as_str() != "--json")
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         if query.trim().is_empty() {
             return Err(CliError::usage(
                 "question is required; interactive mode is disabled",
@@ -221,13 +233,20 @@ fn run(
                 ))
                 .map_err(semantic_cli_error)?;
             #[cfg(test)]
-            print_semantic(answer, &root, _semantic_output, arguments[0] != "--message")?;
+            print_semantic(
+                answer,
+                &root,
+                _semantic_output,
+                arguments[0] != "--message",
+                json_output,
+            )?;
             #[cfg(not(test))]
             print_semantic(
                 answer,
                 &root,
                 &mut io::stdout(),
                 arguments[0] != "--message",
+                json_output,
             )?;
             return Ok(0);
         }
@@ -299,7 +318,19 @@ fn print_semantic(
     root: &Path,
     writer: &mut impl Write,
     compact: bool,
+    json_output: bool,
 ) -> Result<(), CliError> {
+    if json_output {
+        // Probe Chat's sessionId is replaced by this ADK invocation identity;
+        // token usage is unavailable from the validated answer contract.
+        let output = json!({"response": answer.answer(), "sessionId": answer.invocation_identity(), "tokenUsage": null});
+        let mut bytes = serde_json::to_vec(&output)
+            .map_err(|_| CliError::failed("cannot serialize semantic answer"))?;
+        bytes.push(b'\n');
+        return writer
+            .write_all(&bytes)
+            .map_err(|_| CliError::failed("cannot write semantic answer"));
+    }
     if compact {
         return writeln!(writer, "{}", answer.answer())
             .map_err(|_| CliError::failed("cannot write semantic answer"));
@@ -798,8 +829,29 @@ mod tests {
         env::set_current_dir(&root).expect("fixture cwd");
         env::set_var("PBI_RS_PROBE", &probe);
         let question = "where is exact_reuse_receipt?".to_owned();
-        let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1.";
-        for (path, expected) in [("receipt.py", true), ("../outside.py", false)] {
+        let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1. Quoted: \"back\\slash\".";
+        for (path, expected, arguments) in [
+            ("receipt.py", true, vec![question.clone()]),
+            (
+                "receipt.py",
+                true,
+                vec![question.clone(), "--json".to_owned()],
+            ),
+            (
+                "receipt.py",
+                true,
+                vec![
+                    "--message".to_owned(),
+                    question.clone(),
+                    "--json".to_owned(),
+                ],
+            ),
+            (
+                "../outside.py",
+                false,
+                vec![question.clone(), "--json".to_owned()],
+            ),
+        ] {
             let response = json!({"answer":answer,"uncertainty":"Only the verified source was inspected.","citations":[{"path":path,"start_line":1,"end_line":1}]});
             let profile =
                 FakeModelProfile::new("pbi-test", "1", "fake-model", [response.to_string()]);
@@ -809,13 +861,23 @@ mod tests {
                 .bind_worker(&CredentialBroker::new())
                 .expect("binding");
             let mut output = Vec::new();
-            let result = run(vec![question.clone()], Some(&binding), &mut output);
+            let result = run(arguments.clone(), Some(&binding), &mut output);
             if expected {
                 assert!(matches!(result, Ok(0)), "expected cited answer");
-                assert_eq!(
-                    String::from_utf8(output).expect("utf8"),
-                    format!("{answer}\n")
-                );
+                if arguments.contains(&"--json".to_owned()) {
+                    let parsed: serde_json::Value =
+                        serde_json::from_slice(&output).expect("valid JSON with escaped answer");
+                    assert_eq!(parsed["response"], answer);
+                    assert!(parsed["sessionId"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty()));
+                    assert!(parsed["tokenUsage"].is_null());
+                } else {
+                    assert_eq!(
+                        String::from_utf8(output).expect("utf8"),
+                        format!("{answer}\n")
+                    );
+                }
             } else {
                 assert!(
                     matches!(result, Err(CliError { code: 1, .. })),
@@ -824,6 +886,39 @@ mod tests {
                 assert!(output.is_empty(), "forged answer must not leak");
             }
         }
+        let invalid = json!({"answer":"", "uncertainty":"unknown", "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]});
+        let invalid_profile =
+            FakeModelProfile::new("pbi-test", "1", "fake-model", [invalid.to_string()]);
+        let invalid_binding = ModelProfileRegistry::new()
+            .with_worker(invalid_profile)
+            .expect("profile")
+            .bind_worker(&CredentialBroker::new())
+            .expect("binding");
+        let mut invalid_output = Vec::new();
+        assert!(matches!(
+            run(
+                vec![question.clone(), "--json".to_owned()],
+                Some(&invalid_binding),
+                &mut invalid_output
+            ),
+            Err(CliError { code: 1, .. })
+        ));
+        assert!(invalid_output.is_empty());
+        let mut no_hit = Vec::new();
+        let miss = run(
+            vec!["unfindable_xyz".to_owned(), "--json".to_owned()],
+            None,
+            &mut no_hit,
+        );
+        assert!(matches!(
+            miss,
+            Err(CliError {
+                code: 1,
+                prefix: "pbi",
+                ..
+            })
+        ));
+        assert!(no_hit.is_empty());
         env::set_current_dir(previous_dir).expect("restore cwd");
         if let Some(value) = previous_probe {
             env::set_var("PBI_RS_PROBE", value);
