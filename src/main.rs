@@ -12,6 +12,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use workflow_adk::model_profiles::ModelBinding;
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_TIMEOUT: &str = "540";
@@ -29,12 +31,18 @@ fn usage() {
                 pbi-rs search [--bm25] <query>\n\
                 pbi-rs --message <question>\n\
                 pbi-rs --debug-config\n\
-         Default/search output is compact source-verified BM25 evidence; --bm25 relays raw Probe output."
+         Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only; --bm25 relays raw Probe output."
     );
 }
 
 fn main() {
-    let code = match run(env::args().skip(1).collect()) {
+    let code = match run(
+        env::args().skip(1).collect(),
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        &mut Vec::new(),
+    ) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{}: {}", error.prefix, error.message);
@@ -76,7 +84,11 @@ impl CliError {
     }
 }
 
-fn run(arguments: Vec<String>) -> Result<i32, CliError> {
+fn run(
+    arguments: Vec<String>,
+    #[cfg(test)] _injected_binding: Option<&ModelBinding>,
+    #[cfg(test)] _semantic_output: &mut Vec<u8>,
+) -> Result<i32, CliError> {
     if arguments.is_empty() {
         usage();
         return Ok(2);
@@ -142,7 +154,7 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         }
         (
             false,
-            false,
+            true,
             query,
             DEFAULT_TIMEOUT.to_owned(),
             DEFAULT_MAX_RESULTS,
@@ -180,8 +192,19 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
     let probe_stdout = String::from_utf8_lossy(&output.stdout);
     let report = verify_probe_evidence(&probe_stdout, &root, &query, max_results)
         .map_err(evidence_cli_error)?;
-    if semantic && !report.is_complete() {
-        if let Some(binding) = local_binding_from_environment().map_err(route_cli_error)? {
+    if semantic {
+        #[cfg(test)]
+        let owned_binding = if _injected_binding.is_some() {
+            None
+        } else {
+            local_binding_from_environment().map_err(route_cli_error)?
+        };
+        #[cfg(not(test))]
+        let owned_binding = local_binding_from_environment().map_err(route_cli_error)?;
+        let binding = owned_binding.as_ref();
+        #[cfg(test)]
+        let binding = _injected_binding.or(binding);
+        if let Some(binding) = binding {
             let cancellation = AtomicBool::new(false);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -192,12 +215,20 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
                     &query,
                     &root,
                     &report,
-                    &binding,
+                    binding,
                     deadline,
                     &cancellation,
                 ))
                 .map_err(semantic_cli_error)?;
-            print_semantic(answer, &root)?;
+            #[cfg(test)]
+            print_semantic(answer, &root, _semantic_output, arguments[0] != "--message")?;
+            #[cfg(not(test))]
+            print_semantic(
+                answer,
+                &root,
+                &mut io::stdout(),
+                arguments[0] != "--message",
+            )?;
             return Ok(0);
         }
     }
@@ -219,7 +250,7 @@ fn print_evidence(
         }
     );
     println!("Verified source evidence:");
-    print_evidence_items(evidence, root)?;
+    print_evidence_items(evidence, root, &mut io::stdout())?;
     if !missing_targets.is_empty() {
         println!("Missing targets:");
         for target in missing_targets {
@@ -229,7 +260,11 @@ fn print_evidence(
     Ok(())
 }
 
-fn print_evidence_items(evidence: &[SourceEvidence], root: &Path) -> Result<(), CliError> {
+fn print_evidence_items(
+    evidence: &[SourceEvidence],
+    root: &Path,
+    writer: &mut impl Write,
+) -> Result<(), CliError> {
     for item in evidence {
         let location = item
             .location()
@@ -239,25 +274,43 @@ fn print_evidence_items(evidence: &[SourceEvidence], root: &Path) -> Result<(), 
             || "symbol=none".to_owned(),
             |symbol| format!("symbol={symbol}"),
         );
-        println!(
+        writeln!(
+            writer,
             "- {location} | target={} | {symbol} | {}",
             item.target(),
             item.relevance()
-        );
+        )
+        .map_err(|_| CliError::failed("cannot write source evidence"))?;
         for (offset, line) in item.snippet().lines().enumerate() {
-            println!("  {}: {}", item.location().start_line() + offset, line);
+            writeln!(
+                writer,
+                "  {}: {}",
+                item.location().start_line() + offset,
+                line
+            )
+            .map_err(|_| CliError::failed("cannot write source evidence"))?;
         }
     }
     Ok(())
 }
 
-fn print_semantic(answer: SemanticAnswer, root: &Path) -> Result<(), CliError> {
-    println!("Stage: semantic_adk_model");
-    println!("Invocation attestation: {}", answer.invocation_identity());
-    println!("Answer: {}", answer.answer());
-    println!("Uncertainty: {}", answer.uncertainty());
-    println!("Verified source evidence:");
-    print_evidence_items(answer.citations(), root)
+fn print_semantic(
+    answer: SemanticAnswer,
+    root: &Path,
+    writer: &mut impl Write,
+    compact: bool,
+) -> Result<(), CliError> {
+    if compact {
+        return writeln!(writer, "{}", answer.answer())
+            .map_err(|_| CliError::failed("cannot write semantic answer"));
+    }
+    let mut output = Vec::new();
+    writeln!(output, "Stage: semantic_adk_model\nInvocation attestation: {}\nAnswer: {}\nUncertainty: {}\nVerified source evidence:", answer.invocation_identity(), answer.answer(), answer.uncertainty())
+        .map_err(|_| CliError::failed("cannot write semantic answer"))?;
+    print_evidence_items(answer.citations(), root, &mut output)?;
+    writer
+        .write_all(&output)
+        .map_err(|_| CliError::failed("cannot write semantic answer"))
 }
 
 fn semantic_cli_error(error: SemanticError) -> CliError {
@@ -712,8 +765,73 @@ fn evidence_cli_error(error: EvidenceError) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
     use std::time::SystemTime;
+    use workflow_adk::model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry};
+
+    #[test]
+    fn positional_question_dispatches_through_adk_and_checks_citations() {
+        let root = env::temp_dir().join(format!(
+            "pbi-rs-answer-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("receipt.py"),
+            "def exact_reuse_receipt():\n    return True\n",
+        )
+        .expect("source");
+        let probe = root.join("probe");
+        fs::write(
+            &probe,
+            "#!/bin/sh\nprintf 'File: %s/receipt.py, Lines: 1-2\\n' \"$PWD\"\n",
+        )
+        .expect("probe");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).expect("probe mode");
+        let previous_dir = env::current_dir().expect("cwd");
+        let previous_probe = env::var_os("PBI_RS_PROBE");
+        env::set_current_dir(&root).expect("fixture cwd");
+        env::set_var("PBI_RS_PROBE", &probe);
+        let question = "where is exact_reuse_receipt?".to_owned();
+        let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1.";
+        for (path, expected) in [("receipt.py", true), ("../outside.py", false)] {
+            let response = json!({"answer":answer,"uncertainty":"Only the verified source was inspected.","citations":[{"path":path,"start_line":1,"end_line":1}]});
+            let profile =
+                FakeModelProfile::new("pbi-test", "1", "fake-model", [response.to_string()]);
+            let binding = ModelProfileRegistry::new()
+                .with_worker(profile)
+                .expect("profile")
+                .bind_worker(&CredentialBroker::new())
+                .expect("binding");
+            let mut output = Vec::new();
+            let result = run(vec![question.clone()], Some(&binding), &mut output);
+            if expected {
+                assert!(matches!(result, Ok(0)), "expected cited answer");
+                assert_eq!(
+                    String::from_utf8(output).expect("utf8"),
+                    format!("{answer}\n")
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(CliError { code: 1, .. })),
+                    "forged citation must fail"
+                );
+                assert!(output.is_empty(), "forged answer must not leak");
+            }
+        }
+        env::set_current_dir(previous_dir).expect("restore cwd");
+        if let Some(value) = previous_probe {
+            env::set_var("PBI_RS_PROBE", value);
+        } else {
+            env::remove_var("PBI_RS_PROBE");
+        }
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
 
     #[cfg(target_os = "linux")]
     fn process_identity(root: &Path, name: &str) -> (u32, u64) {
