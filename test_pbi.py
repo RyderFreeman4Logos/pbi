@@ -21,6 +21,7 @@ INSTALLER = ROOT / "install.sh"
 PRIMARY = "abliterated-qwen-latest-27b-none"
 FALLBACK = PRIMARY
 BASE_URL = "http://gb10:18009/v1"
+LOCAL_MP_URL = "http://localhost:18317/v1"
 PROBE_SHIM = "/usr/local/share/mise/shims/probe"
 
 
@@ -4580,8 +4581,8 @@ class PbiTest(unittest.TestCase):
         self.assertEqual(configured["FORCE_PROVIDER"], "openai")
         self.assertEqual(configured["MODEL_NAME"], PRIMARY)
         self.assertEqual(configured["OPENAI_API_KEY"], "test-key")
-        self.assertEqual(configured["OPENAI_API_URL"], BASE_URL)
-        self.assertEqual(configured["LLM_BASE_URL"], BASE_URL)
+        self.assertEqual(configured["OPENAI_API_URL"], LOCAL_MP_URL)
+        self.assertEqual(configured["LLM_BASE_URL"], LOCAL_MP_URL)
         self.assertEqual(configured["MAX_RETRIES"], "3")
         self.assertGreaterEqual(int(configured["REQUEST_TIMEOUT"]), 1_700_000)
         self.assertGreaterEqual(
@@ -7990,7 +7991,7 @@ exit "$status"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"primary_model={PRIMARY}", result.stdout)
         self.assertIn(f"fallback_model={FALLBACK}", result.stdout)
-        self.assertIn(f"base_url={BASE_URL}", result.stdout)
+        self.assertIn(f"base_url={LOCAL_MP_URL}", result.stdout)
         self.assertIn("max_retries=3", result.stdout)
         self.assertIn("search_timeout_seconds=540", result.stdout)
         self.assertIn("search_default=compact_verified_bm25_no_chat", result.stdout)
