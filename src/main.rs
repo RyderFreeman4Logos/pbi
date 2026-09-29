@@ -1,5 +1,6 @@
 use pbi_rs::semantic::{
     investigate, local_binding_from_environment, SemanticAnswer, SemanticError, SemanticRouteError,
+    DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, MODEL_CREDENTIAL_HANDLES,
 };
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 use std::env;
@@ -92,6 +93,14 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         println!("model_path=adk_workflow_kit_single_binding_opt_in");
         println!("model_opt_in_env=PBI_RS_ADK_ENABLE");
         println!("model_route_policy=approved_local_only");
+        println!("model_default_base_url={DEFAULT_LOCAL_BASE_URL}");
+        println!("model_default_name={DEFAULT_LOCAL_MODEL}");
+        println!(
+            "model_credential_handles={}",
+            MODEL_CREDENTIAL_HANDLES.join(",")
+        );
+        println!("model_binding=single_immutable_snapshot");
+        println!("model_route_chain=unavailable_in_pinned_adk_revision");
         println!("api_key=[REDACTED]");
         return Ok(0);
     }
@@ -232,6 +241,8 @@ fn print_evidence_items(evidence: &[SourceEvidence], root: &Path) -> Result<(), 
 }
 
 fn print_semantic(answer: SemanticAnswer, root: &Path) -> Result<(), CliError> {
+    println!("Stage: semantic_adk_model");
+    println!("Invocation attestation: {}", answer.invocation_identity());
     println!("Answer: {}", answer.answer());
     println!("Uncertainty: {}", answer.uncertainty());
     println!("Verified source evidence:");

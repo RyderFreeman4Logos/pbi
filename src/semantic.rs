@@ -25,6 +25,10 @@ const APPROVED_LOCAL_MODELS: [&str; 3] = [
     "abliterated-qwen-latest-27b-low",
     "abliterated-qwen-latest-27b-medium",
 ];
+pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:18317/v1";
+pub const DEFAULT_LOCAL_MODEL: &str = "abliterated-qwen-latest-27b-none";
+pub const MODEL_CREDENTIAL_HANDLES: [&str; 3] =
+    ["CLIPROXY_API_KEY", "OPENAI_API_KEY", "LOCAL_ROUTER_API_KEY"];
 const ADK_ENABLE_ENV: &str = "PBI_RS_ADK_ENABLE";
 
 const OUTPUT_SCHEMA: &str = r#"{
@@ -94,6 +98,9 @@ pub enum SemanticError {
 
 impl fmt::Display for SemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Invocation(kind) = self {
+            return write!(formatter, "semantic model invocation failed: {kind:?}");
+        }
         formatter.write_str(match self {
             Self::EmptyQuestion => "semantic question is empty",
             Self::NoEvidence => "semantic investigation requires verified source evidence",
@@ -102,7 +109,7 @@ impl fmt::Display for SemanticError {
             Self::Protocol => "semantic invocation protocol could not be built",
             Self::Cancelled => "semantic investigation was cancelled",
             Self::DeadlineExceeded => "semantic investigation exceeded its bounded deadline",
-            Self::Invocation(_) => "semantic model invocation failed",
+            Self::Invocation(_) => unreachable!("invocation errors are formatted above"),
             Self::InvalidOutput => "semantic model output failed validation",
             Self::CitationMismatch => "semantic model returned an unverified citation",
         })
@@ -128,7 +135,9 @@ impl fmt::Display for SemanticRouteError {
             Self::IncompleteConfig => "semantic route configuration is incomplete",
             Self::UnapprovedRoute => "semantic route is not an approved local route",
             Self::UnapprovedModel => "semantic model is not an approved local model",
-            Self::MissingCredential => "semantic route credential handle is missing",
+            Self::MissingCredential => {
+                "semantic route requires one credential handle: CLIPROXY_API_KEY, OPENAI_API_KEY, or LOCAL_ROUTER_API_KEY"
+            }
             Self::Profile => "semantic model profile could not be bound",
         })
     }
@@ -152,14 +161,13 @@ pub fn local_binding_from_environment() -> Result<Option<ModelBinding>, Semantic
         Ok("1") => {}
         Ok(_) => return Err(SemanticRouteError::InvalidEnable),
     }
-    let base_url = first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?
-        .ok_or(SemanticRouteError::IncompleteConfig)?;
-    let model =
-        first_value(&["LOCAL_MODEL", "LLM_MODEL"])?.ok_or(SemanticRouteError::IncompleteConfig)?;
-    validate_local_route(&base_url, &model)?;
-    let credential_name = ["CLIPROXY_API_KEY", "OPENAI_API_KEY", "LOCAL_ROUTER_API_KEY"]
+    let (base_url, model) = local_route_from_values(
+        first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?,
+        first_value(&["LOCAL_MODEL", "LLM_MODEL"])?,
+    )?;
+    let credential_name = MODEL_CREDENTIAL_HANDLES
         .into_iter()
-        .find(|name| env::var_os(name).is_some())
+        .find(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
         .ok_or(SemanticRouteError::MissingCredential)?;
     let profile = OpenAiCompatibleProfile::new(
         "pbi-rs-local",
@@ -177,6 +185,16 @@ pub fn local_binding_from_environment() -> Result<Option<ModelBinding>, Semantic
         .bind_worker(&CredentialBroker::new())
         .map(Some)
         .map_err(|_| SemanticRouteError::Profile)
+}
+
+fn local_route_from_values(
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Result<(String, String), SemanticRouteError> {
+    let base_url = base_url.unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_owned());
+    let model = model.unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned());
+    validate_local_route(&base_url, &model)?;
+    Ok((base_url, model))
 }
 
 fn first_value(names: &[&str]) -> Result<Option<String>, SemanticRouteError> {
@@ -501,6 +519,14 @@ mod tests {
     }
 
     #[test]
+    fn semantic_invocation_error_display_is_safe_and_typed() {
+        assert_eq!(
+            SemanticError::Invocation(ModelInvocationErrorKind::ModelProfile).to_string(),
+            "semantic model invocation failed: ModelProfile"
+        );
+    }
+
+    #[test]
     fn route_admission_rejects_cloud_and_unapproved_models() {
         assert_eq!(
             validate_local_route(
@@ -512,6 +538,17 @@ mod tests {
         assert_eq!(
             validate_local_route("http://gb10:18009/v1", "cloud-model"),
             Err(SemanticRouteError::UnapprovedModel)
+        );
+    }
+
+    #[test]
+    fn local_route_defaults_match_the_approved_pbi_source_route() {
+        assert_eq!(
+            local_route_from_values(None, None),
+            Ok((
+                "http://localhost:18317/v1".to_owned(),
+                "abliterated-qwen-latest-27b-none".to_owned()
+            ))
         );
     }
 
