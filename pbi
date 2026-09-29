@@ -1687,7 +1687,7 @@ remaining_file_candidates() {
     # candidates visible, with round-robin extraction as the upgrade path.
     footer_path_limit=$((16 / ${#footer_path_matches[@]}))
     ((footer_path_limit > 0)) || footer_path_limit=1
-    if question_has_multiple_semantic_targets "$query"; then
+    if [[ -n "${semantic_trace_scope_tokens:-}" ]]; then
       local semantic_target_count
       semantic_target_count="$(semantic_target_groups "$query" | awk 'NF { count += 1 } END { print count + 0 }')"
       ((footer_path_limit >= semantic_target_count)) || footer_path_limit="$semantic_target_count"
@@ -1702,7 +1702,7 @@ remaining_file_candidates() {
           while IFS= read -r group; do
             semantic_group_tokens "$group"
           done < <(semantic_target_groups "$query")
-        elif question_has_multiple_semantic_targets "$query"; then
+        elif [[ -n "${semantic_trace_scope_tokens:-}" ]]; then
           while IFS= read -r group; do
             semantic_group_expansion_tokens "$group"
           done < <(semantic_target_groups "$query")
@@ -1726,12 +1726,12 @@ remaining_file_candidates() {
         path="${BASH_REMATCH[1]}"
         line_number="${BASH_REMATCH[2]}"
         hit_text="${hit#"$path:$line_number:"}"
-        if question_has_multiple_semantic_targets "$query" &&
+        if [[ -n "${semantic_trace_scope_tokens:-}" ]] &&
            ! semantic_trace_line_matches_any_target_group "$hit_text"; then
           continue
         fi
         target_group=""
-        if question_has_multiple_semantic_targets "$query"; then
+        if [[ -n "${semantic_trace_scope_tokens:-}" ]]; then
           while IFS= read -r group; do
             if semantic_trace_group_line_has_required_behavior "$group" "$hit_text"; then
               target_group="$group"
@@ -1743,7 +1743,7 @@ remaining_file_candidates() {
         fi
         if [[ -n "${last_footer_line[$path]+seen}" ]] &&
            ((line_number <= last_footer_line[$path] + 2)); then
-          if ! question_has_multiple_semantic_targets "$query" ||
+          if [[ -z "${semantic_trace_scope_tokens:-}" ]] ||
              ! semantic_trace_line_matches_any_target_group "$hit_text"; then
             continue
           fi
@@ -2604,7 +2604,11 @@ question_requires_semantic_trace() {
   local q="${1,,}"
   question_describes_lifecycle_investigation "$1" && return 0
   question_has_multiple_semantic_targets "$1" || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+(is|are|does)([^[:alnum:]]|$) ]] && return 0
+  [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+(are|does)([^[:alnum:]]|$) ]] && return 0
+  if [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+is([^[:alnum:]]|$) ]] &&
+     [[ "$q" =~ (^|[^[:alnum:]_-])and[[:space:]]+[[:alnum:]_]+-[[:alnum:]_-]+[[:space:]]+[[:alpha:]_]+([^[:alnum:]_]|$) ]]; then
+    return 0
+  fi
   [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing)|compil(e|ed|ation|ing)|dispatch(ed|ing)?|resum(e|ed|ing)|check(ed|ing|s)?)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])also[[:space:]]+locate([^[:alnum:]]|$) ]]
@@ -2634,6 +2638,8 @@ semantic_target_groups() {
 
 semantic_trace_scope_tokens_for_candidates() {
   local query="$1" candidates="$2" group token normalized_token candidate path normalized_path key count
+  [[ "${query,,}" =~ (^|[^[:alnum:]])where[[:space:]]+is([^[:alnum:]]|$) ]] || return 0
+  [[ "${query,,}" =~ (^|[^[:alnum:]_-])and[[:space:]]+[[:alnum:]_]+-[[:alnum:]_-]+[[:space:]]+[[:alpha:]_]+([^[:alnum:]_]|$) ]] || return 0
   local -A seen_token_paths=()
   question_has_multiple_semantic_targets "$query" || return 0
   group="$(semantic_target_groups "$query" | sed -n '1p')"
@@ -4019,7 +4025,9 @@ emit_semantic_trace_from_candidates() {
     fi
     symbol_locations="$(recover_semantic_trace_locations || true)"
     locations="$(printf '%s\n%s\n%s\n' "$helper_locations" "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
-    locations="$(filter_semantic_trace_locations "$locations" || true)"
+    if [[ -n "${semantic_trace_scope_tokens:-}" ]]; then
+      locations="$(filter_semantic_trace_locations "$locations" || true)"
+    fi
     fallback_locations=""
     if ! question_requests_recipe_scope "${question:-}"; then
       fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
