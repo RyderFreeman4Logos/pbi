@@ -186,6 +186,12 @@ def test_original_jsonl_query_returns_both_verified_source_targets(tmp_path):
                 "    extensions.push((extension_name(None, &key)?, map.next_value()?));\n"
                 "}\n"
             ),
+            # Lexical overlap alone must not admit a fixture setup line as
+            # evidence for parser behavior.
+            "crates/verbatim-core/src/parser/canonical_jsonl/tests.rs": (
+                'let mut f = NamedTempFile::with_suffix(".jsonl").unwrap();\n'
+                "let fixture = \"JSONL parser error conversion unknown-field handling\";\n"
+            ),
         },
     )
 
@@ -196,6 +202,9 @@ def test_original_jsonl_query_returns_both_verified_source_targets(tmp_path):
     assert "map_err" in result.stdout
     assert "crates/verbatim-core/src/parser/canonical_jsonl/permissive.rs:" in result.stdout
     assert "extensions.push" in result.stdout
+    assert "crates/verbatim-core/src/parser/canonical_jsonl/tests.rs:" not in result.stdout
+    assert "NamedTempFile::with_suffix" not in result.stdout
+    assert "let fixture =" not in result.stdout
     assert result.stderr == ""
     assert not trace.exists(), "complete source evidence must not need model chat"
 

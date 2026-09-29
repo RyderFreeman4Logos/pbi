@@ -3393,7 +3393,7 @@ semantic_trace_group_line_has_required_behavior() {
   local group="${1,,}" candidate="${2,,}"
   if [[ "$group" =~ (^|[^[:alnum:]])errors?([^[:alnum:]]|$) &&
         "$group" =~ (^|[^[:alnum:]])(convert|conversion|wrap|wrapping)([^[:alnum:]]|$) ]]; then
-    [[ "$candidate" =~ (map_err|diagnostic|wrap(error)?|convert(error)?|from\() ]] || return 1
+    [[ "$candidate" =~ (^|[^[:alnum:]_])(map_err|diagnostic|wrap(error)?|convert(error)?|from\() ]] || return 1
     if [[ "$group" =~ (^|[^[:alnum:]])(jsonl|parser)([^[:alnum:]]|$) ]]; then
       [[ "$candidate" =~ (parse|deserial|decode) ]]
     fi
@@ -3781,7 +3781,7 @@ filter_semantic_trace_locations() {
 }
 
 format_semantic_trace_evidence() {
-  local locations="$1" location file line_number text emitted=0
+  local locations="$1" location file line_number text relative emitted=0
   printf '%s\n' 'Verified source evidence:'
   while IFS= read -r location; do
     [[ "$location" =~ ^(.+):([[:digit:]]+)$ ]] || continue
@@ -3792,6 +3792,18 @@ format_semantic_trace_evidence() {
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
     text="${text#"${text%%[![:space:]]*}"}"
     [[ -n "$text" ]] || continue
+    relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
+    # Test paths are admitted only when this exact line expresses a
+    # requested behavior; source implementations and relevant test cases
+    # remain eligible.
+    if is_test_coverage_evidence "$relative" "$text"; then
+      if [[ "$text" =~ ^[[:space:]]*(describe|it|test)[[:space:]]*\( ]]; then
+        :
+      else
+        semantic_trace_candidate_matches_target "$relative $text" "$relative" || continue
+      fi
+    fi
     ((${#text} <= 200)) || text="${text:0:200}..."
     printf -- '- %s — %s\n' "$location" "$text"
     emitted=$((emitted + 1))
@@ -3804,7 +3816,7 @@ semantic_group_has_required_behavior() {
   local normalized_group="${group,,}" normalized_haystack="${haystack,,}"
   if [[ "$normalized_group" =~ (^|[^[:alnum:]])errors?([^[:alnum:]]|$) &&
         "$normalized_group" =~ (^|[^[:alnum:]])(convert|conversion|wrap|wrapping)([^[:alnum:]]|$) ]]; then
-    required='(map_err|diagnostic|wrap(error)?|convert(error)?|from\()'
+    required='(^|[^[:alnum:]_])(map_err|diagnostic|wrap(error)?|convert(error)?|from\()'
     [[ "$normalized_haystack" =~ $required ]]
   elif [[ "$normalized_group" =~ unknown[-_[:space:]]+fields? ]]; then
     required='(extensions?[[:space:]]*\.[[:space:]]*push|deny_unknown_fields)'
