@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -311,8 +312,8 @@ fn probe_command(
 }
 
 #[cfg(unix)]
-fn signal_probe_group(child: &Child, signal: &str) {
-    let group = format!("-{}", child.id());
+fn signal_probe_group_id(pid: u32, signal: &str) {
+    let group = format!("-{pid}");
     let _ = Command::new("/bin/kill")
         .args([signal, "--", group.as_str()])
         .stdout(Stdio::null())
@@ -320,13 +321,24 @@ fn signal_probe_group(child: &Child, signal: &str) {
         .status();
 }
 
+#[cfg(unix)]
+fn signal_probe_group(child: &Child, signal: &str) {
+    signal_probe_group_id(child.id(), signal);
+}
+
 #[cfg(not(unix))]
 fn signal_probe_group(_child: &Child, _signal: &str) {}
+
+#[cfg(not(unix))]
+fn signal_probe_group_id(_pid: u32, _signal: &str) {}
 
 fn wait_probe_child(child: &mut Child, deadline: Instant) -> Result<(ExitStatus, bool), CliError> {
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok((status, false)),
+            Ok(Some(status)) => {
+                signal_probe_group(child, "-TERM");
+                return Ok((status, false));
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
                 signal_probe_group(child, "-TERM");
@@ -359,6 +371,75 @@ fn wait_probe_child(child: &mut Child, deadline: Instant) -> Result<(ExitStatus,
     }
 }
 
+fn read_probe_pipe(pipe: impl Read) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pipe.take((MAX_PROBE_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn receive_probe_output(
+    receiver: &Receiver<(bool, io::Result<Vec<u8>>)>,
+    stdout: &mut Option<io::Result<Vec<u8>>>,
+    stderr: &mut Option<io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> Result<bool, CliError> {
+    while stdout.is_none() || stderr.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok((is_stdout, result)) if is_stdout => *stdout = Some(result),
+            Ok((_, result)) => *stderr = Some(result),
+            Err(RecvTimeoutError::Timeout) => return Ok(false),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(CliError::failed("Probe output reader failed"));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn collect_probe_output(
+    receiver: Receiver<(bool, io::Result<Vec<u8>>)>,
+    stdout_reader: thread::JoinHandle<()>,
+    stderr_reader: thread::JoinHandle<()>,
+    group_id: u32,
+) -> Result<(Vec<u8>, Vec<u8>), CliError> {
+    signal_probe_group_id(group_id, "-TERM");
+    let mut stdout = None;
+    let mut stderr = None;
+    let first_deadline = Instant::now() + Duration::from_millis(PROBE_CLEANUP_GRACE_MILLIS);
+    let drained = match receive_probe_output(&receiver, &mut stdout, &mut stderr, first_deadline) {
+        Ok(true) => true,
+        Ok(false) => {
+            signal_probe_group_id(group_id, "-KILL");
+            let final_deadline = Instant::now() + Duration::from_millis(PROBE_CLEANUP_GRACE_MILLIS);
+            receive_probe_output(&receiver, &mut stdout, &mut stderr, final_deadline)?
+        }
+        Err(error) => {
+            signal_probe_group_id(group_id, "-KILL");
+            return Err(error);
+        }
+    };
+    signal_probe_group_id(group_id, "-KILL");
+    if !drained {
+        return Err(CliError::failed("cannot drain Probe output"));
+    }
+    stdout_reader
+        .join()
+        .map_err(|_| CliError::failed("Probe stdout reader failed"))?;
+    stderr_reader
+        .join()
+        .map_err(|_| CliError::failed("Probe stderr reader failed"))?;
+    let stdout = stdout.ok_or_else(|| CliError::failed("Probe stdout reader failed"))?;
+    let stderr = stderr.ok_or_else(|| CliError::failed("Probe stderr reader failed"))?;
+    let stdout = stdout.map_err(|_| CliError::failed("cannot read Probe output"))?;
+    let stderr = stderr.map_err(|_| CliError::failed("cannot read Probe diagnostics"))?;
+    Ok((stdout, stderr))
+}
+
 fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, CliError> {
     if Instant::now() >= deadline {
         return Err(CliError {
@@ -374,33 +455,43 @@ fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, 
             code: 127,
             message: "probe is unavailable on PATH".to_owned(),
         })?;
-    let Some(mut stdout_pipe) = child.stdout.take() else {
+    let group_id = child.id();
+    let Some(stdout_pipe) = child.stdout.take() else {
+        signal_probe_group_id(group_id, "-KILL");
         let _ = child.kill();
         let _ = child.wait();
         return Err(CliError::failed("Probe stdout pipe was unavailable"));
     };
-    let Some(mut stderr_pipe) = child.stderr.take() else {
+    let Some(stderr_pipe) = child.stderr.take() else {
+        signal_probe_group_id(group_id, "-KILL");
         let _ = child.kill();
         let _ = child.wait();
         return Err(CliError::failed("Probe stderr pipe was unavailable"));
     };
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout_pipe.read_to_end(&mut output).map(|_| output)
+    let (sender, receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn({
+        let sender = sender.clone();
+        move || {
+            let _ = sender.send((true, read_probe_pipe(stdout_pipe)));
+        }
     });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr_pipe.read_to_end(&mut output).map(|_| output)
+    let stderr_reader = thread::spawn({
+        let sender = sender.clone();
+        move || {
+            let _ = sender.send((false, read_probe_pipe(stderr_pipe)));
+        }
     });
-    let (status, timed_out) = wait_probe_child(&mut child, deadline)?;
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| CliError::failed("Probe stdout reader failed"))?
-        .map_err(|_| CliError::failed("cannot read Probe output"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| CliError::failed("Probe stderr reader failed"))?
-        .map_err(|_| CliError::failed("cannot read Probe diagnostics"))?;
+    drop(sender);
+    let wait_result = wait_probe_child(&mut child, deadline);
+    let output_result = collect_probe_output(receiver, stdout_reader, stderr_reader, group_id);
+    let (status, timed_out) = match wait_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = output_result;
+            return Err(error);
+        }
+    };
+    let (stdout, stderr) = output_result?;
     if stdout.len().saturating_add(stderr.len()) > MAX_PROBE_OUTPUT_BYTES {
         return Err(CliError::failed("Probe output exceeded the bounded limit"));
     }
@@ -493,20 +584,97 @@ fn evidence_cli_error(error: EvidenceError) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::SystemTime;
 
+    #[cfg(target_os = "linux")]
+    fn process_identity(root: &Path, name: &str) -> (u32, u64) {
+        let identity = fs::read_to_string(root.join(name)).expect("fixture process identity");
+        let mut fields = identity.split_whitespace();
+        (
+            fields.next().expect("process id").parse().expect("pid"),
+            fields
+                .next()
+                .expect("start time")
+                .parse()
+                .expect("start time"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_identity_is_running(pid: u32, start_time: u64) -> bool {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        let mut fields = fields.split_whitespace();
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        let current_start = fields.nth(19).and_then(|value| value.parse::<u64>().ok());
+        current_start == Some(start_time) && state != "Z"
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn probe_process_is_killed_at_outer_deadline() {
-        let mut command = Command::new("/usr/bin/sleep");
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        command.arg("1");
-        let result = run_probe_command(command, Instant::now() + Duration::from_millis(20));
-        match result {
-            Err(error) => assert_eq!(error.code, 124),
-            Ok(_) => panic!("Probe exceeded its outer deadline"),
-        }
+    fn probe_process_cleans_descendants_holding_pipes_on_timeout_and_early_exit() {
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("pbi-rs-process-tree-{suffix}"));
+        fs::create_dir_all(&root).expect("fixture directory");
+
+        let run_fixture = |name: &str, body: &str, deadline: Duration| {
+            let script = format!(
+                "trap '' TERM\nprintf '%s %s\\n' \"$$\" \"$(awk '{{print $22}}' /proc/$$/stat)\" > \"$PBI_RS_TEST_ROOT/root.identity\"\n{body}"
+            );
+            let mut command = Command::new("/bin/sh");
+            command.arg("-c").arg(script).env("PBI_RS_TEST_ROOT", &root);
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            let started = Instant::now();
+            let result = run_probe_command(command, Instant::now() + deadline);
+            let elapsed = started.elapsed();
+            let root_identity = process_identity(&root, "root.identity");
+            let descendant_identity = process_identity(&root, "descendant.identity");
+            assert!(
+                !process_identity_is_running(root_identity.0, root_identity.1),
+                "{name}: direct Probe child remained alive"
+            );
+            assert!(
+                !process_identity_is_running(descendant_identity.0, descendant_identity.1),
+                "{name}: Probe descendant remained alive"
+            );
+            (result, elapsed)
+        };
+
+        let (timeout_result, timeout_elapsed) = run_fixture(
+            "timeout",
+            "sleep 30 &\nchild=$!\nprintf '%s %s\\n' \"$child\" \"$(awk '{print $22}' /proc/$child/stat)\" > \"$PBI_RS_TEST_ROOT/descendant.identity\"\nwait \"$child\"",
+            Duration::from_millis(100),
+        );
+        assert!(
+            timeout_elapsed < Duration::from_millis(500),
+            "timeout cleanup exceeded bound: {timeout_elapsed:?}"
+        );
+        assert!(matches!(timeout_result, Err(error) if error.code == 124));
+
+        let (early_exit_result, early_exit_elapsed) = run_fixture(
+            "early exit",
+            "sleep 1 &\nchild=$!\nprintf '%s %s\\n' \"$child\" \"$(awk '{print $22}' /proc/$child/stat)\" > \"$PBI_RS_TEST_ROOT/descendant.identity\"\nexit 0",
+            Duration::from_millis(100),
+        );
+        assert!(
+            early_exit_elapsed < Duration::from_millis(500),
+            "early-exit cleanup exceeded bound: {early_exit_elapsed:?}"
+        );
+        assert!(matches!(early_exit_result, Ok(output) if output.status.success()));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
