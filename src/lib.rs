@@ -2,7 +2,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-/// The compact location format consumed by callers and by the old pbi wrapper.
+const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_EVIDENCE_LINES: usize = 4;
+
+/// A verified source path and the exact line span returned to a caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceLocation {
     path: PathBuf,
@@ -49,6 +52,60 @@ impl SourceLocation {
     }
 }
 
+/// One compact, source-verified answer candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceEvidence {
+    location: SourceLocation,
+    target: String,
+    snippet: String,
+    symbol: Option<String>,
+    relevance: String,
+}
+
+impl SourceEvidence {
+    pub fn location(&self) -> &SourceLocation {
+        &self.location
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn snippet(&self) -> &str {
+        &self.snippet
+    }
+
+    pub fn symbol(&self) -> Option<&str> {
+        self.symbol.as_deref()
+    }
+
+    pub fn relevance(&self) -> &str {
+        &self.relevance
+    }
+}
+
+/// Verified evidence and explicit coverage state for one deterministic query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceReport {
+    complete: bool,
+    evidence: Vec<SourceEvidence>,
+    missing_targets: Vec<String>,
+}
+
+impl EvidenceReport {
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn evidence(&self) -> &[SourceEvidence] {
+        &self.evidence
+    }
+
+    pub fn missing_targets(&self) -> &[String] {
+        &self.missing_targets
+    }
+}
+
 /// Privacy-safe failures from deterministic source verification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceError {
@@ -78,19 +135,35 @@ struct RawLocation {
     path: PathBuf,
     start_line: usize,
     end_line: usize,
+    order: usize,
 }
 
-/// Parse and source-check Probe's plain search result without invoking a model.
+#[derive(Clone, Debug)]
+struct QueryGroup {
+    label: String,
+    terms: Vec<String>,
+    exact_symbols: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ScoredEvidence {
+    evidence: SourceEvidence,
+    score: i32,
+    order: usize,
+}
+
+/// Parse Probe output, inspect the cited files, and return compact evidence.
 ///
-/// A candidate is accepted only when its file is inside `root` and the reported
-/// source span contains enough distinctive query evidence. This deliberately
-/// rejects bare location stamps and unrelated high-ranking matches.
-pub fn verify_probe_locations(
+/// Probe ranges are candidate file hints, not proof. The verifier reads a
+/// bounded source file, selects a small local window, excludes generated/test
+/// distractors, and records which query groups remain unsupported. No model or
+/// repository write is involved.
+pub fn verify_probe_evidence(
     probe_output: &str,
     root: &Path,
     query: &str,
     max_results: usize,
-) -> Result<Vec<SourceLocation>, EvidenceError> {
+) -> Result<EvidenceReport, EvidenceError> {
     if probe_output.trim().is_empty() {
         return Err(EvidenceError::EmptyProbeOutput);
     }
@@ -98,19 +171,145 @@ pub fn verify_probe_locations(
         return Err(EvidenceError::NoSourceLocations);
     }
     let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
+    let raw_locations = parse_probe_locations(probe_output)?;
+    let groups = query_groups(query);
+    if groups.is_empty() {
+        return Err(EvidenceError::NoSourceLocations);
+    }
+
+    let mut choices: Vec<Vec<ScoredEvidence>> = vec![Vec::new(); groups.len()];
+    for raw in raw_locations {
+        let Some(path) = resolve_candidate_path(&raw.path, &root) else {
+            continue;
+        };
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() || excluded_path(relative) || source_is_too_large(&path)
+        {
+            continue;
+        }
+        let test_candidate = test_path(relative);
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let lines: Vec<&str> = source.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
+        for (group_index, group) in groups.iter().enumerate() {
+            let raw_order = raw
+                .order
+                .saturating_add(raw.start_line)
+                .saturating_add(raw.end_line);
+            if let Some(choice) = best_window(
+                group,
+                &groups,
+                relative,
+                &path,
+                &lines,
+                raw_order,
+                test_candidate,
+            ) {
+                choices[group_index].push(choice);
+            }
+        }
+    }
+
+    let mut evidence = Vec::new();
+    let mut covered = vec![false; groups.len()];
+    for (group_index, group_choices) in choices.iter_mut().enumerate() {
+        group_choices.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.order.cmp(&right.order))
+                .then_with(|| {
+                    left.evidence
+                        .location
+                        .start_line
+                        .cmp(&right.evidence.location.start_line)
+                })
+        });
+        let Some(choice) = group_choices.first().cloned() else {
+            continue;
+        };
+        if let Some(existing) = evidence
+            .iter()
+            .position(|candidate: &SourceEvidence| candidate.location == choice.evidence.location)
+        {
+            let _ = existing;
+            covered[group_index] = true;
+            continue;
+        }
+        if evidence.len() >= max_results {
+            continue;
+        }
+        evidence.push(choice.evidence);
+        covered[group_index] = true;
+    }
+
+    let missing_targets = groups
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !covered[*index])
+        .map(|(_, group)| group.label.clone())
+        .collect::<Vec<_>>();
+    if evidence.is_empty() {
+        return Err(EvidenceError::NoSourceLocations);
+    }
+    Ok(EvidenceReport {
+        complete: missing_targets.is_empty(),
+        evidence,
+        missing_targets,
+    })
+}
+
+/// Compatibility view for callers that only need verified exact locations.
+pub fn verify_probe_locations(
+    probe_output: &str,
+    root: &Path,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SourceLocation>, EvidenceError> {
+    let report = verify_probe_evidence(probe_output, root, query, max_results)?;
+    let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
+    let ranges = parse_probe_locations(probe_output)?;
+    let locations = report
+        .evidence
+        .into_iter()
+        .filter(|evidence| {
+            ranges.iter().any(|raw| {
+                resolve_candidate_path(&raw.path, &root).is_some_and(|path| {
+                    path == evidence.location.path
+                        && evidence.location.start_line >= raw.start_line
+                        && evidence.location.end_line <= raw.end_line
+                })
+            })
+        })
+        .map(|evidence| evidence.location)
+        .collect::<Vec<_>>();
+    if locations.is_empty() {
+        Err(EvidenceError::NoSourceLocations)
+    } else {
+        Ok(locations)
+    }
+}
+
+fn parse_probe_locations(probe_output: &str) -> Result<Vec<RawLocation>, EvidenceError> {
     let mut raw_locations = Vec::new();
     let mut malformed_range = false;
-    for line in probe_output.lines() {
+    for (order, line) in probe_output.lines().enumerate() {
         let Some(rest) = line.trim().strip_prefix("File: ") else {
             continue;
         };
         let Some((path_text, range_text)) = rest.rsplit_once(", Lines: ") else {
             continue;
         };
-        let Some((start_text, end_text)) = range_text.trim().split_once('-') else {
-            malformed_range = true;
-            continue;
-        };
+        let range_text = range_text.trim();
+        let (start_text, end_text) = range_text
+            .split_once('-')
+            .unwrap_or((range_text, range_text));
         let Ok(start_line) = start_text.trim().parse::<usize>() else {
             malformed_range = true;
             continue;
@@ -127,6 +326,7 @@ pub fn verify_probe_locations(
             path: PathBuf::from(path_text.trim()),
             start_line,
             end_line,
+            order,
         });
     }
     if raw_locations.is_empty() {
@@ -136,85 +336,139 @@ pub fn verify_probe_locations(
             Err(EvidenceError::NoSourceLocations)
         };
     }
+    Ok(raw_locations)
+}
 
-    let terms = distinctive_terms(query);
-    let compact_query = compact_alphanumeric(query);
-    let compound_query = query_compound_symbol(query);
-    let mut locations = Vec::new();
-    for raw in raw_locations {
-        let Ok(path) = fs::canonicalize(&raw.path) else {
-            continue;
-        };
-        let Ok(relative) = path.strip_prefix(&root) else {
-            continue;
-        };
-        if relative.as_os_str().is_empty() || excluded_path(relative) {
-            continue;
-        }
-        let Ok(source) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let source_lines: Vec<&str> = source.lines().collect();
-        if raw.start_line > source_lines.len() {
-            continue;
-        }
-        let end_line = raw.end_line.min(source_lines.len());
-        let span = source_lines[raw.start_line - 1..end_line].join("\n");
-        if !has_distinctive_evidence(&span, &terms, &compact_query, compound_query.as_deref()) {
-            continue;
-        }
-        let location = SourceLocation::new(path, raw.start_line, end_line);
-        if !locations
-            .iter()
-            .any(|seen: &SourceLocation| seen == &location)
-        {
-            locations.push(location);
-        }
-        if locations.len() == max_results {
-            break;
-        }
-    }
-    if locations.is_empty() {
-        Err(EvidenceError::NoSourceLocations)
+fn resolve_candidate_path(raw: &Path, root: &Path) -> Option<PathBuf> {
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
     } else {
-        Ok(locations)
+        root.join(raw)
+    };
+    let path = fs::canonicalize(candidate).ok()?;
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() || excluded_path(relative) {
+        return None;
     }
+    Some(path)
+}
+
+fn source_is_too_large(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.len() > MAX_SOURCE_BYTES)
+        .unwrap_or(true)
 }
 
 fn excluded_path(relative: &Path) -> bool {
     relative.components().any(|component| match component {
-        Component::Normal(name) => matches!(
-            name.to_str(),
-            Some("drafts") | Some("target") | Some("node_modules") | Some("__pycache__")
-        ),
+        Component::Normal(name) => {
+            let Some(name) = name.to_str() else {
+                return true;
+            };
+            name == "drafts"
+                || name == "target"
+                || name == "node_modules"
+                || name == "__pycache__"
+                || name == ".git"
+                || name == ".env"
+                || name.starts_with(".env.")
+        }
         _ => false,
     })
 }
 
-fn distinctive_terms(query: &str) -> Vec<String> {
-    let stop_words = [
-        "a", "an", "and", "are", "at", "be", "for", "from", "how", "is", "of", "or", "the", "to",
-        "what", "where", "which", "who", "why",
-    ];
-    let mut terms = Vec::new();
-    let mut current = String::new();
-    for character in query.chars() {
-        if character.is_alphanumeric() {
-            current.extend(character.to_lowercase());
-        } else if !current.is_empty() {
-            if current.len() >= 4
-                && !stop_words.contains(&current.as_str())
-                && !terms.contains(&current)
-            {
-                terms.push(current.clone());
+fn test_path(relative: &Path) -> bool {
+    relative.components().any(|component| match component {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy().to_lowercase();
+            name == "test"
+                || name == "tests"
+                || name == "__tests__"
+                || name.starts_with("test_")
+                || name.ends_with("_test.rs")
+                || name.ends_with("_tests.rs")
+                || name.contains(".test.")
+        }
+        _ => false,
+    })
+}
+
+fn query_groups(query: &str) -> Vec<QueryGroup> {
+    let mut groups = Vec::<Vec<String>>::new();
+    let mut current = Vec::new();
+    for token in raw_query_tokens(query) {
+        if token == "and" || token == "or" {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
             }
-            current.clear();
+        } else if !query_stop_word(&token) {
+            current.push(token);
         }
     }
-    if current.len() >= 4 && !stop_words.contains(&current.as_str()) && !terms.contains(&current) {
-        terms.push(current);
+    if !current.is_empty() {
+        groups.push(current);
     }
-    terms
+    groups
+        .into_iter()
+        .filter_map(|tokens| {
+            let mut terms = Vec::new();
+            let mut exact_symbols = Vec::new();
+            for token in &tokens {
+                if token.len() >= 3 && !terms.contains(token) {
+                    terms.push(token.clone());
+                }
+                if token.contains('_') || token.contains("::") {
+                    exact_symbols.push(compact_alphanumeric(token));
+                }
+            }
+            (!terms.is_empty()).then(|| QueryGroup {
+                label: tokens.join(" "),
+                terms,
+                exact_symbols,
+            })
+        })
+        .collect()
+}
+
+fn raw_query_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for character in value.chars() {
+        if character.is_alphanumeric() || character == '_' || character == ':' {
+            current.extend(character.to_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn query_stop_word(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "at"
+            | "be"
+            | "does"
+            | "for"
+            | "from"
+            | "how"
+            | "is"
+            | "of"
+            | "or"
+            | "the"
+            | "to"
+            | "what"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+    )
 }
 
 fn compact_alphanumeric(value: &str) -> String {
@@ -225,37 +479,458 @@ fn compact_alphanumeric(value: &str) -> String {
         .collect()
 }
 
-fn has_distinctive_evidence(
-    span: &str,
-    terms: &[String],
-    compact_query: &str,
-    compound_query: Option<&str>,
-) -> bool {
-    let lower_span = span.to_lowercase();
-    if let Some(compound) = compound_query {
-        return compact_alphanumeric(&lower_span).contains(compound);
+fn tokenized(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut previous = None;
+    for character in value.chars() {
+        let boundary = character.is_uppercase()
+            && previous.is_some_and(|previous: char| previous.is_lowercase());
+        if !character.is_alphanumeric() || boundary {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current).to_lowercase());
+            }
+            if character.is_alphanumeric() {
+                current.push(character);
+            }
+        } else {
+            current.push(character);
+        }
+        previous = Some(character);
     }
-    let matching_terms = terms
-        .iter()
-        .filter(|term| lower_span.contains(term.as_str()))
-        .count();
-    if terms.len() <= 1 {
-        return matching_terms > 0
-            || (!compact_query.is_empty() && compact_alphanumeric(span).contains(compact_query));
+    if !current.is_empty() {
+        tokens.push(current.to_lowercase());
     }
-    matching_terms >= 2
-        || (!compact_query.is_empty() && compact_alphanumeric(span).contains(compact_query))
+    tokens
 }
 
-fn query_compound_symbol(query: &str) -> Option<String> {
-    query.split_whitespace().find_map(|token| {
-        if token.contains('_') {
-            let compact = compact_alphanumeric(token);
-            (!compact.is_empty()).then_some(compact)
-        } else {
-            None
+fn token_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let common = left
+        .iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    common >= 4 && common * 5 >= left.len().min(right.len()) * 4
+}
+
+fn matching_terms(terms: &[String], text: &str) -> Vec<String> {
+    let source_tokens = tokenized(text);
+    terms
+        .iter()
+        .filter(|term| source_tokens.iter().any(|token| token_matches(term, token)))
+        .cloned()
+        .collect()
+}
+
+fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    let add = |features: &mut Vec<&'static str>, feature| {
+        if !features.contains(&feature) {
+            features.push(feature);
         }
+    };
+    for term in &group.terms {
+        if ["error", "err", "failure", "fail", "exception"]
+            .iter()
+            .any(|word| token_matches(term, word))
+        {
+            add(&mut features, "error");
+        }
+        if [
+            "parse",
+            "parser",
+            "conversion",
+            "convert",
+            "decode",
+            "deserialize",
+            "serialize",
+        ]
+        .iter()
+        .any(|word| token_matches(term, word))
+        {
+            add(&mut features, "conversion");
+        }
+        if [
+            "unknown", "field", "fields", "key", "keys", "handling", "handle",
+        ]
+        .iter()
+        .any(|word| token_matches(term, word))
+        {
+            add(&mut features, "data");
+        }
+    }
+    features
+}
+
+fn window_features(text: &str) -> Vec<&'static str> {
+    let lower = text.to_lowercase();
+    let mut features = Vec::new();
+    let add = |features: &mut Vec<&'static str>, feature| {
+        if !features.contains(&feature) {
+            features.push(feature);
+        }
+    };
+    let tokens = tokenized(&lower);
+    if tokens.iter().any(|token| {
+        ["error", "err", "failure", "fail", "exception", "invalid"]
+            .iter()
+            .any(|word| token_matches(token, word))
+    }) || lower.contains("map_err")
+    {
+        add(&mut features, "error");
+    }
+    if tokens.iter().any(|token| {
+        [
+            "parse",
+            "convert",
+            "decode",
+            "deserialize",
+            "serialize",
+            "map",
+        ]
+        .iter()
+        .any(|word| token_matches(token, word))
+    }) || lower.contains("map_err")
+        || lower.contains("?")
+    {
+        add(&mut features, "conversion");
+    }
+    if tokens.iter().any(|token| {
+        [
+            "unknown",
+            "field",
+            "fields",
+            "key",
+            "keys",
+            "extension",
+            "extensions",
+        ]
+        .iter()
+        .any(|word| token_matches(token, word))
+    }) || lower.contains("if ")
+        || lower.contains("else")
+        || lower.contains("match ")
+        || lower.contains(".push")
+        || lower.contains(".insert")
+        || lower.contains("next_value")
+    {
+        add(&mut features, "data");
+    }
+    features
+}
+
+fn call_markers(text: &str) -> Vec<String> {
+    let characters: Vec<char> = text.chars().collect();
+    let mut markers = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if !(characters[index].is_alphanumeric() || characters[index] == '_') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < characters.len()
+            && (characters[index].is_alphanumeric()
+                || characters[index] == '_'
+                || characters[index] == '.'
+                || characters[index] == ':')
+        {
+            index += 1;
+        }
+        let name: String = characters[start..index]
+            .iter()
+            .collect::<String>()
+            .trim_end_matches(':')
+            .to_owned();
+        let mut lookahead = index;
+        while lookahead < characters.len() && characters[lookahead].is_whitespace() {
+            lookahead += 1;
+        }
+        if lookahead < characters.len() && characters[lookahead] == '<' {
+            let mut depth = 0usize;
+            while lookahead < characters.len() {
+                match characters[lookahead] {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            lookahead += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                lookahead += 1;
+            }
+            while lookahead < characters.len() && characters[lookahead].is_whitespace() {
+                lookahead += 1;
+            }
+        }
+        let previous_word = characters[..start]
+            .iter()
+            .rev()
+            .skip_while(|character| character.is_whitespace())
+            .take_while(|character| character.is_alphanumeric() || **character == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        if lookahead < characters.len()
+            && characters[lookahead] == '('
+            && !matches!(
+                name.as_str(),
+                "if" | "for" | "while" | "match" | "fn" | "struct"
+            )
+            && previous_word != "fn"
+            && !markers.contains(&name)
+        {
+            markers.push(name);
+        }
+    }
+    markers
+}
+
+fn line_markers(text: &str) -> Vec<String> {
+    if text.trim_start().starts_with('#') {
+        return Vec::new();
+    }
+    let mut markers = call_markers(text);
+    if text.contains('?') {
+        markers.push("error propagation".to_owned());
+    }
+    if text.contains("=>") || text.contains(" else") || text.trim_start().starts_with("if ") {
+        markers.push("branch".to_owned());
+    }
+    if text.contains('=')
+        && !text.contains("==")
+        && !text.contains("=>")
+        && !text.trim_start().starts_with("#")
+        && !markers.contains(&"assignment".to_owned())
+    {
+        markers.push("assignment".to_owned());
+    }
+    markers
+}
+
+fn behavior_query(group: &QueryGroup) -> bool {
+    group.terms.iter().any(|term| {
+        [
+            "error",
+            "parser",
+            "parse",
+            "conversion",
+            "convert",
+            "decode",
+            "unknown",
+            "field",
+            "handling",
+            "handle",
+            "deserialize",
+            "serialize",
+            "reject",
+            "accept",
+        ]
+        .iter()
+        .any(|word| token_matches(term, word))
     })
+}
+
+fn exact_symbol_in_lines(
+    group: &QueryGroup,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    let candidates = lines[start..end]
+        .iter()
+        .flat_map(|line| raw_identifiers(line))
+        .collect::<Vec<_>>();
+    group.exact_symbols.iter().find_map(|expected| {
+        candidates
+            .iter()
+            .find(|candidate| compact_alphanumeric(candidate) == *expected)
+            .cloned()
+    })
+}
+
+fn raw_identifiers(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            current.push(character);
+        } else if !current.is_empty() {
+            values.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        values.push(current);
+    }
+    values
+}
+
+fn best_window(
+    group: &QueryGroup,
+    all_groups: &[QueryGroup],
+    relative: &Path,
+    path: &Path,
+    lines: &[&str],
+    order: usize,
+    test_candidate: bool,
+) -> Option<ScoredEvidence> {
+    let all_terms = all_groups
+        .iter()
+        .flat_map(|group| group.terms.iter().cloned())
+        .collect::<Vec<_>>();
+    let path_text = relative.to_string_lossy();
+    let requested = requested_features(group);
+    let behavioral = behavior_query(group);
+    let context_terms = all_groups
+        .iter()
+        .flat_map(|candidate| candidate.terms.iter().cloned())
+        .filter(|term| !group.terms.contains(term))
+        .collect::<Vec<_>>();
+    let mut best: Option<ScoredEvidence> = None;
+    for start in 0..lines.len() {
+        for length in 1..=MAX_EVIDENCE_LINES.min(lines.len() - start) {
+            let end = start + length;
+            let text = lines[start..end].join("\n");
+            let group_matches = matching_terms(&group.terms, &text);
+            let path_matches = matching_terms(&group.terms, &path_text);
+            let path_context = matching_terms(&context_terms, &path_text);
+            let context_matches = matching_terms(&all_terms, &format!("{path_text}\n{text}"));
+            let features = window_features(&text);
+            let overlap = requested
+                .iter()
+                .filter(|feature| features.contains(feature))
+                .count();
+            let markers = lines[start..end]
+                .iter()
+                .flat_map(|line| line_markers(line))
+                .fold(Vec::new(), |mut markers, marker| {
+                    if !markers.contains(&marker) {
+                        markers.push(marker);
+                    }
+                    markers
+                });
+            let exact_symbol = exact_symbol_in_lines(group, lines, start, end);
+            let test_context = test_window(lines, start, end);
+            if exact_symbol.is_none() && lexical_harness_window(&text) {
+                continue;
+            }
+            let actionable = markers
+                .iter()
+                .any(|marker| marker != "assignment" && marker != "branch");
+            let setup_lines = lines[start..end]
+                .iter()
+                .filter(|line| line.trim_start().starts_with("let "))
+                .count();
+            let direct = group_matches.len();
+            let simple_lexical = !behavioral && direct >= 2;
+            let exact = exact_symbol.is_some();
+            if !exact
+                && ((behavioral && (!actionable || (direct == 0 && overlap == 0)))
+                    || (!behavioral && !simple_lexical))
+            {
+                continue;
+            }
+            if direct == 0 && overlap == 0 && !exact {
+                continue;
+            }
+            let score = (direct as i32 * 12)
+                + (path_matches.len() as i32 * 3)
+                + (path_context.len() as i32 * 10)
+                + (overlap as i32 * 20)
+                + (context_matches.len() as i32 * 2)
+                + (markers.len() as i32 * 3)
+                - (setup_lines as i32 * 3)
+                - if test_candidate || test_context {
+                    16
+                } else {
+                    0
+                }
+                + if exact { 100 } else { 0 }
+                - length as i32;
+            let location = SourceLocation::new(path.to_path_buf(), start + 1, end);
+            let symbol = exact_symbol
+                .or_else(|| markers.iter().find(|marker| useful_symbol(marker)).cloned());
+            let mut relevance_parts = Vec::new();
+            if !group_matches.is_empty() {
+                relevance_parts.push(format!("terms={}", group_matches.join(",")));
+            } else if !path_matches.is_empty() {
+                relevance_parts.push(format!("path_terms={}", path_matches.join(",")));
+            }
+            if !markers.is_empty() {
+                relevance_parts.push(format!(
+                    "code={}",
+                    markers
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            if test_candidate || test_context {
+                relevance_parts.push("context=test".to_owned());
+            }
+            if relevance_parts.is_empty() {
+                relevance_parts.push("exact symbol".to_owned());
+            }
+            let candidate = ScoredEvidence {
+                evidence: SourceEvidence {
+                    location,
+                    target: group.label.clone(),
+                    snippet: text,
+                    symbol,
+                    relevance: relevance_parts.join(" "),
+                },
+                score,
+                order,
+            };
+            if match best.as_ref() {
+                None => true,
+                Some(current) => candidate.score > current.score,
+            } {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn test_window(lines: &[&str], start: usize, end: usize) -> bool {
+    let context_start = start.saturating_sub(64);
+    lines[context_start..end].iter().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("#[test")
+            || lower.contains("cfg(test")
+            || lower.contains("mod tests")
+            || (lower.contains("fn test_") && lower.contains('('))
+    })
+}
+
+fn useful_symbol(marker: &str) -> bool {
+    marker.chars().any(|character| character.is_alphanumeric())
+        && marker != "assignment"
+        && marker != "branch"
+        && marker != "error propagation"
+        && marker != "Some"
+        && marker != "Ok"
+        && marker != "Err"
+        && marker != "format"
+        && marker != "Vec::new"
+}
+
+fn lexical_harness_window(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    (lower.contains("search") || lower.contains("grep") || lower.contains("probe"))
+        && (text.contains('"') || text.contains('\''))
 }
 
 #[cfg(test)]
@@ -408,5 +1083,137 @@ mod tests {
         .expect("verified source");
         assert_eq!(locations.len(), 1);
         assert!(locations[0].path().ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn evidence_compacts_broad_ranges_and_covers_distinct_targets() {
+        let fixture = Fixture::new();
+        let parser = fixture.root.join("src/parser.rs");
+        let permissive = fixture.root.join("src/permissive.rs");
+        let test_file = fixture.root.join("src/parser_tests.rs");
+        let decoy = fixture.root.join("src/unknown_field.rs");
+        fs::write(
+            &parser,
+            "fn decode(line: &str) {\n    let decoded = parse_jsonl_value(line).map_err(|error| {\n        Error::new(JsonlDecodeError { source: error })\n    })?;\n    use_value(decoded);\n}\n",
+        )
+        .expect("parser source");
+        fs::write(
+            &permissive,
+            "fn visit(map: &mut Map) {\n    if known(&key) {\n        map.next_value::<IgnoredAny>()?;\n    } else {\n        extensions.push((key, map.next_value()?));\n    }\n}\n",
+        )
+        .expect("unknown-field source");
+        fs::write(
+            &test_file,
+            "let fixture = \"JSONL parser error conversion unknown-field handling\";\n",
+        )
+        .expect("test source");
+        fs::write(
+            &decoy,
+            "#[serde(deny_unknown_fields)]\nfn reject_unknown_field() {}\n",
+        )
+        .expect("decoy source");
+        let output = format!(
+            "File: {}, Lines: 1-99\nFile: {}, Lines: 1-99\nFile: {}, Lines: 1-99\nFile: {}, Lines: 1-99\n",
+            parser.display(),
+            permissive.display(),
+            test_file.display(),
+            decoy.display()
+        );
+        let report = verify_probe_evidence(
+            &output,
+            &fixture.root,
+            "where is JSONL parser error conversion and unknown-field handling?",
+            8,
+        )
+        .expect("verified evidence");
+        assert!(report.is_complete());
+        assert_eq!(report.evidence().len(), 2);
+        assert!(report.evidence().iter().any(|evidence| evidence
+            .location()
+            .path()
+            .ends_with("src/parser.rs")
+            && evidence.snippet().contains("map_err")
+            && evidence.location().end_line() - evidence.location().start_line() < 4));
+        assert!(report.evidence().iter().any(|evidence| {
+            evidence.location().path().ends_with("src/permissive.rs")
+                && evidence.snippet().contains("extensions.push")
+        }));
+        assert!(!report
+            .evidence()
+            .iter()
+            .any(|evidence| evidence.location().path().ends_with("parser_tests.rs")));
+        assert!(!report
+            .evidence()
+            .iter()
+            .any(|evidence| evidence.location().path().ends_with("unknown_field.rs")));
+    }
+
+    #[test]
+    fn evidence_reports_missing_target_without_claiming_complete() {
+        let fixture = Fixture::new();
+        let parser = fixture.root.join("src/parser.rs");
+        fs::write(
+            &parser,
+            "fn decode(line: &str) {\n    parse_jsonl_value(line).map_err(convert_error)?;\n}\n",
+        )
+        .expect("parser source");
+        let output = format!("File: {}, Lines: 1-99\n", parser.display());
+        let report = verify_probe_evidence(
+            &output,
+            &fixture.root,
+            "where is JSONL parser error conversion and unknown-field handling?",
+            8,
+        )
+        .expect("partial evidence");
+        assert!(!report.is_complete());
+        assert_eq!(report.evidence().len(), 1);
+        assert_eq!(report.missing_targets().len(), 1);
+    }
+
+    #[test]
+    fn evidence_exposes_an_exact_symbol_when_present() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("src/errors.rs");
+        fs::write(
+            &source,
+            "fn probe_json_error(input: &str) {\n    convert(input);\n}\n",
+        )
+        .expect("symbol source");
+        let output = format!("File: {}, Lines: 1-99\n", source.display());
+        let report = verify_probe_evidence(&output, &fixture.root, "where is probe_json_error?", 8)
+            .expect("symbol evidence");
+        assert!(report.is_complete());
+        assert_eq!(report.evidence()[0].symbol(), Some("probe_json_error"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_rejects_traversal_and_symlink_boundary_candidates() {
+        let fixture = Fixture::new();
+        let outside = fixture
+            .root
+            .parent()
+            .expect("parent")
+            .join("outside-link.rs");
+        fs::write(&outside, "compression publication cache assembly\n").expect("outside source");
+        let link = fixture.root.join("src/link.rs");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+        let symlink_output = format!("File: {}, Lines: 1-1\n", link.display());
+        let traversal_output = format!(
+            "File: ../{}, Lines: 1-1\n",
+            outside.file_name().unwrap().display()
+        );
+        for output in [symlink_output, traversal_output] {
+            assert_eq!(
+                verify_probe_evidence(
+                    &output,
+                    &fixture.root,
+                    "compression publication cache assembly",
+                    8,
+                ),
+                Err(EvidenceError::NoSourceLocations)
+            );
+        }
+        let _ = fs::remove_file(&outside);
     }
 }

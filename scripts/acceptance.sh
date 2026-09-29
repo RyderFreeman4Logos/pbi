@@ -6,7 +6,10 @@ fixture="$repo_root/tests/fixtures/repo"
 probe="$repo_root/tests/fixtures/probe-fixture.sh"
 
 verified=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "compression publication cache assembly")
-test "$verified" = 'src/lib.rs:1'
+printf '%s\n' "$verified" | grep -q '^Coverage: complete$'
+printf '%s\n' "$verified" | grep -q '^Verified source evidence:$'
+printf '%s\n' "$verified" | grep -q '^-[[:space:]]src/lib.rs:1 '
+printf '%s\n' "$verified" | grep -q 'compression publication and cache key assembly'
 
 raw=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search --bm25 "compression publication cache assembly")
 printf '%s\n' "$raw" | grep -q '^File: '
@@ -23,5 +26,6 @@ printf '%s\n' "$debug" | grep -q '^api_key=\[REDACTED\]$'
 printf '%s\n' "$debug" | grep -q '^search_default=compact_verified_bm25_no_chat$'
 
 real=$(cd "$repo_root" && "$binary" search "SourceLocation src/lib.rs")
-printf '%s\n' "$real" | grep -Eq '^src/lib.rs:[0-9]+(-[0-9]+)?$'
+printf '%s\n' "$real" | grep -q '^Coverage: complete$'
+printf '%s\n' "$real" | grep -Eq '^-[[:space:]]src/lib.rs:[0-9]+(-[0-9]+)? '
 printf '%s\n' 'acceptance: deterministic fixture and real Probe passed'

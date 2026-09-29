@@ -1,4 +1,4 @@
-use pbi_rs::{verify_probe_locations, EvidenceError};
+use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -119,8 +119,12 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         )
     };
 
-    let root =
-        env::current_dir().map_err(|_| CliError::failed("cannot determine repository root"))?;
+    let root = env::current_dir()
+        .map_err(|_| CliError::failed("cannot determine repository root"))
+        .and_then(|root| {
+            fs::canonicalize(root)
+                .map_err(|_| CliError::failed("cannot canonicalize repository root"))
+        })?;
     let output = invoke_probe(&root, &query, &timeout, max_results, raw)?;
     if raw {
         io::stdout()
@@ -138,17 +142,51 @@ fn run(arguments: Vec<String>) -> Result<i32, CliError> {
         return Ok(exit_status(&output));
     }
     let probe_stdout = String::from_utf8_lossy(&output.stdout);
-    let locations = verify_probe_locations(&probe_stdout, &root, &query, max_results)
+    let report = verify_probe_evidence(&probe_stdout, &root, &query, max_results)
         .map_err(evidence_cli_error)?;
-    for location in locations {
-        println!(
-            "{}",
-            location
-                .display_relative(&root)
-                .map_err(evidence_cli_error)?
+    print_evidence(report.evidence(), report.missing_targets(), &root)?;
+    Ok(if report.is_complete() { 0 } else { 1 })
+}
+
+fn print_evidence(
+    evidence: &[SourceEvidence],
+    missing_targets: &[String],
+    root: &Path,
+) -> Result<(), CliError> {
+    println!(
+        "Coverage: {}",
+        if missing_targets.is_empty() {
+            "complete"
+        } else {
+            "incomplete"
+        }
+    );
+    println!("Verified source evidence:");
+    for item in evidence {
+        let location = item
+            .location()
+            .display_relative(root)
+            .map_err(evidence_cli_error)?;
+        let symbol = item.symbol().map_or_else(
+            || "symbol=none".to_owned(),
+            |symbol| format!("symbol={symbol}"),
         );
+        println!(
+            "- {location} | target={} | {symbol} | {}",
+            item.target(),
+            item.relevance()
+        );
+        for (offset, line) in item.snippet().lines().enumerate() {
+            println!("  {}: {}", item.location().start_line() + offset, line);
+        }
     }
-    Ok(0)
+    if !missing_targets.is_empty() {
+        println!("Missing targets:");
+        for target in missing_targets {
+            println!("- {target}");
+        }
+    }
+    Ok(())
 }
 
 fn parse_search(arguments: &[String]) -> Result<(bool, String, String, usize), CliError> {

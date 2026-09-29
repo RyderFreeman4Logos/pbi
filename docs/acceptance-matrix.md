@@ -6,8 +6,8 @@ Status values are **PASS** only after the command or test has actually run in th
 
 | Contract from `pbi` | pbi-rs milestone behavior | Status |
 |---|---|---|
-| `pbi <question...>` | Runs Probe BM25 first and prints only verified `path:line[-line]` locations. | PASS after `just acceptance` |
-| `pbi search <query>` | Same deterministic compact evidence path. | PASS after `just acceptance` |
+| `pbi <question...>` | Runs Probe BM25 first and prints compact verified evidence: exact source spans, target, relevance, and optional symbol. | PASS after `just acceptance` |
+| `pbi search <query>` | Same deterministic compact evidence path; incomplete target coverage is reported instead of claimed complete. | PASS after `just acceptance` |
 | `pbi search --bm25 <query>` | Relays raw Probe stdout/stderr; no model call. | PASS after `just acceptance` |
 | `pbi --message <question>` | Accepted as a deterministic search alias; semantic model answer is not claimed. | PARTIAL |
 | `pbi --debug-config` | Safe diagnostic output; auth is always `[REDACTED]`. | PASS after `just acceptance` |
@@ -21,8 +21,8 @@ Status values are **PASS** only after the command or test has actually run in th
 | Acceptance | Evidence | Status |
 |---|---|---|
 | BM25 is mandatory before any semantic path | `src/main.rs` always invokes `probe search --reranker bm25`; no model dependency exists in this slice. | PASS |
-| Bare location stamps fail closed | `verify_probe_locations` requires readable in-root source text and query evidence. | PASS by unit test |
-| Unrelated spans fail closed | Unit test rejects a candidate whose line lacks the distinctive query terms; fixture acceptance checks status 1 and empty stdout. | PASS after `just acceptance` |
+| Bare location stamps fail closed | `verify_probe_evidence` requires readable in-root source text and a compact locally relevant span; `verify_probe_locations` remains the range-bounded compatibility view. | PASS by unit test |
+| Unrelated spans fail closed | Focused fixtures reject lexical test/decoy spans, retain verified partial evidence, and emit explicit missing targets. | PASS after `just acceptance` |
 | Source boundary is preserved | Canonical path must remain under the invocation root; outside-root candidates are discarded. | PASS by unit test |
 | Generated/noise boundaries | `drafts`, `target`, `node_modules`, and `__pycache__` are excluded. | PASS by unit test coverage through verifier |
 | Raw mode remains raw | `--bm25` does not parse, summarize, or invoke a model. | PASS after `just acceptance` |
