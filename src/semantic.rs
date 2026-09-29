@@ -142,6 +142,7 @@ pub enum SemanticRouteError {
     IncompleteConfig,
     UnapprovedRoute,
     UnapprovedModel,
+    UnapprovedCredentialHandle,
     MissingCredential,
     Profile,
 }
@@ -153,6 +154,7 @@ impl fmt::Display for SemanticRouteError {
             Self::IncompleteConfig => "semantic route configuration is incomplete",
             Self::UnapprovedRoute => "semantic route is not an approved local route",
             Self::UnapprovedModel => "semantic model is not an approved local model",
+            Self::UnapprovedCredentialHandle => "semantic credential handle is not approved",
             Self::MissingCredential => {
                 "semantic route requires one credential handle: CLIPROXY_API_KEY, OPENAI_API_KEY, or LOCAL_ROUTER_API_KEY"
             }
@@ -183,10 +185,18 @@ pub fn local_binding_from_environment() -> Result<Option<ModelBinding>, Semantic
         first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?,
         first_value(&["LOCAL_MODEL", "LLM_MODEL"])?,
     )?;
-    let credential_name = MODEL_CREDENTIAL_HANDLES
-        .into_iter()
-        .find(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
-        .ok_or(SemanticRouteError::MissingCredential)?;
+    let credential_name = if let Some(name) = env::var_os("PBI_RS_CREDENTIAL_HANDLE") {
+        let name = name
+            .into_string()
+            .map_err(|_| SemanticRouteError::UnapprovedCredentialHandle)?;
+        select_explicit_credential_handle(&name)?.to_owned()
+    } else {
+        MODEL_CREDENTIAL_HANDLES
+            .into_iter()
+            .find(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+            .ok_or(SemanticRouteError::MissingCredential)?
+            .to_owned()
+    };
     let profile = OpenAiCompatibleProfile::new(
         "pbi-rs-local",
         "1",
@@ -213,6 +223,13 @@ fn local_route_from_values(
     let model = model.unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned());
     validate_local_route(&base_url, &model)?;
     Ok((base_url, model))
+}
+
+fn select_explicit_credential_handle(name: &str) -> Result<&str, SemanticRouteError> {
+    MODEL_CREDENTIAL_HANDLES
+        .contains(&name)
+        .then_some(name)
+        .ok_or(SemanticRouteError::UnapprovedCredentialHandle)
 }
 
 fn first_value(names: &[&str]) -> Result<Option<String>, SemanticRouteError> {
@@ -550,6 +567,22 @@ mod tests {
             }
             .to_string(),
             "semantic model invocation failed: ModelProfile; model_error=Provider; attempts=1"
+        );
+    }
+
+    #[test]
+    fn explicit_credential_handle_selects_only_source_approved_name() {
+        assert_eq!(
+            select_explicit_credential_handle("CLIPROXY_API_KEY"),
+            Ok("CLIPROXY_API_KEY")
+        );
+        assert_eq!(
+            select_explicit_credential_handle("UNAPPROVED_KEY"),
+            Err(SemanticRouteError::UnapprovedCredentialHandle)
+        );
+        assert_eq!(
+            select_explicit_credential_handle(""),
+            Err(SemanticRouteError::UnapprovedCredentialHandle)
         );
     }
 
