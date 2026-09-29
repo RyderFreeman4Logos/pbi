@@ -3,7 +3,9 @@
 set -euo pipefail
 
 readonly PBI_VERSION="0.1.0"
-readonly DEFAULT_BASE_URL="http://gb10:18009/v1"
+readonly LOCAL_MP_BASE_URL="http://localhost:18317/v1"
+readonly DEFAULT_BASE_URL="$LOCAL_MP_BASE_URL"
+readonly APPROVED_FALLBACK_BASE_URL="http://gb10:18009/v1"
 readonly DEFAULT_PRIMARY_MODEL="abliterated-qwen-latest-27b-none"
 readonly DEFAULT_FALLBACK_MODEL="$DEFAULT_PRIMARY_MODEL"
 readonly DEFAULT_REQUEST_TIMEOUT_MS="1700000"
@@ -1086,6 +1088,7 @@ question_is_multi_target_where() {
   fi
   [[ "$q" =~ (^|[[:space:]])where[[:space:]]+is([[:space:]]|$) ]] || return 1
   [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(the|a|an|what|which|where|how|does|its|their)([[:space:]]|$) ]] && return 0
+  [[ "$q" =~ (^|[^[:alnum:]_-])and[[:space:]]+[[:alnum:]_]+-[[:alnum:]_-]+[[:space:]]+[[:alpha:]_]+([^[:alnum:]_]|$) ]] && return 0
   [[ "$q" =~ ,[[:space:]]*(and[[:space:]]+)?(what|which|where|how|does)([[:space:]]|$) ]]
 }
 
@@ -1555,7 +1558,7 @@ fast_path_footer_path_matches_query() {
 remaining_file_candidates() {
   local line path resolved_path in_footer=false kept=0 query="${2:-${question:-}}" footer_tokens
   local footer_rg_matches rg_command footer_rg_pattern footer_rg_status deadline_ns="${3:-}"
-  local footer_line_matches hit line_number fallback_path_tokens="" symbol normalized file_name
+  local footer_line_matches hit hit_text line_number fallback_path_tokens="" symbol normalized file_name target_group
   local path_kept footer_path_limit
   local -a footer_source_paths=() footer_path_matches=() footer_match_args=()
   local -A footer_source_path_seen=() footer_path_seen=()
@@ -1625,10 +1628,15 @@ remaining_file_candidates() {
     normalized="${normalized//[^[:alnum:]]/}"
     [[ -n "$normalized" ]] && fallback_path_tokens+="${fallback_path_tokens:+$'\n'}$normalized"
   done < <(search_named_symbols "$query")
-  [[ -n "$fallback_path_tokens" ]] || fallback_path_tokens="$footer_tokens"
+  if [[ -n "${semantic_trace_scope_tokens:-}" ]]; then
+    fallback_path_tokens="$semantic_trace_scope_tokens"
+  else
+    [[ -n "$fallback_path_tokens" ]] || fallback_path_tokens="$footer_tokens"
+  fi
   if [[ -n "$rg_command" ]] && ! fast_path_deadline_reached "$deadline_ns"; then
     while IFS= read -r path; do
       fast_path_deadline_reached "$deadline_ns" && break
+      semantic_trace_path_in_scope "$path" || continue
       if [[ -z "${footer_path_seen[$path]+seen}" ]]; then
         footer_path_matches+=("$path")
         footer_path_seen["$path"]=1
@@ -1672,23 +1680,34 @@ remaining_file_candidates() {
       fast_path_deadline_reached "$deadline_ns" && return 1
     fi
   fi
-  declare -A emitted_footer_paths=() last_footer_line=() footer_path_kept=()
+  declare -A emitted_footer_paths=() last_footer_line=() footer_path_kept=() footer_path_group_seen=()
   if ((${#footer_path_matches[@]} > 0)) && [[ -n "$rg_command" ]] &&
      ! fast_path_deadline_reached "$deadline_ns"; then
     # ponytail: fixed 16-location budget; per-file fairness keeps later
     # candidates visible, with round-robin extraction as the upgrade path.
     footer_path_limit=$((16 / ${#footer_path_matches[@]}))
     ((footer_path_limit > 0)) || footer_path_limit=1
+    if question_has_multiple_semantic_targets "$query"; then
+      local semantic_target_count
+      semantic_target_count="$(semantic_target_groups "$query" | awk 'NF { count += 1 } END { print count + 0 }')"
+      ((footer_path_limit >= semantic_target_count)) || footer_path_limit="$semantic_target_count"
+    fi
     while IFS= read -r line; do
       [[ -n "$line" ]] && footer_match_args+=( -e "$line" )
     done < <(
       {
-        fast_path_match_variants "$query"
         if question_requests_recipe_scope "$query"; then
+          fast_path_match_variants "$query"
           printf '%s\n' just
           while IFS= read -r group; do
             semantic_group_tokens "$group"
           done < <(semantic_target_groups "$query")
+        elif question_has_multiple_semantic_targets "$query"; then
+          while IFS= read -r group; do
+            semantic_group_expansion_tokens "$group"
+          done < <(semantic_target_groups "$query")
+        else
+          fast_path_match_variants "$query"
         fi
       } | awk 'NF && !seen[$0]++'
     )
@@ -1696,6 +1715,7 @@ remaining_file_candidates() {
       footer_line_matches=""
       for path in "${footer_path_matches[@]}"; do
         fast_path_deadline_reached "$deadline_ns" && break
+        semantic_trace_path_in_scope "$path" || continue
         hit="$(run_rg_with_deadline "$deadline_ns" "$rg_command" \
           -n -F -m 32 --with-filename "${footer_match_args[@]}" -- "$path" 2>/dev/null || true)"
         [[ -z "$hit" ]] || footer_line_matches+="${footer_line_matches:+$'\n'}$hit"
@@ -1705,13 +1725,33 @@ remaining_file_candidates() {
         [[ "$hit" =~ ^(.+):([[:digit:]]+): ]] || continue
         path="${BASH_REMATCH[1]}"
         line_number="${BASH_REMATCH[2]}"
+        hit_text="${hit#"$path:$line_number:"}"
+        if question_has_multiple_semantic_targets "$query" &&
+           ! semantic_trace_line_matches_any_target_group "$hit_text"; then
+          continue
+        fi
+        target_group=""
+        if question_has_multiple_semantic_targets "$query"; then
+          while IFS= read -r group; do
+            if semantic_trace_group_line_has_required_behavior "$group" "$hit_text"; then
+              target_group="$group"
+              break
+            fi
+          done < <(semantic_target_groups "$query")
+          [[ -n "$target_group" ]] || continue
+          [[ -z "${footer_path_group_seen["$path|$target_group"]+seen}" ]] || continue
+        fi
         if [[ -n "${last_footer_line[$path]+seen}" ]] &&
            ((line_number <= last_footer_line[$path] + 2)); then
-          continue
+          if ! question_has_multiple_semantic_targets "$query" ||
+             ! semantic_trace_line_matches_any_target_group "$hit_text"; then
+            continue
+          fi
         fi
         path_kept="${footer_path_kept[$path]:-0}"
         ((path_kept < footer_path_limit)) || continue
         last_footer_line["$path"]="$line_number"
+        [[ -z "$target_group" ]] || footer_path_group_seen["$path|$target_group"]=1
         if question_requests_recipe_scope "$query" &&
            [[ "${path##*/}" == [Jj]ustfile || "${path##*/}" == *.justfile ]]; then
           block_end="$(awk -v target="$line_number" '
@@ -2564,7 +2604,7 @@ question_requires_semantic_trace() {
   local q="${1,,}"
   question_describes_lifecycle_investigation "$1" && return 0
   question_has_multiple_semantic_targets "$1" || return 1
-  [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+(are|does)([^[:alnum:]]|$) ]] && return 0
+  [[ "$q" =~ (^|[^[:alnum:]])where[[:space:]]+(is|are|does)([^[:alnum:]]|$) ]] && return 0
   [[ "$q" =~ (^|[^[:alnum:]])(trace|how|through|contracts?|callers?|wiring|enforc(e|ed|ement|ing)|compil(e|ed|ation|ing)|dispatch(ed|ing)?|resum(e|ed|ing)|check(ed|ing|s)?)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])and[[:space:]]+(its|their)([^[:alnum:]]|$) ]] ||
     [[ "$q" =~ (^|[^[:alnum:]])also[[:space:]]+locate([^[:alnum:]]|$) ]]
@@ -2590,6 +2630,48 @@ semantic_target_groups() {
       }
     }
   '
+}
+
+semantic_trace_scope_tokens_for_candidates() {
+  local query="$1" candidates="$2" group token normalized_token candidate path normalized_path key count
+  local -A seen_token_paths=()
+  question_has_multiple_semantic_targets "$query" || return 0
+  group="$(semantic_target_groups "$query" | sed -n '1p')"
+  while IFS= read -r token; do
+    normalized_token="${token,,}"
+    normalized_token="${normalized_token//[^[:alnum:]]/}"
+    ((${#normalized_token} >= 4)) || continue
+    count=0
+    while IFS= read -r candidate; do
+      [[ "$candidate" =~ ^File:[[:space:]]+(.+)$ ]] || continue
+      path="${BASH_REMATCH[1]}"
+      path="${path%%, Lines:*}"
+      key="$normalized_token|$path"
+      [[ -z "${seen_token_paths[$key]+seen}" ]] || continue
+      normalized_path="${path,,}"
+      normalized_path="${normalized_path//[^[:alnum:]]/}"
+      [[ "$normalized_path" == *"$normalized_token"* ]] || continue
+      seen_token_paths["$key"]=1
+      count=$((count + 1))
+    done <<< "$candidates"
+    ((count >= 2)) && printf '%s\n' "$normalized_token"
+  done < <(search_distinctive_tokens "$group") | awk 'NF && !seen[$0]++'
+}
+
+semantic_trace_path_in_scope() {
+  local path="$1" token normalized_path normalized_token count=0 matched=0
+  [[ -n "${semantic_trace_scope_tokens:-}" ]] || return 0
+  normalized_path="${path,,}"
+  normalized_path="${normalized_path//[^[:alnum:]]/}"
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    normalized_token="${token,,}"
+    normalized_token="${normalized_token//[^[:alnum:]]/}"
+    [[ -n "$normalized_token" ]] || continue
+    count=$((count + 1))
+    [[ "$normalized_path" == *"$normalized_token"* ]] && matched=$((matched + 1))
+  done <<< "$semantic_trace_scope_tokens"
+  ((count == 0 || matched == count))
 }
 
 semantic_group_tokens() {
@@ -2632,6 +2714,25 @@ semantic_group_tokens() {
       }
     }
   '
+  if [[ "$group" =~ (^|[^[:alnum:]])errors?([^[:alnum:]]|$) &&
+        "$group" =~ (^|[^[:alnum:]])(convert|conversion|wrap|wrapping)([^[:alnum:]]|$) ]]; then
+    printf '%s\n' map_err diagnostic
+  fi
+  if [[ "${group,,}" =~ (^|[^[:alnum:]])unknown[-_[:space:]]+fields?([^[:alnum:]]|$) ]]; then
+    printf '%s\n' extensions.push deny_unknown_fields
+  fi
+}
+
+semantic_group_expansion_tokens() {
+  local group="$1" normalized_group="${1,,}"
+  if [[ "$normalized_group" =~ (^|[^[:alnum:]])errors?([^[:alnum:]]|$) &&
+        "$normalized_group" =~ (^|[^[:alnum:]])(convert|conversion|wrap|wrapping)([^[:alnum:]]|$) ]]; then
+    printf '%s\n' map_err diagnostic
+  elif [[ "$normalized_group" =~ unknown[-_[:space:]]+fields? ]]; then
+    printf '%s\n' extensions.push deny_unknown_fields
+  else
+    semantic_group_tokens "$group"
+  fi
 }
 
 line_has_relationship_edge() {
@@ -3282,10 +3383,37 @@ is_semantic_trace_metadata_line() {
   [[ "$2" =~ ^[[:space:]]*(issue|rationale|provenance|revision|source[_-]?commit|commit|range)[[:space:]]*[:=] ]]
 }
 
+semantic_trace_group_line_has_required_behavior() {
+  local group="${1,,}" candidate="${2,,}"
+  if [[ "$group" =~ (^|[^[:alnum:]])errors?([^[:alnum:]]|$) &&
+        "$group" =~ (^|[^[:alnum:]])(convert|conversion|wrap|wrapping)([^[:alnum:]]|$) ]]; then
+    [[ "$candidate" =~ (map_err|diagnostic|wrap(error)?|convert(error)?|from\() ]] || return 1
+    if [[ "$group" =~ (^|[^[:alnum:]])(jsonl|parser)([^[:alnum:]]|$) ]]; then
+      [[ "$candidate" =~ (parse|deserial|decode) ]]
+    fi
+  elif [[ "$group" =~ unknown[-_[:space:]]+fields? ]]; then
+    [[ "$candidate" =~ (extensions?[[:space:]]*\.[[:space:]]*push|deny_unknown_fields) ]]
+  fi
+}
+
+semantic_trace_line_matches_any_target_group() {
+  local text="$1" group
+  while IFS= read -r group; do
+    semantic_trace_group_line_has_required_behavior "$group" "$text" && return 0
+  done < <(semantic_target_groups "${question:-}")
+  return 1
+}
+
 semantic_trace_candidate_matches_target() {
   local candidate="$1" candidate_file="${2:-}" skip_timeout_test_noise="${3:-false}" group tokens token score plain_overlap
+  [[ -z "$candidate_file" ]] || semantic_trace_path_in_scope "$candidate_file" || return 1
   while IFS= read -r group; do
     [[ -n "$group" ]] || continue
+    semantic_trace_group_line_has_required_behavior "$group" "$candidate" || continue
+    if [[ "${question,,}" =~ (^|[^[:alnum:]_-])server([^[:alnum:]_-]|$) ]] &&
+       [[ -n "$candidate_file" && "$candidate_file" != *server* ]]; then
+      continue
+    fi
     tokens="$(printf '%s\n%s\n' "$(semantic_group_tokens "$group")" "$(question_phrase_tokens "$group")" | awk 'NF && !seen[$0]++')"
     if [[ "$group" =~ (^|[^[:alnum:]_-])tests?([^[:alnum:]_-]|$) ]] &&
        [[ -n "$candidate_file" ]] && ! is_test_coverage_evidence "$candidate_file" "$candidate"; then
@@ -3555,6 +3683,7 @@ recover_semantic_trace_locations() {
     if [[ -z "$relative" || "$relative" == /* || "$relative" == ../* ]]; then
       relative="$(basename -- "$file")"
     fi
+    semantic_trace_path_in_scope "$relative" || continue
     while IFS= read -r line_number; do
       fast_path_deadline_reached "${deadline_ns:-}" && break
       [[ "$line_number" =~ ^[[:digit:]]+$ ]] || continue
@@ -3635,6 +3764,7 @@ filter_semantic_trace_locations() {
     [[ -f "$file" ]] || continue
     relative="$(realpath --relative-to="$PWD" -- "$file" 2>/dev/null || true)"
     [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]] || relative="$(basename -- "$file")"
+    semantic_trace_path_in_scope "$relative" || continue
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
     semantic_trace_accepts_candidate "$relative" "$text" "$distinctive_tokens" "$phrase_tokens" "$accepted_haystack" || continue
     accepted_haystack+="${accepted_haystack:+ }$relative $text"
@@ -3665,9 +3795,17 @@ format_semantic_trace_evidence() {
 
 semantic_group_has_required_behavior() {
   local group="$1" haystack="$2" required
+  local normalized_group="${group,,}" normalized_haystack="${haystack,,}"
+  if [[ "$normalized_group" =~ (^|[^[:alnum:]])errors?([^[:alnum:]]|$) &&
+        "$normalized_group" =~ (^|[^[:alnum:]])(convert|conversion|wrap|wrapping)([^[:alnum:]]|$) ]]; then
+    required='(map_err|diagnostic|wrap(error)?|convert(error)?|from\()'
+    [[ "$normalized_haystack" =~ $required ]]
+  elif [[ "$normalized_group" =~ unknown[-_[:space:]]+fields? ]]; then
+    required='(extensions?[[:space:]]*\.[[:space:]]*push|deny_unknown_fields)'
+    [[ "$normalized_haystack" =~ $required ]]
   # Generic hermes_cli/config tokens are not CLI-to-TUI launch or runtime-asset
   # evidence (#247). Require a behavior word from the group itself.
-  if [[ "$group" =~ (^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$) ]]; then
+  elif [[ "$group" =~ (^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$) ]]; then
     [[ "$group" == *commentary/final* && "$haystack" == *commentary/final* ]] && return 0
     required='(^|[^[:alnum:]_-])(tui|launch)([^[:alnum:]_-]|$)'
   elif [[ "$group" =~ (^|[^[:alnum:]_-])(runtime|assets?)([^[:alnum:]_-]|$) ]]; then
@@ -3693,6 +3831,7 @@ semantic_trace_is_complete() {
     line_number="${BASH_REMATCH[2]}"
     [[ "$file" != /* ]] && file="$PWD/$file"
     [[ -f "$file" ]] || continue
+    semantic_trace_path_in_scope "$file" || continue
     text="$(sed -n "${line_number}p" "$file" 2>/dev/null || true)"
     [[ -n "$text" ]] || continue
     haystack+="${haystack:+ }$file $text $(canonical_overlap_tokens "$file $text")"
@@ -3865,6 +4004,7 @@ recover_shared_metrics_helper_locations() {
 
 emit_semantic_trace_from_candidates() {
   local deadline_ns="${1:-}" locations fallback_locations evidence answer symbol symbol_locations named_test helper_locations=""
+  semantic_trace_scope_tokens="$(semantic_trace_scope_tokens_for_candidates "${question:-}" "${bm25_candidates:-}" || true)"
   locations=""
   named_test="$(question_named_test_symbol "${question:-}")"
   if [[ -n "$named_test" ]] && ! question_requests_recipe_scope "${question:-}"; then
@@ -3879,6 +4019,7 @@ emit_semantic_trace_from_candidates() {
     fi
     symbol_locations="$(recover_semantic_trace_locations || true)"
     locations="$(printf '%s\n%s\n%s\n' "$helper_locations" "$locations" "$symbol_locations" | awk 'NF && !seen[$0]++')"
+    locations="$(filter_semantic_trace_locations "$locations" || true)"
     fallback_locations=""
     if ! question_requests_recipe_scope "${question:-}"; then
       fallback_locations="$(recover_distinctive_source_locations "$deadline_ns" true || true)"
@@ -3900,6 +4041,7 @@ emit_semantic_trace_from_candidates() {
   fi
   ((semantic_trace_covered_count > 0)) || return 1
   semantic_trace_partial_emitted=true
+  ((config_endpoint_count > 0)) && return 1
   printf '%s\n' 'pbi: partial source answer; verified candidates retained' >&2
   printf '%s\n' "$evidence" >&2
   printf 'Missing: %s\n' "${semantic_trace_missing:-requested semantic coverage}" >&2
@@ -4155,7 +4297,7 @@ planner_status=0
 planner_had_system_message_warning=false
 
 emit_unapproved_route_guidance() {
-  printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; set primary_model and fallback_model to abliterated-qwen-latest-27b-none, -low, or -medium, and base_url to http://gb10:18009/v1' >&2
+  printf '%s\n' 'pbi: phase=routing category=unapproved-local-route; set primary_model and fallback_model to abliterated-qwen-latest-27b-none, -low, or -medium, and base_url to http://localhost:18317/v1 (local MP) or http://gb10:18009/v1' >&2
   exit 78
 }
 
@@ -4213,7 +4355,11 @@ run_bounded_probe_search() {
 }
 
 approved_local_route() {
-  [[ "$1" == openai && "$3" == "$DEFAULT_BASE_URL" ]] || return 1
+  [[ "$1" == openai ]] || return 1
+  case "$3" in
+    "$DEFAULT_BASE_URL"|"$APPROVED_FALLBACK_BASE_URL") ;;
+    *) return 1 ;;
+  esac
   case "$2" in
     abliterated-qwen-latest-27b-none|abliterated-qwen-latest-27b-low|abliterated-qwen-latest-27b-medium) return 0 ;;
     *) return 1 ;;
@@ -4233,13 +4379,13 @@ configure_local_routing() {
   approved_local_route openai "$primary_model" "$base_url" || { reject_local_route; return 78; }
   approved_local_route openai "$fallback_model" "$base_url" || { reject_local_route; return 78; }
   if ((config_endpoint_count > 0)); then
-    # Match identity first; an environment base override applies to every slot.
+    # Honor configured/environment transports; default to local MP only when unset.
     for ((endpoint_index = 0; endpoint_index < config_endpoint_count; endpoint_index += 1)); do
       endpoint_provider="${config_endpoint_provider[endpoint_index]}"
       endpoint_model="${config_endpoint_model[endpoint_index]}"
       endpoint_base_url="${config_endpoint_base_url[endpoint_index]}"
       endpoint_api_key="${config_endpoint_api_key[endpoint_index]}"
-      endpoint_base_url="${CLIPROXY_BASE_URL:-${LOCAL_ROUTER_BASEURL:-$endpoint_base_url}}"
+      endpoint_base_url="${CLIPROXY_BASE_URL:-${LOCAL_ROUTER_BASEURL:-${endpoint_base_url:-$LOCAL_MP_BASE_URL}}}"
       approved_local_route "$endpoint_provider" "$endpoint_model" "$endpoint_base_url" || continue
       if [[ "$endpoint_model" == "$primary_model" && -n "$environment_api_key" ]]; then
         endpoint_api_key="$environment_api_key"
@@ -4643,6 +4789,10 @@ else
   fi
   if run_default_bm25_fast_path; then
     exit 0
+  fi
+  if [[ "${semantic_trace_partial_emitted:-false}" == true ]] &&
+      ((config_endpoint_count > 0)) && ! configure_local_routing; then
+    emit_unapproved_route_guidance
   fi
   [[ "${semantic_trace_partial_emitted:-false}" == true ]] && exit 1
   if [[ "$search_fast_path_miss" == true ]]; then

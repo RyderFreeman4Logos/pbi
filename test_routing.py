@@ -1,4 +1,4 @@
-"""GB10 route admission is a closed model/base contract, not file order."""
+"""Approved Qwen routes prefer the exact local MP transport."""
 import json
 
 import pytest
@@ -6,6 +6,7 @@ import pytest
 import test_pbi
 
 BASE = "http://gb10:18009/v1"
+LOCAL_MP = "http://localhost:18317/v1"
 MODELS = tuple(f"abliterated-qwen-latest-27b-{level}" for level in ("none", "low", "medium"))
 
 
@@ -106,11 +107,170 @@ def test_exact_local_catalog_models_can_be_selected(tmp_path, model):
                for slot in json.loads(route["FALLBACK_PROVIDERS"]))
 
 
+@pytest.mark.parametrize("model", MODELS)
+def test_approved_models_accept_exact_local_mp_transport(tmp_path, model):
+    harness = test_pbi.PbiTest()
+    env, trace = harness.fake_environment(tmp_path)
+    config = tmp_path / "config.toml"
+    config.write_text(f'primary_model = "{model}"\n' + "".join(
+        endpoint(approved, LOCAL_MP) for approved in reversed(MODELS)))
+    env["PBI_CONFIG_FILE"] = str(config)
+
+    result = harness.run_pbi("--message", "hello", env=env)
+
+    assert result.returncode == 23, result.stderr
+    route = json.loads(trace.read_text())["env"]
+    assert route["MODEL_NAME"] == model
+    assert route["OPENAI_API_URL"] == LOCAL_MP
+    slots = json.loads(route["FALLBACK_PROVIDERS"])
+    assert [slot["model"] for slot in slots] == [model] + [m for m in reversed(MODELS) if m != model]
+    assert all(slot["provider"] == "openai" and slot["baseURL"] == LOCAL_MP for slot in slots)
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_explicit_unapproved_configured_base_is_not_overridden(tmp_path, model):
+    harness = test_pbi.PbiTest()
+    env, trace = harness.fake_environment(tmp_path)
+    config = tmp_path / "config.toml"
+    config.write_text(f'primary_model = "{model}"\n' + "".join(
+        endpoint(approved, "http://configured-route.invalid/v1")
+        for approved in reversed(MODELS)))
+    env["PBI_CONFIG_FILE"] = str(config)
+
+    result = harness.run_pbi("--message", "hello", env=env)
+
+    assert result.returncode == 78
+    assert "phase=routing category=unapproved-local-route" in result.stderr
+    assert result.stdout == ""
+    assert "fixture-secret" not in result.stdout + result.stderr
+    assert not trace.exists()
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_missing_configured_base_defaults_to_local_mp(tmp_path, model):
+    harness = test_pbi.PbiTest()
+    env, trace = harness.fake_environment(tmp_path)
+    config = tmp_path / "config.toml"
+    config.write_text(f'primary_model = "{model}"\n' + "".join(
+        endpoint(approved, "") for approved in reversed(MODELS)))
+    env["PBI_CONFIG_FILE"] = str(config)
+
+    result = harness.run_pbi("--message", "hello", env=env)
+
+    assert result.returncode == 23, result.stderr
+    route = json.loads(trace.read_text())["env"]
+    assert route["MODEL_NAME"] == model
+    assert route["OPENAI_API_URL"] == LOCAL_MP
+    slots = json.loads(route["FALLBACK_PROVIDERS"])
+    assert all(slot["model"] in MODELS and slot["provider"] == "openai"
+               and slot["baseURL"] == LOCAL_MP for slot in slots)
+
+
+def test_original_jsonl_query_returns_both_verified_source_targets(tmp_path):
+    harness = test_pbi.PbiTest()
+    question = "where is JSONL parser error conversion and unknown-field handling?"
+    result, trace = harness.run_default_semantic_fixture(
+        tmp_path,
+        question,
+        {
+            "crates/verbatim-core/src/parser/canonical_jsonl.rs": (
+                "let decoded =\n"
+                "    permissive::parse_jsonl_value(line, extra, mode).map_err(|error| {\n"
+                "        anyhow::Error::new(JsonlDecodeError { line_no, path, source: error })\n"
+                "    })?;\n"
+            ),
+            "crates/verbatim-core/src/parser/canonical_jsonl/permissive.rs": (
+                "if self.package && PACKAGE_FIELDS.contains(&key.as_str()) {\n"
+                "    map.next_value::<serde::de::IgnoredAny>()?;\n"
+                "} else {\n"
+                "    extensions.push((extension_name(None, &key)?, map.next_value()?));\n"
+                "}\n"
+            ),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Coverage: complete" in result.stdout
+    assert "Verified source evidence:" in result.stdout
+    assert "crates/verbatim-core/src/parser/canonical_jsonl.rs:" in result.stdout
+    assert "map_err" in result.stdout
+    assert "crates/verbatim-core/src/parser/canonical_jsonl/permissive.rs:" in result.stdout
+    assert "extensions.push" in result.stdout
+    assert result.stderr == ""
+    assert not trace.exists(), "complete source evidence must not need model chat"
+
+
+def test_semantic_trace_recovers_targets_beyond_bm25_line_windows(tmp_path):
+    harness = test_pbi.PbiTest()
+    question = "where is JSONL parser error conversion and unknown-field handling?"
+    repo = tmp_path / "repo"
+    parser = repo / "src/parser/canonical_jsonl.rs"
+    permissive = repo / "src/parser/canonical_jsonl/permissive.rs"
+    api_decoy = repo / "src/api/unknown_field.rs"
+    parser.parent.mkdir(parents=True)
+    permissive.parent.mkdir(parents=True)
+    api_decoy.parent.mkdir(parents=True)
+    parser_lines = ["fn generated_id() {}"] + ["let value = 1;"] * 48
+    parser_error_line = len(parser_lines) + 1
+    parser_lines += [
+        "let decoded = permissive::parse_jsonl_value(line, extra, mode).map_err(|error| {",
+        "    anyhow::Error::new(JsonlDecodeError { line_no, path, source: error })",
+        "})?;",
+    ]
+    parser.write_text("\n".join(parser_lines) + "\n")
+    permissive_lines = ["struct PermissiveRecord;"] + ["let value = 1;"] * 48
+    unknown_field_line = len(permissive_lines) + 1
+    permissive_lines += [
+        "if self.package && PACKAGE_FIELDS.contains(&key.as_str()) {",
+        "    map.next_value::<serde::de::IgnoredAny>()?;",
+        "} else {",
+        "    extensions.push((extension_name(None, &key)?, map.next_value()?));",
+        "}",
+    ]
+    permissive.write_text("\n".join(permissive_lines) + "\n")
+    api_decoy.write_text(
+        "#[serde(deny_unknown_fields)]\n"
+        "fn reject_unknown_field() {}\n"
+    )
+
+    env, trace = harness.fake_environment(tmp_path)
+    probe = tmp_path / "probe"
+    probe.write_text(
+        "#!/usr/bin/env python3\n"
+        f"print('File: {parser}, Lines: 1-1')\n"
+        f"print('File: {permissive}, Lines: 1-1')\n"
+        f"print('File: {api_decoy}, Lines: 1-1')\n"
+    )
+    probe.chmod(0o755)
+    env["PBI_TEST_PROBE"] = str(probe)
+    result = harness.run_pbi(
+        question,
+        env=env,
+        cwd=repo,
+        binary=harness.fake_pbi(tmp_path, probe),
+        timeout=8,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Coverage: complete" in result.stdout
+    error_conversion_line = parser_error_line
+    assert f"src/parser/canonical_jsonl.rs:{error_conversion_line}" in result.stdout
+    assert f"src/parser/canonical_jsonl/permissive.rs:{unknown_field_line + 3}" in result.stdout
+    assert "map_err" in result.stdout
+    assert "extensions.push" in result.stdout
+    assert "src/api/unknown_field.rs" not in result.stdout
+    assert result.stderr == ""
+    assert not trace.exists()
+
+
 @pytest.mark.parametrize("model,base,provider", [
     ("spark", BASE, "openai"),
+    ("spark", LOCAL_MP, "openai"),
     ("abliterated-qwen-latest-27b-high", BASE, "openai"),
     (MODELS[0] + "/suffix", BASE, "openai"),
     (MODELS[0], "http://127.0.0.1:8317/v1", "openai"),
+    (MODELS[0], "http://localhost:18318/v1", "openai"),
+    (MODELS[0], "http://127.0.0.1:18317/v1", "openai"),
     (MODELS[0], BASE + "/", "openai"),
     (MODELS[0], "http://fixture-secret@gb10:18009/v1", "openai"),
     (MODELS[0], BASE, "anthropic"),
@@ -121,6 +281,7 @@ def test_unapproved_route_fails_closed_before_chat(tmp_path, model, base, provid
     config = tmp_path / "config.toml"
     config.write_text(f'primary_model = "{model}"\n' + endpoint(model, base, provider))
     env["PBI_CONFIG_FILE"] = str(config)
+    env["LOCAL_ROUTER_BASEURL"] = base
     for args in (("--message", "hello"), ("--debug-config",)):
         result = harness.run_pbi(*args, env=env)
         assert result.returncode == 78
