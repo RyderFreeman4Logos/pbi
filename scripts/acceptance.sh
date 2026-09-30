@@ -16,20 +16,20 @@ printf '%s\n' "$raw" | grep -q '^File: '
 
 set +e
 unrelated=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "ghost evidence" 2>/dev/null)
-status=$?
+search_rc=$?
 unrelated_error=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "ghost evidence" 2>&1 >/dev/null)
-error_status=$?
+error_rc=$?
 set -e
-test "$status" -eq 1
-test "$error_status" -eq 1
+test "$search_rc" -eq 1
+test "$error_rc" -eq 1
 test -z "$unrelated"
 test "$unrelated_error" = "pbi: no source locations found"
 
 set +e
 bare_miss=$(cd "$fixture" && PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$probe" "$binary" "ghost evidence" 2>/dev/null)
-bare_status=$?
+bare_rc=$?
 set -e
-test "$bare_status" -eq 1
+test "$bare_rc" -eq 1
 test -z "$bare_miss"
 
 bare_evidence=$(cd "$fixture" && PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$probe" "$binary" "compression publication cache assembly")
@@ -43,11 +43,9 @@ printf '%s\n' "$or_evidence" | grep -q '^-[[:space:]]src/lib.rs:1 '
 debug=$($binary --debug-config)
 printf '%s\n' "$debug" | grep -q '^api_key=\[REDACTED\]$'
 printf '%s\n' "$debug" | grep -q '^search_default=compact_verified_bm25_no_chat$'
-printf '%s\n' "$debug" | grep -q '^model_default_base_url=http://localhost:18317/v1$'
-printf '%s\n' "$debug" | grep -q '^model_default_name=abliterated-qwen-latest-27b-none$'
-printf '%s\n' "$debug" | grep -q '^model_credential_handles=CLIPROXY_API_KEY,OPENAI_API_KEY,LOCAL_ROUTER_API_KEY$'
-printf '%s\n' "$debug" | grep -q '^model_route_snapshot=single_authorized_candidate$'
-printf '%s\n' "$debug" | grep -q '^model_route_chain=one_candidate_per_request_snapshot$'
+printf '%s\n' "$debug" | grep -q '^model_route_snapshot=ordered_authorized_candidates_bounded_by_kit$'
+printf '%s\n' "$debug" | grep -q '^model_route_chain=repeatable_cli_routes_or_single_default$'
+printf '%s\n' "$debug" | grep -q '^model_route_credentials=handle_names_only_values_not_emitted$'
 
 real=$(cd "$repo_root/src" && "$binary" search "SourceLocation display_relative")
 printf '%s\n' "$real" | grep -q '^Coverage: complete$'

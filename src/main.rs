@@ -1,7 +1,10 @@
 use pbi_rs::semantic::{
-    investigate, local_route_publisher_from_environment, SemanticAnswer, SemanticError,
-    SemanticRouteError, DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, MODEL_CREDENTIAL_HANDLES,
+    admit_local_routes, investigate, local_route_publisher_from_cli_routes,
+    local_route_publisher_from_environment, LocalModelRoute, SemanticAnswer, SemanticError,
+    SemanticRouteError,
 };
+#[cfg(test)]
+use pbi_rs::semantic::{AdmittedLocalModelRoute, DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL};
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 use serde_json::json;
 use std::env;
@@ -33,11 +36,11 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
 fn usage() {
     println!(
         "pbi-rs {VERSION} — Probe-backed source evidence\n\
-         Usage: pbi-rs <question...> [--json]\n\
+         Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
                 pbi-rs search [--bm25] <query>\n\
-                pbi-rs --message <question> [--json]\n\
+                pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only; --bm25 relays raw Probe output."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only; --bm25 relays raw Probe output."
     );
 }
 
@@ -90,11 +93,65 @@ impl CliError {
     }
 }
 
+#[cfg(test)]
+type TestRoutePublisherFactory<'a> =
+    dyn Fn(&[AdmittedLocalModelRoute]) -> Result<ModelRoutePublisher, SemanticRouteError> + 'a;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestRouteInjection<'a> {
+    Publisher(&'a ModelRoutePublisher),
+    Factory {
+        build: &'a TestRoutePublisherFactory<'a>,
+        deadline: Duration,
+    },
+}
+
+fn parse_local_route_prefix(
+    arguments: Vec<String>,
+) -> Result<(Vec<String>, Vec<LocalModelRoute>), CliError> {
+    let mut index = 0;
+    let mut routes = Vec::new();
+    while arguments
+        .get(index)
+        .is_some_and(|argument| argument == "--model-route")
+    {
+        if arguments.len().saturating_sub(index) < 4 {
+            return Err(CliError::usage(
+                "--model-route requires BASE_URL, MODEL, and CREDENTIAL_HANDLE_NAME",
+            ));
+        }
+        routes.push(LocalModelRoute::new(
+            arguments[index + 1].clone(),
+            arguments[index + 2].clone(),
+            arguments[index + 3].clone(),
+        ));
+        index += 4;
+    }
+    if arguments[index..]
+        .iter()
+        .any(|argument| argument == "--model-route")
+    {
+        return Err(CliError::usage(
+            "--model-route options must precede the command or question",
+        ));
+    }
+    Ok((arguments[index..].to_vec(), routes))
+}
+
+fn debug_config_output() -> String {
+    format!(
+        "probe_binary={}\nsearch_default=compact_verified_bm25_no_chat\nsearch_bm25_opt_in=--bm25_raw_no_llm_probe\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nsearch_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\napi_key=[REDACTED]\n",
+        env::var("PBI_RS_PROBE").unwrap_or_else(|_| "probe".to_owned())
+    )
+}
+
 fn run(
     arguments: Vec<String>,
-    #[cfg(test)] _injected_publisher: Option<&ModelRoutePublisher>,
+    #[cfg(test)] _test_route_injection: Option<TestRouteInjection<'_>>,
     #[cfg(test)] _semantic_output: &mut Vec<u8>,
 ) -> Result<i32, CliError> {
+    let (arguments, route_specs) = parse_local_route_prefix(arguments)?;
     if arguments.is_empty() {
         usage();
         return Ok(2);
@@ -111,29 +168,15 @@ fn run(
         return Ok(0);
     }
     if arguments[0] == "--debug-config" {
-        println!(
-            "probe_binary={}",
-            env::var("PBI_RS_PROBE").unwrap_or_else(|_| "probe".to_owned())
-        );
-        println!("search_default=compact_verified_bm25_no_chat");
-        println!("search_bm25_opt_in=--bm25_raw_no_llm_probe");
-        println!("search_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}");
-        println!("search_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}");
-        println!("model_path=adk_workflow_kit_authorized_route_snapshot");
-        println!("model_opt_in_env=PBI_RS_ADK_ENABLE");
-        println!("model_route_policy=approved_local_only");
-        println!("model_default_base_url={DEFAULT_LOCAL_BASE_URL}");
-        println!("model_default_name={DEFAULT_LOCAL_MODEL}");
-        println!(
-            "model_credential_handles={}",
-            MODEL_CREDENTIAL_HANDLES.join(",")
-        );
-        println!("model_route_snapshot=single_authorized_candidate");
-        println!("model_route_chain=one_candidate_per_request_snapshot");
-        println!("api_key=[REDACTED]");
+        print!("{}", debug_config_output());
         return Ok(0);
     }
 
+    if arguments[0] == "search" && !route_specs.is_empty() {
+        return Err(CliError::usage(
+            "--model-route is only supported for semantic questions",
+        ));
+    }
     let json_output = arguments[0] != "search" && arguments.iter().any(|arg| arg == "--json");
     let (raw, semantic, query, timeout, max_results) = if arguments[0] == "search" {
         let (raw, query, timeout, max_results) = parse_search(&arguments[1..])?;
@@ -178,18 +221,33 @@ fn run(
         )
     };
 
+    let admitted_routes = if route_specs.is_empty() {
+        None
+    } else {
+        Some(admit_local_routes(route_specs).map_err(route_cli_error)?)
+    };
     let root = env::current_dir()
         .map_err(|_| CliError::failed("cannot determine repository root"))
         .and_then(|root| {
             fs::canonicalize(root)
                 .map_err(|_| CliError::failed("cannot canonicalize repository root"))
         })?;
-    let deadline = Instant::now()
-        + Duration::from_secs(if semantic {
+    #[cfg(test)]
+    let deadline_duration = match _test_route_injection {
+        Some(TestRouteInjection::Factory { deadline, .. }) => deadline,
+        _ => Duration::from_secs(if semantic {
             MESSAGE_OUTER_DEADLINE_SECONDS
         } else {
             PROBE_OUTER_DEADLINE_SECONDS
-        });
+        }),
+    };
+    #[cfg(not(test))]
+    let deadline_duration = Duration::from_secs(if semantic {
+        MESSAGE_OUTER_DEADLINE_SECONDS
+    } else {
+        PROBE_OUTER_DEADLINE_SECONDS
+    });
+    let deadline = Instant::now() + deadline_duration;
     let output = invoke_probe(&root, &query, &timeout, max_results, raw, deadline)?;
     if raw {
         io::stdout()
@@ -211,15 +269,35 @@ fn run(
         .map_err(evidence_cli_error)?;
     if semantic {
         #[cfg(test)]
-        let owned_publisher = if _injected_publisher.is_some() {
-            None
-        } else {
-            local_route_publisher_from_environment().map_err(route_cli_error)?
+        let injected_publisher = match _test_route_injection {
+            Some(TestRouteInjection::Publisher(publisher)) => Some(publisher),
+            Some(TestRouteInjection::Factory { .. }) | None => None,
+        };
+        #[cfg(test)]
+        let owned_publisher = match _test_route_injection {
+            Some(TestRouteInjection::Factory { build, .. }) => {
+                let routes = admitted_routes
+                    .as_deref()
+                    .ok_or_else(|| route_cli_error(SemanticRouteError::IncompleteConfig))?;
+                Some(build(routes).map_err(route_cli_error)?)
+            }
+            Some(TestRouteInjection::Publisher(_)) => None,
+            None => match admitted_routes.as_deref() {
+                Some(routes) => {
+                    local_route_publisher_from_cli_routes(routes).map_err(route_cli_error)?
+                }
+                None => local_route_publisher_from_environment().map_err(route_cli_error)?,
+            },
         };
         #[cfg(not(test))]
-        let owned_publisher = local_route_publisher_from_environment().map_err(route_cli_error)?;
+        let owned_publisher = match admitted_routes.as_deref() {
+            Some(routes) => {
+                local_route_publisher_from_cli_routes(routes).map_err(route_cli_error)?
+            }
+            None => local_route_publisher_from_environment().map_err(route_cli_error)?,
+        };
         #[cfg(test)]
-        let publisher = _injected_publisher.or(owned_publisher.as_ref());
+        let publisher = injected_publisher.or(owned_publisher.as_ref());
         #[cfg(not(test))]
         let publisher = owned_publisher.as_ref();
         if let Some(publisher) = publisher {
@@ -803,8 +881,15 @@ fn evidence_cli_error(error: EvidenceError) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adk_rust::{
+        AdkError, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse,
+    };
     use serde_json::json;
     use std::fs;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::SystemTime;
 
     fn test_publisher(response: serde_json::Value) -> ModelRoutePublisher {
@@ -820,6 +905,145 @@ mod tests {
         )
         .expect("authorized test snapshot");
         ModelRoutePublisher::new(snapshot)
+    }
+
+    enum TestModelBehavior {
+        RateLimited,
+        Internal,
+        Pending,
+        Respond(String),
+    }
+
+    struct TestRouteLlm {
+        calls: Arc<AtomicUsize>,
+        behavior: TestModelBehavior,
+    }
+
+    #[adk_rust::async_trait]
+    impl Llm for TestRouteLlm {
+        fn name(&self) -> &str {
+            "pbi-rs-cli-route-test"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let response = match &self.behavior {
+                TestModelBehavior::RateLimited => {
+                    return Err(AdkError::new(
+                        ErrorComponent::Model,
+                        ErrorCategory::RateLimited,
+                        "pbi-rs-test",
+                        "pbi-rs-test",
+                    ));
+                }
+                TestModelBehavior::Internal => {
+                    return Err(AdkError::new(
+                        ErrorComponent::Model,
+                        ErrorCategory::Internal,
+                        "pbi-rs-test",
+                        "pbi-rs-test",
+                    ));
+                }
+                TestModelBehavior::Pending => return std::future::pending().await,
+                TestModelBehavior::Respond(response) => response.clone(),
+            };
+            Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
+                LlmResponse::new(Content::new("assistant").with_text(response)),
+            )])))
+        }
+    }
+
+    fn cli_route_publisher(
+        routes: &[AdmittedLocalModelRoute],
+        response: &str,
+        authorize_first: bool,
+        first_behavior: TestModelBehavior,
+        first_calls: Arc<AtomicUsize>,
+        second_calls: Arc<AtomicUsize>,
+    ) -> Result<ModelRoutePublisher, SemanticRouteError> {
+        if routes.len() != 2 {
+            return Err(SemanticRouteError::IncompleteConfig);
+        }
+        let mut registry = ModelProfileRegistry::new()
+            .with_worker(FakeModelProfile::new(
+                routes[0].profile_name(),
+                "1",
+                routes[0].model(),
+                [response],
+            ))
+            .map_err(|_| SemanticRouteError::Profile)?;
+        registry
+            .register(FakeModelProfile::new(
+                routes[1].profile_name(),
+                "1",
+                routes[1].model(),
+                [response],
+            ))
+            .map_err(|_| SemanticRouteError::Profile)?;
+        let candidates = routes
+            .iter()
+            .map(AdmittedLocalModelRoute::candidate)
+            .collect::<Vec<_>>();
+        let authorized = if authorize_first {
+            candidates.clone()
+        } else {
+            vec![candidates[1].clone()]
+        };
+        let snapshot = ModelRouteSnapshot::new(
+            registry,
+            candidates.clone(),
+            ModelRouteAuthorization::new(authorized),
+        )
+        .map_err(|_| SemanticRouteError::Profile)?
+        .with_test_llm(
+            candidates[0].clone(),
+            Arc::new(TestRouteLlm {
+                calls: first_calls,
+                behavior: first_behavior,
+            }),
+        )
+        .map_err(|_| SemanticRouteError::Profile)?
+        .with_test_llm(
+            candidates[1].clone(),
+            Arc::new(TestRouteLlm {
+                calls: second_calls,
+                behavior: TestModelBehavior::Respond(response.to_owned()),
+            }),
+        )
+        .map_err(|_| SemanticRouteError::Profile)?;
+        Ok(ModelRoutePublisher::new(snapshot))
+    }
+
+    fn cli_route_arguments(question: &str) -> Vec<String> {
+        [
+            "--model-route",
+            DEFAULT_LOCAL_BASE_URL,
+            DEFAULT_LOCAL_MODEL,
+            "CLIPROXY_API_KEY",
+            "--model-route",
+            "http://gb10:18009/v1",
+            "abliterated-qwen-latest-27b-low",
+            "OPENAI_API_KEY",
+            "--message",
+            question,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn assert_semantic_message_output(output: &[u8], answer: &str) {
+        let output = String::from_utf8(output.to_vec()).expect("semantic message output");
+        assert!(output.starts_with("Stage: semantic_adk_model\nInvocation attestation: sha256:"));
+        assert!(output.contains(&format!("Answer: {answer}\n")));
+        assert!(output.contains("Uncertainty: Only the verified source span was inspected.\n"));
+        assert!(output
+            .contains("- receipt.py:1 | target=exact_reuse_receipt | symbol=exact_reuse_receipt"));
+        assert!(output.ends_with("  1: def exact_reuse_receipt():\n"));
     }
 
     #[test]
@@ -840,7 +1064,10 @@ mod tests {
         let probe = root.join("probe");
         fs::write(
             &probe,
-            "#!/bin/sh\nprintf 'File: %s/receipt.py, Lines: 1-2\\n' \"$PWD\"\n",
+            r##"#!/bin/sh
+printf '%s\n' "$@" > "$PWD/probe.args"
+printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
+"##,
         )
         .expect("probe");
         use std::os::unix::fs::PermissionsExt;
@@ -860,12 +1087,197 @@ mod tests {
         assert!(matches!(
             run(
                 vec!["search".to_owned(), question.clone()],
-                Some(&search_route),
+                Some(TestRouteInjection::Publisher(&search_route)),
                 &mut search_output
             ),
             Ok(0)
         ));
         assert!(search_output.is_empty(), "search must not invoke synthesis");
+
+        let route_question = vec![
+            "--model-route".to_owned(),
+            DEFAULT_LOCAL_BASE_URL.to_owned(),
+            DEFAULT_LOCAL_MODEL.to_owned(),
+            "CLIPROXY_API_KEY".to_owned(),
+            "--message".to_owned(),
+            question.clone(),
+        ];
+        let route_publisher = test_publisher(json!({
+            "answer": answer,
+            "uncertainty": "Only the verified source span was inspected.",
+            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+        }));
+        let mut route_output = Vec::new();
+        assert!(matches!(
+            run(
+                route_question,
+                Some(TestRouteInjection::Publisher(&route_publisher)),
+                &mut route_output
+            ),
+            Ok(0)
+        ));
+        let probe_arguments = fs::read_to_string(root.join("probe.args")).expect("probe args");
+        assert!(!probe_arguments.contains(DEFAULT_LOCAL_BASE_URL));
+        assert!(!probe_arguments.contains(DEFAULT_LOCAL_MODEL));
+        assert!(!probe_arguments.contains("CLIPROXY_API_KEY"));
+        assert!(probe_arguments.ends_with(&format!("--\n{question}\n")));
+        assert_semantic_message_output(&route_output, answer);
+
+        let semantic_response = json!({
+            "answer": answer,
+            "uncertainty": "Only the verified source span was inspected.",
+            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+        })
+        .to_string();
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_factory = |routes: &[AdmittedLocalModelRoute]| {
+            cli_route_publisher(
+                routes,
+                &semantic_response,
+                true,
+                TestModelBehavior::RateLimited,
+                first_calls.clone(),
+                second_calls.clone(),
+            )
+        };
+        let mut fallback_output = Vec::new();
+        assert_eq!(
+            run(
+                cli_route_arguments(&question),
+                Some(TestRouteInjection::Factory {
+                    build: &fallback_factory,
+                    deadline: Duration::from_secs(30),
+                }),
+                &mut fallback_output,
+            )
+            .unwrap_or_else(|_| panic!("authorized local route fallback failed")),
+            0
+        );
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert_semantic_message_output(&fallback_output, answer);
+        let route_arguments = fs::read_to_string(root.join("probe.args")).expect("probe args");
+        for secretish in [
+            DEFAULT_LOCAL_BASE_URL,
+            DEFAULT_LOCAL_MODEL,
+            "CLIPROXY_API_KEY",
+            "http://gb10:18009/v1",
+            "abliterated-qwen-latest-27b-low",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(!route_arguments.contains(secretish));
+        }
+
+        fs::remove_file(root.join("probe.args")).expect("clear probe args");
+        let invalid_factory_calls = Arc::new(AtomicUsize::new(0));
+        let invalid_factory = |routes: &[AdmittedLocalModelRoute]| {
+            invalid_factory_calls.fetch_add(1, Ordering::SeqCst);
+            cli_route_publisher(
+                routes,
+                &semantic_response,
+                true,
+                TestModelBehavior::RateLimited,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            )
+        };
+        let mut unapproved_later = cli_route_arguments(&question);
+        unapproved_later[6].clear();
+        let mut rejected_output = Vec::new();
+        let rejected = run(
+            unapproved_later,
+            Some(TestRouteInjection::Factory {
+                build: &invalid_factory,
+                deadline: Duration::from_secs(30),
+            }),
+            &mut rejected_output,
+        )
+        .expect_err("later unapproved model must reject the entire route set");
+        assert_eq!(rejected.code, 78);
+        assert_eq!(invalid_factory_calls.load(Ordering::SeqCst), 0);
+        assert!(!root.join("probe.args").exists());
+        assert!(rejected_output.is_empty());
+
+        let internal_calls = Arc::new(AtomicUsize::new(0));
+        let unused_fallback_calls = Arc::new(AtomicUsize::new(0));
+        let internal_factory = |routes: &[AdmittedLocalModelRoute]| {
+            cli_route_publisher(
+                routes,
+                &semantic_response,
+                true,
+                TestModelBehavior::Internal,
+                internal_calls.clone(),
+                unused_fallback_calls.clone(),
+            )
+        };
+        let mut internal_output = Vec::new();
+        assert!(run(
+            cli_route_arguments(&question),
+            Some(TestRouteInjection::Factory {
+                build: &internal_factory,
+                deadline: Duration::from_secs(30),
+            }),
+            &mut internal_output,
+        )
+        .is_err());
+        assert_eq!(internal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(unused_fallback_calls.load(Ordering::SeqCst), 0);
+        assert!(internal_output.is_empty());
+
+        let unauthorized_calls = Arc::new(AtomicUsize::new(0));
+        let unauthorized_fallback_calls = Arc::new(AtomicUsize::new(0));
+        let unauthorized_factory = |routes: &[AdmittedLocalModelRoute]| {
+            cli_route_publisher(
+                routes,
+                &semantic_response,
+                false,
+                TestModelBehavior::RateLimited,
+                unauthorized_calls.clone(),
+                unauthorized_fallback_calls.clone(),
+            )
+        };
+        let mut unauthorized_output = Vec::new();
+        assert!(run(
+            cli_route_arguments(&question),
+            Some(TestRouteInjection::Factory {
+                build: &unauthorized_factory,
+                deadline: Duration::from_secs(30),
+            }),
+            &mut unauthorized_output,
+        )
+        .is_err());
+        assert_eq!(unauthorized_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(unauthorized_fallback_calls.load(Ordering::SeqCst), 0);
+        assert!(unauthorized_output.is_empty());
+
+        let pending_calls = Arc::new(AtomicUsize::new(0));
+        let deadline_fallback_calls = Arc::new(AtomicUsize::new(0));
+        let pending_factory = |routes: &[AdmittedLocalModelRoute]| {
+            cli_route_publisher(
+                routes,
+                &semantic_response,
+                true,
+                TestModelBehavior::Pending,
+                pending_calls.clone(),
+                deadline_fallback_calls.clone(),
+            )
+        };
+        let deadline_start = Instant::now();
+        let mut deadline_output = Vec::new();
+        assert!(run(
+            cli_route_arguments(&question),
+            Some(TestRouteInjection::Factory {
+                build: &pending_factory,
+                deadline: Duration::from_millis(700),
+            }),
+            &mut deadline_output,
+        )
+        .is_err());
+        assert!(deadline_start.elapsed() < Duration::from_secs(3));
+        assert_eq!(pending_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(deadline_fallback_calls.load(Ordering::SeqCst), 0);
+        assert!(deadline_output.is_empty());
 
         let incomplete_question = "where is exact_reuse_receipt and missing_target";
         let incomplete_probe = format!("File: {}, Lines: 1-1\n", root.join("receipt.py").display());
@@ -887,7 +1299,7 @@ mod tests {
         assert!(matches!(
             run(
                 vec![incomplete_question.to_owned()],
-                Some(&incomplete_route),
+                Some(TestRouteInjection::Publisher(&incomplete_route)),
                 &mut incomplete_output
             ),
             Ok(0)
@@ -922,7 +1334,11 @@ mod tests {
             let response = json!({"answer":answer,"uncertainty":"Only the verified source was inspected.","citations":[{"path":path,"start_line":1,"end_line":1}]});
             let publisher = test_publisher(response);
             let mut output = Vec::new();
-            let result = run(arguments.clone(), Some(&publisher), &mut output);
+            let result = run(
+                arguments.clone(),
+                Some(TestRouteInjection::Publisher(&publisher)),
+                &mut output,
+            );
             if expected {
                 assert!(matches!(result, Ok(0)), "expected cited answer");
                 if arguments.contains(&"--json".to_owned()) {
@@ -953,7 +1369,7 @@ mod tests {
         assert!(matches!(
             run(
                 vec![question.clone(), "--json".to_owned()],
-                Some(&invalid_publisher),
+                Some(TestRouteInjection::Publisher(&invalid_publisher)),
                 &mut invalid_output
             ),
             Err(CliError { code: 1, .. })

@@ -12,7 +12,7 @@ use workflow_adk::{
     EscalationPolicy, InferenceBudget, ModelInvocationSpec, ModelProfileIdentity, ModelRole,
     ModelRouteAuthorization, ModelRouteCancellation, ModelRouteCandidate, ModelRoutePolicy,
     ModelRoutePublisher, ModelRouteSnapshot, ModelRouteTerminalErrorKind, PromptProtocol,
-    ProviderRouteIdentity, ReasoningEffort, StructuredOutputContract,
+    ProviderRouteIdentity, ReasoningEffort, StructuredOutputContract, MAX_MODEL_ROUTE_CANDIDATES,
 };
 use workflow_runtime::TrustDomain;
 
@@ -129,6 +129,7 @@ impl std::error::Error for SemanticError {}
 pub enum SemanticRouteError {
     InvalidEnable,
     IncompleteConfig,
+    CandidateLimit,
     UnapprovedRoute,
     UnapprovedModel,
     UnapprovedCredentialHandle,
@@ -141,18 +142,93 @@ impl fmt::Display for SemanticRouteError {
         formatter.write_str(match self {
             Self::InvalidEnable => "semantic route opt-in is invalid",
             Self::IncompleteConfig => "semantic route configuration is incomplete",
+            Self::CandidateLimit => "semantic route configuration exceeds the kit candidate limit",
             Self::UnapprovedRoute => "semantic route is not an approved local route",
             Self::UnapprovedModel => "semantic model is not an approved local model",
             Self::UnapprovedCredentialHandle => "semantic credential handle is not approved",
-            Self::MissingCredential => {
-                "semantic route requires one credential handle: CLIPROXY_API_KEY, OPENAI_API_KEY, or LOCAL_ROUTER_API_KEY"
-            }
+            Self::MissingCredential => "semantic route requires an available credential handle",
             Self::Profile => "semantic model profile could not be bound",
         })
     }
 }
 
 impl std::error::Error for SemanticRouteError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalModelRoute {
+    base_url: String,
+    model: String,
+    credential_handle: String,
+}
+
+impl LocalModelRoute {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        credential_handle: impl Into<String>,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            credential_handle: credential_handle.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedLocalModelRoute {
+    base_url: String,
+    model: String,
+    credential_handle: String,
+    profile_name: String,
+}
+
+impl AdmittedLocalModelRoute {
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn profile_name(&self) -> &str {
+        &self.profile_name
+    }
+
+    pub fn candidate(&self) -> ModelRouteCandidate {
+        ModelRouteCandidate::new(ModelRole::Worker, self.profile_name.clone(), "1")
+    }
+}
+
+pub fn admit_local_routes(
+    routes: Vec<LocalModelRoute>,
+) -> Result<Vec<AdmittedLocalModelRoute>, SemanticRouteError> {
+    if routes.is_empty() {
+        return Err(SemanticRouteError::IncompleteConfig);
+    }
+    if routes.len() > MAX_MODEL_ROUTE_CANDIDATES {
+        return Err(SemanticRouteError::CandidateLimit);
+    }
+    routes
+        .into_iter()
+        .enumerate()
+        .map(|(index, route)| {
+            validate_local_route(&route.base_url, &route.model)?;
+            select_explicit_credential_handle(&route.credential_handle)?;
+            Ok(AdmittedLocalModelRoute {
+                base_url: route.base_url,
+                model: route.model,
+                credential_handle: route.credential_handle,
+                profile_name: local_route_profile_name(index),
+            })
+        })
+        .collect()
+}
+
+fn local_route_profile_name(index: usize) -> String {
+    if index == 0 {
+        "pbi-rs-local".to_owned()
+    } else {
+        format!("pbi-rs-local-fallback-{}", index + 1)
+    }
+}
 
 pub fn validate_local_route(base_url: &str, model: &str) -> Result<(), SemanticRouteError> {
     if !APPROVED_LOCAL_BASE_URLS.contains(&base_url) {
@@ -166,10 +242,8 @@ pub fn validate_local_route(base_url: &str, model: &str) -> Result<(), SemanticR
 
 pub fn local_route_publisher_from_environment(
 ) -> Result<Option<ModelRoutePublisher>, SemanticRouteError> {
-    match env::var(ADK_ENABLE_ENV).as_deref() {
-        Err(_) | Ok("0") => return Ok(None),
-        Ok("1") => {}
-        Ok(_) => return Err(SemanticRouteError::InvalidEnable),
+    if !semantic_route_opted_in()? {
+        return Ok(None);
     }
     let (base_url, model) = local_route_from_values(
         first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?,
@@ -187,26 +261,71 @@ pub fn local_route_publisher_from_environment(
             .ok_or(SemanticRouteError::MissingCredential)?
             .to_owned()
     };
-    let profile = OpenAiCompatibleProfile::new(
-        "pbi-rs-local",
-        "1",
-        model,
-        base_url,
-        CredentialHandle::environment(credential_name),
-    )
-    .with_provider("openai")
-    .with_runtime(ModelRuntimeConfig::default().with_timeout(Duration::from_secs(30)));
-    let registry = ModelProfileRegistry::new()
-        .with_worker(profile)
+    let routes = admit_local_routes(vec![LocalModelRoute::new(base_url, model, credential_name)])?;
+    Ok(Some(local_route_publisher_from_admitted_routes(&routes)?))
+}
+
+pub fn local_route_publisher_from_cli_routes(
+    routes: &[AdmittedLocalModelRoute],
+) -> Result<Option<ModelRoutePublisher>, SemanticRouteError> {
+    if !semantic_route_opted_in()? {
+        return Ok(None);
+    }
+    Ok(Some(local_route_publisher_from_admitted_routes(routes)?))
+}
+
+fn semantic_route_opted_in() -> Result<bool, SemanticRouteError> {
+    match env::var(ADK_ENABLE_ENV).as_deref() {
+        Err(_) | Ok("0") => Ok(false),
+        Ok("1") => Ok(true),
+        Ok(_) => Err(SemanticRouteError::InvalidEnable),
+    }
+}
+
+pub fn local_route_publisher_from_admitted_routes(
+    routes: &[AdmittedLocalModelRoute],
+) -> Result<ModelRoutePublisher, SemanticRouteError> {
+    if routes.is_empty() {
+        return Err(SemanticRouteError::IncompleteConfig);
+    }
+    if routes.len() > MAX_MODEL_ROUTE_CANDIDATES {
+        return Err(SemanticRouteError::CandidateLimit);
+    }
+    for route in routes {
+        validate_local_route(&route.base_url, &route.model)?;
+        select_explicit_credential_handle(&route.credential_handle)?;
+    }
+
+    let make_profile = |route: &AdmittedLocalModelRoute| {
+        OpenAiCompatibleProfile::new(
+            route.profile_name.clone(),
+            "1",
+            route.model.clone(),
+            route.base_url.clone(),
+            CredentialHandle::environment(route.credential_handle.clone()),
+        )
+        .with_provider("openai")
+        .with_runtime(ModelRuntimeConfig::default().with_timeout(Duration::from_secs(30)))
+    };
+    let mut profiles = ModelProfileRegistry::new()
+        .with_worker(make_profile(&routes[0]))
         .map_err(|_| SemanticRouteError::Profile)?;
-    let candidate = ModelRouteCandidate::new(ModelRole::Worker, "pbi-rs-local", "1");
+    for route in &routes[1..] {
+        profiles
+            .register(make_profile(route))
+            .map_err(|_| SemanticRouteError::Profile)?;
+    }
+    let candidates = routes
+        .iter()
+        .map(AdmittedLocalModelRoute::candidate)
+        .collect::<Vec<_>>();
     let snapshot = ModelRouteSnapshot::new(
-        registry,
-        vec![candidate.clone()],
-        ModelRouteAuthorization::new(vec![candidate]),
+        profiles,
+        candidates.clone(),
+        ModelRouteAuthorization::new(candidates),
     )
     .map_err(|_| SemanticRouteError::Profile)?;
-    Ok(Some(ModelRoutePublisher::new(snapshot)))
+    Ok(ModelRoutePublisher::new(snapshot))
 }
 
 fn local_route_from_values(
@@ -642,6 +761,39 @@ mod tests {
                 "http://localhost:18317/v1".to_owned(),
                 "abliterated-qwen-latest-27b-none".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn admitted_local_candidates_build_one_ordered_kit_publisher_and_enforce_limit() {
+        let routes = vec![
+            LocalModelRoute::new(
+                DEFAULT_LOCAL_BASE_URL,
+                DEFAULT_LOCAL_MODEL,
+                "CLIPROXY_API_KEY",
+            ),
+            LocalModelRoute::new(
+                APPROVED_LOCAL_BASE_URLS[0],
+                APPROVED_LOCAL_MODELS[1],
+                "OPENAI_API_KEY",
+            ),
+        ];
+        let admitted = admit_local_routes(routes.clone()).expect("approved ordered routes");
+        assert_eq!(admitted[0].profile_name(), "pbi-rs-local");
+        assert_eq!(admitted[1].profile_name(), "pbi-rs-local-fallback-2");
+        assert!(local_route_publisher_from_admitted_routes(&admitted).is_ok());
+
+        let invalid_later = vec![
+            routes[0].clone(),
+            LocalModelRoute::new(DEFAULT_LOCAL_BASE_URL, "", "OPENAI_API_KEY"),
+        ];
+        assert_eq!(
+            admit_local_routes(invalid_later),
+            Err(SemanticRouteError::UnapprovedModel)
+        );
+        assert_eq!(
+            admit_local_routes(vec![routes[0].clone(); MAX_MODEL_ROUTE_CANDIDATES + 1]),
+            Err(SemanticRouteError::CandidateLimit)
         );
     }
 
