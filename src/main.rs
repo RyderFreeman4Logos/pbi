@@ -42,6 +42,7 @@ struct SearchOptions {
     help: bool,
     language: Option<String>,
     ignores: Vec<String>,
+    format: Option<String>,
 }
 
 impl Default for SearchOptions {
@@ -55,6 +56,7 @@ impl Default for SearchOptions {
             help: false,
             language: None,
             ignores: Vec::new(),
+            format: None,
         }
     }
 }
@@ -63,7 +65,7 @@ fn usage() {
     println!(
         "pbi-rs {VERSION} — Probe-backed source evidence\n\
          Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
-                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs search [--bm25 [--format/-o <FORMAT>]] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
          Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches remain rooted at CWD, without per-path fallback. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
@@ -559,6 +561,22 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 }
                 index += 1;
             }
+            "--format" | "-o" => {
+                let value = next_value(arguments, &mut index, argument)?;
+                set_search_format(&mut options, value)?;
+            }
+            value if value.starts_with("--format=") || value.starts_with("-o") => {
+                let operand = value
+                    .strip_prefix("--format=")
+                    .or_else(|| {
+                        value
+                            .strip_prefix("-o")
+                            .map(|value| value.strip_prefix('=').unwrap_or(value))
+                    })
+                    .ok_or_else(|| CliError::usage("--format requires a value"))?;
+                set_search_format(&mut options, operand.to_owned())?;
+                index += 1;
+            }
             "--language" | "-l" | "--ignore" | "-i" => {
                 let value = next_value(arguments, &mut index, argument)?;
                 set_search_filter(&mut options, argument, value)?;
@@ -581,6 +599,13 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
         }
     }
     let mut query = query_parts.join(" ");
+    // Legacy pbi:4598 appends plain even to a user format. Installed Probe
+    // rejects that duplicate; validate here rather than launching doomed work.
+    if !raw && options.format.is_some() && !options.help {
+        return Err(CliError::usage(
+            "--format cannot be used multiple times; verified search requires plain",
+        ));
+    }
     if query.trim().is_empty() && !options.help {
         return Err(CliError::usage("search query is required"));
     }
@@ -611,6 +636,23 @@ fn next_value(arguments: &[String], index: &mut usize, option: &str) -> Result<S
         .ok_or_else(|| CliError::usage(format!("{option} requires a value")))?;
     *index += 1;
     Ok(value)
+}
+
+fn set_search_format(options: &mut SearchOptions, value: String) -> Result<(), CliError> {
+    if options.format.is_some() {
+        return Err(CliError::usage("--format cannot be used multiple times"));
+    }
+    // Probe v0.6.0-rc339 src/cli.rs:211-214, not arbitrary forwarding.
+    if !matches!(
+        value.as_str(),
+        "terminal" | "markdown" | "plain" | "json" | "xml" | "color" | "outline" | "outline-xml"
+    ) {
+        return Err(CliError::usage(
+            "--format requires one supported Probe output format",
+        ));
+    }
+    options.format = Some(value);
+    Ok(())
 }
 
 fn set_search_budget(
@@ -757,6 +799,8 @@ fn probe_command(root: &Path, query: &str, options: &SearchOptions, raw: bool) -
     }
     if !raw {
         command.args(["--format", "plain", "--dry-run"]);
+    } else if let Some(format) = &options.format {
+        command.args(["--format", format]);
     }
     command.args(["--", query]);
     command

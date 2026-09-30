@@ -455,6 +455,127 @@ fn explicit_search_options_reach_probe_with_effective_values() {
 }
 
 #[test]
+fn search_format_raw_relays_supported_formats_without_query_pollution() {
+    for format in [
+        "terminal",
+        "markdown",
+        "plain",
+        "json",
+        "xml",
+        "color",
+        "outline",
+        "outline-xml",
+    ] {
+        for (option, inline) in [
+            ("--format", false),
+            ("-o", false),
+            ("--format=", true),
+            ("-o=", true),
+            ("-o", true),
+        ] {
+            let fixture = Fixture::new();
+            let joined = format!("{option}{format}");
+            let mut args = vec!["search", "--bm25", "search option parity"];
+            if inline {
+                args.push(&joined);
+            } else {
+                args.extend([option, format]);
+            }
+            let output = fixture.run(&args, "raw");
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"raw Probe bytes\n");
+            let argv = fixture.argv();
+            assert_eq!(option_value(&argv, "--format"), Some(format));
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("search option parity")
+            );
+            assert!(!argv.contains(&"--dry-run".to_owned()));
+            assert_eq!(option_value(&argv, "--reranker"), Some("bm25"));
+        }
+    }
+}
+
+#[test]
+fn search_format_invalid_duplicates_and_verified_requests_refuse_before_probe() {
+    for raw in [false, true] {
+        for tail in [
+            vec!["--format"],
+            vec!["-o"],
+            vec!["--format="],
+            vec!["-o="],
+            vec!["--format", "--"],
+            vec!["-o", "--bm25"],
+            vec!["--format", ""],
+            vec!["--format=JSON"],
+            vec!["--format=unknown"],
+            vec!["-oxml", "--format=json"],
+            vec!["--format=plain", "-o", "json"],
+        ] {
+            let fixture = Fixture::new();
+            let mut args = vec!["search", "search option parity"];
+            if raw {
+                args.push("--bm25");
+            }
+            args.extend(tail);
+            let output = fixture.run(&args, "raw");
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty());
+            assert!(!fixture.root.join("probe-argv").exists(), "{args:?}");
+        }
+    }
+    // Legacy appends --format plain: installed Probe rejects even an explicit plain.
+    for format in ["json", "plain", "outline-xml"] {
+        let fixture = Fixture::new();
+        let output = fixture.run(
+            &["search", "--format", format, "search option parity"],
+            "evidence",
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("--format cannot be used multiple times"));
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
+fn search_format_literal_separator_and_default_verified_policy_remain() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        &["search", "--bm25", "--", "--format", "json", "-oxml"],
+        "raw",
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("--format json -oxml")
+    );
+    assert_eq!(option_value(&fixture.argv(), "--format"), None);
+    let output = fixture.run(&["search", "search option parity"], "evidence");
+    assert!(output.status.success());
+    assert_eq!(option_value(&fixture.argv(), "--format"), Some("plain"));
+    assert!(fixture.argv().contains(&"--dry-run".to_owned()));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture.rs:1"));
+    let output = fixture.run(&["search", "--format=json", "--help"], "raw");
+    assert!(output.status.success());
+    assert_eq!(fixture.argv(), ["search", "--format=json", "--help"]);
+    for args in [
+        vec!["search", "--bm25", "--format=json"],
+        vec!["search", "--help", "--format=unknown"],
+        vec!["search", "--help", "--format=json", "-oxml"],
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(&args, "raw");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
 fn search_budget_values_preserve_native_numbers_and_formatting() {
     for raw in [false, true] {
         for values in [vec!["0", "+80", "000"], vec!["80", "20", "30"]] {
@@ -582,6 +703,7 @@ fn search_budget_values_cannot_raise_wrapper_output_cap() {
         ];
         if raw {
             args.push("--bm25");
+            args.push("--format=json");
         }
         let output = fixture.run(&args, "raw");
         assert_eq!(output.status.code(), Some(1));

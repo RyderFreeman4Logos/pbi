@@ -137,4 +137,29 @@ done
 budget_verified=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 --max-results=1 --max-bytes=800 --max-tokens=300 --merge-threshold=30 budget_marker_alpha)
 printf '%s\n' "$budget_verified" | grep -q '^Coverage: complete$'
 printf '%s\n' "$budget_verified" | grep -q '^- sample.rs:201 '
-printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native filters, question parsing, code budgets and merge thresholds passed'
+# Native format ownership: no wrapper serializer; compare actual Probe bytes.
+format_root="$filter_root/formats"
+mkdir "$format_root"
+printf '%s\n' 'fn format_operand_marker() {}' > "$format_root/chosen.rs"
+for format in terminal markdown plain json xml color outline outline-xml; do
+    (cd "$format_root" && probe search --timeout 3 --max-results 8 --reranker bm25 --language rs --ignore .git --ignore target --ignore drafts --ignore node_modules --ignore __pycache__ --format "$format" -- format_operand_marker) > "$filter_root/native-format" 2> "$filter_root/native-format.stderr"
+    (cd "$format_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 -l rs -o "$format" format_operand_marker) > "$filter_root/wrapper-format" 2> "$filter_root/wrapper-format.stderr"
+    cmp "$filter_root/native-format" "$filter_root/wrapper-format"
+    cmp "$filter_root/native-format.stderr" "$filter_root/wrapper-format.stderr"
+    if test "$format" = json; then
+        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["summary"]["count"] == len(d["results"]) > 0; assert all("chosen.rs" in r["file"] for r in d["results"])' "$filter_root/wrapper-format"
+    fi
+done
+format_verified=$(cd "$format_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 -l rs format_operand_marker)
+printf '%s\n' "$format_verified" | grep -q '^Coverage: complete$'
+printf '%s\n' "$format_verified" | grep -q '^- chosen.rs:1 '
+printf '%s\n' "$format_verified" | grep -q 'fn format_operand_marker() {}'
+# Legacy verified search appends plain; this Probe rejects duplicate formats.
+set +e
+(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --format=json filter_operand_marker) > "$filter_root/format-denied" 2> "$filter_root/format-denied.stderr"
+format_rc=$?
+set -e
+test "$format_rc" -eq 2
+test ! -s "$filter_root/format-denied"
+grep -q -- '--format cannot be used multiple times' "$filter_root/format-denied.stderr"
+printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native filters, question parsing, code budgets, merge thresholds and eight raw formats passed; verified format duplicate refused'
