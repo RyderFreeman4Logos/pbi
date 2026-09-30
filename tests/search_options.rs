@@ -455,6 +455,145 @@ fn explicit_search_options_reach_probe_with_effective_values() {
 }
 
 #[test]
+fn search_budget_values_preserve_native_numbers_and_formatting() {
+    for raw in [false, true] {
+        for values in [vec!["0", "+80", "000"], vec!["80", "20", "30"]] {
+            for inline in [false, true] {
+                let fixture = Fixture::new();
+                let mut args = vec!["search".to_owned()];
+                if raw {
+                    args.push("--bm25".to_owned());
+                }
+                for (option, value) in ["--max-bytes", "--max-tokens", "--merge-threshold"]
+                    .into_iter()
+                    .zip(&values)
+                {
+                    if inline {
+                        args.push(format!("{option}={value}"));
+                    } else {
+                        args.extend([option.to_owned(), (*value).to_owned()]);
+                    }
+                }
+                args.push("search option parity".to_owned());
+                let args: Vec<_> = args.iter().map(String::as_str).collect();
+                let output = fixture.run(&args, if raw { "raw" } else { "evidence" });
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let argv = fixture.argv();
+                for (option, value) in ["--max-bytes", "--max-tokens", "--merge-threshold"]
+                    .into_iter()
+                    .zip(&values)
+                {
+                    assert_eq!(option_value(&argv, option), Some(*value));
+                }
+                assert_eq!(option_value(&argv, "--reranker"), Some("bm25"));
+                assert_eq!(
+                    option_value(&argv, "--format"),
+                    if raw { None } else { Some("plain") }
+                );
+                assert_eq!(argv.contains(&"--dry-run".to_owned()), !raw);
+                if raw {
+                    assert_eq!(output.stdout, b"raw Probe bytes\n");
+                } else {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(stdout.contains("Coverage: complete"));
+                    assert!(stdout.contains("fixture.rs:1"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn search_budget_invalid_and_duplicate_operands_refuse_before_probe() {
+    for option in ["--max-bytes", "--max-tokens", "--merge-threshold"] {
+        for tail in [
+            vec![option.to_owned()],
+            vec![format!("{option}=")],
+            vec![option.to_owned(), "--".to_owned()],
+            vec![option.to_owned(), "--help".to_owned()],
+            vec![option.to_owned(), "".to_owned()],
+            vec![format!("{option}=-1")],
+            vec![format!("{option}=1.5")],
+            vec![format!("{option}= 1")],
+            vec![format!("{option}=18446744073709551616")],
+            vec![option.to_owned(), "0".to_owned(), format!("{option}=1")],
+        ] {
+            let fixture = Fixture::new();
+            let mut args = vec!["search", "search option parity"];
+            args.extend(tail.iter().map(String::as_str));
+            let output = fixture.run(&args, "evidence");
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty());
+            assert!(!fixture.root.join("probe-argv").exists(), "{args:?}");
+        }
+        let fixture = Fixture::new();
+        let output = fixture.run(&["search", "--bm25", "--", option, "0"], "raw");
+        assert!(output.status.success());
+        assert_eq!(fixture.argv().last(), Some(&format!("{option} 0")));
+        assert_eq!(option_value(&fixture.argv(), option), None);
+    }
+}
+
+#[test]
+fn search_budget_miss_does_not_restart_global_limits_in_fallback() {
+    let fixture = ScopeFixture::new();
+    fs::write(
+        fixture.root.join("z-relevant-late.rs"),
+        format!("fn late_match() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write candidate source");
+    for option in ["--max-bytes=0", "--max-tokens=0", "--merge-threshold=0"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+            .env_clear()
+            .current_dir(&fixture.root)
+            .env("PBI_RS_PROBE", &fixture.probe)
+            .env("PBI_TEST_CAPTURE", &fixture.capture)
+            .env("PBI_TEST_MODE", "saturated")
+            .env("PBI_TEST_EVENTS", &fixture.events)
+            .args(["search", option, SCOPE_QUERY])
+            .output()
+            .expect("run budgeted root miss");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"pbi-rs: probe returned no output\n");
+    }
+    assert_eq!(fixture.calls().len(), 3);
+}
+
+#[test]
+fn search_budget_values_cannot_raise_wrapper_output_cap() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("fake-probe.sh"),
+        format!("#!/bin/sh\nprintf '%s' '{}'\n", "x".repeat(33 * 1024)),
+    )
+    .expect("write excessive-output Probe");
+    for raw in [false, true] {
+        let mut args = vec![
+            "search",
+            "--max-bytes=18446744073709551615",
+            "--max-tokens=18446744073709551615",
+            "--merge-threshold=18446744073709551615",
+            "search option parity",
+        ];
+        if raw {
+            args.push("--bm25");
+        }
+        let output = fixture.run(&args, "raw");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr,
+            b"pbi-rs: Probe output exceeded the bounded limit\n"
+        );
+    }
+}
+
+#[test]
 fn scoped_search_shorthand_normalizes_verified_query_but_not_raw_query() {
     let fixture = Fixture::new();
     let output = fixture.run(&["search", "search_option:parity"], "evidence");
@@ -623,6 +762,9 @@ fn total_probe_deadline_bounds_long_backend_timeout() {
         &[
             "search",
             "--timeout=999",
+            "--max-bytes=18446744073709551615",
+            "--max-tokens=0",
+            "--merge-threshold=18446744073709551615",
             "--max-results",
             "8",
             "search option parity",

@@ -101,4 +101,40 @@ for mode in positional message; do
     question_sanitized=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" "$@" "SourceLocation display_relative" --model-name unapproved_model_route_canary --force-provider=remote_provider_canary)
     test "$question_sanitized" = "$question_clean"
 done
-printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native language/ignore selection, question override discard and no-hit controls passed'
+# Native code-content budgets and post-ranking merging, not argv-only controls.
+# Enough unrelated source avoids Probe's small-file/whole-file extraction path.
+budget_root="$filter_root/budgets"
+mkdir "$budget_root"
+for index in $(seq 1 200); do
+    printf 'fn unrelated_%s() -> u64 { %s }\n' "$index" "$index"
+done > "$budget_root/sample.rs"
+printf 'fn budget_marker_alpha() -> u64 {\n    let alpha = 1;\n    alpha + 10\n}\n' >> "$budget_root/sample.rs"
+printf '\n\n\n\n\n\n\n\n\n\n\n\n' >> "$budget_root/sample.rs"
+printf 'fn budget_marker_beta() -> u64 {\n    let beta = 2;\n    beta + 20\n}\n' >> "$budget_root/sample.rs"
+for budget in --max-bytes=80 --max-tokens=30; do
+    limited=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 "$budget" budget_marker)
+    printf '%s\n' "$limited" | grep -q 'Found 1 search results'
+    printf '%s\n' "$limited" | grep -q 'budget_marker_alpha'
+    ! printf '%s\n' "$limited" | grep -q 'budget_marker_beta'
+done
+for threshold in 0 30; do
+    merged=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 --merge-threshold "$threshold" budget_marker)
+    case "$threshold" in 0) count=2 ;; 30) count=1 ;; esac
+    printf '%s\n' "$merged" | grep -q "Found $count search results"
+    printf '%s\n' "$merged" | grep -q 'budget_marker_alpha'
+    printf '%s\n' "$merged" | grep -q 'budget_marker_beta'
+done
+for budget in --max-bytes=0 --max-tokens=0; do
+    set +e
+    budget_miss=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 "$budget" budget_marker 2> "$filter_root/budget-miss.stderr")
+    budget_rc=$?
+    set -e
+    test "$budget_rc" -eq 1
+    test -z "$budget_miss"
+    IFS= read -r budget_error < "$filter_root/budget-miss.stderr"
+    test "$budget_error" = 'pbi: no source locations found'
+done
+budget_verified=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 --max-results=1 --max-bytes=800 --max-tokens=300 --merge-threshold=30 budget_marker_alpha)
+printf '%s\n' "$budget_verified" | grep -q '^Coverage: complete$'
+printf '%s\n' "$budget_verified" | grep -q '^- sample.rs:201 '
+printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native filters, question parsing, code budgets and merge thresholds passed'

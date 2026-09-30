@@ -36,6 +36,10 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
 struct SearchOptions {
     timeout: String,
     max_results: usize,
+    max_bytes: Option<String>,
+    max_tokens: Option<String>,
+    merge_threshold: Option<String>,
+    help: bool,
     language: Option<String>,
     ignores: Vec<String>,
 }
@@ -45,6 +49,10 @@ impl Default for SearchOptions {
         Self {
             timeout: DEFAULT_TIMEOUT.to_owned(),
             max_results: DEFAULT_MAX_RESULTS,
+            max_bytes: None,
+            max_tokens: None,
+            merge_threshold: None,
+            help: false,
             language: None,
             ignores: Vec::new(),
         }
@@ -55,10 +63,10 @@ fn usage() {
     println!(
         "pbi-rs {VERSION} — Probe-backed source evidence\n\
          Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
-                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. User-filtered searches remain rooted at CWD, without per-path fallback; -- preserves literal query operands."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches remain rooted at CWD, without per-path fallback. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
     );
 }
 
@@ -183,29 +191,7 @@ fn run(
             message: "question is required; interactive mode is disabled".to_owned(),
         });
     }
-    if matches!(arguments[0].as_str(), "--help" | "-h")
-        || (arguments[0] == "search"
-            && arguments
-                .iter()
-                .take_while(|argument| argument.as_str() != "--")
-                .any(|argument| argument == "--help" || argument == "-h"))
-    {
-        if arguments[0] == "search" {
-            if !route_specs.is_empty() {
-                return Err(CliError::usage(
-                    "--model-route is only supported for semantic questions",
-                ));
-            }
-            let root = env::current_dir()
-                .map_err(|_| CliError::failed("cannot determine repository root"))?;
-            let mut command = probe_base_command(&root);
-            command.args(&arguments);
-            let output = run_probe_command(
-                command,
-                Instant::now() + Duration::from_secs(PROBE_OUTER_DEADLINE_SECONDS),
-            )?;
-            return relay_probe_output(&output);
-        }
+    if matches!(arguments[0].as_str(), "--help" | "-h") {
         usage();
         return Ok(0);
     }
@@ -225,6 +211,17 @@ fn run(
     }
     let (raw, semantic, query, options, json_output) = if arguments[0] == "search" {
         let (raw, query, options) = parse_search(&arguments[1..])?;
+        if options.help {
+            let root = env::current_dir()
+                .map_err(|_| CliError::failed("cannot determine repository root"))?;
+            let mut command = probe_base_command(&root);
+            command.args(&arguments);
+            let output = run_probe_command(
+                command,
+                Instant::now() + Duration::from_secs(PROBE_OUTER_DEADLINE_SECONDS),
+            )?;
+            return relay_probe_output(&output);
+        }
         (raw, false, query, options, false)
     } else {
         let (query, json_output) = parse_question(&arguments)?;
@@ -511,6 +508,10 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 raw = true;
                 index += 1;
             }
+            "--help" | "-h" => {
+                options.help = true;
+                index += 1;
+            }
             "--reranker" | "-r" => {
                 // Legacy discards any next operand, even an invalid/empty option.
                 // Probe remains forced to BM25; this is not reranker activation.
@@ -544,6 +545,20 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 }
                 index += 1;
             }
+            "--max-bytes" | "--max-tokens" | "--merge-threshold" => {
+                let value = next_value(arguments, &mut index, argument)?;
+                set_search_budget(&mut options, argument, value)?;
+            }
+            value
+                if value.starts_with("--max-bytes=")
+                    || value.starts_with("--max-tokens=")
+                    || value.starts_with("--merge-threshold=") =>
+            {
+                if let Some((option, operand)) = value.split_once('=') {
+                    set_search_budget(&mut options, option, operand.to_owned())?;
+                }
+                index += 1;
+            }
             "--language" | "-l" | "--ignore" | "-i" => {
                 let value = next_value(arguments, &mut index, argument)?;
                 set_search_filter(&mut options, argument, value)?;
@@ -566,7 +581,7 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
         }
     }
     let mut query = query_parts.join(" ");
-    if query.trim().is_empty() {
+    if query.trim().is_empty() && !options.help {
         return Err(CliError::usage("search query is required"));
     }
     // Legacy verified search expands owner:member, while raw BM25 stays literal.
@@ -596,6 +611,32 @@ fn next_value(arguments: &[String], index: &mut usize, option: &str) -> Result<S
         .ok_or_else(|| CliError::usage(format!("{option} requires a value")))?;
     *index += 1;
     Ok(value)
+}
+
+fn set_search_budget(
+    options: &mut SearchOptions,
+    option: &str,
+    value: String,
+) -> Result<(), CliError> {
+    // Probe's Option<usize> accepts zero and leading +, but not duplicates.
+    value.parse::<usize>().map_err(|_| {
+        CliError::usage(format!(
+            "{option} must be a non-negative integer fitting usize"
+        ))
+    })?;
+    let slot = match option {
+        "--max-bytes" => &mut options.max_bytes,
+        "--max-tokens" => &mut options.max_tokens,
+        "--merge-threshold" => &mut options.merge_threshold,
+        _ => return Err(CliError::usage("unsupported search budget option")),
+    };
+    if slot.is_some() {
+        return Err(CliError::usage(format!(
+            "{option} cannot be used multiple times"
+        )));
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 fn set_search_filter(
@@ -695,6 +736,15 @@ fn probe_command(root: &Path, query: &str, options: &SearchOptions, raw: bool) -
         "--reranker",
         "bm25",
     ]);
+    for (option, value) in [
+        ("--max-bytes", &options.max_bytes),
+        ("--max-tokens", &options.max_tokens),
+        ("--merge-threshold", &options.merge_threshold),
+    ] {
+        if let Some(value) = value {
+            command.args([option, value]);
+        }
+    }
     if let Some(language) = &options.language {
         command.args(["--language", language]);
     }
@@ -961,11 +1011,14 @@ fn invoke_probe(
     deadline: Instant,
 ) -> Result<Output, CliError> {
     let output = run_probe_command(probe_command(root, query, options, raw), deadline)?;
-    // ponytail: filtered root-only search; explicit file fallback bypasses Probe ignores.
-    // Preserve Probe's CWD-relative patterns rather than reimplement glob matching.
+    // ponytail: filtered/budgeted root-only search; fallback bypasses ignores
+    // and restarts global Probe limits. Keep native selection/merge semantics.
     if raw
         || options.language.is_some()
         || !options.ignores.is_empty()
+        || options.max_bytes.is_some()
+        || options.max_tokens.is_some()
+        || options.merge_threshold.is_some()
         || !output.status.success()
         || probe_has_file_records(&output.stdout)
     {
