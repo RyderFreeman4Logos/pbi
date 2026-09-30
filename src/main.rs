@@ -851,6 +851,52 @@ mod tests {
         env::set_var("PBI_RS_PROBE", &probe);
         let question = "where is exact_reuse_receipt?".to_owned();
         let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1. Quoted: \"back\\slash\".";
+        let search_route = test_publisher(json!({
+            "answer":"search must not synthesize",
+            "uncertainty":"This is a no-model control.",
+            "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]
+        }));
+        let mut search_output = Vec::new();
+        assert!(matches!(
+            run(
+                vec!["search".to_owned(), question.clone()],
+                Some(&search_route),
+                &mut search_output
+            ),
+            Ok(0)
+        ));
+        assert!(search_output.is_empty(), "search must not invoke synthesis");
+
+        let incomplete_question = "where is exact_reuse_receipt and missing_target";
+        let incomplete_probe = format!("File: {}, Lines: 1-1\n", root.join("receipt.py").display());
+        let incomplete_report = verify_probe_evidence(
+            &incomplete_probe,
+            &root,
+            incomplete_question,
+            DEFAULT_MAX_RESULTS,
+        )
+        .expect("partial verified evidence");
+        assert!(!incomplete_report.is_complete());
+        assert_eq!(incomplete_report.missing_targets(), &["missing_target"]);
+        let incomplete_route = test_publisher(json!({
+            "answer":answer,
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]
+        }));
+        let mut incomplete_output = Vec::new();
+        assert!(matches!(
+            run(
+                vec![incomplete_question.to_owned()],
+                Some(&incomplete_route),
+                &mut incomplete_output
+            ),
+            Ok(0)
+        ));
+        assert_eq!(
+            String::from_utf8(incomplete_output).expect("semantic output"),
+            format!("{answer}\n")
+        );
+
         for (path, expected, arguments) in [
             ("receipt.py", true, vec![question.clone()]),
             (

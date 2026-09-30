@@ -145,6 +145,7 @@ struct QueryGroup {
     label: String,
     terms: Vec<String>,
     exact_symbols: Vec<String>,
+    any_of: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -174,10 +175,13 @@ pub fn verify_probe_evidence(
     }
     let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
     let raw_locations = parse_probe_locations(probe_output)?;
-    let groups = query_groups(query);
+    let Some(groups) = query_groups(query) else {
+        return Err(EvidenceError::NoSourceLocations);
+    };
     if groups.is_empty() {
         return Err(EvidenceError::NoSourceLocations);
     }
+    let any_of = groups[0].any_of;
 
     let mut choices: Vec<Vec<ScoredEvidence>> = vec![Vec::new(); groups.len()];
     for raw in raw_locations {
@@ -251,12 +255,16 @@ pub fn verify_probe_evidence(
         covered[group_index] = true;
     }
 
-    let missing_targets = groups
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !covered[*index])
-        .map(|(_, group)| group.label.clone())
-        .collect::<Vec<_>>();
+    let missing_targets = if any_of && covered.iter().any(|covered| *covered) {
+        Vec::new()
+    } else {
+        groups
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !covered[*index])
+            .map(|(_, group)| group.label.clone())
+            .collect::<Vec<_>>()
+    };
     if evidence.is_empty() {
         return Err(EvidenceError::NoSourceLocations);
     }
@@ -395,24 +403,42 @@ fn test_path(relative: &Path) -> bool {
     })
 }
 
-fn query_groups(query: &str) -> Vec<QueryGroup> {
+fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
+    if query
+        .chars()
+        .any(|character| matches!(character, '(' | ')' | '&' | '|' | '!'))
+    {
+        return None;
+    }
     let mut groups = Vec::<Vec<String>>::new();
     let mut current = Vec::new();
+    let mut disjunction = None;
     for token in raw_query_tokens(query) {
+        if token == "not" || token == "xor" {
+            return None;
+        }
         if token == "and" || token == "or" {
-            if !current.is_empty() {
-                groups.push(std::mem::take(&mut current));
+            if current.is_empty() {
+                return None;
             }
+            let is_or = token == "or";
+            if disjunction.is_some_and(|previous| previous != is_or) {
+                return None;
+            }
+            disjunction = Some(is_or);
+            groups.push(std::mem::take(&mut current));
         } else if !query_stop_word(&token) {
             current.push(token);
         }
     }
-    if !current.is_empty() {
-        groups.push(current);
+    if current.is_empty() {
+        return None;
     }
-    groups
+    groups.push(current);
+    let any_of = disjunction == Some(true);
+    let groups = groups
         .into_iter()
-        .filter_map(|tokens| {
+        .map(|tokens| {
             let mut terms = Vec::new();
             let mut exact_symbols = Vec::new();
             for token in &tokens {
@@ -427,9 +453,11 @@ fn query_groups(query: &str) -> Vec<QueryGroup> {
                 label: tokens.join(" "),
                 terms,
                 exact_symbols,
+                any_of,
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    Some(groups)
 }
 
 fn raw_query_tokens(value: &str) -> Vec<String> {
@@ -788,7 +816,12 @@ fn best_window(
     let all_terms = all_groups
         .iter()
         .flat_map(|group| group.terms.iter().cloned())
-        .collect::<Vec<_>>();
+        .fold(Vec::new(), |mut terms, term| {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+            terms
+        });
     let path_text = relative.to_string_lossy();
     let requested = requested_features(group);
     let behavioral = behavior_query(group);
@@ -803,6 +836,7 @@ fn best_window(
             let end = start + length;
             let text = lines[start..end].join("\n");
             let group_matches = matching_terms(&group.terms, &text);
+            let any_matches = matching_terms(&all_terms, &text).len();
             let path_matches = matching_terms(&group.terms, &path_text);
             let path_context = matching_terms(&context_terms, &path_text);
             let context_matches = matching_terms(&all_terms, &format!("{path_text}\n{text}"));
@@ -833,7 +867,9 @@ fn best_window(
                 .filter(|line| line.trim_start().starts_with("let "))
                 .count();
             let direct = group_matches.len();
-            let simple_lexical = !behavioral && direct >= 2;
+            // Keep the two-term floor across distinct OR alternatives; one token is not complete evidence.
+            let simple_lexical =
+                !behavioral && (direct >= 2 || (group.any_of && direct >= 1 && any_matches >= 2));
             let exact = exact_symbol.is_some();
             if !exact
                 && ((behavioral && (!actionable || (direct == 0 && overlap == 0)))
@@ -964,6 +1000,60 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn source_evidence_respects_flat_boolean_connectors() {
+        let fixture = Fixture::new();
+        let output = format!(
+            "File: {}, Lines: 1-1\n",
+            fixture.root.join("src/lib.rs").display()
+        );
+        let or_report = verify_probe_evidence(&output, &fixture.root, "compression or cache", 8)
+            .expect("either disjunct is sufficient");
+        assert!(or_report.is_complete());
+        assert!(or_report.missing_targets().is_empty());
+
+        fs::write(fixture.root.join("src/lib.rs"), "compression\n")
+            .expect("insufficient one-term source");
+        assert_eq!(
+            verify_probe_evidence(&output, &fixture.root, "compression or cache", 8),
+            Err(EvidenceError::NoSourceLocations),
+            "one lexical span must not bypass the existing two-term evidence floor"
+        );
+
+        fs::write(fixture.root.join("src/lib.rs"), "compression publication\n")
+            .expect("single OR branch source");
+        let branch_or_report = verify_probe_evidence(
+            &output,
+            &fixture.root,
+            "compression publication or cache key",
+            8,
+        )
+        .expect("one complete OR branch is sufficient");
+        assert!(branch_or_report.is_complete());
+        assert!(branch_or_report.missing_targets().is_empty());
+
+        let and_report = verify_probe_evidence(
+            &output,
+            &fixture.root,
+            "compression publication and cache key",
+            8,
+        )
+        .expect("partial AND evidence");
+        assert!(!and_report.is_complete());
+        assert_eq!(and_report.missing_targets(), &["cache key"]);
+
+        for unsupported in [
+            "(compression publication or cache key)",
+            "compression publication or cache key and assembly",
+        ] {
+            assert_eq!(
+                verify_probe_evidence(&output, &fixture.root, unsupported, 8),
+                Err(EvidenceError::NoSourceLocations),
+                "unsupported boolean syntax must fail closed: {unsupported}"
+            );
         }
     }
 

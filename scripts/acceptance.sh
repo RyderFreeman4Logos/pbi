@@ -36,6 +36,10 @@ bare_evidence=$(cd "$fixture" && PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$probe" "$bin
 printf '%s\n' "$bare_evidence" | grep -q '^Coverage: complete$'
 printf '%s\n' "$bare_evidence" | grep -q 'compression publication and cache key assembly'
 
+or_evidence=$(cd "$fixture" && PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$probe" "$binary" "compression or cache")
+printf '%s\n' "$or_evidence" | grep -q '^Coverage: complete$'
+printf '%s\n' "$or_evidence" | grep -q '^-[[:space:]]src/lib.rs:1 '
+
 debug=$($binary --debug-config)
 printf '%s\n' "$debug" | grep -q '^api_key=\[REDACTED\]$'
 printf '%s\n' "$debug" | grep -q '^search_default=compact_verified_bm25_no_chat$'
