@@ -592,3 +592,267 @@ fn accepts(name: &str) -> bool { name == "id" }
     }
     assert!(failed.is_empty(), "structural boundaries: {failed:?}");
 }
+
+#[test]
+fn scope_ownership_and_liveness_matrix() {
+    let fixture = Fixture::new();
+    let cases = [
+        (
+            "key_reassignment",
+            false,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { name = "unrelated".to_owned(); extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "helper_pattern_shadow",
+            false,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) -> Result<(), &'static str> {
+ if !schema.contains(&key) { extras.push(extension_name(Some("unrelated"), &key)?); }
+ Ok(())
+}
+fn extension_name(location: Option<&str>, key: &str) -> Result<String, &'static str> {
+ let name = match location { Some(key) => format!("{key}"), None => format!("{key}") };
+ Ok(name)
+}
+"#####,
+        ),
+        (
+            "discarded_closure_rejection",
+            false,
+            r#####"fn parse(key: &str) -> Result<(), &'static str> {
+ let _ = || -> Result<(), &'static str> { if key != "id" { return Err("unknown field"); } Ok(()) };
+ Ok(())
+}
+"#####,
+        ),
+        (
+            "discarded_closure_capture",
+            false,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ let _ = || { if !schema.contains(&name) { extras.push(name.clone()); } };
+}
+"#####,
+        ),
+        (
+            "unreachable_capture",
+            false,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { return; extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "key_identity_control",
+            true,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "key_compound_assignment",
+            false,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { name += "unrelated"; extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "key_mutating_method",
+            false,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { name.clear(); extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "key_mutable_borrow",
+            false,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { rewrite(&mut name); extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "receiver_reassignment",
+            false,
+            r#####"fn visit(name: String, mut schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { schema = other_schema(); extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "nested_key_rebinding",
+            false,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { let Some(name) = unrelated() else { return; }; extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "unrelated_assignment_control",
+            true,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { other = 7; extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "unrelated_method_control",
+            true,
+            r#####"fn visit(mut name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { other.clear(); extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "helper_pattern_control",
+            true,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) -> Result<(), &'static str> {
+ if !schema.contains(&key) { extras.push(extension_name(Some("unrelated"), &key)?); }
+ Ok(())
+}
+fn extension_name(location: Option<&str>, key: &str) -> Result<String, &'static str> {
+ let name = match location { Some(location) => format!("{key}"), None => format!("{key}") };
+ Ok(name)
+}
+"#####,
+        ),
+        (
+            "helper_tuple_pattern_shadow",
+            false,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) -> Result<(), &'static str> {
+ if !schema.contains(&key) { extras.push(extension_name(Some("unrelated"), &key)?); }
+ Ok(())
+}
+fn extension_name(location: Option<&str>, key: &str) -> Result<String, &'static str> {
+ let name = match location { Some((key, _)) => format!("{key}"), None => format!("{key}") };
+ Ok(name)
+}
+"#####,
+        ),
+        (
+            "helper_struct_pattern_shadow",
+            false,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) -> Result<(), &'static str> {
+ if !schema.contains(&key) { extras.push(extension_name(Some("unrelated"), &key)?); }
+ Ok(())
+}
+fn extension_name(location: Option<&str>, key: &str) -> Result<String, &'static str> {
+ let name = match location { Some(Entry { key, .. }) => format!("{key}"), None => format!("{key}") };
+ Ok(name)
+}
+"#####,
+        ),
+        (
+            "helper_at_pattern_shadow",
+            false,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) -> Result<(), &'static str> {
+ if !schema.contains(&key) { extras.push(extension_name(Some("unrelated"), &key)?); }
+ Ok(())
+}
+fn extension_name(location: Option<&str>, key: &str) -> Result<String, &'static str> {
+ let name = match location { Some(key @ _) => format!("{key}"), None => format!("{key}") };
+ Ok(name)
+}
+"#####,
+        ),
+        (
+            "direct_rejection_control",
+            true,
+            r#####"fn parse(key: &str) -> Result<(), &'static str> {
+ if key != "id" { return Err("unknown field"); }
+ Ok(())
+}
+"#####,
+        ),
+        (
+            "direct_capture_control",
+            true,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { extras.push(name.clone()); }
+}
+"#####,
+        ),
+        (
+            "deferred_async_rejection",
+            false,
+            r#####"fn parse(key: &str) -> Result<(), &'static str> {
+ let _ = async { if key != "id" { return Err("unknown field"); } Ok(()) };
+ Ok(())
+}
+"#####,
+        ),
+        (
+            "deferred_async_capture",
+            false,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ let _ = async { if !schema.contains(&name) { extras.push(name.clone()); } };
+}
+"#####,
+        ),
+        (
+            "nested_function_rejection",
+            false,
+            r#####"fn parse(key: &str) -> Result<(), &'static str> {
+ fn nested(key: &str) -> Result<(), &'static str> { if key != "id" { return Err("unknown field"); } Ok(()) }
+ Ok(())
+}
+"#####,
+        ),
+        (
+            "reachable_capture_control",
+            true,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "capture_before_return_control",
+            true,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { extras.push(name); return; }
+}
+"#####,
+        ),
+        (
+            "capture_after_break",
+            false,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ loop { if !schema.contains(&name) { break; extras.push(name); }
+} }
+"#####,
+        ),
+        (
+            "capture_after_continue",
+            false,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+ loop { if !schema.contains(&name) { continue; extras.push(name); }
+} }
+"#####,
+        ),
+        (
+            "rejection_after_return",
+            false,
+            r#####"fn parse(key: &str) -> Result<(), &'static str> { if key != "id" { return Ok(()); return Err("unknown field"); } Ok(()) }
+"#####,
+        ),
+        (
+            "guard_after_function_return",
+            false,
+            r#####"fn parse(key: &str) -> Result<(), &'static str> { return Ok(()); if key != "id" { return Err("unknown field"); } Ok(()) }
+"#####,
+        ),
+    ];
+    assert_eq!(cases.len(), 28);
+    let failed = cases
+        .iter()
+        .filter_map(|(name, positive, source)| {
+            (!fixture.check(name, source, *positive)).then_some(*name)
+        })
+        .collect::<Vec<_>>();
+    assert!(failed.is_empty(), "ownership/liveness cases: {failed:?}");
+}

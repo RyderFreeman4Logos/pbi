@@ -194,6 +194,9 @@ fn returned(stmt: &Stmt) -> Option<&Expr> {
         _ => None,
     }
 }
+fn terminates(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Expr(e, _) if matches!(bare(e), Expr::Return(_) | Expr::Break(_) | Expr::Continue(_)))
+}
 fn literal_comparison(expr: &Expr, parameter: &str, rejection: bool) -> bool {
     let Expr::Binary(e) = bare(expr) else {
         return false;
@@ -295,6 +298,9 @@ impl Collector<'_> {
         // Only direct statements: conditional side effects / block arguments do
         // not establish retained values or an unconditional fallback action.
         for stmt in &branch.stmts {
+            if terminates(stmt) {
+                break;
+            }
             if let Stmt::Expr(Expr::MethodCall(call), _) = stmt {
                 if matches!(call.method.to_string().as_str(), "push" | "insert")
                     && call
@@ -309,6 +315,18 @@ impl Collector<'_> {
     }
 }
 impl<'ast> Visit<'ast> for Collector<'_> {
+    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {
+        // Deferred bodies cannot borrow enclosing execution/return authority.
+        // Closure calls, including immediate calls, remain unsupported.
+    }
+    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+    fn visit_expr_const(&mut self, _: &'ast syn::ExprConst) {}
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        // A local item declaration does not execute its body in this function.
+        if !matches!(stmt, Stmt::Item(_)) {
+            visit::visit_stmt(self, stmt);
+        }
+    }
     fn visit_expr(&mut self, expr: &'ast Expr) {
         let saved = self.returned;
         // Value context flows only through transparent containers; operands of
@@ -360,6 +378,9 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             self.returned =
                 saved && index + 1 == block.stmts.len() && matches!(stmt, Stmt::Expr(_, None));
             self.visit_stmt(stmt);
+            if terminates(stmt) {
+                break;
+            }
         }
         self.returned = saved;
     }
@@ -378,6 +399,9 @@ impl<'ast> Visit<'ast> for Collector<'_> {
                         || (self.returned && index + 1 == expr.then_branch.stmts.len());
                     if exits && returned(stmt).is_some_and(rejection) {
                         self.proofs.add(expr.if_token.span, stmt.span());
+                    }
+                    if terminates(stmt) {
+                        break;
                     }
                 }
             }
@@ -438,7 +462,55 @@ struct History<'a> {
     key: &'a str,
     invalid: bool,
 }
+impl History<'_> {
+    fn owns(&self, expr: &Expr) -> bool {
+        match bare(expr) {
+            Expr::Field(e) => self.owns(&e.base),
+            Expr::Index(e) => self.owns(&e.expr),
+            Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => self.owns(&e.expr),
+            e => name(e).is_some_and(|n| n == self.key || self.receiver == Some(n.as_str())),
+        }
+    }
+}
 impl<'ast> Visit<'ast> for History<'_> {
+    fn visit_expr_assign(&mut self, expr: &'ast syn::ExprAssign) {
+        self.invalid |= self.owns(&expr.left);
+        visit::visit_expr_assign(self, expr);
+    }
+    fn visit_expr_binary(&mut self, expr: &'ast syn::ExprBinary) {
+        if matches!(
+            expr.op,
+            BinOp::AddAssign(_)
+                | BinOp::SubAssign(_)
+                | BinOp::MulAssign(_)
+                | BinOp::DivAssign(_)
+                | BinOp::RemAssign(_)
+                | BinOp::BitXorAssign(_)
+                | BinOp::BitAndAssign(_)
+                | BinOp::BitOrAssign(_)
+                | BinOp::ShlAssign(_)
+                | BinOp::ShrAssign(_)
+        ) {
+            self.invalid |= self.owns(&expr.left);
+        }
+        visit::visit_expr_binary(self, expr);
+    }
+    fn visit_expr_reference(&mut self, expr: &'ast syn::ExprReference) {
+        self.invalid |= expr.mutability.is_some() && self.owns(&expr.expr);
+        visit::visit_expr_reference(self, expr);
+    }
+    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+    fn visit_expr_const(&mut self, _: &'ast syn::ExprConst) {}
+    fn visit_item(&mut self, _: &'ast Item) {}
+    fn visit_block(&mut self, block: &'ast Block) {
+        for stmt in &block.stmts {
+            self.visit_stmt(stmt);
+            if terminates(stmt) {
+                break;
+            }
+        }
+    }
     fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
         if pat.ident == self.key || self.receiver.is_some_and(|r| pat.ident == r) {
             self.invalid = true;
@@ -451,6 +523,17 @@ impl<'ast> Visit<'ast> for History<'_> {
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        // Unresolved key methods may mutate it; retain only transparent key
+        // operations already supported by value linkage, not a keyword blacklist.
+        if name(&call.receiver).as_deref() == Some(self.key)
+            && !(call.args.is_empty()
+                && matches!(
+                    call.method.to_string().as_str(),
+                    "clone" | "to_owned" | "as_str"
+                ))
+        {
+            self.invalid = true;
+        }
         if self
             .receiver
             .is_some_and(|r| name(&call.receiver).as_deref() == Some(r))
@@ -511,7 +594,9 @@ fn template_return(block: &Block, parameter: &str) -> bool {
                         if arm.guard.is_some() {
                             return false;
                         }
-                        if matches!(&arm.pat, Pat::Ident(p) if p.ident == parameter) {
+                        let mut bindings = Bindings::default();
+                        bindings.visit_pat(&arm.pat);
+                        if bindings.0.contains(parameter) {
                             return false;
                         }
                         let Expr::Macro(expr) = bare(&arm.body) else {
