@@ -609,8 +609,21 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
     features
 }
 
+fn without_full_line_comment(line: &str) -> &str {
+    if line.trim_start().starts_with("//") {
+        ""
+    } else {
+        line
+    }
+}
+
 fn window_features(text: &str) -> Vec<&'static str> {
-    let lower = text.to_lowercase();
+    let code = text
+        .lines()
+        .map(without_full_line_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lower = code.to_lowercase();
     let mut features = Vec::new();
     let add = |features: &mut Vec<&'static str>, feature| {
         if !features.contains(&feature) {
@@ -618,6 +631,7 @@ fn window_features(text: &str) -> Vec<&'static str> {
         }
     };
     let tokens = tokenized(&lower);
+    let has = |needle: &str| tokens.iter().any(|token| token_matches(token, needle));
     if tokens.iter().any(|token| {
         ["error", "err", "failure", "fail", "exception", "invalid"]
             .iter()
@@ -663,9 +677,44 @@ fn window_features(text: &str) -> Vec<&'static str> {
     {
         add(&mut features, "data");
     }
-    if lower.contains("unknown field")
-        || lower.contains("extensions.push")
-        || lower.contains("extensions.insert")
+
+    let unknown_field = has("unknown") && has("field");
+    let serde_rejects_unknown_fields = lower.contains("serde")
+        && has("deny")
+        && unknown_field
+        && has("derive")
+        && has("deserialize")
+        && (has("struct") || has("enum"));
+    let captures_unrecognized_fields = if has("field") && has("key") {
+        let membership = lower.find(".contains(");
+        membership.is_some_and(|membership| {
+            let after_membership = &lower[membership..];
+            let collection_mutation =
+                |text: &str| text.contains(".push(") || text.contains(".insert(");
+            lower[..membership]
+                .rfind("if ")
+                .map(|if_start| &lower[if_start + 3..membership])
+                .is_some_and(|condition| {
+                    if condition.contains('!') {
+                        collection_mutation(after_membership)
+                    } else {
+                        after_membership.find("else").is_some_and(|else_start| {
+                            collection_mutation(&after_membership[else_start + 4..])
+                        })
+                    }
+                })
+        })
+    } else {
+        false
+    };
+    let rejects_unknown_field_fallback = unknown_field
+        && has("key")
+        && (has("err") || has("error"))
+        && lower.contains("match ")
+        && lower.contains("=>");
+    if serde_rejects_unknown_fields
+        || captures_unrecognized_fields
+        || rejects_unknown_field_fallback
     {
         add(&mut features, "unknown-field-handling");
     }
@@ -744,6 +793,7 @@ fn call_markers(text: &str) -> Vec<String> {
 }
 
 fn line_markers(text: &str) -> Vec<String> {
+    let text = without_full_line_comment(text);
     if text.trim_start().starts_with('#') {
         return Vec::new();
     }
@@ -1206,7 +1256,6 @@ mod tests {
         let parser = fixture.root.join("src/parser.rs");
         let permissive = fixture.root.join("src/permissive.rs");
         let test_file = fixture.root.join("src/parser_tests.rs");
-        let decoy = fixture.root.join("src/unknown_field.rs");
         fs::write(
             &parser,
             "fn decode(line: &str) {\n    let decoded = parse_jsonl_value(line).map_err(|error| {\n        Error::new(JsonlDecodeError { source: error })\n    })?;\n    use_value(decoded);\n}\n",
@@ -1214,7 +1263,7 @@ mod tests {
         .expect("parser source");
         fs::write(
             &permissive,
-            "fn visit(map: &mut Map) {\n    let mut seen = BTreeSet::new();\n    let mut extensions = Vec::new();\n    while let Some(key) = map.next_key::<String>()? {\n        if !seen.insert(key.clone()) {\n            return Err(A::Error::custom(format!(\"duplicate field `{key}`\")));\n        }\n        if known(&key) {\n            map.next_value::<IgnoredAny>()?;\n        } else {\n            extensions.push((key, map.next_value()?));\n        }\n    }\n}\n",
+            "fn visit(map: &mut Map) {\n    let mut seen = BTreeSet::new();\n    let mut extensions = Vec::new();\n    while let Some(key) = map.next_key::<String>()? {\n        if !seen.insert(key.clone()) {\n            return Err(A::Error::custom(format!(\"duplicate field `{key}`\")));\n        }\n        if RECORD_FIELDS.contains(&key.as_str()) {\n            map.next_value::<IgnoredAny>()?;\n        } else {\n            extensions.push((key, map.next_value()?));\n        }\n    }\n}\n",
         )
         .expect("unknown-field source");
         fs::write(
@@ -1222,17 +1271,11 @@ mod tests {
             "let _fixture = NamedTempFile::new().expect(\"test fixture\");\n// where is JSONL parser error conversion and unknown-field handling?\n",
         )
         .expect("test source");
-        fs::write(
-            &decoy,
-            "#[serde(deny_unknown_fields)]\nfn reject_unknown_field() {}\n",
-        )
-        .expect("decoy source");
         let output = format!(
-            "File: {}, Lines: 1-99\nFile: {}, Lines: 1-99\nFile: {}, Lines: 1-99\nFile: {}, Lines: 1-99\n",
+            "File: {}, Lines: 1-99\nFile: {}, Lines: 1-99\nFile: {}, Lines: 1-99\n",
             parser.display(),
             permissive.display(),
-            test_file.display(),
-            decoy.display()
+            test_file.display()
         );
         let report = verify_probe_evidence(
             &output,
@@ -1257,10 +1300,103 @@ mod tests {
             .evidence()
             .iter()
             .any(|evidence| evidence.location().path().ends_with("parser_tests.rs")));
-        assert!(!report
-            .evidence()
-            .iter()
-            .any(|evidence| evidence.location().path().ends_with("unknown_field.rs")));
+    }
+
+    #[test]
+    fn unknown_field_evidence_requires_semantic_code() {
+        let fixture = Fixture::new();
+        let verify = |name: &str, source: &str| {
+            let path = fixture.root.join("src").join(name);
+            fs::write(&path, source).expect("fixture source");
+            let output = format!("File: {}, Lines: 1-99\n", path.display());
+            verify_probe_evidence(&output, &fixture.root, "unknown field handling", 8)
+        };
+
+        let serde = verify(
+            "serde.rs",
+            r#"use serde::Deserialize;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config { enabled: bool }
+fn decode(input: &str) -> Result<Config, serde_json::Error> { serde_json::from_str(input) }
+"#,
+        )
+        .is_ok_and(|report| {
+            report.is_complete()
+                && report.evidence().iter().any(|evidence| {
+                    evidence.snippet().contains("deny_unknown_fields")
+                        && evidence.snippet().contains("from_str")
+                })
+        });
+        let alternate_extras = verify(
+            "alternate.rs",
+            r#"fn retain<T>(known_fields: &std::collections::HashSet<String>, key: String, value: T) -> Vec<(String, T)> {
+    let mut other_values = Vec::new();
+    if known_fields.contains(&key) { drop(value); } else { other_values.push((key, value)); }
+    other_values
+}
+"#,
+        )
+        .is_ok_and(|report| {
+            report.is_complete()
+                && report
+                    .evidence()
+                    .iter()
+                    .any(|evidence| evidence.snippet().contains("other_values.push"))
+        });
+        let rejecting_fallback = verify(
+            "fallback.rs",
+            r#"#[derive(Debug)]
+enum FieldError { UnknownField(String) }
+fn parse_field(key: &str) -> Result<(), FieldError> {
+    match key {
+        "id" => Ok(()),
+        other => Err(FieldError::UnknownField(other.to_owned())),
+    }
+}
+"#,
+        )
+        .is_ok_and(|report| {
+            report.is_complete()
+                && report.evidence().iter().any(|evidence| {
+                    evidence.snippet().contains("match key")
+                        && evidence.snippet().contains("UnknownField")
+                })
+        });
+        let duplicate_key = matches!(
+            verify(
+                "duplicate.rs",
+                r#"fn reject_duplicate_key(key: &str, seen: &mut Set<String>) -> Result<(), KeyError> {
+    if !seen.insert(key.to_owned()) {
+        return Err(KeyError::DuplicateKey(key.to_owned()));
+    }
+    Ok(())
+}
+"#,
+            ),
+            Err(EvidenceError::NoSourceLocations)
+        );
+        let comment_only = matches!(
+            verify("comment.rs", "// unknown field handling?\n"),
+            Err(EvidenceError::NoSourceLocations)
+        );
+        let comment_with_unrelated_code = matches!(
+            verify(
+                "comment_with_code.rs",
+                "// unknown field handling?\nfn unrelated() { let _ = String::new(); }\n",
+            ),
+            Err(EvidenceError::NoSourceLocations)
+        );
+
+        assert!(
+            serde
+                && alternate_extras
+                && rejecting_fallback
+                && duplicate_key
+                && comment_only
+                && comment_with_unrelated_code,
+            "serde={serde}, alternate extras={alternate_extras}, rejecting fallback={rejecting_fallback}, duplicate-key decoy={duplicate_key}, comment-only decoy={comment_only}, comment with unrelated code={comment_with_unrelated_code}"
+        );
     }
 
     #[test]
