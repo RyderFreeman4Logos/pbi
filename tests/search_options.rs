@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -85,6 +85,74 @@ fn option_value<'a>(args: &'a [String], option: &str) -> Option<&'a str> {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+const SCOPE_QUERY: &str = "compression publication cache assembly";
+
+struct ScopeFixture {
+    base: PathBuf,
+    root: PathBuf,
+    probe: PathBuf,
+    capture: PathBuf,
+}
+
+impl ScopeFixture {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "pbi-rs-search-scope-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("nested/invocation/root");
+        fs::create_dir_all(&root).expect("create nested invocation root");
+        let probe = base.join("fake-probe.sh");
+        fs::write(
+            &probe,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs) printf 'File: %s/z-relevant-late.rs, Lines: 1-1\\n' \"$PWD\" ;; esac ;;\nesac\n",
+        )
+        .expect("write scoped fake Probe");
+        let mut permissions = fs::metadata(&probe)
+            .expect("stat scoped fake Probe")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&probe, permissions).expect("make scoped fake Probe executable");
+        let capture = base.join("probe-calls");
+        Self {
+            base,
+            root,
+            probe,
+            capture,
+        }
+    }
+
+    fn run(&self, mode: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+            .env_clear()
+            .current_dir(&self.root)
+            .env("PBI_RS_PROBE", &self.probe)
+            .env("PBI_TEST_CAPTURE", &self.capture)
+            .env("PBI_TEST_MODE", mode)
+            .args(["search", SCOPE_QUERY])
+            .output()
+            .expect("run pbi-rs in nested invocation root")
+    }
+
+    fn calls(&self) -> Vec<PathBuf> {
+        fs::read_to_string(&self.capture)
+            .expect("read Probe working-directory log")
+            .lines()
+            .map(PathBuf::from)
+            .collect()
+    }
+}
+
+impl Drop for ScopeFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.base);
     }
 }
 
@@ -204,4 +272,117 @@ fn total_probe_deadline_bounds_long_backend_timeout() {
         "deadline was not enforced: {elapsed:?}"
     );
     fixture.assert_search_options("999", "8");
+}
+
+#[test]
+fn probe_scope_uses_nested_invocation_root() {
+    let fixture = ScopeFixture::new();
+    fs::write(
+        fixture.root.join("inside.rs"),
+        format!("fn scoped_match() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write in-scope source");
+    let sibling = fixture
+        .root
+        .parent()
+        .expect("invocation parent")
+        .join("sibling.rs");
+    fs::write(
+        &sibling,
+        format!("fn sibling_match() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write sibling source");
+
+    let output = fixture.run("nested");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inside.rs"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("sibling.rs"));
+    assert_eq!(
+        fixture.calls(),
+        vec![fixture.root.canonicalize().expect("canonical root")]
+    );
+}
+
+#[test]
+fn probe_scope_rejects_sibling_and_outside_symlink_candidates() {
+    let fixture = ScopeFixture::new();
+    let sibling_dir = fixture
+        .root
+        .parent()
+        .expect("invocation parent")
+        .join("sibling");
+    fs::create_dir_all(&sibling_dir).expect("create sibling source directory");
+    fs::write(
+        sibling_dir.join("sibling.rs"),
+        format!("fn sibling_match() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write sibling source");
+
+    let outside_dir = fixture
+        .root
+        .parent()
+        .and_then(|parent| parent.parent())
+        .expect("outside parent")
+        .join("outside");
+    fs::create_dir_all(&outside_dir).expect("create outside source directory");
+    let outside = outside_dir.join("outside.rs");
+    fs::write(
+        &outside,
+        format!("fn outside_match() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write outside source");
+    symlink(&outside, fixture.root.join("outside-link.rs")).expect("link outside source");
+
+    let output = fixture.run("boundary");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "pbi: no source locations found"
+    );
+    assert_eq!(
+        fixture.calls(),
+        vec![fixture.root.canonicalize().expect("canonical root")]
+    );
+}
+
+#[test]
+fn probe_scope_fails_closed_after_root_miss_with_late_17th_match() {
+    let fixture = ScopeFixture::new();
+    for index in 0..16 {
+        fs::write(
+            fixture.root.join(format!("candidate-{index:02}.rs")),
+            "fn decoy() {}\n",
+        )
+        .expect("write early candidate");
+    }
+    let late_match = fixture.root.join("z-relevant-late.rs");
+    fs::write(
+        &late_match,
+        format!("fn late_match() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write relevant seventeenth candidate");
+    let mut candidates = fs::read_dir(&fixture.root)
+        .expect("read candidate files")
+        .map(|entry| entry.expect("candidate entry").path())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    assert_eq!(candidates.len(), 17);
+    assert_eq!(candidates.last(), Some(&late_match));
+
+    let output = fixture.run("saturated");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "pbi-rs: Probe scope exceeded the bounded target limit"
+    );
+    assert_eq!(
+        fixture.calls(),
+        vec![fixture.root.canonicalize().expect("canonical root")]
+    );
 }
