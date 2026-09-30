@@ -594,6 +594,18 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
             add(&mut features, "data");
         }
     }
+    if group
+        .terms
+        .iter()
+        .any(|term| token_matches(term, "unknown"))
+        && group.terms.iter().any(|term| {
+            ["field", "fields", "handling", "handle"]
+                .iter()
+                .any(|word| token_matches(term, word))
+        })
+    {
+        add(&mut features, "unknown-field-handling");
+    }
     features
 }
 
@@ -650,6 +662,12 @@ fn window_features(text: &str) -> Vec<&'static str> {
         || lower.contains("next_value")
     {
         add(&mut features, "data");
+    }
+    if lower.contains("unknown field")
+        || lower.contains("extensions.push")
+        || lower.contains("extensions.insert")
+    {
+        add(&mut features, "unknown-field-handling");
     }
     features
 }
@@ -841,6 +859,11 @@ fn best_window(
             let path_context = matching_terms(&context_terms, &path_text);
             let context_matches = matching_terms(&all_terms, &format!("{path_text}\n{text}"));
             let features = window_features(&text);
+            if requested.contains(&"unknown-field-handling")
+                && !features.contains(&"unknown-field-handling")
+            {
+                continue;
+            }
             let overlap = requested
                 .iter()
                 .filter(|feature| features.contains(feature))
@@ -1191,12 +1214,12 @@ mod tests {
         .expect("parser source");
         fs::write(
             &permissive,
-            "fn visit(map: &mut Map) {\n    if known(&key) {\n        map.next_value::<IgnoredAny>()?;\n    } else {\n        extensions.push((key, map.next_value()?));\n    }\n}\n",
+            "fn visit(map: &mut Map) {\n    let mut seen = BTreeSet::new();\n    let mut extensions = Vec::new();\n    while let Some(key) = map.next_key::<String>()? {\n        if !seen.insert(key.clone()) {\n            return Err(A::Error::custom(format!(\"duplicate field `{key}`\")));\n        }\n        if known(&key) {\n            map.next_value::<IgnoredAny>()?;\n        } else {\n            extensions.push((key, map.next_value()?));\n        }\n    }\n}\n",
         )
         .expect("unknown-field source");
         fs::write(
             &test_file,
-            "let fixture = \"JSONL parser error conversion unknown-field handling\";\n",
+            "let _fixture = NamedTempFile::new().expect(\"test fixture\");\n// where is JSONL parser error conversion and unknown-field handling?\n",
         )
         .expect("test source");
         fs::write(
