@@ -95,6 +95,7 @@ struct ScopeFixture {
     root: PathBuf,
     probe: PathBuf,
     capture: PathBuf,
+    events: PathBuf,
 }
 
 impl ScopeFixture {
@@ -112,7 +113,7 @@ impl ScopeFixture {
         let probe = base.join("fake-probe.sh");
         fs::write(
             &probe,
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs) printf 'File: %s/z-relevant-late.rs, Lines: 1-1\\n' \"$PWD\" ;; esac ;;\nesac\n",
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/z-relevant-late.rs, Lines: 1-1\\n' \"$PWD\" ;; *.rs) printf 'fallback-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\nesac\n",
         )
         .expect("write scoped fake Probe");
         let mut permissions = fs::metadata(&probe)
@@ -121,11 +122,13 @@ impl ScopeFixture {
         permissions.set_mode(0o700);
         fs::set_permissions(&probe, permissions).expect("make scoped fake Probe executable");
         let capture = base.join("probe-calls");
+        let events = base.join("probe-events");
         Self {
             base,
             root,
             probe,
             capture,
+            events,
         }
     }
 
@@ -136,6 +139,7 @@ impl ScopeFixture {
             .env("PBI_RS_PROBE", &self.probe)
             .env("PBI_TEST_CAPTURE", &self.capture)
             .env("PBI_TEST_MODE", mode)
+            .env("PBI_TEST_EVENTS", &self.events)
             .args(["search", SCOPE_QUERY])
             .output()
             .expect("run pbi-rs in nested invocation root")
@@ -146,6 +150,14 @@ impl ScopeFixture {
             .expect("read Probe working-directory log")
             .lines()
             .map(PathBuf::from)
+            .collect()
+    }
+
+    fn events(&self) -> Vec<String> {
+        fs::read_to_string(&self.events)
+            .expect("read Probe's result events")
+            .lines()
+            .map(str::to_owned)
             .collect()
     }
 }
@@ -385,4 +397,56 @@ fn probe_scope_fails_closed_after_root_miss_with_late_17th_match() {
         fixture.calls(),
         vec![fixture.root.canonicalize().expect("canonical root")]
     );
+}
+
+#[test]
+fn probe_scope_returns_late_under_cap_match_after_root_miss() {
+    let fixture = ScopeFixture::new();
+    for name in ["a-decoy.rs", "m-decoy.rs"] {
+        fs::write(fixture.root.join(name), "fn decoy() {}\n").expect("write decoy source");
+    }
+    let late_match = fixture.root.join("z-relevant-late.rs");
+    fs::write(
+        &late_match,
+        format!("fn late_match() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write relevant late candidate");
+    let mut candidates = fs::read_dir(&fixture.root)
+        .expect("read candidate files")
+        .map(|entry| entry.expect("candidate entry").path())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    assert_eq!(candidates.len(), 3);
+    assert_eq!(candidates.last(), Some(&late_match));
+
+    let output = fixture.run("saturated");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Coverage: complete"), "{stdout}");
+    assert!(stdout.contains("Verified source evidence:"), "{stdout}");
+    assert!(stdout.contains("z-relevant-late.rs:1"), "{stdout}");
+    assert!(stdout.contains("fn late_match()"), "{stdout}");
+    assert!(!stdout.contains("a-decoy.rs"), "{stdout}");
+
+    let root = fixture
+        .root
+        .canonicalize()
+        .expect("canonical invocation root");
+    assert_eq!(fixture.calls(), vec![root; candidates.len() + 1]);
+    let canonical_late_match = late_match.canonicalize().expect("canonical late match");
+    let mut expected_events = vec![format!("root-miss|{SCOPE_QUERY}")];
+    expected_events.extend(candidates.iter().map(|path| {
+        let canonical_path = path.canonicalize().expect("canonical candidate path");
+        let result = if canonical_path == canonical_late_match {
+            "fallback-hit"
+        } else {
+            "fallback-miss"
+        };
+        format!("{result}|{}", canonical_path.display())
+    }));
+    assert_eq!(fixture.events(), expected_events);
 }
