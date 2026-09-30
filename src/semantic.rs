@@ -3,15 +3,16 @@ use serde_json::{json, Value};
 use std::env;
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use workflow_adk::model_profiles::{
-    CredentialBroker, CredentialHandle, ModelBinding, ModelProfileErrorKind, ModelProfileRegistry,
-    ModelRuntimeConfig, OpenAiCompatibleProfile,
+    CredentialBroker, CredentialHandle, ModelProfileRegistry, ModelRuntimeConfig,
+    OpenAiCompatibleProfile,
 };
 use workflow_adk::{
-    EscalationPolicy, InferenceBudget, ModelInvocationErrorKind, ModelInvocationSpec,
-    PromptProtocol, ReasoningEffort, StructuredOutputContract,
+    EscalationPolicy, InferenceBudget, ModelInvocationSpec, ModelProfileIdentity, ModelRole,
+    ModelRouteAuthorization, ModelRouteCancellation, ModelRouteCandidate, ModelRoutePolicy,
+    ModelRoutePublisher, ModelRouteSnapshot, ModelRouteTerminalErrorKind, PromptProtocol,
+    ProviderRouteIdentity, ReasoningEffort, StructuredOutputContract,
 };
 use workflow_runtime::TrustDomain;
 
@@ -91,10 +92,9 @@ pub enum SemanticError {
     Protocol,
     Cancelled,
     DeadlineExceeded,
-    Invocation {
-        kind: ModelInvocationErrorKind,
-        model_error: Option<ModelProfileErrorKind>,
-        attempts: u8,
+    Route {
+        kind: ModelRouteTerminalErrorKind,
+        attempts: usize,
     },
     InvalidOutput,
     CitationMismatch,
@@ -102,22 +102,11 @@ pub enum SemanticError {
 
 impl fmt::Display for SemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Self::Invocation {
-            kind,
-            model_error,
-            attempts,
-        } = self
-        {
-            return match model_error {
-                Some(model_error) => write!(
-                    formatter,
-                    "semantic model invocation failed: {kind:?}; model_error={model_error:?}; attempts={attempts}"
-                ),
-                None => write!(
-                    formatter,
-                    "semantic model invocation failed: {kind:?}; attempts={attempts}"
-                ),
-            };
+        if let Self::Route { kind, attempts } = self {
+            return write!(
+                formatter,
+                "semantic model route failed: {kind:?}; attempts={attempts}"
+            );
         }
         formatter.write_str(match self {
             Self::EmptyQuestion => "semantic question is empty",
@@ -127,7 +116,7 @@ impl fmt::Display for SemanticError {
             Self::Protocol => "semantic invocation protocol could not be built",
             Self::Cancelled => "semantic investigation was cancelled",
             Self::DeadlineExceeded => "semantic investigation exceeded its bounded deadline",
-            Self::Invocation { .. } => unreachable!("invocation errors are formatted above"),
+            Self::Route { .. } => unreachable!("route errors are formatted above"),
             Self::InvalidOutput => "semantic model output failed validation",
             Self::CitationMismatch => "semantic model returned an unverified citation",
         })
@@ -175,7 +164,8 @@ pub fn validate_local_route(base_url: &str, model: &str) -> Result<(), SemanticR
     Ok(())
 }
 
-pub fn local_binding_from_environment() -> Result<Option<ModelBinding>, SemanticRouteError> {
+pub fn local_route_publisher_from_environment(
+) -> Result<Option<ModelRoutePublisher>, SemanticRouteError> {
     match env::var(ADK_ENABLE_ENV).as_deref() {
         Err(_) | Ok("0") => return Ok(None),
         Ok("1") => {}
@@ -209,10 +199,14 @@ pub fn local_binding_from_environment() -> Result<Option<ModelBinding>, Semantic
     let registry = ModelProfileRegistry::new()
         .with_worker(profile)
         .map_err(|_| SemanticRouteError::Profile)?;
-    registry
-        .bind_worker(&CredentialBroker::new())
-        .map(Some)
-        .map_err(|_| SemanticRouteError::Profile)
+    let candidate = ModelRouteCandidate::new(ModelRole::Worker, "pbi-rs-local", "1");
+    let snapshot = ModelRouteSnapshot::new(
+        registry,
+        vec![candidate.clone()],
+        ModelRouteAuthorization::new(vec![candidate]),
+    )
+    .map_err(|_| SemanticRouteError::Profile)?;
+    Ok(Some(ModelRoutePublisher::new(snapshot)))
 }
 
 fn local_route_from_values(
@@ -257,18 +251,15 @@ pub async fn investigate(
     question: &str,
     root: &Path,
     report: &EvidenceReport,
-    binding: &ModelBinding,
+    policy: &ModelRoutePolicy,
     deadline: Instant,
-    cancellation: &AtomicBool,
+    cancellation: &ModelRouteCancellation,
 ) -> Result<SemanticAnswer, SemanticError> {
     if question.trim().is_empty() {
         return Err(SemanticError::EmptyQuestion);
     }
     if report.evidence().is_empty() {
         return Err(SemanticError::NoEvidence);
-    }
-    if cancellation.load(Ordering::Acquire) {
-        return Err(SemanticError::Cancelled);
     }
     if Instant::now() >= deadline {
         return Err(SemanticError::DeadlineExceeded);
@@ -334,34 +325,42 @@ pub async fn investigate(
     let budget = InferenceBudget::new(ReasoningEffort::Low, 512, 0)
         .map(|budget| budget.with_escalation(EscalationPolicy::None))
         .map_err(|_| SemanticError::Protocol)?;
+    let route_placeholder = ProviderRouteIdentity::new(
+        ModelProfileIdentity::new("pbi-rs-route-placeholder", "1"),
+        "openai",
+        "pbi-rs-route-placeholder",
+        "pbi-rs-route-placeholder",
+        "pbi-rs-route-placeholder",
+    );
     let spec = ModelInvocationSpec::new(
         protocol,
         question.to_owned(),
-        workflow_adk::ProviderRouteIdentity::from_binding(binding),
+        route_placeholder,
         budget,
         output,
     )
     .map_err(|_| SemanticError::Protocol)?;
 
-    let invocation = async {
-        tokio::select! {
-            result = spec.invoke(binding) => result.map_err(|error| SemanticError::Invocation {
-                kind: error.kind(),
-                model_error: error.model_error(),
-                attempts: error.attempts(),
-            }),
-            _ = wait_for_cancellation(cancellation) => Err(SemanticError::Cancelled),
+    let broker = CredentialBroker::new();
+    let result = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        policy.invoke(&spec, &broker, cancellation),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return Err(match error.kind() {
+                ModelRouteTerminalErrorKind::Cancelled => SemanticError::Cancelled,
+                ModelRouteTerminalErrorKind::DeadlineExceeded => SemanticError::DeadlineExceeded,
+                kind => SemanticError::Route {
+                    kind,
+                    attempts: error.attempts().len(),
+                },
+            });
         }
+        Err(_) => return Err(SemanticError::DeadlineExceeded),
     };
-    let result =
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), invocation).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(SemanticError::DeadlineExceeded),
-        };
-    if cancellation.load(Ordering::Acquire) {
-        return Err(SemanticError::Cancelled);
-    }
     if Instant::now() >= deadline {
         return Err(SemanticError::DeadlineExceeded);
     }
@@ -372,12 +371,6 @@ pub async fn investigate(
         &evidence,
         invocation_identity,
     )
-}
-
-async fn wait_for_cancellation(cancellation: &AtomicBool) {
-    while !cancellation.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
 }
 
 fn decode_answer(
@@ -455,10 +448,42 @@ fn decode_answer(
 mod tests {
     use super::*;
     use crate::verify_probe_evidence;
+    use adk_rust::{AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest};
     use std::fs;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use workflow_adk::model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry};
+    use workflow_adk::model_profiles::{FakeModelProfile, ModelProfileRegistry};
+
+    struct FailingAdapter {
+        calls: AtomicUsize,
+        pending: bool,
+    }
+
+    #[adk_rust::async_trait]
+    impl Llm for FailingAdapter {
+        fn name(&self) -> &str {
+            "offline-route-test"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.pending {
+                std::future::pending().await
+            } else {
+                Err(AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::RateLimited,
+                    "offline",
+                    "offline",
+                ))
+            }
+        }
+    }
 
     struct Fixture {
         root: std::path::PathBuf,
@@ -492,14 +517,19 @@ mod tests {
         }
     }
 
-    fn binding(response: Value) -> workflow_adk::model_profiles::ModelBinding {
+    fn publisher(response: Value) -> ModelRoutePublisher {
         let profile = FakeModelProfile::new("pbi-test", "1", "fake-model", [response.to_string()]);
         let registry = ModelProfileRegistry::new()
             .with_worker(profile)
             .expect("fake profile");
-        registry
-            .bind_worker(&CredentialBroker::new())
-            .expect("fake binding")
+        let candidate = ModelRouteCandidate::new(ModelRole::Worker, "pbi-test", "1");
+        let snapshot = ModelRouteSnapshot::new(
+            registry,
+            vec![candidate.clone()],
+            ModelRouteAuthorization::new(vec![candidate]),
+        )
+        .expect("single authorized route snapshot");
+        ModelRoutePublisher::new(snapshot)
     }
 
     #[test]
@@ -510,8 +540,10 @@ mod tests {
             "uncertainty": "Only the supplied source span was inspected.",
             "citations": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
         });
-        let binding = binding(response);
-        let cancelled = AtomicBool::new(false);
+        let publisher = publisher(response);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let policy = publisher.policy(deadline);
+        let cancellation = ModelRouteCancellation::new();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -521,9 +553,9 @@ mod tests {
                 "where is answer parse error",
                 &fixture.root,
                 &fixture.report,
-                &binding,
-                Instant::now() + Duration::from_secs(2),
-                &cancelled,
+                &policy,
+                deadline,
+                &cancellation,
             ))
             .expect("semantic answer");
         assert_eq!(answer.citations().len(), 1);
@@ -540,8 +572,10 @@ mod tests {
             "uncertainty": "not enough evidence",
             "citations": [{"path": "../outside.rs", "start_line": 1, "end_line": 1}]
         });
-        let binding = binding(response);
-        let cancelled = AtomicBool::new(false);
+        let publisher = publisher(response);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let policy = publisher.policy(deadline);
+        let cancellation = ModelRouteCancellation::new();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -550,9 +584,9 @@ mod tests {
             "where is answer parse error",
             &fixture.root,
             &fixture.report,
-            &binding,
-            Instant::now() + Duration::from_secs(2),
-            &cancelled,
+            &policy,
+            deadline,
+            &cancellation,
         ));
         assert_eq!(result, Err(SemanticError::CitationMismatch));
     }
@@ -560,13 +594,12 @@ mod tests {
     #[test]
     fn semantic_invocation_error_display_exposes_safe_typed_metadata() {
         assert_eq!(
-            SemanticError::Invocation {
-                kind: ModelInvocationErrorKind::ModelProfile,
-                model_error: Some(ModelProfileErrorKind::Provider),
+            SemanticError::Route {
+                kind: ModelRouteTerminalErrorKind::Provider,
                 attempts: 1,
             }
             .to_string(),
-            "semantic model invocation failed: ModelProfile; model_error=Provider; attempts=1"
+            "semantic model route failed: Provider; attempts=1"
         );
     }
 
@@ -613,9 +646,121 @@ mod tests {
     }
 
     #[test]
+    fn ordered_route_retry_denial_and_deadline_stay_inside_one_policy() {
+        let fixture = Fixture::new();
+        let response = json!({
+            "answer": "Fallback verified the parser.",
+            "uncertainty": "Only the supplied source span was inspected.",
+            "citations": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
+        });
+        let first = ModelRouteCandidate::new(ModelRole::Worker, "first", "1");
+        let second = ModelRouteCandidate::new(ModelRole::Worker, "second", "1");
+        let first_adapter = Arc::new(FailingAdapter {
+            calls: AtomicUsize::new(0),
+            pending: false,
+        });
+        let registry = ModelProfileRegistry::new()
+            .with_worker(FakeModelProfile::new(
+                "first",
+                "1",
+                "fake-first",
+                ["unused"],
+            ))
+            .expect("first profile");
+        let mut registry = registry;
+        registry
+            .register(FakeModelProfile::new(
+                "second",
+                "1",
+                "fake-second",
+                [response.to_string()],
+            ))
+            .expect("second profile");
+        let snapshot = ModelRouteSnapshot::new(
+            registry.clone(),
+            [first.clone(), second.clone()],
+            ModelRouteAuthorization::new([first.clone(), second.clone()]),
+        )
+        .expect("authorized ordered snapshot")
+        .with_test_llm(first.clone(), first_adapter.clone())
+        .expect("injected first adapter");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = runtime
+            .block_on(investigate(
+                "where is answer parse error",
+                &fixture.root,
+                &fixture.report,
+                &ModelRoutePublisher::new(snapshot).policy(deadline),
+                deadline,
+                &ModelRouteCancellation::new(),
+            ))
+            .expect("authorized retry reaches second route");
+        assert_eq!(result.answer(), "Fallback verified the parser.");
+        assert_eq!(result.citations().len(), 1);
+        assert_eq!(first_adapter.calls.load(Ordering::SeqCst), 1);
+
+        let denied = ModelRouteSnapshot::new(
+            registry.clone(),
+            [first.clone(), second.clone()],
+            ModelRouteAuthorization::new([second.clone()]),
+        )
+        .expect("denied candidate remains in snapshot")
+        .with_test_llm(first.clone(), first_adapter.clone())
+        .expect("injected first adapter");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = runtime.block_on(investigate(
+            "where is answer parse error",
+            &fixture.root,
+            &fixture.report,
+            &ModelRoutePublisher::new(denied).policy(deadline),
+            deadline,
+            &ModelRouteCancellation::new(),
+        ));
+        assert_eq!(
+            error,
+            Err(SemanticError::Route {
+                kind: ModelRouteTerminalErrorKind::AuthorizationDenied,
+                attempts: 1,
+            })
+        );
+        assert_eq!(first_adapter.calls.load(Ordering::SeqCst), 1);
+
+        let pending = Arc::new(FailingAdapter {
+            calls: AtomicUsize::new(0),
+            pending: true,
+        });
+        let deadline_snapshot = ModelRouteSnapshot::new(
+            registry,
+            [first.clone(), second],
+            ModelRouteAuthorization::new([
+                first.clone(),
+                ModelRouteCandidate::new(ModelRole::Worker, "second", "1"),
+            ]),
+        )
+        .expect("authorized deadline snapshot")
+        .with_test_llm(first, pending.clone())
+        .expect("injected pending adapter");
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let error = runtime.block_on(investigate(
+            "where is answer parse error",
+            &fixture.root,
+            &fixture.report,
+            &ModelRoutePublisher::new(deadline_snapshot).policy(deadline),
+            deadline,
+            &ModelRouteCancellation::new(),
+        ));
+        assert_eq!(error, Err(SemanticError::DeadlineExceeded));
+        assert_eq!(pending.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn semantic_path_fails_closed_on_cancel_and_expired_deadline() {
         let fixture = Fixture::new();
-        let binding = binding(json!({
+        let publisher = publisher(json!({
             "answer": "unused",
             "uncertainty": "unused",
             "citations": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
@@ -624,23 +769,28 @@ mod tests {
             .enable_time()
             .build()
             .expect("runtime");
-        let cancelled = AtomicBool::new(true);
+        let cancelled = ModelRouteCancellation::new();
+        cancelled.cancel();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let policy = publisher.policy(deadline);
         let cancelled_result = runtime.block_on(investigate(
             "where is answer parse error",
             &fixture.root,
             &fixture.report,
-            &binding,
-            Instant::now() + Duration::from_secs(2),
+            &policy,
+            deadline,
             &cancelled,
         ));
         assert_eq!(cancelled_result, Err(SemanticError::Cancelled));
-        let active = AtomicBool::new(false);
+        let deadline = Instant::now();
+        let policy = publisher.policy(deadline);
+        let active = ModelRouteCancellation::new();
         let expired_result = runtime.block_on(investigate(
             "where is answer parse error",
             &fixture.root,
             &fixture.report,
-            &binding,
-            Instant::now(),
+            &policy,
+            deadline,
             &active,
         ));
         assert_eq!(expired_result, Err(SemanticError::DeadlineExceeded));

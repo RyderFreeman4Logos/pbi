@@ -1,6 +1,6 @@
 use pbi_rs::semantic::{
-    investigate, local_binding_from_environment, SemanticAnswer, SemanticError, SemanticRouteError,
-    DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, MODEL_CREDENTIAL_HANDLES,
+    investigate, local_route_publisher_from_environment, SemanticAnswer, SemanticError,
+    SemanticRouteError, DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, MODEL_CREDENTIAL_HANDLES,
 };
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 use serde_json::json;
@@ -9,12 +9,17 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(test)]
-use workflow_adk::model_profiles::ModelBinding;
+use workflow_adk::model_profiles::{FakeModelProfile, ModelProfileRegistry};
+use workflow_adk::ModelRouteCancellation;
+#[cfg(test)]
+use workflow_adk::{
+    ModelRole, ModelRouteAuthorization, ModelRouteCandidate, ModelRoutePublisher,
+    ModelRouteSnapshot,
+};
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_TIMEOUT: &str = "540";
@@ -87,7 +92,7 @@ impl CliError {
 
 fn run(
     arguments: Vec<String>,
-    #[cfg(test)] _injected_binding: Option<&ModelBinding>,
+    #[cfg(test)] _injected_publisher: Option<&ModelRoutePublisher>,
     #[cfg(test)] _semantic_output: &mut Vec<u8>,
 ) -> Result<i32, CliError> {
     if arguments.is_empty() {
@@ -114,7 +119,7 @@ fn run(
         println!("search_bm25_opt_in=--bm25_raw_no_llm_probe");
         println!("search_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}");
         println!("search_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}");
-        println!("model_path=adk_workflow_kit_single_binding_opt_in");
+        println!("model_path=adk_workflow_kit_authorized_route_snapshot");
         println!("model_opt_in_env=PBI_RS_ADK_ENABLE");
         println!("model_route_policy=approved_local_only");
         println!("model_default_base_url={DEFAULT_LOCAL_BASE_URL}");
@@ -123,8 +128,8 @@ fn run(
             "model_credential_handles={}",
             MODEL_CREDENTIAL_HANDLES.join(",")
         );
-        println!("model_binding=single_immutable_snapshot");
-        println!("model_route_chain=unavailable_in_pinned_adk_revision");
+        println!("model_route_snapshot=single_authorized_candidate");
+        println!("model_route_chain=one_candidate_per_request_snapshot");
         println!("api_key=[REDACTED]");
         return Ok(0);
     }
@@ -206,18 +211,20 @@ fn run(
         .map_err(evidence_cli_error)?;
     if semantic {
         #[cfg(test)]
-        let owned_binding = if _injected_binding.is_some() {
+        let owned_publisher = if _injected_publisher.is_some() {
             None
         } else {
-            local_binding_from_environment().map_err(route_cli_error)?
+            local_route_publisher_from_environment().map_err(route_cli_error)?
         };
         #[cfg(not(test))]
-        let owned_binding = local_binding_from_environment().map_err(route_cli_error)?;
-        let binding = owned_binding.as_ref();
+        let owned_publisher = local_route_publisher_from_environment().map_err(route_cli_error)?;
         #[cfg(test)]
-        let binding = _injected_binding.or(binding);
-        if let Some(binding) = binding {
-            let cancellation = AtomicBool::new(false);
+        let publisher = _injected_publisher.or(owned_publisher.as_ref());
+        #[cfg(not(test))]
+        let publisher = owned_publisher.as_ref();
+        if let Some(publisher) = publisher {
+            let cancellation = ModelRouteCancellation::new();
+            let policy = publisher.policy(deadline);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -227,7 +234,7 @@ fn run(
                     &query,
                     &root,
                     &report,
-                    binding,
+                    &policy,
                     deadline,
                     &cancellation,
                 ))
@@ -799,7 +806,21 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::time::SystemTime;
-    use workflow_adk::model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry};
+
+    fn test_publisher(response: serde_json::Value) -> ModelRoutePublisher {
+        let profile = FakeModelProfile::new("pbi-test", "1", "fake-model", [response.to_string()]);
+        let registry = ModelProfileRegistry::new()
+            .with_worker(profile)
+            .expect("profile");
+        let candidate = ModelRouteCandidate::new(ModelRole::Worker, "pbi-test", "1");
+        let snapshot = ModelRouteSnapshot::new(
+            registry,
+            vec![candidate.clone()],
+            ModelRouteAuthorization::new(vec![candidate]),
+        )
+        .expect("authorized test snapshot");
+        ModelRoutePublisher::new(snapshot)
+    }
 
     #[test]
     fn positional_question_dispatches_through_adk_and_checks_citations() {
@@ -853,15 +874,9 @@ mod tests {
             ),
         ] {
             let response = json!({"answer":answer,"uncertainty":"Only the verified source was inspected.","citations":[{"path":path,"start_line":1,"end_line":1}]});
-            let profile =
-                FakeModelProfile::new("pbi-test", "1", "fake-model", [response.to_string()]);
-            let binding = ModelProfileRegistry::new()
-                .with_worker(profile)
-                .expect("profile")
-                .bind_worker(&CredentialBroker::new())
-                .expect("binding");
+            let publisher = test_publisher(response);
             let mut output = Vec::new();
-            let result = run(arguments.clone(), Some(&binding), &mut output);
+            let result = run(arguments.clone(), Some(&publisher), &mut output);
             if expected {
                 assert!(matches!(result, Ok(0)), "expected cited answer");
                 if arguments.contains(&"--json".to_owned()) {
@@ -887,18 +902,12 @@ mod tests {
             }
         }
         let invalid = json!({"answer":"", "uncertainty":"unknown", "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]});
-        let invalid_profile =
-            FakeModelProfile::new("pbi-test", "1", "fake-model", [invalid.to_string()]);
-        let invalid_binding = ModelProfileRegistry::new()
-            .with_worker(invalid_profile)
-            .expect("profile")
-            .bind_worker(&CredentialBroker::new())
-            .expect("binding");
+        let invalid_publisher = test_publisher(invalid);
         let mut invalid_output = Vec::new();
         assert!(matches!(
             run(
                 vec![question.clone(), "--json".to_owned()],
-                Some(&invalid_binding),
+                Some(&invalid_publisher),
                 &mut invalid_output
             ),
             Err(CliError { code: 1, .. })

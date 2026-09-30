@@ -42,7 +42,8 @@ printf '%s\n' "$debug" | grep -q '^search_default=compact_verified_bm25_no_chat$
 printf '%s\n' "$debug" | grep -q '^model_default_base_url=http://localhost:18317/v1$'
 printf '%s\n' "$debug" | grep -q '^model_default_name=abliterated-qwen-latest-27b-none$'
 printf '%s\n' "$debug" | grep -q '^model_credential_handles=CLIPROXY_API_KEY,OPENAI_API_KEY,LOCAL_ROUTER_API_KEY$'
-printf '%s\n' "$debug" | grep -q '^model_binding=single_immutable_snapshot$'
+printf '%s\n' "$debug" | grep -q '^model_route_snapshot=single_authorized_candidate$'
+printf '%s\n' "$debug" | grep -q '^model_route_chain=one_candidate_per_request_snapshot$'
 
 real=$(cd "$repo_root/src" && "$binary" search "SourceLocation display_relative")
 printf '%s\n' "$real" | grep -q '^Coverage: complete$'
