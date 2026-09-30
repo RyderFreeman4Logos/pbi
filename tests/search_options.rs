@@ -169,6 +169,121 @@ impl Drop for ScopeFixture {
 }
 
 #[test]
+fn dispatch_version_alias_and_no_argument_diagnostic() {
+    let fixture = Fixture::new();
+    let version = fixture.run(&["--version"], "raw");
+    let alias = fixture.run(&["-V"], "raw");
+    assert!(alias.status.success());
+    assert_eq!(alias.stdout, version.stdout);
+    assert!(alias.stderr.is_empty());
+    assert!(!fixture.root.join("probe-argv").exists());
+}
+
+#[test]
+fn dispatch_no_argument_diagnostic() {
+    let fixture = Fixture::new();
+    let empty = fixture.run(&[], "raw");
+    assert_eq!(empty.status.code(), Some(2));
+    assert!(empty.stdout.is_empty());
+    assert_eq!(
+        empty.stderr,
+        b"pbi: question is required; interactive mode is disabled\n"
+    );
+    assert!(!fixture.root.join("probe-argv").exists());
+}
+
+#[test]
+fn dispatch_search_help_relays_probe_and_respects_literal_separator() {
+    let fixture = Fixture::new();
+    for flag in ["--help", "-h"] {
+        let output = fixture.run(&["search", flag], "raw");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"raw Probe bytes\n");
+        assert_eq!(fixture.argv(), ["search", flag]);
+    }
+    let output = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--",
+            "--help",
+            "-h",
+            "-V",
+            "--reranker",
+            "-r",
+        ],
+        "raw",
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"raw Probe bytes\n");
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("--help -h -V --reranker -r")
+    );
+    assert_eq!(option_value(&fixture.argv(), "--reranker"), Some("bm25"));
+}
+
+#[test]
+fn dispatch_reranker_overrides_are_consumed_without_activation() {
+    let fixture = Fixture::new();
+    for override_args in [
+        vec!["--reranker", "hybrid"],
+        vec!["-r", "not-a-reranker"],
+        vec!["--reranker=ms-marco-minilm-l6"],
+        vec!["--reranker="],
+        vec!["--reranker", ""],
+        vec!["-r", "--bm25"],
+    ] {
+        for raw in [false, true] {
+            let mut args = vec!["search"];
+            if raw {
+                args.push("--bm25");
+            }
+            args.extend(override_args.iter().copied());
+            args.push("search option parity");
+            let output = fixture.run(&args, if raw { "raw" } else { "evidence" });
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let argv = fixture.argv();
+            assert_eq!(option_value(&argv, "--reranker"), Some("bm25"));
+            assert_eq!(
+                argv.iter()
+                    .filter(|arg| arg.as_str() == "--reranker")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("search option parity")
+            );
+            assert_eq!(argv.contains(&"--dry-run".to_owned()), !raw);
+        }
+    }
+    // Legacy tolerates a missing override operand when the query already exists.
+    let output = fixture.run(
+        &["search", "search option parity", "--reranker"],
+        "evidence",
+    );
+    assert!(output.status.success());
+    for args in [
+        vec!["search", "--reranker"],
+        vec!["search", "-r", "query"],
+        vec!["search", "--reranker="],
+        vec!["search", "--reranker", "--", "--bogus"],
+    ] {
+        fs::remove_file(fixture.root.join("probe-argv")).ok();
+        let output = fixture.run(&args, "evidence");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
 fn default_search_options_reach_probe() {
     let fixture = Fixture::new();
     let output = fixture.run(&["search", "search option parity"], "evidence");

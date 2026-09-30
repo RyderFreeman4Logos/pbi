@@ -84,4 +84,13 @@ raw_filtered=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 
 printf '%s\n' "$raw_filtered" | grep -q 'File: .*chosen.rs'
 ! printf '%s\n' "$raw_filtered" | grep -q 'File: .*drafts/'
 ! printf '%s\n' "$raw_filtered" | grep -q 'File: .*chosen.py'
+for flag in --help -h; do
+    probe search "$flag" > "$filter_root/probe-help" 2> "$filter_root/probe-help.stderr"
+    PBI_RS_ADK_ENABLE=0 "$binary" search "$flag" > "$filter_root/wrapper-help" 2> "$filter_root/wrapper-help.stderr"
+    cmp "$filter_root/probe-help" "$filter_root/wrapper-help"
+    cmp "$filter_root/probe-help.stderr" "$filter_root/wrapper-help.stderr"
+done
+reranked=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 -l rs --reranker=not-a-reranker filter_operand_marker)
+printf '%s\n' "$reranked" | grep -q '^- chosen.rs:1 '
+! printf '%s\n' "$reranked" | grep -q 'drafts/'
 printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native language/ignore selection and no-hit controls passed'

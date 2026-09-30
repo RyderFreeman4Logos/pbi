@@ -58,7 +58,7 @@ fn usage() {
                 pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. User-filtered searches remain rooted at CWD, without per-path fallback; -- preserves literal query operands."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. User-filtered searches remain rooted at CWD, without per-path fallback; -- preserves literal query operands."
     );
 }
 
@@ -172,18 +172,37 @@ fn run(
 ) -> Result<i32, CliError> {
     let (arguments, route_specs) = parse_local_route_prefix(arguments)?;
     if arguments.is_empty() {
-        usage();
-        return Ok(2);
+        return Err(CliError {
+            code: 2,
+            prefix: "pbi",
+            message: "question is required; interactive mode is disabled".to_owned(),
+        });
     }
     if arguments
         .iter()
         .take_while(|argument| argument.as_str() != "--")
         .any(|argument| argument == "--help" || argument == "-h")
     {
+        if arguments[0] == "search" {
+            if !route_specs.is_empty() {
+                return Err(CliError::usage(
+                    "--model-route is only supported for semantic questions",
+                ));
+            }
+            let root = env::current_dir()
+                .map_err(|_| CliError::failed("cannot determine repository root"))?;
+            let mut command = probe_base_command(&root);
+            command.args(&arguments);
+            let output = run_probe_command(
+                command,
+                Instant::now() + Duration::from_secs(PROBE_OUTER_DEADLINE_SECONDS),
+            )?;
+            return relay_probe_output(&output);
+        }
         usage();
         return Ok(0);
     }
-    if arguments[0] == "--version" {
+    if arguments[0] == "--version" || arguments[0] == "-V" {
         println!("pbi-rs {VERSION}");
         return Ok(0);
     }
@@ -258,13 +277,7 @@ fn run(
     let deadline = Instant::now() + deadline_duration;
     let output = invoke_probe(&root, &query, &options, raw, deadline)?;
     if raw {
-        io::stdout()
-            .write_all(&output.stdout)
-            .map_err(|_| CliError::failed("cannot write Probe output"))?;
-        io::stderr()
-            .write_all(&output.stderr)
-            .map_err(|_| CliError::failed("cannot write Probe diagnostics"))?;
-        return Ok(exit_status(&output));
+        return relay_probe_output(&output);
     }
     if !output.status.success() {
         io::stderr()
@@ -471,6 +484,12 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 raw = true;
                 index += 1;
             }
+            "--reranker" | "-r" => {
+                // Legacy discards any next operand, even an invalid/empty option.
+                // Probe remains forced to BM25; this is not reranker activation.
+                index = (index + 2).min(arguments.len());
+            }
+            value if value.starts_with("--reranker=") => index += 1,
             "--timeout" => {
                 options.timeout = next_value(arguments, &mut index, "--timeout")?;
                 validate_decimal(&options.timeout, "--timeout")?;
@@ -626,7 +645,7 @@ fn probe_has_file_records(stdout: &[u8]) -> bool {
         .any(|line| line.trim_start().starts_with("File: "))
 }
 
-fn probe_command(root: &Path, query: &str, options: &SearchOptions, raw: bool) -> Command {
+fn probe_base_command(root: &Path) -> Command {
     let probe = env::var_os("PBI_RS_PROBE").unwrap_or_else(|| "probe".into());
     let mut command = Command::new(probe);
     #[cfg(unix)]
@@ -634,7 +653,13 @@ fn probe_command(root: &Path, query: &str, options: &SearchOptions, raw: bool) -
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    command.current_dir(root).args([
+    command.current_dir(root);
+    command
+}
+
+fn probe_command(root: &Path, query: &str, options: &SearchOptions, raw: bool) -> Command {
+    let mut command = probe_base_command(root);
+    command.args([
         "search",
         "--timeout",
         &options.timeout,
@@ -929,6 +954,16 @@ fn invoke_probe(
 
 fn exit_status(output: &Output) -> i32 {
     output.status.code().unwrap_or(1)
+}
+
+fn relay_probe_output(output: &Output) -> Result<i32, CliError> {
+    io::stdout()
+        .write_all(&output.stdout)
+        .map_err(|_| CliError::failed("cannot write Probe output"))?;
+    io::stderr()
+        .write_all(&output.stderr)
+        .map_err(|_| CliError::failed("cannot write Probe diagnostics"))?;
+    Ok(exit_status(output))
 }
 
 fn evidence_cli_error(error: EvidenceError) -> CliError {
