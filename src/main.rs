@@ -68,7 +68,7 @@ fn usage() {
                 pbi-rs search [--bm25 [--format/-o <FORMAT>]] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches remain rooted at CWD, without per-path fallback. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Search --question accepts one split/inline operand (including empty), consumed without inference because BM25 ignores it; BERT reranking is not enabled. Search --session refuses durable cache writes, not Chat resumability; ambient PROBE_SESSION_ID is removed from Probe children. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches remain rooted at CWD, without per-path fallback. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
     );
 }
 
@@ -490,6 +490,7 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool), CliError> {
 
 fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), CliError> {
     let mut raw = false;
+    let mut question_seen = false;
     let mut options = SearchOptions::default();
     let mut query_parts = Vec::new();
     let mut after_separator = false;
@@ -520,6 +521,24 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 index = (index + 2).min(arguments.len());
             }
             value if value.starts_with("--reranker=") => index += 1,
+            value if value == "--session" || value.starts_with("--session=") => {
+                return Err(CliError::usage(
+                    "--session requires durable Probe cache writes; search session storage is not supported",
+                ));
+            }
+            value if value == "--question" || value.starts_with("--question=") => {
+                if question_seen {
+                    return Err(CliError::usage("--question cannot be used multiple times"));
+                }
+                // Probe result_ranking.rs:138-145 uses question only with BERT.
+                // BM25 compatibility consumes it without inference or forwarding.
+                if value == "--question" {
+                    next_value(arguments, &mut index, "--question")?;
+                } else {
+                    index += 1;
+                }
+                question_seen = true;
+            }
             "--timeout" => {
                 options.timeout = next_value(arguments, &mut index, "--timeout")?;
                 validate_decimal(&options.timeout, "--timeout")?;
@@ -758,6 +777,8 @@ fn probe_has_file_records(stdout: &[u8]) -> bool {
 fn probe_base_command(root: &Path) -> Command {
     let probe = env::var_os("PBI_RS_PROBE").unwrap_or_else(|| "probe".into());
     let mut command = Command::new(probe);
+    // Probe search_runner.rs:306-314 otherwise opens an implicit durable cache.
+    command.env_remove("PROBE_SESSION_ID");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

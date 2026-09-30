@@ -405,6 +405,112 @@ fn question_parity_positional_multiword_literal_and_missing_controls() {
 }
 
 #[test]
+fn search_question_is_consumed_without_inference() {
+    for raw in [false, true] {
+        for question in [
+            vec!["--question", "unrelated operand"],
+            vec!["--question=--help"],
+            vec!["--question", ""],
+            vec!["--question="],
+        ] {
+            let fixture = Fixture::new();
+            let mut args = vec!["search"];
+            if raw {
+                args.push("--bm25");
+            }
+            args.extend(question);
+            args.push("search option parity");
+            let output = fixture.run(&args, if raw { "raw" } else { "evidence" });
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let argv = fixture.argv();
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("search option parity")
+            );
+            assert_eq!(option_value(&argv, "--reranker"), Some("bm25"));
+            assert!(!argv
+                .iter()
+                .any(|arg| arg.contains("question") || arg.contains("unrelated")));
+        }
+    }
+    for tail in [
+        vec!["--question"],
+        vec!["--question", "--help"],
+        vec!["--question=x", "--question=y"],
+    ] {
+        let fixture = Fixture::new();
+        let mut args = vec!["search", "search option parity"];
+        args.extend(tail);
+        let output = fixture.run(&args, "evidence");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--",
+            "--question",
+            "--session",
+            "literal",
+        ],
+        "raw",
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("--question --session literal")
+    );
+}
+
+#[test]
+fn search_session_refuses_durable_cache_before_probe() {
+    for tail in [
+        vec!["--session", "owned-id"],
+        vec!["--session=../outside"],
+        vec!["--session="],
+        vec!["--session"],
+        vec!["--session", "--help"],
+    ] {
+        let fixture = Fixture::new();
+        let mut args = vec!["search", "search option parity"];
+        args.extend(tail);
+        let output = fixture.run(&args, "evidence");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"pbi-rs: --session requires durable Probe cache writes; search session storage is not supported\n");
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
+fn search_session_ambient_cache_is_not_activated() {
+    let fixture = Fixture::new();
+    let probe = fixture.root.join("fake-probe.sh");
+    fs::write(&probe, "#!/bin/sh\nset -eu\nif [ -n \"${PROBE_SESSION_ID+x}\" ]; then exit 42; fi\nprintf 'raw Probe bytes\\n'\n").expect("write env guard Probe");
+    let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .current_dir(&fixture.root)
+        .env("PBI_RS_PROBE", probe)
+        .env("PROBE_SESSION_ID", "user-session")
+        .args(["search", "--bm25", "search option parity"])
+        .output()
+        .expect("run ambient session control");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"raw Probe bytes\n");
+}
+
+#[test]
 fn default_search_options_reach_probe() {
     let fixture = Fixture::new();
     let output = fixture.run(&["search", "search option parity"], "evidence");
