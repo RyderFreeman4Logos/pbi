@@ -284,6 +284,127 @@ fn dispatch_reranker_overrides_are_consumed_without_activation() {
 }
 
 #[test]
+fn question_parity_discards_route_overrides_without_activation() {
+    for message in [false, true] {
+        for overrides in [
+            vec![
+                "--model-name",
+                "unapproved-model",
+                "--force-provider",
+                "remote",
+            ],
+            vec!["--model-name=unapproved-model", "--force-provider=remote"],
+            vec!["--model-name", "", "--force-provider="],
+            vec![
+                "--model-name",
+                "--model-route",
+                "--force-provider",
+                "--help",
+            ],
+            vec!["--force-provider"],
+        ] {
+            let fixture = Fixture::new();
+            let mut args = if message { vec!["--message"] } else { vec![] };
+            args.push("search option parity");
+            args.extend(overrides);
+            let output = fixture.run(&args, "evidence");
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let argv = fixture.argv();
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("search option parity")
+            );
+            assert_eq!(option_value(&argv, "--reranker"), Some("bm25"));
+            assert!(!argv
+                .iter()
+                .any(|arg| arg.contains("unapproved") || arg == "remote"));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Coverage: complete"));
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("semantic_adk_model"));
+        }
+    }
+}
+
+#[test]
+fn question_parity_message_rejects_unsupported_chat_tail_before_probe() {
+    for tail in [
+        vec!["--session", "resume-id"],
+        vec!["--session=resume-id"],
+        vec!["--max-tokens", "123"],
+        vec!["extra", "question"],
+        vec!["--model-route", "http://example.invalid", "model", "handle"],
+    ] {
+        let fixture = Fixture::new();
+        let mut args = vec!["--message", "search option parity"];
+        args.extend(tail);
+        let output = fixture.run(&args, "evidence");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported"));
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
+fn question_parity_positional_multiword_literal_and_missing_controls() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        &["search", "option", "parity", "--model-name=x"],
+        "evidence",
+    );
+    // Use a non-command first word for the actual positional multiword control.
+    assert_eq!(output.status.code(), Some(2));
+    let output = fixture.run(
+        &["option", "search", "parity", "--model-name=x"],
+        "evidence",
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("option search parity")
+    );
+    let output = fixture.run(
+        &[
+            "search option parity",
+            "--",
+            "--model-name=literal",
+            "--json",
+            "--model-route",
+        ],
+        "evidence",
+    );
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("search option parity --model-name=literal --json --model-route")
+    );
+    assert_ne!(output.status.code(), Some(2));
+    for args in [
+        vec!["--message", "--json", "--model-name=ignored"],
+        vec!["--message", "--model-name", "--force-provider=ignored"],
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(&args, "evidence");
+        assert_ne!(output.status.code(), Some(2));
+        assert_eq!(fixture.argv().last().map(String::as_str), Some(args[1]));
+    }
+    for args in [
+        vec!["--model-name", "x"],
+        vec!["--force-provider="],
+        vec!["--message"],
+        vec!["--message", "", "--json"],
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(&args, "evidence");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
 fn default_search_options_reach_probe() {
     let fixture = Fixture::new();
     let output = fixture.run(&["search", "search option parity"], "evidence");

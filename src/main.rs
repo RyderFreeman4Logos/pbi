@@ -58,7 +58,7 @@ fn usage() {
                 pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. User-filtered searches remain rooted at CWD, without per-path fallback; -- preserves literal query operands."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. User-filtered searches remain rooted at CWD, without per-path fallback; -- preserves literal query operands."
     );
 }
 
@@ -146,15 +146,20 @@ fn parse_local_route_prefix(
         ));
         index += 4;
     }
-    if arguments[index..]
-        .iter()
-        .take_while(|argument| argument.as_str() != "--")
-        .any(|argument| argument == "--model-route")
+    if arguments
+        .get(index)
+        .is_some_and(|argument| argument == "search")
+        && arguments[index..]
+            .iter()
+            .take_while(|argument| argument.as_str() != "--")
+            .any(|argument| argument == "--model-route")
     {
         return Err(CliError::usage(
-            "--model-route options must precede the command or question",
+            "--model-route is only supported for semantic questions",
         ));
     }
+    // Non-prefix question routes are rejected after discard operands have been
+    // consumed; an ignored legacy value may itself be --model-route.
     Ok((arguments[index..].to_vec(), routes))
 }
 
@@ -178,10 +183,12 @@ fn run(
             message: "question is required; interactive mode is disabled".to_owned(),
         });
     }
-    if arguments
-        .iter()
-        .take_while(|argument| argument.as_str() != "--")
-        .any(|argument| argument == "--help" || argument == "-h")
+    if matches!(arguments[0].as_str(), "--help" | "-h")
+        || (arguments[0] == "search"
+            && arguments
+                .iter()
+                .take_while(|argument| argument.as_str() != "--")
+                .any(|argument| argument == "--help" || argument == "-h"))
     {
         if arguments[0] == "search" {
             if !route_specs.is_empty() {
@@ -216,36 +223,12 @@ fn run(
             "--model-route is only supported for semantic questions",
         ));
     }
-    let json_output = arguments[0] != "search" && arguments.iter().any(|arg| arg == "--json");
-    let (raw, semantic, query, options) = if arguments[0] == "search" {
+    let (raw, semantic, query, options, json_output) = if arguments[0] == "search" {
         let (raw, query, options) = parse_search(&arguments[1..])?;
-        (raw, false, query, options)
-    } else if arguments[0] == "--message" {
-        let query = arguments[1..]
-            .iter()
-            .filter(|arg| arg.as_str() != "--json")
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if query.trim().is_empty() {
-            return Err(CliError::usage(
-                "question is required; interactive mode is disabled",
-            ));
-        }
-        (false, true, query, SearchOptions::default())
+        (raw, false, query, options, false)
     } else {
-        let query = arguments
-            .iter()
-            .filter(|arg| arg.as_str() != "--json")
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if query.trim().is_empty() {
-            return Err(CliError::usage(
-                "question is required; interactive mode is disabled",
-            ));
-        }
-        (false, true, query, SearchOptions::default())
+        let (query, json_output) = parse_question(&arguments)?;
+        (false, true, query, SearchOptions::default(), json_output)
     };
 
     let admitted_routes = if route_specs.is_empty() {
@@ -460,6 +443,50 @@ fn route_cli_error(error: SemanticRouteError) -> CliError {
         prefix: "pbi-rs",
         message: format!("semantic route denied: {error}"),
     }
+}
+
+fn parse_question(arguments: &[String]) -> Result<(String, bool), CliError> {
+    let message = arguments.first().is_some_and(|arg| arg == "--message");
+    let mut parts = Vec::new();
+    let mut index = 0;
+    if message {
+        // Legacy pbi:4769 captures exactly one question before parsing Chat args.
+        if let Some(question) = arguments.get(1) {
+            parts.push(question.as_str());
+        }
+        index = 2;
+    }
+    let mut literal = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.get(index) {
+        match argument.as_str() {
+            value if literal => parts.push(value),
+            "--" if !message => literal = true,
+            "--json" => json_output = true,
+            "--model-name" | "--force-provider" => {
+                // Discard exactly one operand if present, even option-looking.
+                index += 1;
+            }
+            value
+                if value.starts_with("--model-name=") || value.starts_with("--force-provider=") => {
+            }
+            value if message || value.starts_with('-') => {
+                return Err(CliError::usage(format!(
+                    "unsupported {} option or operand: {value}; only --json and discarded legacy routing options are supported; --model-route must precede the question",
+                    if message { "Chat" } else { "question" }
+                )));
+            }
+            value => parts.push(value),
+        }
+        index += 1;
+    }
+    let query = parts.join(" ");
+    if query.trim().is_empty() {
+        return Err(CliError::usage(
+            "question is required; interactive mode is disabled",
+        ));
+    }
+    Ok((query, json_output))
 }
 
 fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), CliError> {
@@ -1375,6 +1402,51 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         assert_eq!(deadline_fallback_calls.load(Ordering::SeqCst), 0);
         assert!(deadline_output.is_empty());
 
+        let mut override_question = cli_route_arguments(&question);
+        override_question.extend(
+            [
+                "--model-name=unapproved-model",
+                "--force-provider",
+                "remote",
+                "--json",
+            ]
+            .map(str::to_owned),
+        );
+        let override_factory = |routes: &[AdmittedLocalModelRoute]| {
+            assert_eq!(routes[0].model(), DEFAULT_LOCAL_MODEL);
+            assert_eq!(routes[1].model(), "abliterated-qwen-latest-27b-low");
+            cli_route_publisher(
+                routes,
+                &semantic_response,
+                true,
+                TestModelBehavior::RateLimited,
+                first_calls.clone(),
+                second_calls.clone(),
+            )
+        };
+        let mut override_output = Vec::new();
+        assert_eq!(
+            run(
+                override_question,
+                Some(TestRouteInjection::Factory {
+                    build: &override_factory,
+                    deadline: Duration::from_secs(30)
+                }),
+                &mut override_output
+            )
+            .unwrap_or_else(|error| panic!("override discard failed: {}", error.message)),
+            0
+        );
+        assert!(fs::read_to_string(root.join("probe.args"))
+            .expect("probe args")
+            .ends_with(&format!("--\n{question}\n")));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&override_output).expect("explicit JSON");
+        assert_eq!(parsed["response"], answer);
+        assert!(parsed["tokenUsage"].is_null());
+        assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 2);
+
         let incomplete_question = "where is exact_reuse_receipt and missing_target";
         let incomplete_probe = format!("File: {}, Lines: 1-1\n", root.join("receipt.py").display());
         let incomplete_report = verify_probe_evidence(
@@ -1458,6 +1530,32 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                 );
                 assert!(output.is_empty(), "forged answer must not leak");
             }
+        }
+        for arguments in [
+            vec![
+                question.clone(),
+                "--model-name".to_owned(),
+                "--json".to_owned(),
+            ],
+            vec![question.clone(), "--".to_owned(), "--json".to_owned()],
+        ] {
+            let publisher = test_publisher(
+                json!({"answer":answer,"uncertainty":"Only the verified source was inspected.","citations":[{"path":"receipt.py","start_line":1,"end_line":1}]}),
+            );
+            let mut output = Vec::new();
+            assert!(matches!(
+                run(
+                    arguments,
+                    Some(TestRouteInjection::Publisher(&publisher)),
+                    &mut output
+                ),
+                Ok(0)
+            ));
+            assert_eq!(
+                output,
+                format!("{answer}\n").as_bytes(),
+                "discarded/literal JSON must not activate output mode"
+            );
         }
         let invalid = json!({"answer":"", "uncertainty":"unknown", "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]});
         let invalid_publisher = test_publisher(invalid);

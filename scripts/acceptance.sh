@@ -93,4 +93,12 @@ done
 reranked=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 -l rs --reranker=not-a-reranker filter_operand_marker)
 printf '%s\n' "$reranked" | grep -q '^- chosen.rs:1 '
 ! printf '%s\n' "$reranked" | grep -q 'drafts/'
-printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native language/ignore selection and no-hit controls passed'
+# Actual no-model question parsing must not let discarded routing values enter
+# retrieval/coverage. Message mode keeps its single first question unchanged.
+question_clean=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" "SourceLocation display_relative")
+for mode in positional message; do
+    case "$mode" in positional) set -- ;; message) set -- --message ;; esac
+    question_sanitized=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" "$@" "SourceLocation display_relative" --model-name unapproved_model_route_canary --force-provider=remote_provider_canary)
+    test "$question_sanitized" = "$question_clean"
+done
+printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native language/ignore selection, question override discard and no-hit controls passed'
