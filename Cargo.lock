@@ -1612,7 +1612,9 @@ name = "pbi-rs"
 version = "0.1.0"
 dependencies = [
  "adk-rust",
+ "proc-macro2",
  "serde_json",
+ "syn 2.0.119",
  "tokio",
  "workflow-adk",
  "workflow-runtime",

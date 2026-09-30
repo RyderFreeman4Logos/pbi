@@ -12,6 +12,9 @@ name = "pbi_rs"
 path = "src/lib.rs"
 
 [dependencies]
+# Reuse the already locked syntax crates; no new package versions.
+syn = { version = "=2.0.119", features = ["full", "visit"] }
+proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 serde_json = "=1.0.149"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
 workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "42b1834682e433c30e23527c9234c8acc821426b" }

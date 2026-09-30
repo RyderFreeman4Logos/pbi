@@ -2,10 +2,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Cargo must stay behind ionice and the repository's canonical just recipes.
 fmt:
-    ionice -c 3 rustfmt --edition 2021 --check src/lib.rs src/main.rs src/semantic.rs tests/search_options.rs tests/relevance.rs
+    ionice -c 3 rustfmt --edition 2021 --check src/lib.rs src/main.rs src/semantic.rs src/relevance_scope.rs tests/search_options.rs tests/relevance.rs
 
 fmt-fix:
-    ionice -c 3 rustfmt --edition 2021 src/lib.rs src/main.rs src/semantic.rs tests/search_options.rs tests/relevance.rs
+    ionice -c 3 rustfmt --edition 2021 src/lib.rs src/main.rs src/semantic.rs src/relevance_scope.rs tests/search_options.rs tests/relevance.rs
 
 lock:
     ionice -c 3 cargo generate-lockfile --offline

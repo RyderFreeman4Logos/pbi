@@ -297,3 +297,298 @@ fn accepts(name: &str) -> bool { name == "id" }
         .collect::<Vec<_>>();
     assert!(failed.is_empty(), "field-role cases failed: {failed:?}");
 }
+
+#[test]
+fn frozen_scope_findings_and_siblings() {
+    let fixture = Fixture::new();
+    let cases = [
+        (
+            "control",
+            true,
+            r#####"fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+"#####,
+        ),
+        (
+            "trailing_blank_line",
+            true,
+            r#####"fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+
+"#####,
+        ),
+        (
+            "quote_character",
+            true,
+            r#####"const QUOTE: char = '"';
+fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+"#####,
+        ),
+        (
+            "quote_character_exposes_literal",
+            false,
+            r#####"const QUOTE: char = '"';
+const NOTE: &str = "match key { other => Err(FieldError::UnknownField(other)) }?";
+"#####,
+        ),
+        (
+            "lifetime_control",
+            true,
+            r#####"fn lifetime<'a>(x: &'a str) -> &'a str { x }
+fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+"#####,
+        ),
+        (
+            "unicode_control",
+            true,
+            r#####"const NOTE: &str = "中文 🦀"; /* 嵌套 /* α */ */
+fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+"#####,
+        ),
+        (
+            "discarded_key_argument",
+            false,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, pending: &mut Vec<i32>) {
+    if schema.contains(&name) { drop(name); } else { pending.push({ drop(name); 7 }); }
+}
+"#####,
+        ),
+        (
+            "history_outside_window",
+            false,
+            r#####"fn visit(name: String, schema: &mut std::collections::HashSet<String>, leftovers: &mut Vec<String>) {
+    if !schema.contains(&name) {
+        leftovers.push(name.clone());
+        let a = 1;
+        let b = 2;
+        schema.insert(name);
+    }
+}
+"#####,
+        ),
+        (
+            "adjacent_unrelated_branch",
+            false,
+            r#####"fn unrelated(flag: bool) -> Result<(), &'static str> {
+    if flag { log(); }
+    let _ = Err("unknown field").unwrap_or_else(|_: &str| ());
+    Ok(())
+}
+"#####,
+        ),
+        (
+            "discarded_predicate_comparison",
+            false,
+            r#####"fn visit(name: String, leftovers: &mut Vec<String>) {
+    if accepts(&name) { drop(name); } else { leftovers.push(name); }
+}
+fn accepts(name: &str) -> bool { let _ = name == "id"; true }
+"#####,
+        ),
+        (
+            "many_blank_lines",
+            true,
+            r#####"fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+
+
+
+"#####,
+        ),
+        (
+            "escaped_quote_char",
+            true,
+            r#####"const Q: char = '\"';
+fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+"#####,
+        ),
+        (
+            "unicode_char",
+            true,
+            r#####"const Q: char = '🦀';
+fn parse_field(key: &str) -> Result<(), &'static str> {
+    if key != "id" { return Err("unknown field"); }
+    Ok(())
+}
+"#####,
+        ),
+        (
+            "byte_quote_char",
+            false,
+            r#####"const Q: u8 = b'"';
+const NOTE: &str = "match key { other => Err(FieldError::UnknownField(other)) }?";
+"#####,
+        ),
+        (
+            "discarded_key_tuple",
+            false,
+            r#####"fn visit(name: String, schema: &Set<String>, pending: &mut Vec<(i32,i32)>) { if !schema.contains(&name) { pending.push(({drop(name); 7}, 1)); } }
+"#####,
+        ),
+        (
+            "returned_predicate",
+            true,
+            r#####"fn visit(name: String, leftovers: &mut Vec<String>) { if accepts(&name) {drop(name);} else {leftovers.push(name);} }
+fn accepts(name: &str) -> bool { return name == "id"; }
+"#####,
+        ),
+        (
+            "history_else_far",
+            false,
+            r#####"fn visit(name: String, schema: &mut Set<String>, leftovers: &mut Vec<String>) {
+ if schema.contains(&name) {drop(name);} else {
+ leftovers.push(name.clone());
+ let a=1;
+ let b=2;
+ schema.insert(name);
+ }
+}
+"#####,
+        ),
+        (
+            "swallowed_inside_guard",
+            false,
+            r#####"fn visit(key: &str) -> Result<(), &str> { if key != "id" { let _ = Err("unknown field").unwrap_or_else(|_: &str| ()); } Ok(()) }
+"#####,
+        ),
+        (
+            "sibling_history",
+            true,
+            r#####"fn visit(name: String, schema: &Set<String>, other: &mut Set<String>, leftovers: &mut Vec<String>) { if !schema.contains(&name) { leftovers.push(name); } else {other.insert(name);} }
+"#####,
+        ),
+    ];
+    let failed = cases
+        .iter()
+        .filter_map(|(name, positive, source)| {
+            (!std::panic::catch_unwind(|| fixture.check(name, source, *positive)).unwrap_or(false))
+                .then_some(*name)
+        })
+        .collect::<Vec<_>>();
+    assert!(failed.is_empty(), "scope regressions: {failed:?}");
+}
+
+#[test]
+fn transformed_key_capture_requires_local_return_linkage() {
+    let fixture = Fixture::new();
+    let source = r#"fn visit(package: bool, key: String, extensions: &mut Vec<(String,i32)>) {
+ if package && PACKAGE_FIELDS.contains(&key.as_str()) {
+  ignored();
+ } else {
+  extensions.push((extension_name(None, &key)?, value()?));
+ }
+}
+fn extension_name(location: Option<&str>, key: &str) -> Result<String, Error> {
+ if key.is_empty() { return Err(error()); }
+ let name = match location {
+  Some(location) => format!("{location}.x.{key}"),
+  None => format!("x.{key}"),
+ };
+ if name.len() > 64 { return Err(error()); }
+ Ok(name)
+}
+"#;
+    assert!(fixture.check("linked_transform", source, true));
+    let discarded = source
+        .replace(
+            r#"format!("{location}.x.{key}")"#,
+            r#"format!("{location}.x")"#,
+        )
+        .replace(r#"format!("x.{key}")"#, r#"format!("x")"#);
+    assert!(fixture.check("discarded_transform", &discarded, false));
+}
+
+#[test]
+fn admitted_literal_stress_is_bounded_and_fail_closed() {
+    let fixture = Fixture::new();
+    let source = format!("fn main() {{\n{}}}\n", "let _ = \"\";\n".repeat(100_000));
+    assert!(source.len() < 2 * 1024 * 1024);
+    assert!(fixture.check("literal_budget", &source, false));
+}
+
+#[test]
+fn structural_value_and_binding_boundaries() {
+    let fixture = Fixture::new();
+    let cases = [
+        (
+            "swallowed_tail_match",
+            false,
+            r#"fn parse(key: &str) -> () {
+ (match key { "id" => Ok(()), other => Err(FieldError::UnknownField(other)) }).unwrap_or_else(|_| ())
+}
+"#,
+        ),
+        (
+            "shadowed_predicate",
+            false,
+            r#"fn visit(name: String, extras: &mut Vec<String>) {
+ let accepts = |_: &str| true;
+ if accepts(&name) { drop(name); } else { extras.push(name); }
+}
+fn accepts(name: &str) -> bool { name == "id" }
+"#,
+        ),
+        (
+            "shadowed_guard_key",
+            false,
+            r#"fn visit(name: String, schema: &Set<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) { let name = "unrelated".to_owned(); extras.push(name); }
+}
+"#,
+        ),
+        (
+            "later_receiver_clear",
+            false,
+            r#"fn visit(name: String, schema: &mut Set<String>, extras: &mut Vec<String>) {
+ if !schema.contains(&name) {
+  extras.push(name);
+  unrelated();
+  unrelated();
+  schema.clear();
+ }
+}
+"#,
+        ),
+        (
+            "propagated_match",
+            true,
+            r#"fn parse(key: &str) -> Result<(), FieldError> {
+ (match key { "id" => Ok(()), other => Err(FieldError::UnknownField(other)) })?;
+ Ok(())
+}
+"#,
+        ),
+    ];
+    let mut failed = cases
+        .iter()
+        .filter_map(|(name, positive, source)| {
+            (!fixture.check(name, source, *positive)).then_some(*name)
+        })
+        .collect::<Vec<_>>();
+    let fields = (0..30)
+        .map(|i| format!("field_{i}: Option<String>,\n"))
+        .collect::<String>();
+    let source = format!("struct ManyFields {{\n{fields}}}\nfn parse(key: &str) -> Result<(), &str> {{ if key != \"id\" {{ return Err(\"unknown field\"); }} Ok(()) }}\n");
+    if !fixture.check("comma_separated_fields", &source, true) {
+        failed.push("comma_separated_fields");
+    }
+    assert!(failed.is_empty(), "structural boundaries: {failed:?}");
+}

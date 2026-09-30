@@ -1,3 +1,4 @@
+mod relevance_scope;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -609,23 +610,16 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
     features
 }
 
-struct LiteralSpan {
-    start: usize,
-    end: usize,
-}
-
 struct CodeView {
     code: String,
-    literals: Vec<LiteralSpan>,
 }
 
 impl CodeView {
-    // Rust lexical handling only: comments and double-quoted ordinary/raw strings.
+    // Byte-preserving lexical projection; semantic proof uses the syntax tree.
     // Mask bytes, not lines, so every window still addresses the original source.
     fn new(source: &str) -> Self {
         let bytes = source.as_bytes();
         let mut code = bytes.to_vec();
-        let mut literals = Vec::new();
         let mut index = 0;
         while index < bytes.len() {
             let start = index;
@@ -648,6 +642,8 @@ impl CodeView {
                         index += 1;
                     }
                 }
+            } else if bytes[index] == b'\'' && character_end(source, index).is_some() {
+                index = character_end(source, index).unwrap_or(index + 1);
             } else {
                 let mut quote = index;
                 if bytes[index] == b'r' {
@@ -678,7 +674,6 @@ impl CodeView {
                         index += 1;
                     }
                 }
-                literals.push(LiteralSpan { start, end: index });
             }
             for byte in &mut code[start..index] {
                 if *byte != b'\n' && *byte != b'\r' {
@@ -689,160 +684,39 @@ impl CodeView {
         Self {
             // Retained UTF-8 is unchanged; each removed byte is ASCII whitespace.
             code: String::from_utf8_lossy(&code).into_owned(),
-            literals,
         }
     }
 }
 
-fn identifier_before(text: &str) -> &str {
-    let text = text.trim_end();
-    let start = text
-        .char_indices()
-        .rfind(|(_, character)| {
-            !character.is_alphanumeric() && !matches!(*character, '_' | ':' | '.')
-        })
-        .map_or(0, |(position, character)| position + character.len_utf8());
-    &text[start..]
-}
-
-fn scope_end(text: &str, opening: usize, open: char, close: char) -> usize {
-    let mut depth = 0usize;
-    for (index, character) in text[opening..].char_indices() {
-        match character {
-            character if character == open => depth += 1,
-            character if character == close => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return opening + index + 1;
+// A character has one scalar or one escape followed by a closing apostrophe.
+// Lifetimes have no closing apostrophe and must remain executable syntax.
+fn character_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut end = start + 1;
+    if bytes.get(end) == Some(&b'\\') {
+        end += 1;
+        match bytes.get(end)? {
+            b'u' if bytes.get(end + 1) == Some(&b'{') => {
+                end += 2;
+                let limit = (end + 7).min(bytes.len());
+                while end < limit && bytes[end] != b'}' {
+                    end += 1;
                 }
-            }
-            _ => {}
-        }
-    }
-    text.len()
-}
-
-fn error_argument(code: &str) -> bool {
-    let mut calls = Vec::new();
-    for (index, character) in code.char_indices() {
-        match character {
-            '(' => calls.push(identifier_before(&code[..index]).to_lowercase()),
-            ')' => {
-                calls.pop();
-            }
-            _ => {}
-        }
-    }
-    calls.iter().any(|call| {
-        tokenized(call)
-            .iter()
-            .any(|token| token == "err" || token == "error")
-    })
-}
-
-fn error_diagnostic(code: &str, source: &str, start: usize, end: usize, kind: &str) -> bool {
-    let message = tokenized(&source[start..end]);
-    message.iter().any(|token| token == kind)
-        && message
-            .iter()
-            .any(|token| token == "field" || token == "fields")
-        && error_argument(&code[..start])
-}
-
-fn captures_field_fallback(code: &str, source: &str, literals: &[(usize, usize)]) -> bool {
-    for (if_start, _) in code.match_indices("if ") {
-        let rest = &code[if_start + 3..];
-        let Some(opening) = rest.find('{') else {
-            continue;
-        };
-        let condition = rest[..opening].trim();
-        let Some(argument_start) = condition.find('(') else {
-            continue;
-        };
-        let call = identifier_before(&condition[..argument_start]);
-        let Some(key) = raw_identifiers(&condition[argument_start + 1..])
-            .first()
-            .cloned()
-        else {
-            continue;
-        };
-        let receiver = call.strip_suffix(".contains");
-        let schema_role = if let Some(receiver) = receiver {
-            tokenized(receiver)
-                .iter()
-                .any(|token| token == "field" || token == "fields" || token == "schema")
-        } else {
-            // A local predicate must actually compare its argument to a literal key.
-            let definition = format!("fn {call}(");
-            code.find(&definition).is_some_and(|start| {
-                let signature = start + definition.len();
-                let Some(parameter) = raw_identifiers(&code[signature..]).first().cloned() else {
-                    return false;
-                };
-                let Some(body_start) = code[signature..].find('{').map(|offset| signature + offset)
-                else {
-                    return false;
-                };
-                let body_end = scope_end(code, body_start, '{', '}');
-                literals.iter().any(|(start, end)| {
-                    if *start <= body_start || *end > body_end {
-                        return false;
-                    }
-                    let before = code[body_start..*start].trim_end();
-                    before
-                        .strip_suffix("==")
-                        .is_some_and(|operand| identifier_before(operand) == parameter)
-                })
-            })
-        };
-        if !schema_role {
-            continue;
-        }
-        let end = scope_end(rest, opening, '{', '}');
-        let (branch, branches_end) = if condition.starts_with('!') {
-            (&rest[opening..end], end)
-        } else {
-            let after = rest[end..].trim_start();
-            let Some(after) = after.strip_prefix("else").map(str::trim_start) else {
-                continue;
-            };
-            if !after.starts_with('{') {
-                continue;
-            }
-            let branch_end = scope_end(after, 0, '{', '}');
-            (&after[..branch_end], rest.len() - after.len() + branch_end)
-        };
-        let body_start = if_start + 3 + opening;
-        let body_end = if_start + 3 + branches_end;
-        if literals.iter().any(|(start, end)| {
-            *start >= body_start
-                && *end <= body_end
-                && error_diagnostic(code, source, *start, *end, "duplicate")
-        }) {
-            continue;
-        }
-        // Mutating the membership collection establishes history, not a schema.
-        if receiver.is_some_and(|receiver| {
-            let branches = &rest[opening..branches_end];
-            branches.contains(&format!("{receiver}.insert("))
-                || branches.contains(&format!("{receiver}.push("))
-        }) {
-            continue;
-        }
-        for mutation in [".push(", ".insert("] {
-            for (start, _) in branch.match_indices(mutation) {
-                let opening = start + mutation.len() - 1;
-                let end = scope_end(branch, opening, '(', ')');
-                if raw_identifiers(&branch[opening + 1..end]).contains(&key) {
-                    return true;
+                if bytes.get(end) != Some(&b'}') {
+                    return None;
                 }
+                end += 1;
             }
+            b'x' => end += 3,
+            _ => end += 1,
         }
+    } else {
+        end += source.get(end..)?.chars().next()?.len_utf8();
     }
-    false
+    (bytes.get(end) == Some(&b'\'')).then_some(end + 1)
 }
 
-fn window_features(code: &str, source: &str, literals: &[(usize, usize)]) -> Vec<&'static str> {
+fn window_features(code: &str, unknown_field_proved: bool) -> Vec<&'static str> {
     let lower = code.to_lowercase();
     let mut features = Vec::new();
     let add = |features: &mut Vec<&'static str>, feature| {
@@ -851,7 +725,6 @@ fn window_features(code: &str, source: &str, literals: &[(usize, usize)]) -> Vec
         }
     };
     let tokens = tokenized(&lower);
-    let has = |needle: &str| tokens.iter().any(|token| token_matches(token, needle));
     if tokens.iter().any(|token| {
         ["error", "err", "failure", "fail", "exception", "invalid"]
             .iter()
@@ -898,32 +771,7 @@ fn window_features(code: &str, source: &str, literals: &[(usize, usize)]) -> Vec
         add(&mut features, "data");
     }
 
-    let unknown_field = has("unknown") && has("field");
-    let serde_rejects_unknown_fields = lower.contains("serde")
-        && has("deny")
-        && unknown_field
-        && has("derive")
-        && has("deserialize")
-        && (has("struct") || has("enum"));
-    let captures_unrecognized_fields = captures_field_fallback(code, source, literals);
-    let diagnostic_rejection = literals
-        .iter()
-        .any(|(start, end)| error_diagnostic(code, source, *start, *end, "unknown"));
-    let unknown_field_error_call = code.match_indices('(').any(|(index, _)| {
-        let name = tokenized(identifier_before(&code[..index]));
-        name.iter().any(|token| token == "unknown")
-            && name
-                .iter()
-                .any(|token| token == "field" || token == "fields")
-            && error_argument(&code[..index])
-    });
-    let rejects_unknown_field_fallback = (unknown_field_error_call || diagnostic_rejection)
-        && (has("err") || has("error"))
-        && (lower.contains("if ") || (lower.contains("match ") && lower.contains("=>")));
-    if serde_rejects_unknown_fields
-        || captures_unrecognized_fields
-        || rejects_unknown_field_fallback
-    {
+    if unknown_field_proved {
         add(&mut features, "unknown-field-handling");
     }
     features
@@ -1107,30 +955,18 @@ fn best_window(
         .collect::<Vec<_>>();
     let source = lines.join("\n");
     let view = CodeView::new(&source);
-    let code_lines: Vec<&str> = view.code.lines().collect();
-    let mut offset = 0;
-    let offsets: Vec<usize> = lines
-        .iter()
-        .map(|line| {
-            let start = offset;
-            offset += line.len() + 1;
-            start
-        })
-        .collect();
+    // split, unlike lines(), preserves the cardinality of the original joined lines.
+    let code_lines: Vec<&str> = view.code.split('\n').collect();
+    let scopes = relevance_scope::Proofs::new(&source, &view.code);
+    if requested.contains(&"unknown-field-handling") && scopes.is_empty() {
+        return None;
+    }
     let mut best: Option<ScoredEvidence> = None;
     for start in 0..lines.len() {
         for length in 1..=MAX_EVIDENCE_LINES.min(lines.len() - start) {
             let end = start + length;
             let text = lines[start..end].join("\n");
             let code = code_lines[start..end].join("\n");
-            let literals: Vec<(usize, usize)> = view
-                .literals
-                .iter()
-                .filter(|literal| {
-                    literal.start >= offsets[start] && literal.end <= offsets[start] + text.len()
-                })
-                .map(|literal| (literal.start - offsets[start], literal.end - offsets[start]))
-                .collect();
             let relevance_text = if behavioral { &code } else { &text };
             let group_matches = matching_terms(&group.terms, relevance_text);
             let any_matches = matching_terms(&all_terms, relevance_text).len();
@@ -1138,7 +974,7 @@ fn best_window(
             let path_context = matching_terms(&context_terms, &path_text);
             let context_matches =
                 matching_terms(&all_terms, &format!("{path_text}\n{relevance_text}"));
-            let features = window_features(&code, &text, &literals);
+            let features = window_features(&code, scopes.covers(start + 1, end));
             if requested.contains(&"unknown-field-handling")
                 && !features.contains(&"unknown-field-handling")
             {
