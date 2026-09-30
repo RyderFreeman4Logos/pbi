@@ -609,20 +609,240 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
     features
 }
 
-fn without_full_line_comment(line: &str) -> &str {
-    if line.trim_start().starts_with("//") {
-        ""
-    } else {
-        line
+struct LiteralSpan {
+    start: usize,
+    end: usize,
+}
+
+struct CodeView {
+    code: String,
+    literals: Vec<LiteralSpan>,
+}
+
+impl CodeView {
+    // Rust lexical handling only: comments and double-quoted ordinary/raw strings.
+    // Mask bytes, not lines, so every window still addresses the original source.
+    fn new(source: &str) -> Self {
+        let bytes = source.as_bytes();
+        let mut code = bytes.to_vec();
+        let mut literals = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            let start = index;
+            if bytes[index..].starts_with(b"//") {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            } else if bytes[index..].starts_with(b"/*") {
+                index += 2;
+                let mut depth = 1;
+                while index < bytes.len() && depth > 0 {
+                    if bytes[index..].starts_with(b"/*") {
+                        depth += 1;
+                        index += 2;
+                    } else if bytes[index..].starts_with(b"*/") {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            } else {
+                let mut quote = index;
+                if bytes[index] == b'r' {
+                    quote += 1;
+                    while quote < bytes.len() && bytes[quote] == b'#' {
+                        quote += 1;
+                    }
+                }
+                if bytes.get(quote) != Some(&b'"') {
+                    index += 1;
+                    continue;
+                }
+                let raw = bytes[index] == b'r';
+                let hashes = quote.saturating_sub(index + 1);
+                index = quote + 1;
+                while index < bytes.len() {
+                    if !raw && bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"'
+                        && (!raw
+                            || bytes
+                                .get(index + 1..index + 1 + hashes)
+                                .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#')))
+                    {
+                        index += 1 + if raw { hashes } else { 0 };
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+                literals.push(LiteralSpan { start, end: index });
+            }
+            for byte in &mut code[start..index] {
+                if *byte != b'\n' && *byte != b'\r' {
+                    *byte = b' ';
+                }
+            }
+        }
+        Self {
+            // Retained UTF-8 is unchanged; each removed byte is ASCII whitespace.
+            code: String::from_utf8_lossy(&code).into_owned(),
+            literals,
+        }
     }
 }
 
-fn window_features(text: &str) -> Vec<&'static str> {
-    let code = text
-        .lines()
-        .map(without_full_line_comment)
-        .collect::<Vec<_>>()
-        .join("\n");
+fn identifier_before(text: &str) -> &str {
+    let text = text.trim_end();
+    let start = text
+        .char_indices()
+        .rfind(|(_, character)| {
+            !character.is_alphanumeric() && !matches!(*character, '_' | ':' | '.')
+        })
+        .map_or(0, |(position, character)| position + character.len_utf8());
+    &text[start..]
+}
+
+fn scope_end(text: &str, opening: usize, open: char, close: char) -> usize {
+    let mut depth = 0usize;
+    for (index, character) in text[opening..].char_indices() {
+        match character {
+            character if character == open => depth += 1,
+            character if character == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return opening + index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
+fn error_argument(code: &str) -> bool {
+    let mut calls = Vec::new();
+    for (index, character) in code.char_indices() {
+        match character {
+            '(' => calls.push(identifier_before(&code[..index]).to_lowercase()),
+            ')' => {
+                calls.pop();
+            }
+            _ => {}
+        }
+    }
+    calls.iter().any(|call| {
+        tokenized(call)
+            .iter()
+            .any(|token| token == "err" || token == "error")
+    })
+}
+
+fn error_diagnostic(code: &str, source: &str, start: usize, end: usize, kind: &str) -> bool {
+    let message = tokenized(&source[start..end]);
+    message.iter().any(|token| token == kind)
+        && message
+            .iter()
+            .any(|token| token == "field" || token == "fields")
+        && error_argument(&code[..start])
+}
+
+fn captures_field_fallback(code: &str, source: &str, literals: &[(usize, usize)]) -> bool {
+    for (if_start, _) in code.match_indices("if ") {
+        let rest = &code[if_start + 3..];
+        let Some(opening) = rest.find('{') else {
+            continue;
+        };
+        let condition = rest[..opening].trim();
+        let Some(argument_start) = condition.find('(') else {
+            continue;
+        };
+        let call = identifier_before(&condition[..argument_start]);
+        let Some(key) = raw_identifiers(&condition[argument_start + 1..])
+            .first()
+            .cloned()
+        else {
+            continue;
+        };
+        let receiver = call.strip_suffix(".contains");
+        let schema_role = if let Some(receiver) = receiver {
+            tokenized(receiver)
+                .iter()
+                .any(|token| token == "field" || token == "fields" || token == "schema")
+        } else {
+            // A local predicate must actually compare its argument to a literal key.
+            let definition = format!("fn {call}(");
+            code.find(&definition).is_some_and(|start| {
+                let signature = start + definition.len();
+                let Some(parameter) = raw_identifiers(&code[signature..]).first().cloned() else {
+                    return false;
+                };
+                let Some(body_start) = code[signature..].find('{').map(|offset| signature + offset)
+                else {
+                    return false;
+                };
+                let body_end = scope_end(code, body_start, '{', '}');
+                literals.iter().any(|(start, end)| {
+                    if *start <= body_start || *end > body_end {
+                        return false;
+                    }
+                    let before = code[body_start..*start].trim_end();
+                    before
+                        .strip_suffix("==")
+                        .is_some_and(|operand| identifier_before(operand) == parameter)
+                })
+            })
+        };
+        if !schema_role {
+            continue;
+        }
+        let end = scope_end(rest, opening, '{', '}');
+        let (branch, branches_end) = if condition.starts_with('!') {
+            (&rest[opening..end], end)
+        } else {
+            let after = rest[end..].trim_start();
+            let Some(after) = after.strip_prefix("else").map(str::trim_start) else {
+                continue;
+            };
+            if !after.starts_with('{') {
+                continue;
+            }
+            let branch_end = scope_end(after, 0, '{', '}');
+            (&after[..branch_end], rest.len() - after.len() + branch_end)
+        };
+        let body_start = if_start + 3 + opening;
+        let body_end = if_start + 3 + branches_end;
+        if literals.iter().any(|(start, end)| {
+            *start >= body_start
+                && *end <= body_end
+                && error_diagnostic(code, source, *start, *end, "duplicate")
+        }) {
+            continue;
+        }
+        // Mutating the membership collection establishes history, not a schema.
+        if receiver.is_some_and(|receiver| {
+            let branches = &rest[opening..branches_end];
+            branches.contains(&format!("{receiver}.insert("))
+                || branches.contains(&format!("{receiver}.push("))
+        }) {
+            continue;
+        }
+        for mutation in [".push(", ".insert("] {
+            for (start, _) in branch.match_indices(mutation) {
+                let opening = start + mutation.len() - 1;
+                let end = scope_end(branch, opening, '(', ')');
+                if raw_identifiers(&branch[opening + 1..end]).contains(&key) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn window_features(code: &str, source: &str, literals: &[(usize, usize)]) -> Vec<&'static str> {
     let lower = code.to_lowercase();
     let mut features = Vec::new();
     let add = |features: &mut Vec<&'static str>, feature| {
@@ -685,33 +905,21 @@ fn window_features(text: &str) -> Vec<&'static str> {
         && has("derive")
         && has("deserialize")
         && (has("struct") || has("enum"));
-    let captures_unrecognized_fields = if has("field") && has("key") {
-        let membership = lower.find(".contains(");
-        membership.is_some_and(|membership| {
-            let after_membership = &lower[membership..];
-            let collection_mutation =
-                |text: &str| text.contains(".push(") || text.contains(".insert(");
-            lower[..membership]
-                .rfind("if ")
-                .map(|if_start| &lower[if_start + 3..membership])
-                .is_some_and(|condition| {
-                    if condition.contains('!') {
-                        collection_mutation(after_membership)
-                    } else {
-                        after_membership.find("else").is_some_and(|else_start| {
-                            collection_mutation(&after_membership[else_start + 4..])
-                        })
-                    }
-                })
-        })
-    } else {
-        false
-    };
-    let rejects_unknown_field_fallback = unknown_field
-        && has("key")
+    let captures_unrecognized_fields = captures_field_fallback(code, source, literals);
+    let diagnostic_rejection = literals
+        .iter()
+        .any(|(start, end)| error_diagnostic(code, source, *start, *end, "unknown"));
+    let unknown_field_error_call = code.match_indices('(').any(|(index, _)| {
+        let name = tokenized(identifier_before(&code[..index]));
+        name.iter().any(|token| token == "unknown")
+            && name
+                .iter()
+                .any(|token| token == "field" || token == "fields")
+            && error_argument(&code[..index])
+    });
+    let rejects_unknown_field_fallback = (unknown_field_error_call || diagnostic_rejection)
         && (has("err") || has("error"))
-        && lower.contains("match ")
-        && lower.contains("=>");
+        && (lower.contains("if ") || (lower.contains("match ") && lower.contains("=>")));
     if serde_rejects_unknown_fields
         || captures_unrecognized_fields
         || rejects_unknown_field_fallback
@@ -793,7 +1001,6 @@ fn call_markers(text: &str) -> Vec<String> {
 }
 
 fn line_markers(text: &str) -> Vec<String> {
-    let text = without_full_line_comment(text);
     if text.trim_start().starts_with('#') {
         return Vec::new();
     }
@@ -898,17 +1105,40 @@ fn best_window(
         .flat_map(|candidate| candidate.terms.iter().cloned())
         .filter(|term| !group.terms.contains(term))
         .collect::<Vec<_>>();
+    let source = lines.join("\n");
+    let view = CodeView::new(&source);
+    let code_lines: Vec<&str> = view.code.lines().collect();
+    let mut offset = 0;
+    let offsets: Vec<usize> = lines
+        .iter()
+        .map(|line| {
+            let start = offset;
+            offset += line.len() + 1;
+            start
+        })
+        .collect();
     let mut best: Option<ScoredEvidence> = None;
     for start in 0..lines.len() {
         for length in 1..=MAX_EVIDENCE_LINES.min(lines.len() - start) {
             let end = start + length;
             let text = lines[start..end].join("\n");
-            let group_matches = matching_terms(&group.terms, &text);
-            let any_matches = matching_terms(&all_terms, &text).len();
+            let code = code_lines[start..end].join("\n");
+            let literals: Vec<(usize, usize)> = view
+                .literals
+                .iter()
+                .filter(|literal| {
+                    literal.start >= offsets[start] && literal.end <= offsets[start] + text.len()
+                })
+                .map(|literal| (literal.start - offsets[start], literal.end - offsets[start]))
+                .collect();
+            let relevance_text = if behavioral { &code } else { &text };
+            let group_matches = matching_terms(&group.terms, relevance_text);
+            let any_matches = matching_terms(&all_terms, relevance_text).len();
             let path_matches = matching_terms(&group.terms, &path_text);
             let path_context = matching_terms(&context_terms, &path_text);
-            let context_matches = matching_terms(&all_terms, &format!("{path_text}\n{text}"));
-            let features = window_features(&text);
+            let context_matches =
+                matching_terms(&all_terms, &format!("{path_text}\n{relevance_text}"));
+            let features = window_features(&code, &text, &literals);
             if requested.contains(&"unknown-field-handling")
                 && !features.contains(&"unknown-field-handling")
             {
@@ -918,7 +1148,7 @@ fn best_window(
                 .iter()
                 .filter(|feature| features.contains(feature))
                 .count();
-            let markers = lines[start..end]
+            let markers = code_lines[start..end]
                 .iter()
                 .flat_map(|line| line_markers(line))
                 .fold(Vec::new(), |mut markers, marker| {
@@ -927,7 +1157,7 @@ fn best_window(
                     }
                     markers
                 });
-            let exact_symbol = exact_symbol_in_lines(group, lines, start, end);
+            let exact_symbol = exact_symbol_in_lines(group, &code_lines, start, end);
             let test_context = test_window(lines, start, end);
             if exact_symbol.is_none() && lexical_harness_window(&text) {
                 continue;
