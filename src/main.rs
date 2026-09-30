@@ -37,10 +37,10 @@ fn usage() {
     println!(
         "pbi-rs {VERSION} — Probe-backed source evidence\n\
          Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
-                pbi-rs search [--bm25] <query>\n\
+                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only; --bm25 relays raw Probe output."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion."
     );
 }
 
@@ -502,9 +502,23 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, String, usize), C
             }
         }
     }
-    let query = query_parts.join(" ");
+    let mut query = query_parts.join(" ");
     if query.trim().is_empty() {
         return Err(CliError::usage("search query is required"));
+    }
+    // Legacy verified search expands owner:member, while raw BM25 stays literal.
+    if !raw {
+        if let Some((owner, member)) = query.split_once(':') {
+            let is_name = |name: &str| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+            };
+            if is_name(owner) && is_name(member) {
+                query = format!("{owner} {member}");
+            }
+        }
     }
     Ok((raw, query, timeout, max_results))
 }

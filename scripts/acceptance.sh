@@ -50,4 +50,8 @@ printf '%s\n' "$debug" | grep -q '^model_route_credentials=handle_names_only_val
 real=$(cd "$repo_root/src" && "$binary" search "SourceLocation display_relative")
 printf '%s\n' "$real" | grep -q '^Coverage: complete$'
 printf '%s\n' "$real" | grep -Eq '^-[[:space:]]lib.rs:[0-9]+(-[0-9]+)? '
+scoped=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" search "SourceLocation:display_relative")
+printf '%s\n' "$scoped" | grep -q '^Coverage: complete$'
+printf '%s\n' "$scoped" | grep -Eq '^-[[:space:]]lib.rs:[0-9]+(-[0-9]+)? '
+printf '%s\n' "$scoped" | grep -q 'pub fn display_relative'
 printf '%s\n' 'acceptance: deterministic fixture and real Probe passed'

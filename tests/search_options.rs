@@ -219,6 +219,30 @@ fn explicit_search_options_reach_probe_with_effective_values() {
 }
 
 #[test]
+fn scoped_search_shorthand_normalizes_verified_query_but_not_raw_query() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["search", "search_option:parity"], "evidence");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("search_option parity")
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture.rs:1"));
+
+    let output = fixture.run(&["search", "--bm25", "search_option:parity"], "raw");
+    assert!(output.status.success());
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("search_option:parity")
+    );
+    assert_eq!(output.stdout, b"raw Probe bytes\n");
+}
+
+#[test]
 fn invalid_or_missing_numeric_options_stop_before_probe() {
     let fixture = Fixture::new();
     for (args, expected_error) in [
