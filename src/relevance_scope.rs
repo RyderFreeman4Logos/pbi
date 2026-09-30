@@ -356,7 +356,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         let mut bindings = Bindings::default();
         bindings.visit_signature(&item.sig);
         bindings.visit_block(&item.block);
-        let previous = std::mem::replace(&mut self.shadowed, bindings.0);
+        let previous = std::mem::replace(&mut self.shadowed, bindings.names);
         self.visit_block(&item.block);
         self.shadowed = previous;
         self.returned = saved;
@@ -367,7 +367,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         let mut bindings = Bindings::default();
         bindings.visit_signature(&item.sig);
         bindings.visit_block(&item.block);
-        let previous = std::mem::replace(&mut self.shadowed, bindings.0);
+        let previous = std::mem::replace(&mut self.shadowed, bindings.names);
         self.visit_block(&item.block);
         self.shadowed = previous;
         self.returned = saved;
@@ -463,13 +463,19 @@ struct History<'a> {
     invalid: bool,
 }
 impl History<'_> {
-    fn owns(&self, expr: &Expr) -> bool {
+    fn owns_root(&self, expr: &Expr, root: &str) -> bool {
         match bare(expr) {
-            Expr::Field(e) => self.owns(&e.base),
-            Expr::Index(e) => self.owns(&e.expr),
-            Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => self.owns(&e.expr),
-            e => name(e).is_some_and(|n| n == self.key || self.receiver == Some(n.as_str())),
+            Expr::Field(e) => self.owns_root(&e.base, root),
+            Expr::Index(e) => self.owns_root(&e.expr, root),
+            Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => self.owns_root(&e.expr, root),
+            e => name(e).is_some_and(|n| n == root),
         }
+    }
+    fn owns(&self, expr: &Expr) -> bool {
+        self.owns_root(expr, self.key)
+            || self
+                .receiver
+                .is_some_and(|receiver| self.owns_root(expr, receiver))
     }
 }
 impl<'ast> Visit<'ast> for History<'_> {
@@ -525,8 +531,9 @@ impl<'ast> Visit<'ast> for History<'_> {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         // Unresolved key methods may mutate it; retain only transparent key
         // operations already supported by value linkage, not a keyword blacklist.
-        if name(&call.receiver).as_deref() == Some(self.key)
+        if self.owns_root(&call.receiver, self.key)
             && !(call.args.is_empty()
+                && name(&call.receiver).as_deref() == Some(self.key)
                 && matches!(
                     call.method.to_string().as_str(),
                     "clone" | "to_owned" | "as_str"
@@ -536,8 +543,7 @@ impl<'ast> Visit<'ast> for History<'_> {
         }
         if self
             .receiver
-            .is_some_and(|r| name(&call.receiver).as_deref() == Some(r))
-            && call.method != "contains"
+            .is_some_and(|r| self.owns_root(&call.receiver, r) && call.method != "contains")
         {
             self.invalid = true;
         }
@@ -596,7 +602,7 @@ fn template_return(block: &Block, parameter: &str) -> bool {
                         }
                         let mut bindings = Bindings::default();
                         bindings.visit_pat(&arm.pat);
-                        if bindings.0.contains(parameter) {
+                        if bindings.opaque || bindings.names.contains(parameter) {
                             return false;
                         }
                         let Expr::Macro(expr) = bare(&arm.body) else {
@@ -627,13 +633,19 @@ fn template_return(block: &Block, parameter: &str) -> bool {
 }
 
 #[derive(Default)]
-struct Bindings(BTreeSet<String>);
+struct Bindings {
+    names: BTreeSet<String>,
+    opaque: bool,
+}
 impl<'ast> Visit<'ast> for Bindings {
     fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
-        self.0.insert(pat.ident.to_string());
+        self.names.insert(pat.ident.to_string());
         visit::visit_pat_ident(self, pat);
     }
+    fn visit_expr_macro(&mut self, _: &'ast syn::ExprMacro) {
+        self.opaque = true;
+    }
     fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
-        self.0.insert(function.sig.ident.to_string());
+        self.names.insert(function.sig.ident.to_string());
     }
 }

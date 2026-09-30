@@ -856,3 +856,112 @@ fn extension_name(location: Option<&str>, key: &str) -> Result<String, &'static 
         .collect::<Vec<_>>();
     assert!(failed.is_empty(), "ownership/liveness cases: {failed:?}");
 }
+
+#[test]
+fn projection_and_deferred_boundary_controls() {
+    let fixture = Fixture::new();
+    let cases = [
+        (
+            "key_field_mutating_method",
+            false,
+            r#####"struct Key(String);
+fn visit(key: Key, schema: &std::collections::HashSet<Key>, extras: &mut Vec<Key>) {
+    if !schema.contains(&key) { key.0.clear(); extras.push(key); }
+}
+"#####,
+        ),
+        (
+            "receiver_deref_mutating_method",
+            false,
+            r#####"fn visit(name: String, schema: &mut std::collections::HashSet<String>, extras: &mut Vec<String>) {
+    if !schema.contains(&name) { (*schema).insert(name.clone()); extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "helper_macro_pattern_shadow",
+            false,
+            r#####"macro_rules! nested_pattern { ($binding:ident) => { Some(Some($binding)) }; }
+fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) -> Result<(), &'static str> {
+    if !schema.contains(&key) { extras.push(extension_name(Some(Some("unrelated")), &key)?); }
+    Ok(())
+}
+fn extension_name(location: Option<Option<&str>>, key: &str) -> Result<String, &'static str> {
+    let name = match location {
+        nested_pattern!(key) => format!("{key}"),
+        _ => format!("{key}"),
+    };
+    Ok(name)
+}
+"#####,
+        ),
+        (
+            "key_field_unrelated_method_control",
+            true,
+            r#####"struct Key(String);
+fn visit(key: Key, other: &mut Key, schema: &std::collections::HashSet<Key>, extras: &mut Vec<Key>) {
+    if !schema.contains(&key) { other.0.clear(); extras.push(key); }
+}
+"#####,
+        ),
+        (
+            "receiver_deref_unrelated_method_control",
+            true,
+            r#####"fn visit(name: String, schema: &std::collections::HashSet<String>, other: &mut std::collections::HashSet<String>, extras: &mut Vec<String>) {
+    if !schema.contains(&name) { (*other).insert(name.clone()); extras.push(name); }
+}
+"#####,
+        ),
+        (
+            "helper_nested_pattern_control",
+            true,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) -> Result<(), &'static str> {
+    if !schema.contains(&key) { extras.push(extension_name(Some(Some("location")), &key)?); }
+    Ok(())
+}
+fn extension_name(location: Option<Option<&str>>, key: &str) -> Result<String, &'static str> {
+    let name = match location {
+        Some(Some(location)) => format!("{location}:{key}"),
+        _ => format!("{key}"),
+    };
+    Ok(name)
+}
+"#####,
+        ),
+        (
+            "const_block_capture",
+            false,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+    let _ = const { if !schema.contains(&key) { extras.push(key); } };
+}
+"#####,
+        ),
+        (
+            "immediate_closure_capture",
+            false,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+    let _ = (|| { if !schema.contains(&key) { extras.push(key.clone()); } })();
+}
+"#####,
+        ),
+        (
+            "key_len_conservative",
+            false,
+            r#####"fn visit(key: String, schema: &std::collections::HashSet<String>, extras: &mut Vec<String>) {
+    if !schema.contains(&key) { let _ = key.len(); extras.push(key); }
+}
+"#####,
+        ),
+    ];
+    assert_eq!(cases.len(), 9);
+    let failed = cases
+        .iter()
+        .filter_map(|(name, positive, source)| {
+            (!fixture.check(name, source, *positive)).then_some(*name)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        failed.is_empty(),
+        "projection/deferred controls: {failed:?}"
+    );
+}
