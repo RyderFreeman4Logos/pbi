@@ -243,6 +243,105 @@ fn scoped_search_shorthand_normalizes_verified_query_but_not_raw_query() {
 }
 
 #[test]
+fn search_filters_preserve_operands_safety_and_literal_separator() {
+    let fixture = Fixture::new();
+    for filters in [
+        vec!["--language", "rust", "--ignore", "*.py", "-i", "!drafts/**"],
+        vec!["-l", "rust", "--ignore=*.py", "--ignore=!drafts/**"],
+    ] {
+        for raw in [false, true] {
+            let mut args = vec!["search"];
+            args.extend(filters.iter().copied());
+            if raw {
+                args.push("--bm25");
+            }
+            args.push("search option parity");
+            let output = fixture.run(&args, if raw { "raw" } else { "evidence" });
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let argv = fixture.argv();
+            assert_eq!(option_value(&argv, "--language"), Some("rust"));
+            let ignores: Vec<_> = argv
+                .iter()
+                .enumerate()
+                .filter_map(|(index, arg)| {
+                    if arg == "--ignore" {
+                        argv.get(index + 1).map(String::as_str)
+                    } else {
+                        arg.strip_prefix("--ignore=")
+                    }
+                })
+                .collect();
+            assert_eq!(
+                ignores,
+                [
+                    "*.py",
+                    "!drafts/**",
+                    ".git",
+                    "target",
+                    "drafts",
+                    "node_modules",
+                    "__pycache__"
+                ]
+            );
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("search option parity")
+            );
+            if raw {
+                assert_eq!(output.stdout, b"raw Probe bytes\n");
+                assert!(!argv.contains(&"--format".to_owned()));
+            }
+        }
+    }
+    let output = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--",
+            "--language",
+            "--ignore",
+            "--help",
+            "-h",
+            "--model-route",
+        ],
+        "raw",
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"raw Probe bytes\n");
+    assert_eq!(
+        fixture.argv().last().map(String::as_str),
+        Some("--language --ignore --help -h --model-route")
+    );
+}
+
+#[test]
+fn invalid_filter_operands_stop_before_probe() {
+    for args in [
+        vec!["search", "--language"],
+        vec!["search", "-l"],
+        vec!["search", "--ignore"],
+        vec!["search", "-i"],
+        vec!["search", "--language", "--ignore", "query"],
+        vec!["search", "--ignore", "--", "query"],
+        vec!["search", "--language=", "query"],
+        vec!["search", "--ignore=", "query"],
+        vec!["search", "--language", "not-a-language", "query"],
+        vec!["search", "-l", "rust", "-l", "python", "query"],
+        vec!["search", "--format", "json", "query"],
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(&args, "evidence");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
 fn invalid_or_missing_numeric_options_stop_before_probe() {
     let fixture = Fixture::new();
     for (args, expected_error) in [

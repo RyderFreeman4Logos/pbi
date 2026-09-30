@@ -54,4 +54,34 @@ scoped=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" search "SourceLoca
 printf '%s\n' "$scoped" | grep -q '^Coverage: complete$'
 printf '%s\n' "$scoped" | grep -Eq '^-[[:space:]]lib.rs:[0-9]+(-[0-9]+)? '
 printf '%s\n' "$scoped" | grep -q 'pub fn display_relative'
-printf '%s\n' 'acceptance: deterministic fixture and real Probe passed'
+# Real Probe controls: each language selects its source; ignore can remove all hits.
+filter_root=$(mktemp -d "${TMPDIR:?}/pbi-rs-filter-XXXXXX")
+trap 'rm -rf -- "$filter_root"' EXIT HUP INT TERM
+printf '%s\n' 'fn filter_operand_marker() {}' > "$filter_root/chosen.rs"
+printf '%s\n' 'def filter_operand_marker(): pass' > "$filter_root/chosen.py"
+mkdir "$filter_root/drafts"
+printf '%s\n' 'fn filter_operand_marker() {}' > "$filter_root/drafts/hidden.rs"
+for language in rust python; do
+    filtered=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 --max-results=8 -l "$language" filter_operand_marker)
+    printf '%s\n' "$filtered" | grep -q '^Coverage: complete$'
+    case "$language" in rust) wanted=rs; unwanted=py ;; python) wanted=py; unwanted=rs ;; esac
+    printf '%s\n' "$filtered" | grep -q "^- chosen.$wanted:1 "
+    ! printf '%s\n' "$filtered" | grep -q "chosen.$unwanted"
+    ! printf '%s\n' "$filtered" | grep -q 'drafts/'
+done
+ignored=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 -i '*.rs' filter_operand_marker)
+printf '%s\n' "$ignored" | grep -q '^- chosen.py:1 '
+! printf '%s\n' "$ignored" | grep -q 'chosen.rs'
+set +e
+no_hit=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 --ignore='*.rs' --ignore='*.py' filter_operand_marker 2> "$filter_root/no-hit.stderr")
+no_hit_rc=$?
+set -e
+test "$no_hit_rc" -eq 1
+test -z "$no_hit"
+IFS= read -r no_hit_error < "$filter_root/no-hit.stderr"
+test "$no_hit_error" = 'pbi: no source locations found'
+raw_filtered=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 -l rs -i '!drafts/**' filter_operand_marker)
+printf '%s\n' "$raw_filtered" | grep -q 'File: .*chosen.rs'
+! printf '%s\n' "$raw_filtered" | grep -q 'File: .*drafts/'
+! printf '%s\n' "$raw_filtered" | grep -q 'File: .*chosen.py'
+printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native language/ignore selection and no-hit controls passed'

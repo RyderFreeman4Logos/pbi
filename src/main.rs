@@ -33,14 +33,32 @@ const PROBE_CLEANUP_GRACE_MILLIS: u64 = 100;
 const MAX_SCOPED_PROBE_TARGETS: usize = 16;
 const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
 
+struct SearchOptions {
+    timeout: String,
+    max_results: usize,
+    language: Option<String>,
+    ignores: Vec<String>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_TIMEOUT.to_owned(),
+            max_results: DEFAULT_MAX_RESULTS,
+            language: None,
+            ignores: Vec::new(),
+        }
+    }
+}
+
 fn usage() {
     println!(
         "pbi-rs {VERSION} — Probe-backed source evidence\n\
          Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
-                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] <query>\n\
+                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. User-filtered searches remain rooted at CWD, without per-path fallback; -- preserves literal query operands."
     );
 }
 
@@ -130,6 +148,7 @@ fn parse_local_route_prefix(
     }
     if arguments[index..]
         .iter()
+        .take_while(|argument| argument.as_str() != "--")
         .any(|argument| argument == "--model-route")
     {
         return Err(CliError::usage(
@@ -158,6 +177,7 @@ fn run(
     }
     if arguments
         .iter()
+        .take_while(|argument| argument.as_str() != "--")
         .any(|argument| argument == "--help" || argument == "-h")
     {
         usage();
@@ -178,9 +198,9 @@ fn run(
         ));
     }
     let json_output = arguments[0] != "search" && arguments.iter().any(|arg| arg == "--json");
-    let (raw, semantic, query, timeout, max_results) = if arguments[0] == "search" {
-        let (raw, query, timeout, max_results) = parse_search(&arguments[1..])?;
-        (raw, false, query, timeout, max_results)
+    let (raw, semantic, query, options) = if arguments[0] == "search" {
+        let (raw, query, options) = parse_search(&arguments[1..])?;
+        (raw, false, query, options)
     } else if arguments[0] == "--message" {
         let query = arguments[1..]
             .iter()
@@ -193,13 +213,7 @@ fn run(
                 "question is required; interactive mode is disabled",
             ));
         }
-        (
-            false,
-            true,
-            query,
-            DEFAULT_TIMEOUT.to_owned(),
-            DEFAULT_MAX_RESULTS,
-        )
+        (false, true, query, SearchOptions::default())
     } else {
         let query = arguments
             .iter()
@@ -212,13 +226,7 @@ fn run(
                 "question is required; interactive mode is disabled",
             ));
         }
-        (
-            false,
-            true,
-            query,
-            DEFAULT_TIMEOUT.to_owned(),
-            DEFAULT_MAX_RESULTS,
-        )
+        (false, true, query, SearchOptions::default())
     };
 
     let admitted_routes = if route_specs.is_empty() {
@@ -248,7 +256,7 @@ fn run(
         PROBE_OUTER_DEADLINE_SECONDS
     });
     let deadline = Instant::now() + deadline_duration;
-    let output = invoke_probe(&root, &query, &timeout, max_results, raw, deadline)?;
+    let output = invoke_probe(&root, &query, &options, raw, deadline)?;
     if raw {
         io::stdout()
             .write_all(&output.stdout)
@@ -265,7 +273,7 @@ fn run(
         return Ok(exit_status(&output));
     }
     let probe_stdout = String::from_utf8_lossy(&output.stdout);
-    let report = verify_probe_evidence(&probe_stdout, &root, &query, max_results)
+    let report = verify_probe_evidence(&probe_stdout, &root, &query, options.max_results)
         .map_err(evidence_cli_error)?;
     if semantic {
         #[cfg(test)]
@@ -441,10 +449,9 @@ fn route_cli_error(error: SemanticRouteError) -> CliError {
     }
 }
 
-fn parse_search(arguments: &[String]) -> Result<(bool, String, String, usize), CliError> {
+fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), CliError> {
     let mut raw = false;
-    let mut timeout = DEFAULT_TIMEOUT.to_owned();
-    let mut max_results = DEFAULT_MAX_RESULTS;
+    let mut options = SearchOptions::default();
     let mut query_parts = Vec::new();
     let mut after_separator = false;
     let mut index = 0;
@@ -465,29 +472,39 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, String, usize), C
                 index += 1;
             }
             "--timeout" => {
-                timeout = next_value(arguments, &mut index, "--timeout")?;
-                validate_decimal(&timeout, "--timeout")?;
+                options.timeout = next_value(arguments, &mut index, "--timeout")?;
+                validate_decimal(&options.timeout, "--timeout")?;
             }
             value if value.starts_with("--timeout=") => {
-                timeout = value[10..].to_owned();
-                validate_decimal(&timeout, "--timeout")?;
+                options.timeout = value[10..].to_owned();
+                validate_decimal(&options.timeout, "--timeout")?;
                 index += 1;
             }
             "--max-results" => {
                 let value = next_value(arguments, &mut index, "--max-results")?;
-                max_results = value
+                options.max_results = value
                     .parse::<usize>()
                     .map_err(|_| CliError::usage("--max-results must be a positive integer"))?;
-                if max_results == 0 {
+                if options.max_results == 0 {
                     return Err(CliError::usage("--max-results must be a positive integer"));
                 }
             }
             value if value.starts_with("--max-results=") => {
-                max_results = value[14..]
+                options.max_results = value[14..]
                     .parse::<usize>()
                     .map_err(|_| CliError::usage("--max-results must be a positive integer"))?;
-                if max_results == 0 {
+                if options.max_results == 0 {
                     return Err(CliError::usage("--max-results must be a positive integer"));
+                }
+                index += 1;
+            }
+            "--language" | "-l" | "--ignore" | "-i" => {
+                let value = next_value(arguments, &mut index, argument)?;
+                set_search_filter(&mut options, argument, value)?;
+            }
+            value if value.starts_with("--language=") || value.starts_with("--ignore=") => {
+                if let Some((option, operand)) = value.split_once('=') {
+                    set_search_filter(&mut options, option, operand.to_owned())?;
                 }
                 index += 1;
             }
@@ -520,10 +537,11 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, String, usize), C
             }
         }
     }
-    Ok((raw, query, timeout, max_results))
+    Ok((raw, query, options))
 }
 
 fn next_value(arguments: &[String], index: &mut usize, option: &str) -> Result<String, CliError> {
+    // Search filters and numeric options share the same operand boundary.
     *index += 1;
     let value = arguments
         .get(*index)
@@ -532,6 +550,31 @@ fn next_value(arguments: &[String], index: &mut usize, option: &str) -> Result<S
         .ok_or_else(|| CliError::usage(format!("{option} requires a value")))?;
     *index += 1;
     Ok(value)
+}
+
+fn set_search_filter(
+    options: &mut SearchOptions,
+    option: &str,
+    value: String,
+) -> Result<(), CliError> {
+    if value.is_empty() {
+        return Err(CliError::usage(format!("{option} requires a value")));
+    }
+    if option == "--ignore" || option == "-i" {
+        options.ignores.push(value);
+    } else {
+        // Probe v0.6.0-rc339 src/cli.rs:159-177, not arbitrary forwarding.
+        const LANGUAGES: &str = "rust rs javascript js jsx typescript ts tsx python py go c h cpp cc cxx hpp hxx java ruby rb php swift solidity sol crystal cr haskell hs lhs csharp cs yaml yml";
+        if options.language.is_some()
+            || !LANGUAGES.split_ascii_whitespace().any(|name| name == value)
+        {
+            return Err(CliError::usage(
+                "--language requires one supported Probe language or alias",
+            ));
+        }
+        options.language = Some(value);
+    }
+    Ok(())
 }
 
 fn validate_decimal(value: &str, option: &str) -> Result<(), CliError> {
@@ -583,13 +626,7 @@ fn probe_has_file_records(stdout: &[u8]) -> bool {
         .any(|line| line.trim_start().starts_with("File: "))
 }
 
-fn probe_command(
-    root: &Path,
-    query: &str,
-    timeout: &str,
-    max_results: usize,
-    raw: bool,
-) -> Command {
+fn probe_command(root: &Path, query: &str, options: &SearchOptions, raw: bool) -> Command {
     let probe = env::var_os("PBI_RS_PROBE").unwrap_or_else(|| "probe".into());
     let mut command = Command::new(probe);
     #[cfg(unix)]
@@ -600,14 +637,22 @@ fn probe_command(
     command.current_dir(root).args([
         "search",
         "--timeout",
-        timeout,
+        &options.timeout,
         "--max-results",
-        &max_results.to_string(),
-        "--ignore",
-        "drafts",
+        &options.max_results.to_string(),
         "--reranker",
         "bm25",
     ]);
+    if let Some(language) = &options.language {
+        command.args(["--language", language]);
+    }
+    for ignore in &options.ignores {
+        command.arg(format!("--ignore={ignore}"));
+    }
+    // Probe's last matching override wins, including user negation patterns.
+    for excluded in PROBE_SCOPE_EXCLUDED_NAMES {
+        command.args(["--ignore", excluded]);
+    }
     if !raw {
         command.args(["--format", "plain", "--dry-run"]);
     }
@@ -818,8 +863,7 @@ fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, 
 fn invoke_probe_scope(
     root: &Path,
     query: &str,
-    timeout: &str,
-    max_results: usize,
+    options: &SearchOptions,
     paths: &[PathBuf],
     deadline: Instant,
 ) -> Result<Output, CliError> {
@@ -827,7 +871,7 @@ fn invoke_probe_scope(
     let mut stderr = Vec::new();
     let mut status = None;
     for path in paths {
-        let mut command = probe_command(root, query, timeout, max_results, false);
+        let mut command = probe_command(root, query, options, false);
         command.arg(path);
         let output = run_probe_command(command, deadline)?;
         let success = output.status.success();
@@ -860,16 +904,19 @@ fn invoke_probe_scope(
 fn invoke_probe(
     root: &Path,
     query: &str,
-    timeout: &str,
-    max_results: usize,
+    options: &SearchOptions,
     raw: bool,
     deadline: Instant,
 ) -> Result<Output, CliError> {
-    let output = run_probe_command(
-        probe_command(root, query, timeout, max_results, raw),
-        deadline,
-    )?;
-    if raw || !output.status.success() || probe_has_file_records(&output.stdout) {
+    let output = run_probe_command(probe_command(root, query, options, raw), deadline)?;
+    // ponytail: filtered root-only search; explicit file fallback bypasses Probe ignores.
+    // Preserve Probe's CWD-relative patterns rather than reimplement glob matching.
+    if raw
+        || options.language.is_some()
+        || !options.ignores.is_empty()
+        || !output.status.success()
+        || probe_has_file_records(&output.stdout)
+    {
         return Ok(output);
     }
 
@@ -877,7 +924,7 @@ fn invoke_probe(
     if paths.is_empty() {
         return Ok(output);
     }
-    invoke_probe_scope(root, query, timeout, max_results, &paths, deadline)
+    invoke_probe_scope(root, query, options, &paths, deadline)
 }
 
 fn exit_status(output: &Output) -> i32 {
