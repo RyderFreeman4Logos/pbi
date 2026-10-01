@@ -573,36 +573,39 @@ fn definition_identity(tokens: &[String]) -> (Option<String>, Option<String>, Op
         .map(|index| {
             let qualified = names.remove(index);
             let (owner, member) = qualified.rsplit_once("::").unwrap_or((&qualified, ""));
-            let owner = owner.rsplit("::").next().unwrap_or(owner);
             if !member.is_empty() {
                 names.insert(index.min(names.len()), member.to_owned());
             }
             owner.to_owned()
         })
         .or_else(|| {
-            if !definition_request_shape(tokens) {
+            if !definition_request_shape(tokens) || names.len() < 2 {
                 return None;
             }
-            let symbol_at = names.iter().rposition(|token| {
-                token.contains('_') || token.chars().any(|character| character.is_uppercase())
-            })?;
-            let candidate = symbol_at
-                .checked_sub(1)
-                .and_then(|index| names.get(index))?;
-            candidate
+            let member = names.last()?;
+            let candidate = names.get(names.len() - 2)?;
+            let owner_shaped = candidate
                 .chars()
                 .next()
-                .is_some_and(|character| character.is_uppercase())
-                .then(|| candidate.clone())
+                .is_some_and(|character| character.is_uppercase() || character == '_');
+            let member_shaped = member
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic() || character == '_');
+            (owner_shaped && member_shaped && !noise(member)).then(|| candidate.clone())
         });
-    let symbol = names
-        .iter()
-        .rev()
-        .find(|token| {
-            token.contains('_') || token.chars().any(|character| character.is_uppercase())
-        })
-        .or(names.last())
-        .cloned();
+    let symbol = if owner.is_some() && !names.iter().any(|token| token.contains("::")) {
+        names.last().cloned()
+    } else {
+        names
+            .iter()
+            .rev()
+            .find(|token| {
+                token.contains('_') || token.chars().any(|character| character.is_uppercase())
+            })
+            .or(names.last())
+            .cloned()
+    };
     (symbol, owner, path)
 }
 
@@ -1502,9 +1505,6 @@ fn declaration_names(
         .and_then(|extension| extension.to_str())
         == Some("rs");
     if rust {
-        if !production_source(line) || code_line.trim().is_empty() {
-            return Vec::new();
-        }
         let structural: Vec<String> = declarations
             .iter()
             .filter(|declaration| declaration.line == line_number)
@@ -1512,6 +1512,9 @@ fn declaration_names(
             .collect();
         if !structural.is_empty() {
             return structural;
+        }
+        if !production_source(line) || code_line.trim().is_empty() {
+            return Vec::new();
         }
         return rust_declaration_name(code_line).into_iter().collect();
     }

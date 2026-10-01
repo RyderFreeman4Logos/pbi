@@ -34,26 +34,27 @@ fn collect_items(items: &[Item], module: Option<&str>, found: &mut Vec<Declarati
             Item::Enum(item) => push(item.ident.span(), &item.ident, module, found),
             Item::Trait(item) => {
                 push(item.ident.span(), &item.ident, module, found);
+                let owner = qualify(module, &item.ident.to_string());
                 for member in &item.items {
-                    if let TraitItem::Fn(function) = member {
-                        push(
-                            function.sig.ident.span(),
-                            &function.sig.ident,
-                            Some(&item.ident.to_string()),
-                            found,
-                        );
-                    }
+                    let (span, name) = match member {
+                        TraitItem::Fn(function) => (function.sig.ident.span(), &function.sig.ident),
+                        TraitItem::Const(item) => (item.ident.span(), &item.ident),
+                        TraitItem::Type(item) => (item.ident.span(), &item.ident),
+                        _ => continue,
+                    };
+                    push(span, name, Some(&owner), found);
                 }
             }
             Item::Type(item) => push(item.ident.span(), &item.ident, module, found),
             Item::Mod(item) => {
                 push(item.ident.span(), &item.ident, module, found);
                 if let Some((_, nested)) = &item.content {
-                    collect_items(nested, Some(&item.ident.to_string()), found);
+                    let nested_module = qualify(module, &item.ident.to_string());
+                    collect_items(nested, Some(&nested_module), found);
                 }
             }
             Item::Impl(item) => {
-                let owner = impl_owner(&item.self_ty);
+                let owner = impl_owner(&item.self_ty).map(|name| qualify(module, &name));
                 for member in &item.items {
                     let (span, name) = match member {
                         ImplItem::Fn(function) => (function.sig.ident.span(), &function.sig.ident),
@@ -66,6 +67,13 @@ fn collect_items(items: &[Item], module: Option<&str>, found: &mut Vec<Declarati
             }
             _ => {}
         }
+    }
+}
+
+fn qualify(module: Option<&str>, name: &str) -> String {
+    match module {
+        Some(module) if !module.is_empty() => format!("{module}::{name}"),
+        _ => name.to_owned(),
     }
 }
 

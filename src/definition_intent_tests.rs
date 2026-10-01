@@ -69,7 +69,14 @@ fn expect_identity(
     let evidence = &report.evidence()[0];
     assert_eq!(evidence.location().start_line(), line, "{query}");
     assert_eq!(evidence.symbol(), Some(name), "{query}");
-    let _ = owner;
+    if query.contains("::") {
+        let groups = query_groups(query).expect(query);
+        let group = groups
+            .iter()
+            .find(|group| group.symbol.as_deref() == Some(name))
+            .expect(query);
+        assert_eq!(group.owner.as_deref(), owner, "{query}");
+    }
 }
 
 fn expect_miss(root: &Path, output: &str, query: &str) {
@@ -225,6 +232,20 @@ fn owner_qualified_definition_uses_the_real_declaration() {
         "where is Owner::target_func defined in src/lib.rs",
         "fn target_func",
     );
+    let space = Fixture::new();
+    let space_output = space.write(
+        "src/lib.rs",
+        "pub struct Owner;\nimpl Owner { pub fn run(&self) {} }\n",
+    );
+    let report = verify_probe_evidence(&space_output, &space.root, "where is Owner run defined", 4)
+        .expect("space member");
+    assert!(report.is_complete());
+    assert_eq!(report.evidence()[0].symbol(), Some("run"));
+    assert_eq!(report.evidence()[0].location().start_line(), 2);
+    let parsed = query_groups("where is Owner run defined").expect("parse");
+    assert_eq!(parsed[0].owner.as_deref(), Some("Owner"));
+    assert_eq!(parsed[0].symbol.as_deref(), Some("run"));
+    expect_miss(&space.root, &space_output, "where is Owner missing defined");
 }
 
 #[test]
@@ -445,6 +466,13 @@ fn declaration_identity_uses_the_enclosing_declaration() {
         IdentityCase { source: "pub trait Owner {\n    fn target_func(&self) { let _ = 1; }\n}\n", queries: &[("where is Owner::target_func defined", Some((2, "target_func")))] },
         IdentityCase { source: "pub mod owner_mod {\n    pub fn target_func() { let _ = 1; }\n}\n", queries: &[("where is owner_mod::target_func defined", Some((2, "target_func")))] },
         IdentityCase { source: "pub mod outer {\n    pub struct Owner;\n    impl Owner {\n        pub fn target_func(&self) { let _ = 1; }\n    }\n}\n", queries: &[("where is outer::Owner::target_func defined", Some((4, "target_func")))] },
+        IdentityCase { source: "pub mod actual {\n pub struct Owner;\n impl Owner {\n  pub fn target_func(&self) {}\n }\n}\n", queries: &[("where is actual::Owner::target_func defined", Some((4, "target_func"))), ("where is imaginary::Owner::target_func defined", None)] },
+        IdentityCase { source: "pub mod first {\n pub struct Owner;\n impl Owner {\n  pub fn target_func(&self) {}\n }\n}\npub mod second {\n pub struct Owner;\n impl Owner {\n  pub fn target_func(&self) {}\n }\n}\n", queries: &[("where is first::Owner::target_func defined", Some((4, "target_func"))), ("where is second::Owner::target_func defined", Some((10, "target_func"))), ("where is third::Owner::target_func defined", None)] },
+        IdentityCase { source: "pub struct Owner;\nimpl Owner { pub fn run(&self) {} }\n", queries: &[("where is Owner::run defined", Some((2, "run"))), ("where is Owner missing defined", None)] },
+        IdentityCase { source: "/* description */ pub fn target_func() {}\n", queries: &[("where is target_func defined", Some((1, "target_func")))] },
+        IdentityCase { source: "#[inline] pub fn target_func() {}\n", queries: &[("where is target_func defined", Some((1, "target_func")))] },
+        IdentityCase { source: "pub trait Owner {\n const TARGET_CONST: u8 = 1;\n type TargetType;\n fn target_func(&self);\n}\n", queries: &[("where is Owner::TARGET_CONST defined", Some((2, "TARGET_CONST"))), ("where is Owner::TargetType defined", Some((3, "TargetType"))), ("where is Owner::target_func defined", Some((4, "target_func")))] },
+        IdentityCase { source: "pub struct Actual;\nimpl Actual { pub const TARGET_CONST: u8 = 1; }\n", queries: &[("where is Actual::TARGET_CONST defined", Some((2, "TARGET_CONST"))), ("where is Other::TARGET_CONST defined", None)] },
     ];
     for case in cases {
         let fixture = Fixture::new();
@@ -453,7 +481,15 @@ fn declaration_identity_uses_the_enclosing_declaration() {
             match expected {
                 None => expect_miss(&fixture.root, &output, query),
                 Some((line, name)) => {
-                    expect_identity(&fixture.root, &output, query, *line, name, None)
+                    let owner = query.rsplit_once("::").and_then(|(prefix, member)| {
+                        (!member.is_empty()).then(|| {
+                            prefix
+                                .rsplit_once(" is ")
+                                .map(|(_, owner)| owner)
+                                .unwrap_or(prefix)
+                        })
+                    });
+                    expect_identity(&fixture.root, &output, query, *line, name, owner)
                 }
             }
         }
