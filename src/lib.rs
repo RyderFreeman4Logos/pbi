@@ -562,9 +562,11 @@ fn raw_query_tokens(value: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for character in value.chars() {
-        if character.is_alphanumeric() || character == '_' || character == ':' {
-            current.push(character);
-        } else if matches!(character, '/' | '.' | '-') {
+        if character.is_alphanumeric()
+            || character == '_'
+            || character == ':'
+            || matches!(character, '/' | '.' | '-')
+        {
             current.push(character);
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
@@ -1193,7 +1195,7 @@ fn best_window(
                         .then(|| group.symbol.clone())
                         .flatten()
                         .or_else(|| {
-                            raw_identifiers(&code_lines[start + offset])
+                            raw_identifiers(code_lines[start + offset])
                                 .into_iter()
                                 .find(|name| same_name(name, group))
                         })
