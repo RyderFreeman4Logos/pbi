@@ -219,7 +219,6 @@ pub fn verify_probe_evidence(
             if let Some(choice) = best_window(
                 group,
                 &groups,
-                &root,
                 relative,
                 &path,
                 &lines,
@@ -1058,7 +1057,6 @@ fn raw_identifiers(text: &str) -> Vec<String> {
 fn best_window(
     group: &QueryGroup,
     all_groups: &[QueryGroup],
-    root: &Path,
     relative: &Path,
     path: &Path,
     lines: &[&str],
@@ -1167,7 +1165,7 @@ fn best_window(
                 if group
                     .path
                     .as_ref()
-                    .is_some_and(|requested| !paths_match(root, &path_text, requested))
+                    .is_some_and(|requested| !paths_match(path, relative, requested))
                 {
                     continue;
                 }
@@ -1305,7 +1303,10 @@ fn path_token(token: &str) -> bool {
         || token.ends_with(".h")
 }
 
-fn paths_match(root: &Path, actual: &str, requested: &str) -> bool {
+fn paths_match(actual_path: &Path, relative: &Path, requested: &str) -> bool {
+    let Some(root) = actual_path.ancestors().nth(relative.components().count()) else {
+        return false;
+    };
     let requested_path = Path::new(requested);
     let candidate = if requested_path.is_absolute() {
         requested_path.to_path_buf()
@@ -1313,14 +1314,14 @@ fn paths_match(root: &Path, actual: &str, requested: &str) -> bool {
         root.join(requested_path)
     };
     match fs::canonicalize(&candidate) {
-        Ok(resolved) => resolved.strip_prefix(root).is_ok_and(|relative| {
-            !relative.as_os_str().is_empty()
-                && !excluded_path(relative)
+        Ok(resolved) => resolved.strip_prefix(root).is_ok_and(|resolved_relative| {
+            !resolved_relative.as_os_str().is_empty()
+                && !excluded_path(resolved_relative)
                 && resolved
-                    == fs::canonicalize(root.join(actual)).unwrap_or_else(|_| root.join(actual))
+                    == fs::canonicalize(actual_path).unwrap_or_else(|_| actual_path.to_path_buf())
         }),
         Err(_) => {
-            let actual = actual.replace('\\', "/");
+            let actual = relative.to_string_lossy().replace('\\', "/");
             let requested = requested.replace('\\', "/");
             actual == requested || actual.ends_with(&format!("/{requested}"))
         }
