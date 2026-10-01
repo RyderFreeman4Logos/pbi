@@ -1,3 +1,6 @@
+#[cfg(test)]
+#[path = "definition_intent_tests.rs"]
+mod definition_intent_tests;
 mod relevance_scope;
 use std::fmt;
 use std::fs;
@@ -147,6 +150,7 @@ struct QueryGroup {
     terms: Vec<String>,
     exact_symbols: Vec<String>,
     any_of: bool,
+    definition: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -450,11 +454,18 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
                     exact_symbols.push(compact_alphanumeric(token));
                 }
             }
+            let definition = tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "implementation" | "defined" | "definition" | "implement"
+                )
+            });
             (!terms.is_empty()).then(|| QueryGroup {
                 label: tokens.join(" "),
                 terms,
                 exact_symbols,
                 any_of,
+                definition,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -1031,6 +1042,32 @@ fn best_window(
                     || exact_group
                     || (group.any_of && direct >= 1 && any_matches >= 2));
             let exact = exact_symbol.is_some() && group.exact_symbols.len() <= 1;
+            let defined = !group.definition
+                || lines[start..end]
+                    .iter()
+                    .any(|line| defines_requested(line, group));
+            if !defined {
+                continue;
+            }
+            if group.definition {
+                let signature = lines[start..end].iter().any(|line| {
+                    let trimmed = line.trim_start();
+                    defines_requested(line, group)
+                        && (trimmed.starts_with("fn ")
+                            || trimmed.starts_with("pub ")
+                            || trimmed.starts_with("impl "))
+                });
+                let noise = lines[start..end].iter().any(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.contains("path =")
+                        || trimmed.starts_with('#')
+                        || trimmed.starts_with("//")
+                        || trimmed.contains("() {}")
+                });
+                if !signature || noise {
+                    continue;
+                }
+            }
             if !exact
                 && ((behavioral && (!actionable || (direct == 0 && overlap == 0)))
                     || (!behavioral && !simple_lexical))
@@ -1053,9 +1090,45 @@ fn best_window(
                     0
                 }
                 + if exact { 100 } else { 0 }
+                + if !test_candidate
+                    && lines[start..end].iter().any(|line| {
+                        let trimmed = line.trim_start();
+                        (trimmed.starts_with("fn ")
+                            || trimmed.starts_with("pub ")
+                            || trimmed.starts_with("impl "))
+                            && defines_requested(line, group)
+                    })
+                {
+                    120
+                } else {
+                    0
+                }
                 - length as i32;
             let location = SourceLocation::new(path.to_path_buf(), start + 1, end);
-            let symbol = exact_symbol
+            let symbol = lines[start..end]
+                .iter()
+                .find_map(|line| {
+                    let trimmed = line.trim_start();
+                    let declaration = trimmed.starts_with("fn ")
+                        || trimmed.starts_with("pub ")
+                        || trimmed.starts_with("impl ");
+                    (group.definition && declaration && defines_requested(line, group)).then(
+                        || {
+                            raw_identifiers(&CodeView::new(line).code)
+                                .into_iter()
+                                .find(|name| {
+                                    group
+                                        .exact_symbols
+                                        .iter()
+                                        .any(|expected| compact_alphanumeric(name) == *expected)
+                                        || group.terms.iter().any(|term| {
+                                            compact_alphanumeric(name) == compact_alphanumeric(term)
+                                        })
+                                })
+                        },
+                    )?
+                })
+                .or(exact_symbol)
                 .or_else(|| markers.iter().find(|marker| useful_symbol(marker)).cloned());
             let mut relevance_parts = Vec::new();
             if !group_matches.is_empty() {
@@ -1123,6 +1196,60 @@ fn useful_symbol(marker: &str) -> bool {
         && marker != "Err"
         && marker != "format"
         && marker != "Vec::new"
+}
+
+fn defines_requested(line: &str, group: &QueryGroup) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.starts_with("/*") {
+        return false;
+    }
+    let code = CodeView::new(line).code;
+    let names = raw_identifiers(&code);
+    let declared = names.iter().any(|name| {
+        group
+            .exact_symbols
+            .iter()
+            .any(|expected| !expected.is_empty() && compact_alphanumeric(name) == *expected)
+            || group.terms.iter().any(|term| {
+                term.len() >= 3
+                    && !term.contains('_')
+                    && compact_alphanumeric(name) == compact_alphanumeric(term)
+            })
+    });
+    if !declared {
+        return false;
+    }
+    if group
+        .terms
+        .iter()
+        .any(|term| !term.contains('_') && term.chars().next().is_some_and(|c| c.is_uppercase()))
+        && !names.iter().any(|name| {
+            group.terms.iter().any(|term| {
+                term.chars().next().is_some_and(|c| c.is_uppercase())
+                    && compact_alphanumeric(name) == compact_alphanumeric(term)
+            })
+        })
+    {
+        return false;
+    }
+    let head = code.trim_start();
+    let keywords = [
+        "fn ", "struct ", "enum ", "trait ", "type ", "const ", "static ", "impl ", "mod ",
+    ];
+    keywords.iter().any(|keyword| head.contains(keyword))
+        && (head.starts_with("fn ")
+            || head.starts_with("pub ")
+            || head.starts_with("struct ")
+            || head.starts_with("enum ")
+            || head.starts_with("trait ")
+            || head.starts_with("type ")
+            || head.starts_with("const ")
+            || head.starts_with("static ")
+            || head.starts_with("impl ")
+            || head.starts_with("mod ")
+            || head.starts_with("async ")
+            || head.starts_with("unsafe ")
+            || head.starts_with("macro_rules!"))
 }
 
 fn lexical_harness_window(text: &str) -> bool {
