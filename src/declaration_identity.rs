@@ -157,11 +157,29 @@ fn item_binds(item: &Item, root: &str) -> bool {
 
 fn use_binds(tree: &UseTree, root: &str) -> bool {
     match tree {
-        UseTree::Name(name) => bare(&name.ident.to_string()) == root,
-        UseTree::Rename(name) => bare(&name.rename.to_string()) == root,
-        UseTree::Glob(_) => false,
-        UseTree::Path(path) => use_binds(&path.tree, root),
         UseTree::Group(group) => group.items.iter().any(|item| use_binds(item, root)),
+        _ => bound_name(tree).is_some_and(|name| name == root),
+    }
+}
+
+fn bound_name(tree: &UseTree) -> Option<String> {
+    match tree {
+        UseTree::Name(name) => Some(bare(&name.ident.to_string()).to_owned()),
+        UseTree::Rename(name) => Some(bare(&name.rename.to_string()).to_owned()),
+        UseTree::Glob(_) => None,
+        UseTree::Path(path) => match path.tree.as_ref() {
+            UseTree::Group(group) => group.items.iter().find_map(|item| match item {
+                UseTree::Name(name) if name.ident == "self" => {
+                    Some(bare(&path.ident.to_string()).to_owned())
+                }
+                UseTree::Rename(name) if name.ident == "self" => {
+                    Some(bare(&name.rename.to_string()).to_owned())
+                }
+                other => bound_name(other),
+            }),
+            _ => bound_name(&path.tree),
+        },
+        UseTree::Group(_) => None,
     }
 }
 
@@ -197,7 +215,8 @@ fn impl_owner(file: &File, ty: &Type, module: &OwnerPath, binders: &[String]) ->
         _ => {}
     }
     let mut has_type = false;
-    while let Some(segment) = segments.next() {
+    let segments: Vec<_> = segments.collect();
+    for segment in &segments {
         let name = bare(&segment.ident.to_string()).to_owned();
         if matches!(name.as_str(), "crate" | "self" | "super" | "Self") {
             return None;
@@ -206,7 +225,7 @@ fn impl_owner(file: &File, ty: &Type, module: &OwnerPath, binders: &[String]) ->
             if binders.iter().any(|binder| binder == &name) {
                 return None;
             }
-            if segments.peek().is_some() && !proven_root(&file.items, &owner.0, &name) {
+            if !owner.0.is_empty() && !proven_root(&file.items, &owner.0, &name) {
                 return None;
             }
         }

@@ -65,3 +65,87 @@ fn definition_self_type_import_alias_keeps_path_identity() {
         ],
     );
 }
+
+#[test]
+fn definition_self_type_group_self_keeps_parent_path_name() {
+    for (import, local, owner) in [
+        (
+            "use crate::actual::{self};",
+            "actual::Owner",
+            "elsewhere::actual::Owner",
+        ),
+        (
+            "use crate::actual::{self as actual};",
+            "actual::Owner",
+            "elsewhere::actual::Owner",
+        ),
+        (
+            "use crate::actual::{self as renamed};",
+            "renamed::Owner",
+            "elsewhere::renamed::Owner",
+        ),
+        (
+            "use crate::{actual::{self}};",
+            "actual::Owner",
+            "elsewhere::actual::Owner",
+        ),
+    ] {
+        let source = format!(
+            "pub mod actual {{ pub struct Owner; }}\npub mod elsewhere {{\n{import}\nimpl {local} {{\npub fn target_func(&self) {{}}\n}}\n}}\n"
+        );
+        expect_owner_hit(
+            &source,
+            &format!("where is {owner}::target_func defined"),
+            5,
+            "target_func",
+            owner,
+        );
+        expect_owner_miss(
+            &source,
+            &["where is elsewhere::wrong::Owner::target_func defined"],
+        );
+    }
+}
+
+#[test]
+fn definition_self_type_single_root_requires_direct_binding() {
+    expect_owner_miss(
+        "pub mod elsewhere {\npub trait Marker { fn target_func(&self); }\nimpl Marker for String {\nfn target_func(&self) {}\n}\n}\n",
+        &[
+            "where is elsewhere::String::target_func defined",
+            "where is String::target_func defined",
+        ],
+    );
+    expect_owner_hit(
+        "pub mod elsewhere {\npub struct String;\nimpl String {\npub fn target_func(&self) {}\n}\n}\n",
+        "where is elsewhere::String::target_func defined",
+        4,
+        "target_func",
+        "elsewhere::String",
+    );
+    expect_owner_hit(
+        "pub struct String;\npub mod elsewhere {\nuse crate::String;\nimpl String {\npub fn target_func(&self) {}\n}\n}\n",
+        "where is elsewhere::String::target_func defined",
+        5,
+        "target_func",
+        "elsewhere::String",
+    );
+    expect_owner_hit(
+        "pub mod elsewhere {\npub struct Owner<T>(T);\nimpl<T> Owner<T> {\npub fn target_func(&self) {}\n}\n}\n",
+        "where is elsewhere::Owner::target_func defined",
+        4,
+        "target_func",
+        "elsewhere::Owner",
+    );
+    expect_owner_miss(
+        "pub mod elsewhere {\npub struct Owner<T>(T);\nimpl<T> Owner<T> {\npub fn target_func(&self) {}\n}\nimpl Owner<String> {\npub fn specialized(&self) {}\n}\n}\n",
+        &["where is elsewhere::String::specialized defined"],
+    );
+    expect_owner_hit(
+        "pub mod elsewhere {\npub struct r#type;\nimpl r#type {\npub fn target_func(&self) {}\n}\n}\n",
+        "where is elsewhere::type::target_func defined",
+        4,
+        "target_func",
+        "elsewhere::type",
+    );
+}
