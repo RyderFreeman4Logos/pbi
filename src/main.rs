@@ -69,7 +69,7 @@ fn usage() {
                 pbi-rs search [--bm25 [--format/-o <FORMAT>]] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Search --question accepts one split/inline operand (including empty), consumed without inference because BM25 ignores it; BERT reranking is not enabled. Search --session refuses durable cache writes, not Chat resumability; ambient PROBE_SESSION_ID is removed from Probe children. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches remain rooted at CWD, without per-path fallback. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
+         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Search --question accepts one split/inline operand (including empty), consumed without inference because BM25 ignores it; BERT reranking is not enabled. Search --session refuses durable cache writes, not Chat resumability; ambient PROBE_SESSION_ID is removed from Probe children. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches use the same bounded scope and pass those options to every Probe call. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
     );
 }
 
@@ -746,6 +746,11 @@ fn probe_source_name(name: &std::ffi::OsStr) -> bool {
     })
 }
 
+fn scope_skipped_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_none_or(|name| name.starts_with('.') || PROBE_SCOPE_EXCLUDED_NAMES.contains(&name))
+}
+
 fn confined_scope_path(root: &Path, path: &Path) -> Result<bool, CliError> {
     let failed = || CliError::failed("cannot inspect repository files for Probe");
     let root_file = File::open(root).map_err(|_| failed())?;
@@ -758,94 +763,99 @@ fn confined_scope_path(root: &Path, path: &Path) -> Result<bool, CliError> {
         && fs::read_link(path).is_err())
 }
 
-// One directory is one Probe target. Depth 2 is the nested directory itself,
-// not a recursive file list. ponytail: stops at depth 2; deeper trees need a
-// bounded walk that still counts directories, not files.
-fn scope_target(root: &Path, entry: &fs::DirEntry) -> Result<Vec<PathBuf>, CliError> {
+struct ScopePlan {
+    paths: Vec<PathBuf>,
+    truncated: bool,
+}
+
+fn directory_contains_source(path: &Path) -> Result<bool, CliError> {
     let failed = || CliError::failed("cannot inspect repository files for Probe");
-    let file_type = entry.file_type().map_err(|_| failed())?;
-    if file_type.is_symlink() {
-        return Ok(Vec::new());
-    }
-    let name = entry.file_name();
-    if name
-        .to_str()
-        .is_none_or(|name| name.starts_with('.') || PROBE_SCOPE_EXCLUDED_NAMES.contains(&name))
-    {
-        return Ok(Vec::new());
-    }
-    let path = entry.path();
-    if !confined_scope_path(root, &path)? {
-        return Ok(Vec::new());
-    }
-    if file_type.is_file() {
-        return Ok(if probe_source_name(&name) {
-            vec![path]
-        } else {
-            Vec::new()
-        });
-    }
-    if !file_type.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut targets = Vec::new();
-    let mut nested_source = false;
-    for child in fs::read_dir(&path).map_err(|_| failed())? {
+    Ok(fs::read_dir(path).map_err(|_| failed())?.any(|entry| {
+        entry.is_ok_and(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
+                && probe_source_name(&entry.file_name())
+        })
+    }))
+}
+
+fn directory_has_nested_source(path: &Path) -> Result<bool, CliError> {
+    let failed = || CliError::failed("cannot inspect repository files for Probe");
+    for child in fs::read_dir(path).map_err(|_| failed())? {
         let child = child.map_err(|_| failed())?;
-        let child_type = child.file_type().map_err(|_| failed())?;
-        if child_type.is_symlink() {
+        let kind = child.file_type().map_err(|_| failed())?;
+        if kind.is_symlink() || scope_skipped_name(&child.file_name()) || !kind.is_dir() {
             continue;
         }
-        let child_name = child.file_name();
-        if child_name.to_str().is_none_or(|name| name.starts_with('.')) {
+        if !confined_scope_path(path, &child.path())? {
             continue;
         }
-        let child_path = child.path();
-        if !confined_scope_path(root, &child_path)? {
-            continue;
+        if directory_contains_source(&child.path())? {
+            return Ok(true);
         }
-        if child_type.is_file() && probe_source_name(&child_name) {
-            targets.push(child_path);
-        } else if child_type.is_dir() {
-            let has_source = fs::read_dir(&child_path)
-                .map_err(|_| failed())?
-                .any(|entry| {
-                    entry.is_ok_and(|entry| {
-                        entry
-                            .file_type()
-                            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
-                            && probe_source_name(&entry.file_name())
-                    })
-                });
-            if has_source {
-                nested_source = true;
-                targets.push(child_path);
+    }
+    Ok(false)
+}
+
+// A directory that itself contains a nested source directory is one Probe target.
+// Root files, including docs and config, stay searchable. Deeper ordinary layouts
+// are reached by repeating that same directory target, not by raising the cap.
+// ponytail: 16 directories. A wider tree is incomplete coverage, not a full listing.
+fn plan_scope(root: &Path) -> Result<ScopePlan, CliError> {
+    let failed = || CliError::failed("cannot inspect repository files for Probe");
+    let mut paths = Vec::new();
+    let mut bounded = 0usize;
+    let mut pending = vec![root.to_path_buf()];
+    let mut truncated = false;
+    while let Some(dir) = pending.pop() {
+        let mut children = fs::read_dir(&dir)
+            .map_err(|_| failed())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| failed())?;
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
+            let file_type = entry.file_type().map_err(|_| failed())?;
+            if file_type.is_symlink() || scope_skipped_name(&entry.file_name()) {
+                continue;
+            }
+            let path = entry.path();
+            if !confined_scope_path(root, &path)? {
+                continue;
+            }
+            if file_type.is_file() {
+                let source = probe_source_name(&entry.file_name());
+                if dir == root && !source {
+                    paths.push(path);
+                } else if source {
+                    if bounded == MAX_SCOPED_PROBE_TARGETS {
+                        truncated = true;
+                    } else {
+                        bounded += 1;
+                        paths.push(path);
+                    }
+                }
+            } else if file_type.is_dir() {
+                if directory_has_nested_source(&path)? {
+                    if bounded == MAX_SCOPED_PROBE_TARGETS {
+                        truncated = true;
+                    } else {
+                        bounded += 1;
+                        paths.push(path);
+                    }
+                } else {
+                    pending.push(path);
+                }
             }
         }
     }
-    if nested_source {
-        targets.retain(|target| target.is_dir());
-    }
-    targets.sort();
-    Ok(targets)
+    paths.sort();
+    paths.dedup();
+    Ok(ScopePlan { paths, truncated })
 }
 
-fn probe_scope_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
-    let entries = fs::read_dir(root)
-        .map_err(|_| CliError::failed("cannot enumerate repository files for Probe"))?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|_| CliError::failed("cannot enumerate repository files for Probe"))?;
-        paths.extend(scope_target(root, &entry)?);
-        if paths.len() > MAX_SCOPED_PROBE_TARGETS {
-            return Err(CliError::failed(
-                "Probe scope exceeded the bounded target limit",
-            ));
-        }
-    }
-    paths.sort();
-    Ok(paths)
+fn probe_scope_paths(root: &Path) -> Result<ScopePlan, CliError> {
+    plan_scope(root)
 }
 
 fn probe_has_file_records(stdout: &[u8]) -> bool {
@@ -1118,6 +1128,22 @@ fn probe_output_is_relevant(output: &Output, root: &Path, query: &str, max_resul
         .is_ok_and(|report| !report.evidence().is_empty())
 }
 
+fn ignored_scope_file(path: &Path, ignores: &[String]) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    ignores.iter().any(|pattern| {
+        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+        if pattern.starts_with('!') || path.is_dir() {
+            return false;
+        }
+        pattern
+            .strip_prefix('*')
+            .is_some_and(|suffix| !suffix.contains('*') && name.ends_with(suffix))
+            || pattern == name
+    })
+}
+
 fn invoke_probe_scope(
     root: &Path,
     query: &str,
@@ -1127,6 +1153,9 @@ fn invoke_probe_scope(
 ) -> Result<Output, CliError> {
     let mut retained = None;
     for path in paths {
+        if ignored_scope_file(path, &options.ignores) {
+            continue;
+        }
         let mut command = probe_command(root, query, options, false);
         command.arg(path);
         let output = run_probe_command(command, deadline)?;
@@ -1142,7 +1171,8 @@ fn invoke_probe_scope(
         }
     }
     let Some(output) = retained else {
-        return Err(CliError::failed("Probe scope is empty"));
+        // Every scoped target was a user ignore. That is a miss, not an I/O failure.
+        return Err(CliError::compatibility_failed("no source locations found"));
     };
     Ok(output)
 }
@@ -1155,25 +1185,29 @@ fn invoke_probe(
     deadline: Instant,
 ) -> Result<Output, CliError> {
     let output = run_probe_command(probe_command(root, query, options, raw), deadline)?;
-    // ponytail: filtered/budgeted root-only search; fallback bypasses ignores
-    // and restarts global Probe limits. Keep native selection/merge semantics.
-    if raw
-        || options.language.is_some()
-        || !options.ignores.is_empty()
-        || options.max_bytes.is_some()
-        || options.max_tokens.is_some()
-        || options.merge_threshold.is_some()
-        || !output.status.success()
-        || probe_has_file_records(&output.stdout)
-    {
+    // Filters and budgets travel with every scoped Probe call. A root hit still wins.
+    let zero_budget = [
+        &options.max_bytes,
+        &options.max_tokens,
+        &options.merge_threshold,
+    ]
+    .iter()
+    .any(|value| value.as_deref() == Some("0"));
+    if raw || zero_budget || !output.status.success() || probe_has_file_records(&output.stdout) {
         return Ok(output);
     }
 
-    let paths = probe_scope_paths(root)?;
-    if paths.is_empty() {
+    let plan = probe_scope_paths(root)?;
+    if plan.paths.is_empty() {
         return Ok(output);
     }
-    invoke_probe_scope(root, query, options, &paths, deadline)
+    let scoped = invoke_probe_scope(root, query, options, &plan.paths, deadline)?;
+    if plan.truncated && !probe_output_is_relevant(&scoped, root, query, options.max_results) {
+        return Err(CliError::failed(
+            "Probe scope exceeded the bounded target limit",
+        ));
+    }
+    Ok(scoped)
 }
 
 fn exit_status(output: &Output) -> i32 {

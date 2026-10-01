@@ -539,6 +539,10 @@ fn token_matches(left: &str, right: &str) -> bool {
     if left == right {
         return true;
     }
+    // Underscored symbols stay exact. Ordinary words share a prefix, not an arbitrary stem.
+    if left.contains('_') || right.contains('_') {
+        return false;
+    }
     let left = left.as_bytes();
     let right = right.as_bytes();
     let common = left
@@ -967,13 +971,29 @@ fn best_window(
             let end = start + length;
             let text = lines[start..end].join("\n");
             let code = code_lines[start..end].join("\n");
-            let relevance_text = if behavioral { &code } else { &text };
-            let group_matches = matching_terms(&group.terms, relevance_text);
-            let any_matches = matching_terms(&all_terms, relevance_text).len();
+            let source_text = if behavioral { &code } else { &text };
+            let relevance_text = format!("{path_text}\n{source_text}");
+            let group_matches = if group.exact_symbols.is_empty() {
+                matching_terms(&group.terms, source_text)
+            } else {
+                group
+                    .terms
+                    .iter()
+                    .filter(|term| {
+                        let expected = compact_alphanumeric(term);
+                        raw_identifiers(source_text).iter().any(|candidate| {
+                            let compact = compact_alphanumeric(candidate);
+                            compact == expected
+                                || expected.len() >= 8 && compact.starts_with(&expected)
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let any_matches = matching_terms(&all_terms, source_text).len();
             let path_matches = matching_terms(&group.terms, &path_text);
             let path_context = matching_terms(&context_terms, &path_text);
-            let context_matches =
-                matching_terms(&all_terms, &format!("{path_text}\n{relevance_text}"));
+            let context_matches = matching_terms(&all_terms, &relevance_text);
             let features = window_features(&code, scopes.covers(start + 1, end));
             if requested.contains(&"unknown-field-handling")
                 && !features.contains(&"unknown-field-handling")
@@ -1007,8 +1027,10 @@ fn best_window(
                 .count();
             let direct = group_matches.len();
             // Keep the two-term floor across distinct OR alternatives; one token is not complete evidence.
-            let simple_lexical =
-                !behavioral && (direct >= 2 || (group.any_of && direct >= 1 && any_matches >= 2));
+            let simple_lexical = !behavioral
+                && (direct >= 2
+                    || !group.exact_symbols.is_empty() && direct >= 1
+                    || (group.any_of && direct >= 1 && any_matches >= 2));
             let exact = exact_symbol.is_some();
             if !exact
                 && ((behavioral && (!actionable || (direct == 0 && overlap == 0)))
@@ -1504,6 +1526,22 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn evidence_rejects_display_method_as_display_relative() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("crates/verbatim-core/src/ingest.rs");
+        fs::create_dir_all(path.parent().unwrap()).expect("parents");
+        fs::write(
+            &path,
+            "                .with_context(|| format!(\"remove stale image artifact: {}\", path.display()))?;\n        }\n    }\n    if artifacts.is_empty() || fs::read_dir(&source_dir)?.next().is_none() {\n",
+        )
+        .expect("decoy");
+        let output = format!("File: {}, Lines: 1-4\n", path.display());
+        let report =
+            verify_probe_evidence(&output, &fixture.root, "SourceLocation display_relative", 4);
+        assert_eq!(report, Err(EvidenceError::NoSourceLocations));
+    }
+
     #[test]
     fn evidence_rejects_traversal_and_symlink_boundary_candidates() {
         let fixture = Fixture::new();
