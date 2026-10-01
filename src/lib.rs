@@ -490,9 +490,7 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
 }
 
 fn definition_request(tokens: &[String]) -> bool {
-    let asks_place = tokens
-        .iter()
-        .any(|token| token == "where" || token == "location");
+    let asks_place = tokens.iter().any(|token| token == "where");
     let asks_definition = tokens.iter().any(|token| {
         matches!(
             token.as_str(),
@@ -1178,7 +1176,9 @@ fn best_window(
                 + if exact { 100 } else { 0 }
                 + if !test_candidate
                     && lines[start..end].iter().enumerate().any(|(offset, line)| {
-                        defines_requested(line, group, &code_lines, start + offset, relative)
+                        declaration_names(line, code_lines[start + offset], relative)
+                            .iter()
+                            .any(|name| same_name(name, group))
                     })
                 {
                     120
