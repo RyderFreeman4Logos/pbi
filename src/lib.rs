@@ -459,8 +459,18 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
                 {
                     terms.push(term);
                 }
-                if token.contains('_') || token.contains("::") {
-                    exact_symbols.push(compact_alphanumeric(token));
+                let pieces: Vec<&str> = if token.contains("::") {
+                    token
+                        .split("::")
+                        .filter(|piece| !piece.is_empty())
+                        .collect()
+                } else {
+                    vec![token.as_str()]
+                };
+                for piece in pieces {
+                    if piece.contains('_') {
+                        exact_symbols.push(compact_alphanumeric(piece));
+                    }
                 }
             }
             let definition = definition_request(&tokens);

@@ -192,6 +192,21 @@ fn ordinary_implementation_prose_is_not_a_definition_request() {
 }
 
 #[test]
+fn owner_qualified_definition_uses_the_real_declaration() {
+    let fixture = Fixture::new();
+    let output = fixture.write(
+        "src/lib.rs",
+        "impl Owner {\n    pub fn target_func(&self) {}\n}\n",
+    );
+    expect_definition(
+        &fixture.root,
+        &output,
+        "where is Owner::target_func defined in src/lib.rs",
+        "fn target_func",
+    );
+}
+
+#[test]
 fn definition_identity_rejects_wrong_owner_path_and_parameter() {
     let owner = Fixture::new();
     let owner_output = owner.write(
