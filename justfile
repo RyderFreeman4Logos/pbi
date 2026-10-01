@@ -25,6 +25,10 @@ test-relevance:
 build:
     ionice -c 3 cargo build --locked
 
+build-release:
+    ionice -c 3 cargo build --locked --release
+    cp target/release/pbi-rs target/release/pbi
+
 clippy:
     ionice -c 3 cargo clippy --locked --all-targets -- -D warnings
 
