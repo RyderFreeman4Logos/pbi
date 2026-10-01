@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "definition_intent_binding_completeness_tests.rs"]
+mod definition_intent_binding_completeness_tests;
+
 fn expect_owner_miss(source: &str, queries: &[&str]) {
     let fixture = Fixture::new();
     let output = fixture.write("src/lib.rs", source);

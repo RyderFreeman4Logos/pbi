@@ -150,6 +150,7 @@ fn item_binds(item: &Item, root: &str) -> bool {
         Item::Enum(item) => bare(&item.ident.to_string()) == root,
         Item::Trait(item) => bare(&item.ident.to_string()) == root,
         Item::Type(item) => bare(&item.ident.to_string()) == root,
+        Item::Union(item) => bare(&item.ident.to_string()) == root,
         Item::Mod(item) => bare(&item.ident.to_string()) == root,
         _ => false,
     }
@@ -157,8 +158,21 @@ fn item_binds(item: &Item, root: &str) -> bool {
 
 fn use_binds(tree: &UseTree, root: &str) -> bool {
     match tree {
+        UseTree::Path(path) => path_binds(&path.ident, &path.tree, root),
         UseTree::Group(group) => group.items.iter().any(|item| use_binds(item, root)),
         _ => bound_name(tree).is_some_and(|name| name == root),
+    }
+}
+
+fn path_binds(parent: &syn::Ident, tree: &UseTree, root: &str) -> bool {
+    match tree {
+        UseTree::Name(name) if name.ident == "self" => bare(&parent.to_string()) == root,
+        UseTree::Rename(name) if name.ident == "self" => bare(&name.rename.to_string()) == root,
+        UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|item| path_binds(parent, item, root)),
+        other => use_binds(other, root),
     }
 }
 
@@ -167,18 +181,7 @@ fn bound_name(tree: &UseTree) -> Option<String> {
         UseTree::Name(name) => Some(bare(&name.ident.to_string()).to_owned()),
         UseTree::Rename(name) => Some(bare(&name.rename.to_string()).to_owned()),
         UseTree::Glob(_) => None,
-        UseTree::Path(path) => match path.tree.as_ref() {
-            UseTree::Group(group) => group.items.iter().find_map(|item| match item {
-                UseTree::Name(name) if name.ident == "self" => {
-                    Some(bare(&path.ident.to_string()).to_owned())
-                }
-                UseTree::Rename(name) if name.ident == "self" => {
-                    Some(bare(&name.rename.to_string()).to_owned())
-                }
-                other => bound_name(other),
-            }),
-            _ => bound_name(&path.tree),
-        },
+        UseTree::Path(path) => bound_name(&path.tree),
         UseTree::Group(_) => None,
     }
 }
