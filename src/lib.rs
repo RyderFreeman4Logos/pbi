@@ -617,6 +617,7 @@ fn raw_query_tokens(value: &str) -> Vec<String> {
             || character == '_'
             || character == ':'
             || matches!(character, '/' | '.' | '-')
+            || (character == '#' && current.rsplit("::").next() == Some("r"))
         {
             current.push(character);
         } else if !current.is_empty() {
@@ -1263,7 +1264,7 @@ fn best_window(
                                     declaration
                                         .owner
                                         .as_ref()
-                                        .is_some_and(|found| rust_identity_matches(found, owner))
+                                        .is_some_and(|found| found.matches(owner))
                                 })
                         })
                     }));
@@ -1487,8 +1488,8 @@ fn defines_requested(
                 && rust_identity_matches(&declaration.name, symbol)
                 && declaration
                     .owner
-                    .as_deref()
-                    .is_some_and(|found| rust_identity_matches(found, owner))
+                    .as_ref()
+                    .is_some_and(|found| found.matches(owner))
         })
     })
 }

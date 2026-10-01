@@ -446,6 +446,164 @@ struct IdentityCase {
     queries: &'static [(&'static str, Option<(usize, &'static str)>)],
 }
 
+fn expect_path_identity(
+    root: &Path,
+    output: &str,
+    query: &str,
+    line: usize,
+    name: &str,
+    owner: Option<&str>,
+) {
+    let report = verify_probe_evidence(output, root, query, 4).expect(query);
+    assert!(report.is_complete(), "{query}");
+    let evidence = &report.evidence()[0];
+    assert!(
+        (evidence.location().start_line()..=evidence.location().end_line()).contains(&line),
+        "{query}: {evidence:?}"
+    );
+    assert_eq!(evidence.symbol(), Some(name), "{query}");
+    let groups = query_groups(query).expect(query);
+    assert_eq!(groups[0].owner.as_deref(), owner, "{query}");
+    assert!(cited(root, &report).contains(name), "{query}");
+    let source = fs::read_to_string(root.join(evidence.location().path())).expect("source");
+    assert!(
+        declaration_identity::declarations(&source)
+            .iter()
+            .any(|declaration| {
+                declaration.line == line
+                    && declaration.name == name
+                    && owner.is_some_and(|owner| {
+                        declaration
+                            .owner
+                            .as_ref()
+                            .is_some_and(|found| found.matches(owner))
+                    })
+            }),
+        "{query}: missing structural identity on line {line}"
+    );
+}
+
+#[test]
+fn definition_owner_path_uses_type_identity_not_impl_module() {
+    for path in ["crate::actual::Owner", "super::actual::Owner"] {
+        let fixture = Fixture::new();
+        let source = format!("pub mod actual {{ pub struct Owner; }}\npub mod elsewhere {{\n impl {path} {{\n  pub fn target_func(&self) {{}}\n }}\n}}\n");
+        let output = fixture.write("src/lib.rs", &source);
+        expect_path_identity(
+            &fixture.root,
+            &output,
+            "where is actual::Owner::target_func defined",
+            4,
+            "target_func",
+            Some("actual::Owner"),
+        );
+        for owner in ["elsewhere::Owner", "imaginary::Owner", "actual::WrongOwner"] {
+            expect_miss(
+                &fixture.root,
+                &output,
+                &format!("where is {owner}::target_func defined"),
+            );
+        }
+    }
+    let fixture = Fixture::new();
+    let output = fixture.write("src/lib.rs", "pub mod actual { pub struct Owner; }\nimpl actual::Owner {\n pub fn target_func(&self) {}\n}\n");
+    expect_path_identity(
+        &fixture.root,
+        &output,
+        "where is actual::Owner::target_func defined",
+        3,
+        "target_func",
+        Some("actual::Owner"),
+    );
+}
+
+#[test]
+fn definition_owner_path_matches_only_supplied_segment_suffix() {
+    let fixture = Fixture::new();
+    let output = fixture.write("src/lib.rs", "pub mod outer {\n pub mod actual {\n  pub struct Owner;\n  impl self::Owner {\n   pub fn target_func(&self) {}\n  }\n  pub trait Trait {\n   const TARGET_CONST: u8 = 1;\n   type TargetType;\n   fn default_func(&self) {}\n  }\n  impl Trait for Owner {\n   fn trait_func(&self) {}\n  }\n  pub fn direct_func() {}\n }\n}\n");
+    for (owner, member, line) in [
+        ("outer::actual::Owner", "target_func", 5),
+        ("actual::Owner", "target_func", 5),
+        ("Owner", "target_func", 5),
+        ("Trait", "TARGET_CONST", 8),
+        ("actual::Trait", "TargetType", 9),
+        ("Trait", "default_func", 10),
+        ("Owner", "trait_func", 13),
+        ("actual", "direct_func", 15),
+    ] {
+        let query = format!("where is {owner}::{member} defined");
+        expect_path_identity(&fixture.root, &output, &query, line, member, Some(owner));
+        for wrong in [format!("imaginary::{owner}"), format!("wrong::{owner}")] {
+            expect_miss(
+                &fixture.root,
+                &output,
+                &format!("where is {wrong}::{member} defined"),
+            );
+        }
+    }
+    for path in [
+        "super::super::Owner",
+        "<Owner as Trait>::Assoc",
+        "(Owner,)",
+        "::external::Owner",
+    ] {
+        let source = format!("impl {path} {{ fn target_func() {{}} }}");
+        let output = fixture.write("src/lib.rs", &source);
+        expect_miss(
+            &fixture.root,
+            &output,
+            "where is Owner::target_func defined",
+        );
+    }
+}
+
+#[test]
+fn definition_owner_path_normalizes_raw_segments_only() {
+    let fixture = Fixture::new();
+    let output = fixture.write("src/lib.rs", "pub mod r#outer {\n pub mod r#actual {\n  pub struct r#Owner_Name;\n  impl crate::r#outer::r#actual::r#Owner_Name {\n   pub fn r#target_func(&self) {}\n  }\n  pub trait r#Trait {\n   fn r#default_func(&self) {}\n  }\n  pub fn r#direct_func() {}\n }\n}\n");
+    for owner in [
+        "outer::actual::Owner_Name",
+        "Owner_Name",
+        "r#outer::r#actual::r#Owner_Name",
+    ] {
+        expect_path_identity(
+            &fixture.root,
+            &output,
+            &format!("where is {owner}::target_func defined"),
+            5,
+            "target_func",
+            Some(owner),
+        );
+    }
+    expect_path_identity(
+        &fixture.root,
+        &output,
+        "where is outer::actual::Trait::default_func defined",
+        8,
+        "default_func",
+        Some("outer::actual::Trait"),
+    );
+    expect_path_identity(
+        &fixture.root,
+        &output,
+        "where is outer::actual::direct_func defined",
+        10,
+        "direct_func",
+        Some("outer::actual"),
+    );
+    for owner in [
+        "outer::actual::OwnerName",
+        "outer::actual::owner_Name",
+        "imaginary::Owner_Name",
+    ] {
+        expect_miss(
+            &fixture.root,
+            &output,
+            &format!("where is {owner}::target_func defined"),
+        );
+    }
+}
+
 #[test]
 fn declaration_identity_uses_the_enclosing_declaration() {
     let cases = [
