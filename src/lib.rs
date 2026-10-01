@@ -981,11 +981,9 @@ fn best_window(
                     .iter()
                     .filter(|term| {
                         let expected = compact_alphanumeric(term);
-                        raw_identifiers(source_text).iter().any(|candidate| {
-                            let compact = compact_alphanumeric(candidate);
-                            compact == expected
-                                || expected.len() >= 8 && compact.starts_with(&expected)
-                        })
+                        raw_identifiers(source_text)
+                            .iter()
+                            .any(|candidate| compact_alphanumeric(candidate) == expected)
                     })
                     .cloned()
                     .collect()
@@ -1026,12 +1024,13 @@ fn best_window(
                 .filter(|line| line.trim_start().starts_with("let "))
                 .count();
             let direct = group_matches.len();
-            // Keep the two-term floor across distinct OR alternatives; one token is not complete evidence.
+            // A requested compound symbol is covered only when every term is exact.
+            let exact_group = !group.exact_symbols.is_empty() && direct == group.terms.len();
             let simple_lexical = !behavioral
                 && (direct >= 2
-                    || !group.exact_symbols.is_empty() && direct >= 1
+                    || exact_group
                     || (group.any_of && direct >= 1 && any_matches >= 2));
-            let exact = exact_symbol.is_some();
+            let exact = exact_symbol.is_some() && group.exact_symbols.len() <= 1;
             if !exact
                 && ((behavioral && (!actionable || (direct == 0 && overlap == 0)))
                     || (!behavioral && !simple_lexical))

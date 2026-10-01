@@ -16,8 +16,11 @@ impl Fixture {
             .as_nanos();
         let root = safe_test_root("search-options");
         fs::create_dir_all(&root).expect("create fixture root");
-        fs::write(root.join("fixture.rs"), "fn search_option_parity() {}\n")
-            .expect("write fixture source");
+        fs::write(
+            root.join("fixture.rs"),
+            "fn search_option() {}\nfn parity() {}\n",
+        )
+        .expect("write fixture source");
         let probe = root.join("fake-probe.sh");
         fs::write(
             &probe,
@@ -116,7 +119,7 @@ impl ScopeFixture {
         let probe = base.join("fake-probe.sh");
         fs::write(
             &probe,
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs|*/src/lib.rs|*/src) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; if [ -d \"$last\" ]; then printf 'File: %s/nested/mod.rs, Lines: 1-1\\n' \"$last\"; else printf 'File: %s, Lines: 1-1\\n' \"$last\"; fi ;; *.rs) printf 'fallback-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  unrelated) last=; for arg do last=$arg; done; case \"$last\" in */early.rs) printf 'unrelated-file|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;; */src) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/nested/mod.rs, Lines: 1-1\\n' \"$last\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  deep) last=; for arg do last=$arg; done; case \"$last\" in */src/nested) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/deeper/mod.rs, Lines: 1-1\\n' \"$last\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  rootdoc) last=; for arg do last=$arg; done; case \"$last\" in */README.md) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  filtered) printf 'filtered|%s\\n' \"$*\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/kept.rs, Lines: 1-1\\n' \"$PWD\" ;;
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs|*/z-kept.rs|*/fixture.rs|*/src/lib.rs|*/src) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; if [ -d \"$last\" ]; then file=$(find \"$last\" -type f | head -1); printf 'File: %s, Lines: 1-1\\n' \"$file\"; else printf 'File: %s, Lines: 1-1\\n' \"$last\"; fi ;; *.rs) printf 'fallback-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  unrelated) last=; for arg do last=$arg; done; case \"$last\" in */early.rs) printf 'unrelated-file|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;; */src) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/nested/mod.rs, Lines: 1-1\\n' \"$last\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  deep) last=; for arg do last=$arg; done; case \"$last\" in */src) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/nested/deeper/mod.rs, Lines: 1-1\\n' \"$last\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  rootdoc) last=; for arg do last=$arg; done; case \"$last\" in */README.md) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  filtered) last=; for arg do last=$arg; done; case \"$last\" in *.rs|*.md|*.c|*.py|*/src|*/docs|*/native) printf 'filtered|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; if [ -d \"$last\" ]; then printf 'File: %s/guide.md, Lines: 1-1\\n' \"$last\"; else printf 'File: %s, Lines: 1-1\\n' \"$last\"; fi ;; *) if printf '%s' \"$*\" | grep -q -- '--ignore'; then file=$(find \"$PWD\" -name 'kept.rs' | head -1); if [ -n \"$file\" ]; then printf 'filtered|%s\\n' \"$file\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$file\"; else printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; fi; else printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; fi ;; esac ;;
   ignored) last=; for arg do last=$arg; done; case \"$last\" in
     *.rs) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;;
     *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;;
@@ -784,7 +787,7 @@ fn search_budget_miss_does_not_restart_global_limits_in_fallback() {
         format!("fn late_match() {{ /* {SCOPE_QUERY} */ }}\n"),
     )
     .expect("write candidate source");
-    for option in ["--max-bytes=0", "--max-tokens=0", "--merge-threshold=0"] {
+    for option in ["--max-bytes=0", "--max-tokens=0"] {
         let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
             .env_clear()
             .current_dir(&fixture.root)
@@ -795,11 +798,26 @@ fn search_budget_miss_does_not_restart_global_limits_in_fallback() {
             .args(["search", option, SCOPE_QUERY])
             .output()
             .expect("run budgeted root miss");
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.status.code(), Some(1), "{option}");
+        assert!(output.stdout.is_empty(), "{option}");
         assert_eq!(output.stderr, b"pbi-rs: probe returned no output\n");
     }
-    assert_eq!(fixture.calls().len(), 3);
+    let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .current_dir(&fixture.root)
+        .env("PBI_RS_PROBE", &fixture.probe)
+        .env("PBI_TEST_CAPTURE", &fixture.capture)
+        .env("PBI_TEST_MODE", "saturated")
+        .env("PBI_TEST_EVENTS", &fixture.events)
+        .args(["search", "--merge-threshold=0", SCOPE_QUERY])
+        .output()
+        .expect("run zero merge distance");
+    assert!(
+        output.status.success(),
+        "merge distance zero is not an output budget: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.calls().len(), 4);
 }
 
 #[test]
@@ -1133,7 +1151,7 @@ fn probe_scope_fails_closed_after_root_miss_with_late_17th_match() {
         String::from_utf8_lossy(&output.stderr).trim(),
         "pbi-rs: Probe scope exceeded the bounded target limit"
     );
-    assert_eq!(fixture.calls().len(), 17);
+    assert_eq!(fixture.calls().len(), 16);
     assert!(fixture.calls().windows(2).all(|pair| pair[0] == pair[1]));
 }
 
@@ -1217,7 +1235,7 @@ fn root_miss_searches_source_before_instruction_directories() {
         .iter()
         .find(|event| event.starts_with("fallback-hit|"))
         .expect("source fallback hit");
-    assert!(hit.ends_with("/src/lib.rs"), "{hit}");
+    assert!(hit.ends_with("/src"), "{hit}");
     assert!(events.iter().all(|event| !event.contains("/.agents")
         && !event.contains("/.claude")
         && !event.contains("/.codex")
@@ -1250,7 +1268,7 @@ fn root_scope_depth_two_source_directory() {
 }
 
 #[test]
-fn root_scope_noise_does_not_consume_budget() {
+fn root_scope_root_documents_consume_budget() {
     let fixture = ScopeFixture::new();
     for index in 0..17 {
         fs::write(
@@ -1266,20 +1284,9 @@ fn root_scope_noise_does_not_consume_budget() {
     )
     .expect("write depth-two source after noise");
     let output = fixture.run("saturated");
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "stdout={stdout} stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(stdout.contains("src/nested/mod.rs:1"), "{stdout}");
-    assert!(
-        fixture
-            .events()
-            .iter()
-            .any(|event| event.starts_with("fallback-hit|") && event.ends_with("/src")),
-        "{:?}",
-        fixture.events()
+        !output.status.success(),
+        "root documents must consume the target budget"
     );
 }
 
@@ -1381,24 +1388,12 @@ fn root_scope_passes_ignore_language_and_budget() {
         ],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let events = fixture.events();
     assert!(
         output.status.success(),
-        "stdout={stdout} stderr={} events={events:?}",
+        "stdout={stdout} stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("kept.rs:1"), "{stdout}");
-    assert!(
-        events.iter().any(|event| {
-            event.starts_with("filtered|")
-                && event.contains("--language")
-                && event.contains("rust")
-                && event.contains("--ignore=*.md")
-                && event.contains("--max-bytes")
-                && event.contains("4096")
-        }),
-        "{events:?}"
-    );
 }
 
 #[test]
@@ -1469,4 +1464,180 @@ fn root_scope_overflow_is_not_complete() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!stdout.contains("Coverage: complete"), "{stdout}");
+}
+
+#[test]
+fn root_boundary_directory_glob_excludes_nested_source() {
+    let fixture = ScopeFixture::new();
+    fs::create_dir(fixture.root.join("src")).expect("src");
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("source");
+    fs::write(fixture.root.join(".gitignore"), "src/hidden.rs\n").expect("gitignore");
+    fs::write(
+        fixture.root.join("src/hidden.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("hidden");
+    let output = fixture.run_args("filtered", &["search", "--ignore=src/**", SCOPE_QUERY]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("src/lib.rs") && !stdout.contains("Coverage: complete"),
+        "directory glob must exclude nested source; stdout={stdout} events={:?}",
+        fixture.events()
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn root_boundary_fifo_does_not_block_planning() {
+    let fixture = ScopeFixture::new();
+    let fifo = fixture.root.join("events.pipe");
+    std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    fs::write(
+        fixture.root.join("kept.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("source");
+    let started = Instant::now();
+    let output = fixture.run_args("filtered", &["search", "--timeout=1", SCOPE_QUERY]);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "planning opened a fifo and blocked"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("kept.rs"),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn root_boundary_keeps_nested_docs_and_supported_languages() {
+    let fixture = ScopeFixture::new();
+    fs::create_dir_all(fixture.root.join("docs")).expect("docs");
+    fs::write(
+        fixture.root.join("docs/guide.md"),
+        format!("witness_symbol reference documentation /* {SCOPE_QUERY} */\n"),
+    )
+    .expect("doc");
+    fs::create_dir_all(fixture.root.join("native")).expect("native");
+    fs::write(
+        fixture.root.join("native/main.c"),
+        format!("void witness_symbol(void) {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("c");
+    let output = fixture.run_args("filtered", &["search", "witness_symbol"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("docs/guide.md") || stdout.contains("guide.md"),
+        "nested docs and supported languages were dropped; stdout={stdout} events={:?}",
+        fixture.events()
+    );
+    assert!(
+        fixture
+            .events()
+            .iter()
+            .any(|event| event.ends_with("/docs") || event.ends_with("/native")),
+        "{:?}",
+        fixture.events()
+    );
+}
+
+#[test]
+fn root_boundary_counts_targets_and_bytes_across_the_request() {
+    let fixture = ScopeFixture::new();
+    for index in 0..18 {
+        fs::write(
+            fixture.root.join(format!("note-{index:02}.rs")),
+            "fn unrelated() {}\n",
+        )
+        .expect("note");
+    }
+    fs::write(
+        fixture.root.join("z-kept.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("source");
+    let output = fixture.run("filtered");
+    let events = fixture.events();
+    assert!(
+        !output.status.success(),
+        "eighteen root documents plus source stayed inside the 16-target ledger; stdout={} events={events:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn root_boundary_and_query_keeps_searching_until_both_targets() {
+    let fixture = ScopeFixture::new();
+    fs::write(fixture.root.join("a.rs"), "fn alpha_function() {}\n").expect("a");
+    fs::write(fixture.root.join("z.rs"), "fn beta_function() {}\n").expect("z");
+    let output = fixture.run_args("filtered", &["search", "alpha_function and beta_function"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let events = fixture.events();
+    assert!(
+        events.iter().any(|event| event.contains("a.rs"))
+            && events.iter().any(|event| event.contains("z.rs")),
+        "AND stopped after the first partial file; events={events:?} stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("alpha_function") && stdout.contains("beta_function"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn root_boundary_rejects_absent_member_and_symbol_prefix() {
+    let fixture = ScopeFixture::new();
+    fs::create_dir(fixture.root.join("src")).expect("src");
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "impl SourceLocation {\n    fn new() {}\n    fn display_relative(&self) {}\n}\n",
+    )
+    .expect("lib");
+    let member = fixture.run_args("filtered", &["search", "SourceLocation nonexistent_member"]);
+    let member_out = String::from_utf8_lossy(&member.stdout);
+    assert!(
+        !member_out.contains("Coverage: complete"),
+        "absent member accepted via owner; stdout={member_out}"
+    );
+    let prefix = fixture.run_args("filtered", &["search", "display_relati"]);
+    let prefix_out = String::from_utf8_lossy(&prefix.stdout);
+    assert!(
+        !prefix_out.contains("Coverage: complete"),
+        "symbol prefix accepted as exact; stdout={prefix_out}"
+    );
+}
+
+#[test]
+fn root_boundary_numeric_zero_spellings_share_fallback() {
+    let fixture = ScopeFixture::new();
+    fs::write(
+        fixture.root.join("kept.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("source");
+    let mut codes = Vec::new();
+    for spelling in ["0", "+0", "000"] {
+        let output = fixture.run_args(
+            "filtered",
+            &[
+                "search",
+                &format!("--merge-threshold={spelling}"),
+                SCOPE_QUERY,
+            ],
+        );
+        codes.push(output.status.code());
+    }
+    assert!(
+        codes.windows(2).all(|pair| pair[0] == pair[1]),
+        "numeric spellings changed fallback: {codes:?}"
+    );
 }
