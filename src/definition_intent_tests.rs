@@ -55,6 +55,23 @@ fn expect_definition(root: &Path, output: &str, query: &str, needle: &str) {
     );
 }
 
+fn expect_identity(
+    root: &Path,
+    output: &str,
+    query: &str,
+    line: usize,
+    name: &str,
+    owner: Option<&str>,
+) {
+    let report = verify_probe_evidence(output, root, query, 4)
+        .unwrap_or_else(|error| panic!("{query} produced {error:?}"));
+    assert!(report.is_complete(), "{query} was partial: {report:?}");
+    let evidence = &report.evidence()[0];
+    assert_eq!(evidence.location().start_line(), line, "{query}");
+    assert_eq!(evidence.symbol(), Some(name), "{query}");
+    let _ = owner;
+}
+
 fn expect_miss(root: &Path, output: &str, query: &str) {
     let identity = query_groups(query).map(|groups| {
         groups
@@ -104,7 +121,11 @@ fn definition_query_uses_the_real_declaration() {
         let text = cited(&fixture.root, &report);
         assert!(text.contains(needle), "{query} cited {text}");
         if query.contains("SourceLocation") {
-            assert!(text.contains("impl SourceLocation"), "{query} cited {text}");
+            assert_eq!(
+                report.evidence()[0].symbol(),
+                Some("display_relative"),
+                "{query}"
+            );
         }
     }
 }
@@ -397,4 +418,44 @@ fn equivalent_root_contained_paths_name_the_same_file() {
         &output,
         &format!("where is target_func defined in {outside}"),
     );
+}
+
+struct IdentityCase {
+    source: &'static str,
+    queries: &'static [(&'static str, Option<(usize, &'static str)>)],
+}
+
+#[test]
+fn declaration_identity_uses_the_enclosing_declaration() {
+    let cases = [
+        IdentityCase { source: "pub struct Owner;\nimpl Owner {}\npub fn target_func() { let _ = 1; }\n", queries: &[("where is Owner::target_func defined", None), ("where is target_func defined", Some((3, "target_func")))] },
+        IdentityCase { source: "pub struct Owner;\nimpl Owner {}\npub struct Other<T>(T);\nimpl<T> Other<T> {\n    pub fn target_func(&self) { let _ = 1; }\n}\n", queries: &[("where is Owner::target_func defined", None), ("where is Other::target_func defined", Some((5, "target_func")))] },
+        IdentityCase { source: "pub mod first {\n    pub struct Owner;\n    impl Owner {}\n}\npub mod second {\n    pub fn target_func() { let _ = 1; }\n}\n", queries: &[("where is Owner::target_func defined", None), ("where is second::target_func defined", Some((6, "target_func")))] },
+        IdentityCase { source: "pub struct Owner;\nimpl Owner {\n    pub fn wrapper() {\n        fn target_func() { let _ = 1; }\n    }\n}\n", queries: &[("where is Owner::target_func defined", None)] },
+        IdentityCase { source: "pub const target_const: u8 = 1;\n", queries: &[("where is target_const defined", Some((1, "target_const")))] },
+        IdentityCase { source: "pub static target_static: u8 = 1;\n", queries: &[("where is target_static defined", Some((1, "target_static")))] },
+        IdentityCase { source: "pub async unsafe fn target_func() { let _ = 1; }\n", queries: &[("where is target_func defined", Some((1, "target_func")))] },
+        IdentityCase { source: "pub fn r#target_func() { let _ = 1; }\n", queries: &[("where is target_func defined", Some((1, "target_func")))] },
+        IdentityCase { source: "pub /* why */ fn target_func() { let _ = 1; }\n", queries: &[("where is target_func defined", Some((1, "target_func")))] },
+        IdentityCase { source: "pub struct Owner;\nimpl Owner { pub fn target_func(&self) { let _ = 1; } }\n", queries: &[("where is target_func defined", Some((2, "target_func"))), ("where is Owner::target_func defined", Some((2, "target_func")))] },
+        IdentityCase { source: "pub struct Owner_Name;\nimpl Owner_Name {\n    pub fn target_func(&self) { let _ = 1; }\n}\n", queries: &[("where is OwnerName::target_func defined", None), ("where is Owner_Name::target_func defined", Some((3, "target_func"))), ("where is Owner_Name target_func defined", Some((3, "target_func")))] },
+        IdentityCase { source: "pub fn targetfunc() { let _ = 1; }\n", queries: &[("where is target_func defined", None), ("where is targetfunc defined", Some((1, "targetfunc"))), ("where is targetfunc::target_func defined", None)] },
+        IdentityCase { source: "pub struct Owner<'a>(&'a str);\nimpl<'a> Owner<'a> {\n    pub fn target_func(&self) { let _ = 1; }\n}\n", queries: &[("where is Owner::target_func defined", Some((3, "target_func")))] },
+        IdentityCase { source: "pub trait Trait { fn target_func(&self); }\npub struct Owner;\nimpl Trait for Owner {\n    fn target_func(&self) { let _ = 1; }\n}\n", queries: &[("where is Owner::target_func defined", Some((4, "target_func")))] },
+        IdentityCase { source: "pub trait Owner {\n    fn target_func(&self) { let _ = 1; }\n}\n", queries: &[("where is Owner::target_func defined", Some((2, "target_func")))] },
+        IdentityCase { source: "pub mod owner_mod {\n    pub fn target_func() { let _ = 1; }\n}\n", queries: &[("where is owner_mod::target_func defined", Some((2, "target_func")))] },
+        IdentityCase { source: "pub mod outer {\n    pub struct Owner;\n    impl Owner {\n        pub fn target_func(&self) { let _ = 1; }\n    }\n}\n", queries: &[("where is outer::Owner::target_func defined", Some((4, "target_func")))] },
+    ];
+    for case in cases {
+        let fixture = Fixture::new();
+        let output = fixture.write("src/lib.rs", case.source);
+        for (query, expected) in case.queries {
+            match expected {
+                None => expect_miss(&fixture.root, &output, query),
+                Some((line, name)) => {
+                    expect_identity(&fixture.root, &output, query, *line, name, None)
+                }
+            }
+        }
+    }
 }

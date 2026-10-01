@@ -1,3 +1,4 @@
+mod declaration_identity;
 #[cfg(test)]
 #[path = "definition_intent_tests.rs"]
 mod definition_intent_tests;
@@ -447,6 +448,7 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
     let groups = groups
         .into_iter()
         .map(|tokens| {
+            let definition = definition_request(&tokens);
             let mut terms = Vec::new();
             let mut exact_symbols = Vec::new();
             for token in &tokens {
@@ -457,7 +459,15 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
                     && !term.contains('/')
                     && !term.contains('.')
                 {
-                    terms.push(term);
+                    if definition && term.contains("::") {
+                        for piece in term.split("::").filter(|piece| piece.len() >= 3) {
+                            if !terms.contains(&piece.to_owned()) {
+                                terms.push(piece.to_owned());
+                            }
+                        }
+                    } else {
+                        terms.push(term);
+                    }
                 }
                 let pieces: Vec<&str> = if token.contains("::") {
                     token
@@ -468,12 +478,11 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
                     vec![token.as_str()]
                 };
                 for piece in pieces {
-                    if piece.contains('_') {
+                    if piece.contains('_') && !definition {
                         exact_symbols.push(compact_alphanumeric(piece));
                     }
                 }
             }
-            let definition = definition_request(&tokens);
             let (symbol, owner, path) = if definition {
                 definition_identity(&tokens)
             } else {
@@ -482,7 +491,10 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
             (!terms.is_empty()).then(|| QueryGroup {
                 label: tokens
                     .iter()
-                    .filter(|token| !query_stop_word(&token.to_lowercase()))
+                    .filter(|token| {
+                        definition_request_shape(&tokens) && control_word(token) == "where"
+                            || !query_stop_word(&token.to_lowercase())
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(" "),
@@ -499,7 +511,7 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
     Some(groups)
 }
 
-fn definition_request(tokens: &[String]) -> bool {
+fn definition_request_shape(tokens: &[String]) -> bool {
     let control = |token: &str| control_word(token);
     let asks_place = tokens.iter().any(|token| control(token) == "where");
     let asks_definition = tokens.iter().any(|token| {
@@ -511,8 +523,11 @@ fn definition_request(tokens: &[String]) -> bool {
     let explicit_definition = tokens
         .windows(2)
         .any(|pair| control(&pair[0]) == "definition" && control(&pair[1]) == "of");
-    (explicit_definition || (asks_place && asks_definition))
-        && definition_identity(tokens).0.is_some()
+    explicit_definition || (asks_place && asks_definition)
+}
+
+fn definition_request(tokens: &[String]) -> bool {
+    definition_request_shape(tokens) && definition_identity(tokens).0.is_some()
 }
 
 fn definition_identity(tokens: &[String]) -> (Option<String>, Option<String>, Option<String>) {
@@ -558,10 +573,27 @@ fn definition_identity(tokens: &[String]) -> (Option<String>, Option<String>, Op
         .map(|index| {
             let qualified = names.remove(index);
             let (owner, member) = qualified.rsplit_once("::").unwrap_or((&qualified, ""));
+            let owner = owner.rsplit("::").next().unwrap_or(owner);
             if !member.is_empty() {
                 names.insert(index.min(names.len()), member.to_owned());
             }
             owner.to_owned()
+        })
+        .or_else(|| {
+            if !definition_request_shape(tokens) {
+                return None;
+            }
+            let symbol_at = names.iter().rposition(|token| {
+                token.contains('_') || token.chars().any(|character| character.is_uppercase())
+            })?;
+            let candidate = symbol_at
+                .checked_sub(1)
+                .and_then(|index| names.get(index))?;
+            candidate
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_uppercase())
+                .then(|| candidate.clone())
         });
     let symbol = names
         .iter()
@@ -1085,6 +1117,15 @@ fn best_window(
     // split, unlike lines(), preserves the cardinality of the original joined lines.
     let code_lines: Vec<&str> = view.code.split('\n').collect();
     let scopes = relevance_scope::Proofs::new(&source, &view.code);
+    let declarations = if relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("rs")
+    {
+        declaration_identity::declarations(&source)
+    } else {
+        Vec::new()
+    };
     if requested.contains(&"unknown-field-handling") && scopes.is_empty() {
         return None;
     }
@@ -1156,8 +1197,34 @@ fn best_window(
             let exact = exact_symbol.is_some() && group.exact_symbols.len() <= 1;
             let defined = !group.definition
                 || lines[start..end].iter().enumerate().any(|(offset, line)| {
-                    defines_requested(line, group, &code_lines, start + offset, relative)
+                    defines_requested(
+                        line,
+                        group,
+                        &code_lines,
+                        start + offset,
+                        relative,
+                        &declarations,
+                    )
                 });
+            if (group.definition || definition_request_shape(&raw_query_tokens(&group.label)))
+                && !defined
+            {
+                continue;
+            }
+            if group.definition && group.symbol.is_some() {
+                let symbol = group.symbol.as_deref().unwrap_or("");
+                let starts = declarations.iter().any(|declaration| {
+                    (start + 1..=start + 2).contains(&declaration.line)
+                        && rust_identity_matches(&declaration.name, symbol)
+                });
+                let later = declarations.iter().any(|declaration| {
+                    (start + 3..=end).contains(&declaration.line)
+                        && rust_identity_matches(&declaration.name, symbol)
+                });
+                if !starts && later {
+                    continue;
+                }
+            }
             if !defined {
                 continue;
             }
@@ -1170,19 +1237,41 @@ fn best_window(
                     continue;
                 }
                 let signature = lines[start..end].iter().enumerate().any(|(offset, line)| {
-                    defines_requested(line, group, &code_lines, start + offset, relative)
+                    defines_requested(
+                        line,
+                        group,
+                        &code_lines,
+                        start + offset,
+                        relative,
+                        &declarations,
+                    )
                 });
                 if !signature {
                     continue;
                 }
             }
-            if !exact
+            let starts_at_declaration = group.definition
+                && (declarations.is_empty()
+                    || group.symbol.as_ref().is_some_and(|symbol| {
+                        declarations.iter().any(|declaration| {
+                            (start..=start + 1).contains(&declaration.line)
+                                && rust_identity_matches(&declaration.name, symbol)
+                                && group.owner.as_ref().is_none_or(|owner| {
+                                    declaration
+                                        .owner
+                                        .as_ref()
+                                        .is_some_and(|found| rust_identity_matches(found, owner))
+                                })
+                        })
+                    }));
+            if !starts_at_declaration
+                && !exact
                 && ((behavioral && (!actionable || (direct == 0 && overlap == 0)))
                     || (!behavioral && !simple_lexical))
             {
                 continue;
             }
-            if direct == 0 && overlap == 0 && !exact {
+            if !starts_at_declaration && direct == 0 && overlap == 0 && !exact {
                 continue;
             }
             let score = (direct as i32 * 12)
@@ -1200,9 +1289,15 @@ fn best_window(
                 + if exact { 100 } else { 0 }
                 + if !test_candidate
                     && lines[start..end].iter().enumerate().any(|(offset, line)| {
-                        declaration_names(line, code_lines[start + offset], relative)
-                            .iter()
-                            .any(|name| same_name(name, group))
+                        declaration_names(
+                            line,
+                            code_lines[start + offset],
+                            relative,
+                            start + offset + 1,
+                            &declarations,
+                        )
+                        .iter()
+                        .any(|name| same_name(name, group))
                     })
                 {
                     120
@@ -1215,14 +1310,31 @@ fn best_window(
                 .iter()
                 .enumerate()
                 .find_map(|(offset, line)| {
-                    defines_requested(line, group, &code_lines, start + offset, relative)
-                        .then(|| group.symbol.clone())
-                        .flatten()
-                        .or_else(|| {
-                            raw_identifiers(code_lines[start + offset])
-                                .into_iter()
-                                .find(|name| same_name(name, group))
-                        })
+                    defines_requested(
+                        line,
+                        group,
+                        &code_lines,
+                        start + offset,
+                        relative,
+                        &declarations,
+                    )
+                    .then(|| {
+                        declaration_names(
+                            line,
+                            code_lines[start + offset],
+                            relative,
+                            start + offset + 1,
+                            &declarations,
+                        )
+                        .into_iter()
+                        .find(|name| name == group.symbol.as_deref().unwrap_or(name))
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        raw_identifiers(code_lines[start + offset])
+                            .into_iter()
+                            .find(|name| same_name(name, group))
+                    })
                 })
                 .or(exact_symbol)
                 .or_else(|| markers.iter().find(|marker| useful_symbol(marker)).cloned());
@@ -1339,12 +1451,20 @@ fn same_name(name: &str, group: &QueryGroup) -> bool {
             .any(|expected| !expected.is_empty() && compact_alphanumeric(name) == *expected)
 }
 
+fn rust_identity_matches(left: &str, right: &str) -> bool {
+    fn bare(value: &str) -> &str {
+        value.strip_prefix("r#").unwrap_or(value)
+    }
+    bare(left) == bare(right)
+}
+
 fn defines_requested(
     line: &str,
     group: &QueryGroup,
     code_lines: &[&str],
     index: usize,
     relative: &Path,
+    declarations: &[declaration_identity::Declaration],
 ) -> bool {
     let code_line = code_lines.get(index).copied().unwrap_or("");
     if !group.definition || code_line.trim().is_empty() {
@@ -1353,42 +1473,49 @@ fn defines_requested(
     let Some(symbol) = &group.symbol else {
         return false;
     };
-    let names = declaration_names(line, code_line, relative);
-    let declared = names
-        .iter()
-        .any(|name| compact_alphanumeric(name) == compact_alphanumeric(symbol));
+    let names = declaration_names(line, code_line, relative, index + 1, declarations);
+    let declared = names.iter().any(|name| rust_identity_matches(name, symbol));
     if !declared {
         return false;
     }
     group.owner.as_ref().is_none_or(|owner| {
-        names
-            .iter()
-            .any(|name| compact_alphanumeric(name) == compact_alphanumeric(owner))
-            || enclosing_owner(code_lines, index)
-                .is_some_and(|found| compact_alphanumeric(&found) == compact_alphanumeric(owner))
+        declarations.iter().any(|declaration| {
+            declaration.line == index + 1
+                && rust_identity_matches(&declaration.name, symbol)
+                && declaration
+                    .owner
+                    .as_deref()
+                    .is_some_and(|found| rust_identity_matches(found, owner))
+        })
     })
 }
 
-fn enclosing_owner(code_lines: &[&str], index: usize) -> Option<String> {
-    code_lines[..=index]
-        .iter()
-        .rev()
-        .find_map(|line| rust_impl_owner(line))
-}
-
-fn declaration_names(line: &str, code_line: &str, relative: &Path) -> Vec<String> {
+fn declaration_names(
+    line: &str,
+    code_line: &str,
+    relative: &Path,
+    line_number: usize,
+    declarations: &[declaration_identity::Declaration],
+) -> Vec<String> {
     let rust = relative
         .extension()
         .and_then(|extension| extension.to_str())
         == Some("rs");
-    if !rust {
-        return foreign_declaration_name(code_line).into_iter().collect();
+    if rust {
+        if !production_source(line) || code_line.trim().is_empty() {
+            return Vec::new();
+        }
+        let structural: Vec<String> = declarations
+            .iter()
+            .filter(|declaration| declaration.line == line_number)
+            .map(|declaration| declaration.name.clone())
+            .collect();
+        if !structural.is_empty() {
+            return structural;
+        }
+        return rust_declaration_name(code_line).into_iter().collect();
     }
-    if production_source(line) {
-        rust_declaration_name(code_line).into_iter().collect()
-    } else {
-        Vec::new()
-    }
+    foreign_declaration_name(code_line).into_iter().collect()
 }
 
 fn production_source(line: &str) -> bool {
@@ -1421,17 +1548,6 @@ fn rust_declaration_name(code_line: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn rust_impl_owner(code_line: &str) -> Option<String> {
-    let trimmed = code_line.trim_start();
-    let rest = trimmed.strip_prefix("impl ").or_else(|| {
-        trimmed
-            .strip_prefix("pub ")
-            .and_then(|value| value.strip_prefix("impl "))
-    })?;
-    let owner = rest.split(['<', ' ', '{']).next()?.trim();
-    (!owner.is_empty() && owner != "for").then(|| owner.to_owned())
 }
 
 fn foreign_declaration_name(code_line: &str) -> Option<String> {
