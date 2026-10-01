@@ -4,6 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 
+#[cfg(test)]
+#[path = "definition_intent_self_type_tests.rs"]
+mod definition_intent_self_type_tests;
+
 struct Fixture {
     root: PathBuf,
 }

@@ -1,6 +1,6 @@
 //! Direct associated declarations from one syn parse.
 //! Local functions and declarations inside an ended impl are not owners.
-use syn::{ImplItem, Item, TraitItem, Type};
+use syn::{File, ImplItem, Item, TraitItem, Type, UseTree};
 
 /// Segment identity, shared by lexical owners and directly resolvable impl types.
 #[derive(Clone, Debug, Default)]
@@ -43,12 +43,12 @@ pub(super) fn declarations(source: &str) -> Vec<Declaration> {
         return Vec::new();
     };
     let mut found = Vec::new();
-    collect_items(&file.items, &OwnerPath::default(), &mut found);
+    collect_items(&file, &file.items, &OwnerPath::default(), &mut found);
     found.sort_by_key(|declaration| declaration.line);
     found
 }
 
-fn collect_items(items: &[Item], module: &OwnerPath, found: &mut Vec<Declaration>) {
+fn collect_items(file: &File, items: &[Item], module: &OwnerPath, found: &mut Vec<Declaration>) {
     for item in items {
         match item {
             Item::Fn(function) => push(
@@ -79,11 +79,12 @@ fn collect_items(items: &[Item], module: &OwnerPath, found: &mut Vec<Declaration
                 push(item.ident.span(), &item.ident, Some(module), found);
                 if let Some((_, nested)) = &item.content {
                     let nested_module = module.child(&item.ident);
-                    collect_items(nested, &nested_module, found);
+                    collect_items(file, nested, &nested_module, found);
                 }
             }
             Item::Impl(item) => {
-                let owner = impl_owner(&item.self_ty, module);
+                let binders = impl_binders(&item.generics);
+                let owner = impl_owner(file, &item.self_ty, module, &binders);
                 for member in &item.items {
                     let (span, name) = match member {
                         ImplItem::Fn(function) => (function.sig.ident.span(), &function.sig.ident),
@@ -118,21 +119,69 @@ fn push(
     });
 }
 
-fn impl_owner(ty: &Type, module: &OwnerPath) -> Option<OwnerPath> {
+fn impl_binders(generics: &syn::Generics) -> Vec<String> {
+    generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            syn::GenericParam::Type(param) => Some(bare(&param.ident.to_string()).to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn proven_root(items: &[Item], module: &[String], root: &str) -> bool {
+    if module.is_empty() {
+        return items.iter().any(|item| item_binds(item, root));
+    }
+    items.iter().any(|item| match item {
+        Item::Mod(item) if bare(&item.ident.to_string()) == module[0] => item
+            .content
+            .as_ref()
+            .is_some_and(|(_, nested)| proven_root(nested, &module[1..], root)),
+        _ => false,
+    })
+}
+
+fn item_binds(item: &Item, root: &str) -> bool {
+    match item {
+        Item::Use(item) => use_binds(&item.tree, root),
+        Item::Struct(item) => bare(&item.ident.to_string()) == root,
+        Item::Enum(item) => bare(&item.ident.to_string()) == root,
+        Item::Trait(item) => bare(&item.ident.to_string()) == root,
+        Item::Type(item) => bare(&item.ident.to_string()) == root,
+        Item::Mod(item) => bare(&item.ident.to_string()) == root,
+        _ => false,
+    }
+}
+
+fn use_binds(tree: &UseTree, root: &str) -> bool {
+    match tree {
+        UseTree::Name(name) => bare(&name.ident.to_string()) == root,
+        UseTree::Rename(name) => bare(&name.rename.to_string()) == root,
+        UseTree::Glob(_) => false,
+        UseTree::Path(path) => use_binds(&path.tree, root),
+        UseTree::Group(group) => group.items.iter().any(|item| use_binds(item, root)),
+    }
+}
+
+fn impl_owner(file: &File, ty: &Type, module: &OwnerPath, binders: &[String]) -> Option<OwnerPath> {
     let Type::Path(ty) = ty else { return None };
-    // No inference of projections, extern-prelude roots, imports or aliases.
-    // Preserve explicit identity; never substitute the impl's lexical module.
+    // Unproven and generic roots have no concrete owner. Do not invent a module.
     if ty.qself.is_some() || ty.path.leading_colon.is_some() {
         return None;
     }
     let mut segments = ty.path.segments.iter().peekable();
     let mut owner = module.clone();
+    let mut rooted = false;
     match segments.peek()?.ident.to_string().as_str() {
         "crate" => {
             owner = OwnerPath::default();
+            rooted = true;
             segments.next();
         }
         "self" => {
+            rooted = true;
             segments.next();
         }
         "super" => {
@@ -143,16 +192,25 @@ fn impl_owner(ty: &Type, module: &OwnerPath) -> Option<OwnerPath> {
                 owner.0.pop()?;
                 segments.next();
             }
+            rooted = true;
         }
         _ => {}
     }
     let mut has_type = false;
-    for segment in segments {
-        let name = segment.ident.to_string();
+    while let Some(segment) = segments.next() {
+        let name = bare(&segment.ident.to_string()).to_owned();
         if matches!(name.as_str(), "crate" | "self" | "super" | "Self") {
             return None;
         }
-        owner.0.push(bare(&name).to_owned());
+        if !has_type && !rooted {
+            if binders.iter().any(|binder| binder == &name) {
+                return None;
+            }
+            if segments.peek().is_some() && !proven_root(&file.items, &owner.0, &name) {
+                return None;
+            }
+        }
+        owner.0.push(name);
         has_type = true;
     }
     has_type.then_some(owner)
