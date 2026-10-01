@@ -116,7 +116,7 @@ impl ScopeFixture {
         let probe = base.join("fake-probe.sh");
         fs::write(
             &probe,
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs|*/src/lib.rs) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;; *.rs) printf 'fallback-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\nesac\n",
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs|*/src/lib.rs|*/src/nested) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; if [ -d \"$last\" ]; then printf 'File: %s/mod.rs, Lines: 1-1\\n' \"$last\"; else printf 'File: %s, Lines: 1-1\\n' \"$last\"; fi ;; *.rs) printf 'fallback-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\n  unrelated) last=; for arg do last=$arg; done; case \"$last\" in */early.rs) printf 'unrelated-file|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;; */src/nested) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/mod.rs, Lines: 1-1\\n' \"$last\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\nesac\n",
         )
         .expect("write scoped fake Probe");
         let mut permissions = fs::metadata(&probe)
@@ -1216,4 +1216,101 @@ fn root_miss_searches_source_before_instruction_directories() {
         && !event.contains("/.claude")
         && !event.contains("/.codex")
         && !event.contains("same-device-link")));
+}
+
+#[test]
+fn root_scope_depth_two_source_directory() {
+    let fixture = ScopeFixture::new();
+    fs::create_dir_all(fixture.root.join("src/nested")).expect("create nested source directory");
+    fs::write(
+        fixture.root.join("src/nested/mod.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write depth-two source");
+    let output = fixture.run("saturated");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("src/nested/mod.rs:1"), "{stdout}");
+    let hit = fixture
+        .events()
+        .into_iter()
+        .find(|event| event.starts_with("fallback-hit|"))
+        .expect("nested directory fallback hit");
+    assert!(hit.ends_with("/src/nested"), "{hit}");
+}
+
+#[test]
+fn root_scope_noise_does_not_consume_budget() {
+    let fixture = ScopeFixture::new();
+    for index in 0..17 {
+        fs::write(
+            fixture.root.join(format!("noise-{index:02}.md")),
+            "not source\n",
+        )
+        .expect("write root noise");
+    }
+    fs::create_dir_all(fixture.root.join("src/nested")).expect("create nested source directory");
+    fs::write(
+        fixture.root.join("src/nested/mod.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write depth-two source after noise");
+    let output = fixture.run("saturated");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("src/nested/mod.rs:1"), "{stdout}");
+    assert!(
+        fixture
+            .events()
+            .iter()
+            .any(|event| event.starts_with("fallback-hit|") && event.ends_with("/src/nested")),
+        "{:?}",
+        fixture.events()
+    );
+}
+
+#[test]
+fn root_scope_unrelated_file_does_not_stop() {
+    let fixture = ScopeFixture::new();
+    fs::write(
+        fixture.root.join("early.rs"),
+        "fn early() { /* unrelated */ }\n",
+    )
+    .expect("write early unrelated source");
+    fs::create_dir_all(fixture.root.join("src/nested")).expect("create nested source directory");
+    fs::write(
+        fixture.root.join("src/nested/mod.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write late relevant source");
+    let output = fixture.run("unrelated");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("src/nested/mod.rs:1"), "{stdout}");
+    assert!(!stdout.contains("early.rs"), "{stdout}");
+    let events = fixture.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("unrelated-file|") && event.ends_with("/early.rs")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("fallback-hit|") && event.ends_with("/src/nested")),
+        "{events:?}"
+    );
 }

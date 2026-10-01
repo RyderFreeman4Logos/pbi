@@ -738,6 +738,29 @@ fn validate_decimal(value: &str, option: &str) -> Result<(), CliError> {
 const PROBE_SCOPE_EXCLUDED_NAMES: [&str; 5] =
     [".git", "target", "drafts", "node_modules", "__pycache__"];
 
+fn probe_source_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        [".rs", ".py", ".go", ".ts", ".tsx", ".js", ".jsx"]
+            .iter()
+            .any(|extension| name.ends_with(extension))
+    })
+}
+
+fn confined_scope_path(root: &Path, path: &Path) -> Result<bool, CliError> {
+    let failed = || CliError::failed("cannot inspect repository files for Probe");
+    let root_file = File::open(root).map_err(|_| failed())?;
+    let path_file = File::open(path).map_err(|_| failed())?;
+    let root_metadata = root_file.metadata().map_err(|_| failed())?;
+    let path_metadata = path_file.metadata().map_err(|_| failed())?;
+    // Keep the same device and an open descriptor: a replaced symlink cannot cross roots.
+    Ok(root_metadata.dev() == path_metadata.dev()
+        && path.starts_with(root)
+        && fs::read_link(path).is_err())
+}
+
+// One directory is one Probe target. Depth 2 is the nested directory itself,
+// not a recursive file list. ponytail: stops at depth 2; deeper trees need a
+// bounded walk that still counts directories, not files.
 fn scope_target(root: &Path, entry: &fs::DirEntry) -> Result<Vec<PathBuf>, CliError> {
     let failed = || CliError::failed("cannot inspect repository files for Probe");
     let file_type = entry.file_type().map_err(|_| failed())?;
@@ -752,43 +775,59 @@ fn scope_target(root: &Path, entry: &fs::DirEntry) -> Result<Vec<PathBuf>, CliEr
         return Ok(Vec::new());
     }
     let path = entry.path();
-    let root_file = File::open(root).map_err(|_| failed())?;
-    let path_file = File::open(&path).map_err(|_| failed())?;
-    let root_metadata = root_file.metadata().map_err(|_| failed())?;
-    let path_metadata = path_file.metadata().map_err(|_| failed())?;
-    // Keep the same device and an open descriptor: a replaced symlink cannot cross roots.
-    if root_metadata.dev() != path_metadata.dev()
-        || !path.starts_with(root)
-        || fs::read_link(&path).is_ok()
-    {
+    if !confined_scope_path(root, &path)? {
         return Ok(Vec::new());
     }
     if file_type.is_file() {
-        return Ok(vec![path]);
+        return Ok(if probe_source_name(&name) {
+            vec![path]
+        } else {
+            Vec::new()
+        });
     }
     if !file_type.is_dir() {
         return Ok(Vec::new());
     }
-    let mut files = Vec::new();
+    let mut targets = Vec::new();
+    let mut nested_source = false;
     for child in fs::read_dir(&path).map_err(|_| failed())? {
         let child = child.map_err(|_| failed())?;
         let child_type = child.file_type().map_err(|_| failed())?;
+        if child_type.is_symlink() {
+            continue;
+        }
         let child_name = child.file_name();
-        let source = child_name.to_str().is_some_and(|name| {
-            [".rs", ".py", ".go", ".ts", ".tsx", ".js", ".jsx"]
-                .iter()
-                .any(|extension| name.ends_with(extension))
-        });
-        if child_type.is_symlink() || !child_type.is_file() || !source {
+        if child_name.to_str().is_none_or(|name| name.starts_with('.')) {
             continue;
         }
         let child_path = child.path();
-        if child_path.starts_with(root) && fs::read_link(&child_path).is_err() {
-            files.push(child_path);
+        if !confined_scope_path(root, &child_path)? {
+            continue;
+        }
+        if child_type.is_file() && probe_source_name(&child_name) {
+            targets.push(child_path);
+        } else if child_type.is_dir() {
+            let has_source = fs::read_dir(&child_path)
+                .map_err(|_| failed())?
+                .any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        entry
+                            .file_type()
+                            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
+                            && probe_source_name(&entry.file_name())
+                    })
+                });
+            if has_source {
+                nested_source = true;
+                targets.push(child_path);
+            }
         }
     }
-    files.sort();
-    Ok(files)
+    if nested_source {
+        targets.retain(|target| target.is_dir());
+    }
+    targets.sort();
+    Ok(targets)
 }
 
 fn probe_scope_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
@@ -1068,6 +1107,17 @@ fn run_probe_command(mut command: Command, deadline: Instant) -> Result<Output, 
     })
 }
 
+fn probe_output_is_relevant(output: &Output, root: &Path, query: &str, max_results: usize) -> bool {
+    output.status.success()
+        && pbi_rs::verify_probe_evidence(
+            &String::from_utf8_lossy(&output.stdout),
+            root,
+            query,
+            max_results,
+        )
+        .is_ok_and(|report| !report.evidence().is_empty())
+}
+
 fn invoke_probe_scope(
     root: &Path,
     query: &str,
@@ -1075,38 +1125,26 @@ fn invoke_probe_scope(
     paths: &[PathBuf],
     deadline: Instant,
 ) -> Result<Output, CliError> {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut status = None;
+    let mut retained = None;
     for path in paths {
         let mut command = probe_command(root, query, options, false);
         command.arg(path);
         let output = run_probe_command(command, deadline)?;
-        let success = output.status.success();
-        if stdout
-            .len()
-            .saturating_add(stderr.len())
-            .saturating_add(output.stdout.len())
-            .saturating_add(output.stderr.len())
-            > MAX_PROBE_OUTPUT_BYTES
-        {
+        if output.stdout.len().saturating_add(output.stderr.len()) > MAX_PROBE_OUTPUT_BYTES {
             return Err(CliError::failed("Probe output exceeded the bounded limit"));
         }
-        stdout.extend_from_slice(&output.stdout);
-        stderr.extend_from_slice(&output.stderr);
-        status = Some(output.status);
-        if !success {
+        let relevant = probe_output_is_relevant(&output, root, query, options.max_results);
+        let failed = !output.status.success();
+        retained = Some(output);
+        // Unrelated success is not coverage. Keep the bounded remainder.
+        if relevant || failed {
             break;
         }
     }
-    let Some(status) = status else {
+    let Some(output) = retained else {
         return Err(CliError::failed("Probe scope is empty"));
     };
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    Ok(output)
 }
 
 fn invoke_probe(
