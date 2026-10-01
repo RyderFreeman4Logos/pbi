@@ -47,7 +47,7 @@ fn cited(root: &Path, report: &EvidenceReport) -> String {
 fn expect_definition(root: &Path, output: &str, query: &str, needle: &str) {
     let report = verify_probe_evidence(output, root, query, 4)
         .unwrap_or_else(|error| panic!("{query} in {output} produced {error:?}"));
-    assert!(report.is_complete(), "{query} was partial");
+    assert!(report.is_complete(), "{query} was partial: {report:?}");
     let text = cited(root, &report);
     assert!(
         text.contains(needle),
@@ -283,4 +283,118 @@ fn bare_docs_and_prefix_queries_keep_their_contract() {
     let prefix = Fixture::new();
     let prefix_output = prefix.write("src/lib.rs", "fn display_relative(&self) {}\n");
     expect_miss(&prefix.root, &prefix_output, "display_relati");
+}
+
+#[test]
+fn language_control_case_and_sentence_punctuation_keep_definition_proof() {
+    let docs = Fixture::new();
+    let docs_output = docs.write("docs/guide.md", "The target_func API is described here.\n");
+    for query in [
+        "where is target_func defined",
+        "Where is target_func defined",
+        "where is target_func Defined",
+        "where is target_func defined.",
+        "definition of target_func",
+        "Where is the definition of target_func",
+    ] {
+        expect_miss(&docs.root, &docs_output, query);
+    }
+
+    let call = Fixture::new();
+    let call_output = call.write(
+        "src/lib.rs",
+        "pub fn caller() {\n    let target_func = || ();\n    target_func();\n}\n",
+    );
+    for query in [
+        "Where is target_func defined",
+        "where is target_func Defined.",
+        "definition of target_func",
+    ] {
+        expect_miss(&call.root, &call_output, query);
+    }
+
+    let declared = Fixture::new();
+    let declared_output = declared.write("src/lib.rs", "fn target_func() {}\n");
+    for query in ["Where is target_func defined.", "definition of target_func"] {
+        expect_definition(
+            &declared.root,
+            &declared_output,
+            query,
+            "fn target_func() {}",
+        );
+        let report =
+            verify_probe_evidence(&declared_output, &declared.root, query, 4).expect(query);
+        assert_eq!(report.evidence()[0].location.start_line(), 1, "{query}");
+    }
+    let prose = Fixture::new();
+    let prose_output = prose.write(
+        "docs/guide.md",
+        "The implementation strategy uses bounded batches to reduce memory.\n",
+    );
+    expect_definition(
+        &prose.root,
+        &prose_output,
+        "implementation strategy bounded batches",
+        "implementation strategy uses bounded batches",
+    );
+}
+
+#[test]
+fn uppercase_or_keeps_one_existing_branch() {
+    let fixture = Fixture::new();
+    let output = fixture.write("src/lib.rs", "fn target_func() {}\n");
+    let report = verify_probe_evidence(&output, &fixture.root, "target_func OR absent_func", 4)
+        .expect("uppercase or");
+    assert!(report.is_complete(), "{report:?}");
+    assert!(report.missing_targets().is_empty());
+    assert_eq!(cited(&fixture.root, &report), "fn target_func() {}");
+    let conjunction =
+        verify_probe_evidence(&output, &fixture.root, "target_func AND absent_func", 4)
+            .expect("and");
+    assert!(!conjunction.is_complete());
+    assert_eq!(conjunction.missing_targets(), ["absent_func"]);
+}
+
+#[test]
+fn equivalent_root_contained_paths_name_the_same_file() {
+    let fixture = Fixture::new();
+    let output = fixture.write("src/lib.rs", "fn target_func() { let _ = 1; }\n");
+    let absolute = fixture.root.join("src/lib.rs");
+    for requested in [
+        "./src/lib.rs".to_owned(),
+        "src/../src/lib.rs".to_owned(),
+        absolute.display().to_string(),
+    ] {
+        expect_definition(
+            &fixture.root,
+            &output,
+            &format!("where is target_func defined in {requested}"),
+            "fn target_func() { let _ = 1; }",
+        );
+        let report = verify_probe_evidence(
+            &output,
+            &fixture.root,
+            &format!("where is target_func defined in {requested}"),
+            4,
+        )
+        .expect(&requested);
+        assert_eq!(report.evidence()[0].location.start_line(), 1, "{requested}");
+    }
+    expect_miss(
+        &fixture.root,
+        &output,
+        "where is target_func defined in src/missing.rs",
+    );
+    let outside = fixture
+        .root
+        .parent()
+        .expect("parent")
+        .join("outside.rs")
+        .display()
+        .to_string();
+    expect_miss(
+        &fixture.root,
+        &output,
+        &format!("where is target_func defined in {outside}"),
+    );
 }

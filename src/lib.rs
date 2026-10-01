@@ -219,6 +219,7 @@ pub fn verify_probe_evidence(
             if let Some(choice) = best_window(
                 group,
                 &groups,
+                &root,
                 relative,
                 &path,
                 &lines,
@@ -429,7 +430,7 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
             if current.is_empty() {
                 return None;
             }
-            let is_or = token == "or";
+            let is_or = token.eq_ignore_ascii_case("or");
             if disjunction.is_some_and(|previous| previous != is_or) {
                 return None;
             }
@@ -500,20 +501,26 @@ fn query_groups(query: &str) -> Option<Vec<QueryGroup>> {
 }
 
 fn definition_request(tokens: &[String]) -> bool {
-    let asks_place = tokens.iter().any(|token| token == "where");
+    let control = |token: &str| control_word(token);
+    let asks_place = tokens.iter().any(|token| control(token) == "where");
     let asks_definition = tokens.iter().any(|token| {
         matches!(
-            token.as_str(),
+            control(token).as_str(),
             "defined" | "definition" | "implementation" | "implement" | "implements"
         )
     });
-    asks_place && asks_definition && definition_identity(tokens).0.is_some()
+    let explicit_definition = tokens
+        .windows(2)
+        .any(|pair| control(&pair[0]) == "definition" && control(&pair[1]) == "of");
+    (explicit_definition || (asks_place && asks_definition))
+        && definition_identity(tokens).0.is_some()
 }
 
 fn definition_identity(tokens: &[String]) -> (Option<String>, Option<String>, Option<String>) {
     let noise = |token: &str| {
+        let word = control_word(token);
         matches!(
-            token,
+            word.as_str(),
             "where"
                 | "location"
                 | "defined"
@@ -531,6 +538,8 @@ fn definition_identity(tokens: &[String]) -> (Option<String>, Option<String>, Op
                 | "in"
                 | "at"
                 | "file"
+                | "of"
+                | "the"
         ) || token.contains('.')
             || token.contains('/')
     };
@@ -584,6 +593,12 @@ fn raw_query_tokens(value: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+fn control_word(token: &str) -> String {
+    token
+        .trim_end_matches(['.', '?', '!', ',', ';', ':'])
+        .to_lowercase()
 }
 
 fn query_stop_word(token: &str) -> bool {
@@ -1043,6 +1058,7 @@ fn raw_identifiers(text: &str) -> Vec<String> {
 fn best_window(
     group: &QueryGroup,
     all_groups: &[QueryGroup],
+    root: &Path,
     relative: &Path,
     path: &Path,
     lines: &[&str],
@@ -1151,7 +1167,7 @@ fn best_window(
                 if group
                     .path
                     .as_ref()
-                    .is_some_and(|requested| !paths_match(&path_text, requested))
+                    .is_some_and(|requested| !paths_match(root, &path_text, requested))
                 {
                     continue;
                 }
@@ -1289,10 +1305,26 @@ fn path_token(token: &str) -> bool {
         || token.ends_with(".h")
 }
 
-fn paths_match(actual: &str, requested: &str) -> bool {
-    let actual = actual.replace('\\', "/");
-    let requested = requested.replace('\\', "/");
-    actual == requested || actual.ends_with(&format!("/{requested}"))
+fn paths_match(root: &Path, actual: &str, requested: &str) -> bool {
+    let requested_path = Path::new(requested);
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        root.join(requested_path)
+    };
+    match fs::canonicalize(&candidate) {
+        Ok(resolved) => resolved.strip_prefix(root).is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && !excluded_path(relative)
+                && resolved
+                    == fs::canonicalize(root.join(actual)).unwrap_or_else(|_| root.join(actual))
+        }),
+        Err(_) => {
+            let actual = actual.replace('\\', "/");
+            let requested = requested.replace('\\', "/");
+            actual == requested || actual.ends_with(&format!("/{requested}"))
+        }
+    }
 }
 
 fn same_name(name: &str, group: &QueryGroup) -> bool {
