@@ -336,7 +336,12 @@ fn question_parity_discards_route_overrides_without_activation() {
             assert!(!argv
                 .iter()
                 .any(|arg| arg.contains("unapproved") || arg == "remote"));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("Coverage: complete"));
+            assert_eq!(
+                output.stdout,
+                b"fixture.rs:1-2\n",
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
             assert!(!String::from_utf8_lossy(&output.stdout).contains("semantic_adk_model"));
         }
     }
@@ -739,9 +744,7 @@ fn search_budget_values_preserve_native_numbers_and_formatting() {
                 if raw {
                     assert_eq!(output.stdout, b"raw Probe bytes\n");
                 } else {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    assert!(stdout.contains("Coverage: complete"));
-                    assert!(stdout.contains("fixture.rs:1"));
+                    assert_eq!(output.stdout, b"fixture.rs:1-2\n");
                 }
             }
         }
@@ -1181,12 +1184,11 @@ fn probe_scope_returns_late_under_cap_match_after_root_miss() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Coverage: complete"), "{stdout}");
-    assert!(stdout.contains("Verified source evidence:"), "{stdout}");
-    assert!(stdout.contains("z-relevant-late.rs:1"), "{stdout}");
-    assert!(stdout.contains("fn late_match()"), "{stdout}");
-    assert!(!stdout.contains("a-decoy.rs"), "{stdout}");
+    assert_eq!(output.stdout, b"z-relevant-late.rs:1\n");
+    assert!(!output
+        .stdout
+        .windows(9)
+        .any(|window| window == b"a-decoy.rs"));
 
     let root = fixture
         .root
@@ -1588,7 +1590,7 @@ fn root_boundary_and_query_keeps_searching_until_both_targets() {
         "AND stopped after the first partial file; events={events:?} stdout={stdout}"
     );
     assert!(
-        stdout.contains("alpha_function") && stdout.contains("beta_function"),
+        stdout.contains("a.rs:1") && stdout.contains("z.rs:1"),
         "{stdout}"
     );
 }
@@ -1639,5 +1641,90 @@ fn root_boundary_numeric_zero_spellings_share_fallback() {
     assert!(
         codes.windows(2).all(|pair| pair[0] == pair[1]),
         "numeric spellings changed fallback: {codes:?}"
+    );
+}
+
+#[test]
+fn default_question_and_search_print_compact_relative_locations() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.root.join("src")).expect("src");
+    fs::write(fixture.root.join("src/chosen.rs"), "fn parse_search() {}\n").expect("chosen");
+    fs::write(
+        fixture.root.join("fake-probe.sh"),
+        "#!/bin/sh\nset -eu\nprintf '%s\\000' \"$@\" > \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  raw) printf 'File: %s/src/chosen.rs\\nLines: 1-1\\nraw Probe bytes\\n' \"$(pwd)\"; exit 0 ;;\n  miss) printf 'No results found.\\n'; exit 0 ;;\nesac\nprintf 'File: %s/src/chosen.rs, Lines: 1-1\\n' \"$(pwd)\"\n",
+    )
+    .expect("rewrite probe");
+    let hit = fixture.run(&["where is parse_search"], "evidence");
+    assert_eq!(
+        hit.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&hit.stderr)
+    );
+    assert_eq!(hit.stdout, b"src/chosen.rs:1\n");
+    assert!(hit.stderr.is_empty());
+    let json_hit = fixture.run(&["--json", "where is parse_search"], "evidence");
+    assert_eq!(json_hit.status.code(), Some(0));
+    assert_eq!(json_hit.stdout, hit.stdout);
+    let search_hit = fixture.run(&["search", "where is parse_search"], "evidence");
+    assert_eq!(search_hit.status.code(), Some(0));
+    assert_eq!(search_hit.stdout, b"src/chosen.rs:1\n");
+    let miss = fixture.run(&["where is absent_symbol"], "miss");
+    assert_eq!(miss.status.code(), Some(1));
+    assert!(miss.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&miss.stderr).trim(),
+        "pbi: no source locations found"
+    );
+    let raw = fixture.run(&["search", "--bm25", "where is parse_search"], "raw");
+    assert_eq!(raw.status.code(), Some(0));
+    assert!(raw.stdout.windows(6).any(|window| window == b"File: "));
+    assert!(raw.stdout.windows(9).any(|window| window == b"chosen.rs"));
+    assert!(!raw.stdout.starts_with(b"src/chosen.rs:1\n"));
+}
+
+#[test]
+fn compact_output_keeps_qualified_owner_and_root_boundary() {
+    let fixture = ScopeFixture::new();
+    fs::create_dir(fixture.root.join("src")).expect("src");
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "impl SourceLocation {\n    fn display_relative(&self) {}\n    fn other(&self) {}\n}\n",
+    )
+    .expect("lib");
+    let positive = fixture.run_args("saturated", &["search", "SourceLocation display_relative"]);
+    assert_eq!(
+        positive.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    assert_eq!(positive.stdout, b"src/lib.rs:1-2\n");
+    let negative = fixture.run_args("saturated", &["search", "SourceLocation absent_member"]);
+    assert_eq!(negative.status.code(), Some(1));
+    assert!(negative.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&negative.stderr).trim(),
+        "pbi: no source locations found"
+    );
+
+    let sibling_dir = fixture.root.parent().expect("parent").join("sibling");
+    fs::create_dir_all(&sibling_dir).expect("sibling dir");
+    fs::write(sibling_dir.join("sibling.rs"), "fn parse_search() {}\n").expect("sibling");
+    symlink(
+        sibling_dir.join("sibling.rs"),
+        fixture.root.join("outside-link.rs"),
+    )
+    .expect("outside link");
+    let boundary = fixture.run_args("boundary", &["where is parse_search"]);
+    assert_eq!(boundary.status.code(), Some(1));
+    assert!(boundary.stdout.is_empty());
+    assert!(!boundary
+        .stdout
+        .windows(10)
+        .any(|window| window == b"sibling.rs"));
+    assert_eq!(
+        String::from_utf8_lossy(&boundary.stderr).trim(),
+        "pbi: no source locations found"
     );
 }

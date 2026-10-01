@@ -341,32 +341,23 @@ fn run(
             return Ok(0);
         }
     }
-    print_evidence(report.evidence(), report.missing_targets(), &root)?;
+    print_evidence(report.evidence(), &root)?;
     Ok(if report.is_complete() { 0 } else { 1 })
 }
 
-fn print_evidence(
-    evidence: &[SourceEvidence],
-    missing_targets: &[String],
-    root: &Path,
-) -> Result<(), CliError> {
-    println!(
-        "Coverage: {}",
-        if missing_targets.is_empty() {
-            "complete"
-        } else {
-            "incomplete"
-        }
-    );
-    println!("Verified source evidence:");
-    print_evidence_items(evidence, root, &mut io::stdout())?;
-    if !missing_targets.is_empty() {
-        println!("Missing targets:");
-        for target in missing_targets {
-            println!("- {target}");
-        }
+fn print_evidence(evidence: &[SourceEvidence], root: &Path) -> Result<(), CliError> {
+    let mut output = Vec::new();
+    for item in evidence {
+        let location = item
+            .location()
+            .display_relative(root)
+            .map_err(evidence_cli_error)?;
+        writeln!(output, "{location}")
+            .map_err(|_| CliError::failed("cannot write source evidence"))?;
     }
-    Ok(())
+    io::stdout()
+        .write_all(&output)
+        .map_err(|_| CliError::failed("cannot write source evidence"))
 }
 
 fn print_evidence_items(
