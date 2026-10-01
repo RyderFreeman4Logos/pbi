@@ -8,8 +8,9 @@ use pbi_rs::semantic::{AdmittedLocalModelRoute, DEFAULT_LOCAL_BASE_URL, DEFAULT_
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 use serde_json::json;
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -737,6 +738,59 @@ fn validate_decimal(value: &str, option: &str) -> Result<(), CliError> {
 const PROBE_SCOPE_EXCLUDED_NAMES: [&str; 5] =
     [".git", "target", "drafts", "node_modules", "__pycache__"];
 
+fn scope_target(root: &Path, entry: &fs::DirEntry) -> Result<Vec<PathBuf>, CliError> {
+    let failed = || CliError::failed("cannot inspect repository files for Probe");
+    let file_type = entry.file_type().map_err(|_| failed())?;
+    if file_type.is_symlink() {
+        return Ok(Vec::new());
+    }
+    let name = entry.file_name();
+    if name
+        .to_str()
+        .is_none_or(|name| name.starts_with('.') || PROBE_SCOPE_EXCLUDED_NAMES.contains(&name))
+    {
+        return Ok(Vec::new());
+    }
+    let path = entry.path();
+    let root_file = File::open(root).map_err(|_| failed())?;
+    let path_file = File::open(&path).map_err(|_| failed())?;
+    let root_metadata = root_file.metadata().map_err(|_| failed())?;
+    let path_metadata = path_file.metadata().map_err(|_| failed())?;
+    // Keep the same device and an open descriptor: a replaced symlink cannot cross roots.
+    if root_metadata.dev() != path_metadata.dev()
+        || !path.starts_with(root)
+        || fs::read_link(&path).is_ok()
+    {
+        return Ok(Vec::new());
+    }
+    if file_type.is_file() {
+        return Ok(vec![path]);
+    }
+    if !file_type.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for child in fs::read_dir(&path).map_err(|_| failed())? {
+        let child = child.map_err(|_| failed())?;
+        let child_type = child.file_type().map_err(|_| failed())?;
+        let child_name = child.file_name();
+        let source = child_name.to_str().is_some_and(|name| {
+            [".rs", ".py", ".go", ".ts", ".tsx", ".js", ".jsx"]
+                .iter()
+                .any(|extension| name.ends_with(extension))
+        });
+        if child_type.is_symlink() || !child_type.is_file() || !source {
+            continue;
+        }
+        let child_path = child.path();
+        if child_path.starts_with(root) && fs::read_link(&child_path).is_err() {
+            files.push(child_path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn probe_scope_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
     let entries = fs::read_dir(root)
         .map_err(|_| CliError::failed("cannot enumerate repository files for Probe"))?;
@@ -744,20 +798,7 @@ fn probe_scope_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
     for entry in entries {
         let entry =
             entry.map_err(|_| CliError::failed("cannot enumerate repository files for Probe"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|_| CliError::failed("cannot inspect repository files for Probe"))?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| PROBE_SCOPE_EXCLUDED_NAMES.contains(&name))
-        {
-            continue;
-        }
-        paths.push(entry.path());
+        paths.extend(scope_target(root, &entry)?);
         if paths.len() > MAX_SCOPED_PROBE_TARGETS {
             return Err(CliError::failed(
                 "Probe scope exceeded the bounded target limit",

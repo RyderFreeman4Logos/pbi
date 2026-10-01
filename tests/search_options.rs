@@ -10,14 +10,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
+        let _nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "pbi-rs-search-options-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = safe_test_root("search-options");
         fs::create_dir_all(&root).expect("create fixture root");
         fs::write(root.join("fixture.rs"), "fn search_option_parity() {}\n")
             .expect("write fixture source");
@@ -90,6 +87,15 @@ impl Drop for Fixture {
 
 const SCOPE_QUERY: &str = "compression publication cache assembly";
 
+fn safe_test_root(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp")
+        .join(format!("pbi-rs-{label}-{}-{nonce}", std::process::id()))
+}
+
 struct ScopeFixture {
     base: PathBuf,
     root: PathBuf,
@@ -100,20 +106,17 @@ struct ScopeFixture {
 
 impl ScopeFixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
+        let _nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "pbi-rs-search-scope-{}-{nonce}",
-            std::process::id()
-        ));
+        let base = safe_test_root("search-scope");
         let root = base.join("nested/invocation/root");
         fs::create_dir_all(&root).expect("create nested invocation root");
         let probe = base.join("fake-probe.sh");
         fs::write(
             &probe,
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s/z-relevant-late.rs, Lines: 1-1\\n' \"$PWD\" ;; *.rs) printf 'fallback-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\nesac\n",
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$PBI_TEST_CAPTURE\"\ncase \"$PBI_TEST_MODE\" in\n  nested) printf 'File: %s/inside.rs, Lines: 1-1\\n' \"$PWD\" ;;\n  boundary) printf 'File: %s/outside-link.rs, Lines: 1-1\\n' \"$PWD\"; printf 'File: ../sibling/sibling.rs, Lines: 1-1\\n' ;;\n  saturated) last=; for arg do last=$arg; done; case \"$last\" in */z-relevant-late.rs|*/src/lib.rs) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;; *.rs) printf 'fallback-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;; esac ;;\nesac\n",
         )
         .expect("write scoped fake Probe");
         let mut permissions = fs::metadata(&probe)
@@ -1178,4 +1181,39 @@ fn probe_scope_returns_late_under_cap_match_after_root_miss() {
         format!("{result}|{}", canonical_path.display())
     }));
     assert_eq!(fixture.events(), expected_events);
+}
+
+#[test]
+fn root_miss_searches_source_before_instruction_directories() {
+    let fixture = ScopeFixture::new();
+    for name in [".agents", ".claude", ".codex"] {
+        fs::create_dir(fixture.root.join(name)).expect("create instruction directory");
+    }
+    fs::create_dir(fixture.root.join("src")).expect("create source directory");
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        format!("fn display_relative() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("write genuine source");
+    let same_device = fixture.root.join("notes");
+    fs::create_dir(&same_device).expect("create same-device directory");
+    symlink(&same_device, fixture.root.join("same-device-link")).expect("same-device link");
+    let output = fixture.run("saturated");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let events = fixture.events();
+    assert!(
+        output.status.success(),
+        "stdout={stdout} stderr={} events={events:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("src/lib.rs:1"), "{stdout}");
+    let hit = events
+        .iter()
+        .find(|event| event.starts_with("fallback-hit|"))
+        .expect("source fallback hit");
+    assert!(hit.ends_with("/src/lib.rs"), "{hit}");
+    assert!(events.iter().all(|event| !event.contains("/.agents")
+        && !event.contains("/.claude")
+        && !event.contains("/.codex")
+        && !event.contains("same-device-link")));
 }
