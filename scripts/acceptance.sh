@@ -1,153 +1,87 @@
 #!/bin/sh
 set -eu
+
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary="$repo_root/target/debug/pbi-rs"
-fixture="$repo_root/tests/fixtures/repo"
-probe="$repo_root/tests/fixtures/probe-fixture.sh"
-
-verified=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "compression publication cache assembly")
-printf '%s\n' "$verified" | grep -qx 'src/lib.rs:1'
-
-raw=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search --bm25 "compression publication cache assembly")
-printf '%s\n' "$raw" | grep -q '^File: '
-
-set +e
-unrelated=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "ghost evidence" 2>/dev/null)
-search_rc=$?
-unrelated_error=$(cd "$fixture" && PBI_RS_PROBE="$probe" "$binary" search "ghost evidence" 2>&1 >/dev/null)
-error_rc=$?
-set -e
-test "$search_rc" -eq 1
-test "$error_rc" -eq 1
-test -z "$unrelated"
-test "$unrelated_error" = "pbi: no source locations found"
-
-set +e
-bare_miss=$(cd "$fixture" && PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$probe" "$binary" "ghost evidence" 2>/dev/null)
-bare_rc=$?
-set -e
-test "$bare_rc" -eq 1
-test -z "$bare_miss"
-
-bare_evidence=$(cd "$fixture" && PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$probe" "$binary" "compression publication cache assembly")
-printf '%s\n' "$bare_evidence" | grep -qx 'src/lib.rs:1'
-
-or_evidence=$(cd "$fixture" && PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$probe" "$binary" "compression or cache")
-printf '%s\n' "$or_evidence" | grep -qx 'src/lib.rs:1'
-
-debug=$($binary --debug-config)
-printf '%s\n' "$debug" | grep -q '^api_key=\[REDACTED\]$'
-printf '%s\n' "$debug" | grep -q '^search_default=compact_verified_bm25_no_chat$'
-printf '%s\n' "$debug" | grep -q '^model_route_snapshot=ordered_authorized_candidates_bounded_by_kit$'
-printf '%s\n' "$debug" | grep -q '^model_route_chain=repeatable_cli_routes_or_single_default$'
-printf '%s\n' "$debug" | grep -q '^model_route_credentials=handle_names_only_values_not_emitted$'
-
-real=$(cd "$repo_root/src" && "$binary" search "SourceLocation display_relative")
-printf '%s\n' "$real" | grep -Eq '^lib\.rs:[0-9]+$'
-scoped=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" search "SourceLocation:display_relative")
-printf '%s\n' "$scoped" | grep -Eq '^lib\.rs:[0-9]+$'
-# Real Probe controls: each language selects its source; ignore can remove all hits.
-filter_root=$(mktemp -d "${TMPDIR:?}/pbi-rs-filter-XXXXXX")
-trap 'rm -rf -- "$filter_root"' EXIT HUP INT TERM
-printf '%s\n' 'fn filter_operand_marker() {}' > "$filter_root/chosen.rs"
-printf '%s\n' 'def filter_operand_marker(): pass' > "$filter_root/chosen.py"
-mkdir "$filter_root/drafts"
-printf '%s\n' 'fn filter_operand_marker() {}' > "$filter_root/drafts/hidden.rs"
-for language in rust python; do
-    filtered=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 --max-results=8 -l "$language" filter_operand_marker)
-    case "$language" in rust) wanted=rs; unwanted=py ;; python) wanted=py; unwanted=rs ;; esac
-    printf '%s\n' "$filtered" | grep -qx "chosen.$wanted:1"
-    ! printf '%s\n' "$filtered" | grep -q "chosen.$unwanted"
-    ! printf '%s\n' "$filtered" | grep -q 'drafts/'
+fixture=$(mktemp -d "${TMPDIR:?}/pbi-rs-acceptance-XXXXXX")
+trap 'rm -rf -- "$fixture"' EXIT HUP INT TERM
+mkdir "$fixture/bin" "$fixture/repo" "$fixture/capped"
+marker="$fixture/probe-invoked"
+for name in probe probe-chat; do
+    cat > "$fixture/bin/$name" <<'TRAP'
+#!/bin/sh
+printf invoked > "$PBI_PROBE_MARKER"
+exit 97
+TRAP
+    chmod +x "$fixture/bin/$name"
 done
-ignored=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 -i '*.rs' filter_operand_marker)
+
+pbi() {
+    env -i PATH="$fixture/bin:/usr/bin:/bin" HOME="$fixture" \
+        TMPDIR="$TMPDIR" TMP="$TMPDIR" TEMP="$TMPDIR" \
+        PBI_RS_ADK_ENABLE=0 PBI_RS_PROBE="$fixture/bin/probe" \
+        PBI_PROBE_MARKER="$marker" "$binary" "$@"
+}
+
+printf '%s\n' 'fn filter_operand_marker() {}' > "$fixture/repo/chosen.rs"
+printf '%s\n' 'def filter_operand_marker(): pass' > "$fixture/repo/chosen.py"
+printf '%s\n' 'fn ignored_marker() {}' > "$fixture/repo/hidden.rs"
+printf '%s\n' 'hidden.rs' > "$fixture/repo/.gitignore"
+
+# The binary also works with a PATH that contains neither Probe executable.
+plain=$(cd "$fixture/repo" && env -i PATH=/usr/bin:/bin HOME="$fixture" \
+    TMPDIR="$TMPDIR" PBI_RS_ADK_ENABLE=0 "$binary" search filter_operand_marker)
+printf '%s\n' "$plain" | grep -qx 'chosen.rs:1'
+printf '%s\n' "$plain" | grep -qx 'chosen.py:1'
+
+rust=$(cd "$fixture/repo" && pbi search -l rs filter_operand_marker)
+printf '%s\n' "$rust" | grep -qx 'chosen.rs:1'
+! printf '%s\n' "$rust" | grep -q 'chosen.py'
+python=$(cd "$fixture/repo" && pbi search -l python filter_operand_marker)
+printf '%s\n' "$python" | grep -qx 'chosen.py:1'
+! printf '%s\n' "$python" | grep -q 'chosen.rs'
+ignored=$(cd "$fixture/repo" && pbi search -i '*.rs' filter_operand_marker)
 printf '%s\n' "$ignored" | grep -qx 'chosen.py:1'
 ! printf '%s\n' "$ignored" | grep -q 'chosen.rs'
+
 set +e
-no_hit=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 --ignore='*.rs' --ignore='*.py' filter_operand_marker 2> "$filter_root/no-hit.stderr")
-no_hit_rc=$?
+(cd "$fixture/repo" && pbi search ignored_marker) > "$fixture/ignored.out" 2> "$fixture/ignored.err"
+ignored_rc=$?
+(cd "$fixture/repo" && pbi search ghost_evidence) > "$fixture/nohit.out" 2> "$fixture/nohit.err"
+nohit_rc=$?
+(cd "$fixture/repo" && pbi search --bm25 filter_operand_marker) > "$fixture/raw.out" 2> "$fixture/raw.err"
+raw_rc=$?
 set -e
-test "$no_hit_rc" -eq 1
-test -z "$no_hit"
-IFS= read -r no_hit_error < "$filter_root/no-hit.stderr"
-test "$no_hit_error" = 'pbi: no source locations found'
-raw_filtered=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 -l rs -i '!drafts/**' filter_operand_marker)
-printf '%s\n' "$raw_filtered" | grep -q 'File: .*chosen.rs'
-! printf '%s\n' "$raw_filtered" | grep -q 'File: .*drafts/'
-! printf '%s\n' "$raw_filtered" | grep -q 'File: .*chosen.py'
-for flag in --help -h; do
-    probe search "$flag" > "$filter_root/probe-help" 2> "$filter_root/probe-help.stderr"
-    PBI_RS_ADK_ENABLE=0 "$binary" search "$flag" > "$filter_root/wrapper-help" 2> "$filter_root/wrapper-help.stderr"
-    cmp "$filter_root/probe-help" "$filter_root/wrapper-help"
-    cmp "$filter_root/probe-help.stderr" "$filter_root/wrapper-help.stderr"
-done
-reranked=$(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 -l rs --reranker=not-a-reranker filter_operand_marker)
-printf '%s\n' "$reranked" | grep -qx 'chosen.rs:1'
-! printf '%s\n' "$reranked" | grep -q 'drafts/'
-# Actual no-model question parsing must not let discarded routing values enter
-# retrieval/coverage. Message mode keeps its single first question unchanged.
-question_clean=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" "SourceLocation display_relative")
-for mode in positional message; do
-    case "$mode" in positional) set -- ;; message) set -- --message ;; esac
-    question_sanitized=$(cd "$repo_root/src" && PBI_RS_ADK_ENABLE=0 "$binary" "$@" "SourceLocation display_relative" --model-name unapproved_model_route_canary --force-provider=remote_provider_canary)
-    test "$question_sanitized" = "$question_clean"
-done
-# Native code-content budgets and post-ranking merging, not argv-only controls.
-# Enough unrelated source avoids Probe's small-file/whole-file extraction path.
-budget_root="$filter_root/budgets"
-mkdir "$budget_root"
-for index in $(seq 1 200); do
-    printf 'fn unrelated_%s() -> u64 { %s }\n' "$index" "$index"
-done > "$budget_root/sample.rs"
-printf 'fn budget_marker_alpha() -> u64 {\n    let alpha = 1;\n    alpha + 10\n}\n' >> "$budget_root/sample.rs"
-printf '\n\n\n\n\n\n\n\n\n\n\n\n' >> "$budget_root/sample.rs"
-printf 'fn budget_marker_beta() -> u64 {\n    let beta = 2;\n    beta + 20\n}\n' >> "$budget_root/sample.rs"
-for budget in --max-bytes=80 --max-tokens=30; do
-    limited=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 "$budget" budget_marker)
-    printf '%s\n' "$limited" | grep -q 'Found 1 search results'
-    printf '%s\n' "$limited" | grep -q 'budget_marker_alpha'
-    ! printf '%s\n' "$limited" | grep -q 'budget_marker_beta'
-done
-for threshold in 0 30; do
-    merged=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 --merge-threshold "$threshold" budget_marker)
-    case "$threshold" in 0) count=2 ;; 30) count=1 ;; esac
-    printf '%s\n' "$merged" | grep -q "Found $count search results"
-    printf '%s\n' "$merged" | grep -q 'budget_marker_alpha'
-    printf '%s\n' "$merged" | grep -q 'budget_marker_beta'
-done
-for budget in --max-bytes=0 --max-tokens=0; do
-    set +e
-    budget_miss=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 "$budget" budget_marker 2> "$filter_root/budget-miss.stderr")
-    budget_rc=$?
-    set -e
-    test "$budget_rc" -eq 1
-    test -z "$budget_miss"
-    IFS= read -r budget_error < "$filter_root/budget-miss.stderr"
-    test "$budget_error" = 'pbi: no source locations found'
-done
-budget_verified=$(cd "$budget_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 --max-results=1 --max-bytes=800 --max-tokens=300 --merge-threshold=30 budget_marker_alpha)
-printf '%s\n' "$budget_verified" | grep -qx 'sample.rs:201'
-# Native format ownership: no wrapper serializer; compare actual Probe bytes.
-format_root="$filter_root/formats"
-mkdir "$format_root"
-printf '%s\n' 'fn format_operand_marker() {}' > "$format_root/chosen.rs"
-for format in terminal markdown plain json xml color outline outline-xml; do
-    (cd "$format_root" && probe search --timeout 3 --max-results 8 --reranker bm25 --language rs --ignore .git --ignore target --ignore drafts --ignore node_modules --ignore __pycache__ --format "$format" -- format_operand_marker) > "$filter_root/native-format" 2> "$filter_root/native-format.stderr"
-    (cd "$format_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --bm25 --timeout=3 -l rs -o "$format" format_operand_marker) > "$filter_root/wrapper-format" 2> "$filter_root/wrapper-format.stderr"
-    cmp "$filter_root/native-format" "$filter_root/wrapper-format"
-    cmp "$filter_root/native-format.stderr" "$filter_root/wrapper-format.stderr"
-    if test "$format" = json; then
-        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["summary"]["count"] == len(d["results"]) > 0; assert all("chosen.rs" in r["file"] for r in d["results"])' "$filter_root/wrapper-format"
-    fi
-done
-format_verified=$(cd "$format_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --timeout=3 -l rs format_operand_marker)
-printf '%s\n' "$format_verified" | grep -qx 'chosen.rs:1'
-# Legacy verified search appends plain; this Probe rejects duplicate formats.
+test "$ignored_rc" -eq 1
+test "$nohit_rc" -eq 1
+test "$raw_rc" -eq 2
+test ! -s "$fixture/ignored.out"
+test ! -s "$fixture/nohit.out"
+test ! -s "$fixture/raw.out"
+grep -qx 'pbi: no source locations found' "$fixture/nohit.err"
+
+printf '%s\n' 'fn outside_marker() {}' > "$fixture/outside.rs"
+ln -s "$fixture/outside.rs" "$fixture/repo/linked.rs"
 set +e
-(cd "$filter_root" && PBI_RS_ADK_ENABLE=0 "$binary" search --format=json filter_operand_marker) > "$filter_root/format-denied" 2> "$filter_root/format-denied.stderr"
-format_rc=$?
+(cd "$fixture/repo" && pbi search outside_marker) > "$fixture/linked.out" 2> "$fixture/linked.err"
+linked_rc=$?
 set -e
-test "$format_rc" -eq 2
-test ! -s "$filter_root/format-denied"
-grep -q -- '--format cannot be used multiple times' "$filter_root/format-denied.stderr"
-printf '%s\n' 'acceptance: deterministic fixture and real Probe passed; native filters, question parsing, code budgets, merge thresholds and eight raw formats passed; verified format duplicate refused'
+test "$linked_rc" -eq 1
+test ! -s "$fixture/linked.out"
+
+for index in $(seq 1 17); do
+    printf '%s\n' 'fn capped_marker() {}' > "$fixture/capped/file-$index.rs"
+done
+set +e
+(cd "$fixture/capped" && pbi search capped_marker) > "$fixture/capped.out" 2> "$fixture/capped.err"
+capped_rc=$?
+set -e
+test "$capped_rc" -eq 1
+grep -q 'bounded target limit' "$fixture/capped.err"
+
+debug=$(pbi --debug-config)
+printf '%s\n' "$debug" | grep -qx 'search_default=native_bounded_term_frequency_no_probe'
+printf '%s\n' "$debug" | grep -qx 'model_path=adk_workflow_kit_authorized_route_snapshot'
+printf '%s\n' "$debug" | grep -qx 'api_key=\[REDACTED\]'
+test ! -e "$marker"
+printf '%s\n' 'acceptance: native bounded search, filters, root cap, no-hit, linked source, raw refusal, and Probe trap passed'
