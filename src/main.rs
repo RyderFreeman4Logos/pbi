@@ -8,20 +8,15 @@ use pbi_rs::semantic::{
     explicit_admitted_routes_from_environment, local_route_publisher_from_admitted_routes,
     AdmittedLocalModelRoute, DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, ENV_TEST_LOCK,
 };
-use pbi_rs::{verify_probe_evidence, SourceEvidence};
+use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
-mod probe_scope;
-use probe_scope::{
-    evidence_cli_error, exit_status, invoke_probe, probe_base_command, relay_probe_output,
-    run_probe_command, MAX_SCOPED_PROBE_TARGETS,
-};
+mod native_search;
+use native_search::{search_repository, SearchFailure, SearchLimits};
 use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-#[cfg(test)]
-use std::process::Command;
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use workflow_adk::model_profiles::{FakeModelProfile, ModelProfileRegistry};
@@ -144,6 +139,10 @@ type TestRoutePublisherFactory<'a> =
 #[derive(Clone, Copy)]
 enum TestRouteInjection<'a> {
     Publisher(&'a ModelRoutePublisher),
+    PublisherWithEvidence {
+        publisher: &'a ModelRoutePublisher,
+        report: &'a pbi_rs::EvidenceReport,
+    },
     Factory {
         build: &'a TestRoutePublisherFactory<'a>,
         deadline: Duration,
@@ -199,8 +198,7 @@ fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, Sema
         (route.base_url().to_owned(), route.model().to_owned())
     };
     Ok(format!(
-        "probe_binary={}\nsearch_default=compact_verified_bm25_no_chat\nsearch_bm25_opt_in=--bm25_raw_no_llm_probe\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nsearch_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
-        env::var_os("PBI_RS_PROBE").map_or("probe", |_| "[REDACTED]")
+        "search_default=native_bounded_bm25_no_probe\nsearch_bm25_opt_in=refused_probe_removed\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
     ))
 }
 
@@ -245,15 +243,12 @@ fn run(
     let (raw, semantic, query, options, json_output) = if arguments[0] == "search" {
         let (raw, query, options) = parse_search(&arguments[1..])?;
         if options.help {
-            let root = env::current_dir()
-                .map_err(|_| CliError::failed("cannot determine repository root"))?;
-            let mut command = probe_base_command(&root);
-            command.args(&arguments);
-            let output = run_probe_command(
-                command,
-                Instant::now() + Duration::from_secs(PROBE_OUTER_DEADLINE_SECONDS),
-            )?;
-            return relay_probe_output(&output);
+            println!(
+                "pbi-rs search is in-process. Probe and probe-chat are not invoked.\n\
+                 Supported: --timeout --max-results --language/-l --ignore/-i\n\
+                 Refused: --bm25 --help relay, --format, raw Probe flags."
+            );
+            return Ok(0);
         }
         (raw, false, query, options, false)
     } else {
@@ -288,23 +283,59 @@ fn run(
         PROBE_OUTER_DEADLINE_SECONDS
     });
     let deadline = Instant::now() + deadline_duration;
-    let output = invoke_probe(&root, &query, &options, raw, deadline)?;
-    if raw {
-        return relay_probe_output(&output);
+    if raw
+        || options.format.is_some()
+        || options.max_bytes.is_some()
+        || options.max_tokens.is_some()
+        || options.merge_threshold.is_some()
+        || options.files_only
+        || options.exact
+        || options.frequency
+        || options.exclude_filenames
+        || options.strict_elastic_syntax
+    {
+        return Err(CliError::usage(
+            "raw Probe search was removed; use verified search without --bm25 or Probe format flags",
+        ));
     }
-    if !output.status.success() {
-        io::stderr()
-            .write_all(&output.stderr)
-            .map_err(|_| CliError::failed("cannot write Probe diagnostics"))?;
-        return Ok(exit_status(&output));
-    }
-    let probe_stdout = String::from_utf8_lossy(&output.stdout);
-    let report = verify_probe_evidence(&probe_stdout, &root, &query, options.max_results)
-        .map_err(evidence_cli_error)?;
+    let collect_evidence = || -> Result<pbi_rs::EvidenceReport, CliError> {
+        let found = search_repository(
+            &root,
+            &query,
+            &SearchLimits {
+                deadline,
+                max_results: options.max_results,
+                language: options.language.clone(),
+                ignores: options.ignores.clone(),
+            },
+        )
+        .map_err(|failure| match failure {
+            SearchFailure::Deadline => {
+                CliError::failed("native search exceeded its bounded deadline")
+            }
+            SearchFailure::Limit => CliError::failed("native search exceeded its bounded limit"),
+            SearchFailure::TargetLimit => {
+                CliError::failed("native search exceeded the bounded target limit")
+            }
+            SearchFailure::Unavailable => {
+                CliError::failed("native search could not read the repository")
+            }
+        })?;
+        verify_probe_evidence(&found, &root, &query, options.max_results)
+            .map_err(evidence_cli_error)
+    };
+    #[cfg(test)]
+    let report = match _test_route_injection {
+        Some(TestRouteInjection::PublisherWithEvidence { report, .. }) => report.clone(),
+        _ => collect_evidence()?,
+    };
+    #[cfg(not(test))]
+    let report = collect_evidence()?;
     if semantic {
         #[cfg(test)]
         let injected_publisher = match _test_route_injection {
             Some(TestRouteInjection::Publisher(publisher)) => Some(publisher),
+            Some(TestRouteInjection::PublisherWithEvidence { publisher, .. }) => Some(publisher),
             Some(TestRouteInjection::Factory { .. }) | None => None,
         };
         #[cfg(test)]
@@ -318,7 +349,8 @@ fn run(
                 };
                 Some(build(&routes).map_err(route_cli_error)?)
             }
-            Some(TestRouteInjection::Publisher(_)) => None,
+            Some(TestRouteInjection::Publisher(_))
+            | Some(TestRouteInjection::PublisherWithEvidence { .. }) => None,
             None => match admitted_routes.as_deref() {
                 Some(routes) => {
                     local_route_publisher_from_cli_routes(routes).map_err(route_cli_error)?
@@ -375,6 +407,14 @@ fn run(
     }
     print_evidence(&report, &root)?;
     Ok(if report.is_complete() { 0 } else { 1 })
+}
+
+fn evidence_cli_error(error: EvidenceError) -> CliError {
+    if error == EvidenceError::NoSourceLocations {
+        CliError::compatibility_failed(error.to_string())
+    } else {
+        CliError::failed(error.to_string())
+    }
 }
 
 fn print_evidence(report: &pbi_rs::EvidenceReport, root: &Path) -> Result<(), CliError> {
@@ -1154,9 +1194,7 @@ mod tests {
                     ),
                     "{arguments:?}"
                 );
-                assert!(fs::read_to_string(root.join("probe.args"))
-                    .expect("probe args")
-                    .ends_with(&format!("--\n{query}\n")));
+                assert!(!root.join("probe.args").exists(), "{arguments:?}");
                 let text = String::from_utf8(output).expect("utf8");
                 let is_json = arguments.iter().any(|argument| argument == "--json");
                 let published = if is_json {
@@ -1282,13 +1320,36 @@ mod tests {
                 } else {
                     test_publisher(response)
                 };
+                let selected_locations = citations
+                    .as_array()
+                    .expect("citation fixtures")
+                    .iter()
+                    .map(|citation| {
+                        format!(
+                            "File: {}, Lines: 1-6\n",
+                            root.join(citation["path"].as_str().expect("citation path"))
+                                .display()
+                        )
+                    })
+                    .collect::<String>();
+                let selected_report =
+                    verify_probe_evidence(&selected_locations, root, query, DEFAULT_MAX_RESULTS)
+                        .expect("selected evidence must pass the real verifier");
                 let result = run(
                     arguments.clone(),
-                    Some(TestRouteInjection::Publisher(&publisher)),
+                    Some(TestRouteInjection::PublisherWithEvidence {
+                        publisher: &publisher,
+                        report: &selected_report,
+                    }),
                     &mut output,
                 );
                 if class.starts_with("ownership-") {
-                    assert_eq!(calls.load(Ordering::SeqCst), 1, "one synthesis");
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        1,
+                        "one synthesis: {class} {:?}",
+                        result.as_ref().err().map(|error| error.message.as_str())
+                    );
                     assert_eq!(
                         fallback_calls.load(Ordering::SeqCst),
                         0,
@@ -1342,8 +1403,6 @@ mod tests {
                 .iter()
                 .map(|path| format!("File: {}, Lines: 1-6\n", root.join(path).display()))
                 .collect();
-            let quoted_output = probe_output.replace('\'', "'\\''");
-            fs::write(root.join("probe"), format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/probe.args\"\nprintf '%s' '{quoted_output}'\n")).expect("fake Probe");
             let report = verify_probe_evidence(&probe_output, root, query, DEFAULT_MAX_RESULTS)
                 .expect("real verifier");
             assert_eq!(
@@ -2262,7 +2321,7 @@ mod tests {
 
     #[test]
     fn env_toml_route_reaches_adk_snapshot_and_cli_route_wins() {
-        let root = env::temp_dir().join(format!(
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
             "pbi-rs-route-contract-{}",
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2275,18 +2334,6 @@ mod tests {
             "def exact_reuse_receipt():\n    return True\n",
         )
         .expect("source");
-        let probe = root.join("probe");
-        fs::write(
-            &probe,
-            r##"#!/bin/sh
-printf '%s\n' "$@" > "$PWD/probe.args"
-printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
-"##,
-        )
-        .expect("probe");
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).expect("probe mode");
-
         let toml_path = root.join("models.toml");
         let selected_model = "abliterated-qwen-latest-27b-low";
         let decoy_model = "abliterated-qwen-latest-27b-none";
@@ -2309,7 +2356,6 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                     "PBI_CONFIG_FILE",
                     Some(toml_path.to_string_lossy().into_owned()),
                 ),
-                ("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned())),
                 ("LOCAL_MODEL", None),
                 ("LLM_MODEL", None),
                 ("CLIPROXY_BASE_URL", None),
@@ -2438,7 +2484,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
 
     #[test]
     fn positional_question_dispatches_through_adk_and_checks_citations() {
-        let root = env::temp_dir().join(format!(
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
             "pbi-rs-answer-{}",
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2451,21 +2497,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             "def exact_reuse_receipt():\n    return True\n",
         )
         .expect("source");
-        let probe = root.join("probe");
-        fs::write(
-            &probe,
-            r##"#!/bin/sh
-printf '%s\n' "$@" > "$PWD/probe.args"
-printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
-"##,
-        )
-        .expect("probe");
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).expect("probe mode");
-        let _env = RouteConfigEnvGuard::new(
-            &root,
-            &[("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned()))],
-        );
+        let _env = RouteConfigEnvGuard::new(&root, &[]);
         let question = "where is exact_reuse_receipt?".to_owned();
         let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1. Quoted: \"back\\slash\".";
         let search_route = test_publisher(json!({
@@ -2506,12 +2538,8 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             ),
             Ok(0)
         ));
-        let probe_arguments = fs::read_to_string(root.join("probe.args")).expect("probe args");
-        assert!(!probe_arguments.contains(DEFAULT_LOCAL_BASE_URL));
-        assert!(!probe_arguments.contains(DEFAULT_LOCAL_MODEL));
-        assert!(!probe_arguments.contains("CLIPROXY_API_KEY"));
-        assert!(probe_arguments.ends_with(&format!("--\n{question}\n")));
         assert_semantic_message_output(&route_output, answer);
+        assert!(!root.join("probe.args").exists());
 
         let semantic_response = json!({
             "answer": answer,
@@ -2550,19 +2578,8 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
         assert_semantic_message_output(&fallback_output, answer);
-        let route_arguments = fs::read_to_string(root.join("probe.args")).expect("probe args");
-        for secretish in [
-            DEFAULT_LOCAL_BASE_URL,
-            DEFAULT_LOCAL_MODEL,
-            "CLIPROXY_API_KEY",
-            "http://gb10:18009/v1",
-            "abliterated-qwen-latest-27b-low",
-            "OPENAI_API_KEY",
-        ] {
-            assert!(!route_arguments.contains(secretish));
-        }
+        assert!(!root.join("probe.args").exists());
 
-        fs::remove_file(root.join("probe.args")).expect("clear probe args");
         let invalid_factory_calls = Arc::new(AtomicUsize::new(0));
         let invalid_factory = |routes: &[AdmittedLocalModelRoute]| {
             invalid_factory_calls.fetch_add(1, Ordering::SeqCst);
@@ -2707,9 +2724,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             .unwrap_or_else(|error| panic!("override discard failed: {}", error.message)),
             0
         );
-        assert!(fs::read_to_string(root.join("probe.args"))
-            .expect("probe args")
-            .ends_with(&format!("--\n{question}\n")));
+        assert!(!root.join("probe.args").exists());
         let parsed: serde_json::Value =
             serde_json::from_slice(&override_output).expect("explicit JSON");
         let response = parsed["response"].as_str().expect("response");
@@ -2819,7 +2834,6 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             Err(CliError { code: 1, .. })
         ));
         assert!(invalid_output.is_empty());
-        publish_answer_body_citations(&root, &question);
         let mut no_hit = Vec::new();
         let miss = run(
             vec!["unfindable_xyz".to_owned(), "--json".to_owned()],
@@ -2835,6 +2849,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             })
         ));
         assert!(no_hit.is_empty());
+        publish_answer_body_citations(&root, &question);
         drop(_env);
         fs::remove_dir_all(root).expect("clean fixture");
     }
@@ -2874,96 +2889,5 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
 
     mod debug_config_route {
         include!("debug_config_route_tests.rs");
-    }
-
-    #[cfg(target_os = "linux")]
-    fn process_identity(root: &Path, name: &str) -> (u32, u64) {
-        let identity = fs::read_to_string(root.join(name)).expect("fixture process identity");
-        let mut fields = identity.split_whitespace();
-        (
-            fields.next().expect("process id").parse().expect("pid"),
-            fields
-                .next()
-                .expect("start time")
-                .parse()
-                .expect("start time"),
-        )
-    }
-
-    #[cfg(target_os = "linux")]
-    fn process_identity_is_running(pid: u32, start_time: u64) -> bool {
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        let Some((_, fields)) = stat.rsplit_once(") ") else {
-            return false;
-        };
-        let mut fields = fields.split_whitespace();
-        let Some(state) = fields.next() else {
-            return false;
-        };
-        let current_start = fields.nth(19).and_then(|value| value.parse::<u64>().ok());
-        current_start == Some(start_time) && state != "Z"
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn probe_process_cleans_descendants_holding_pipes_on_timeout_and_early_exit() {
-        let suffix = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = env::temp_dir().join(format!("pbi-rs-process-tree-{suffix}"));
-        fs::create_dir_all(&root).expect("fixture directory");
-
-        let run_fixture = |name: &str, body: &str, deadline: Duration| {
-            let script = format!(
-                "trap '' TERM\nprintf '%s %s\\n' \"$$\" \"$(awk '{{print $22}}' /proc/$$/stat)\" > \"$PBI_RS_TEST_ROOT/root.identity\"\n{body}"
-            );
-            let mut command = Command::new("/bin/sh");
-            command.arg("-c").arg(script).env("PBI_RS_TEST_ROOT", &root);
-            {
-                use std::os::unix::process::CommandExt;
-                command.process_group(0);
-            }
-            let started = Instant::now();
-            let result = run_probe_command(command, Instant::now() + deadline);
-            let elapsed = started.elapsed();
-            let root_identity = process_identity(&root, "root.identity");
-            let descendant_identity = process_identity(&root, "descendant.identity");
-            assert!(
-                !process_identity_is_running(root_identity.0, root_identity.1),
-                "{name}: direct Probe child remained alive"
-            );
-            assert!(
-                !process_identity_is_running(descendant_identity.0, descendant_identity.1),
-                "{name}: Probe descendant remained alive"
-            );
-            (result, elapsed)
-        };
-
-        let (timeout_result, timeout_elapsed) = run_fixture(
-            "timeout",
-            "sleep 30 &\nchild=$!\nprintf '%s %s\\n' \"$child\" \"$(awk '{print $22}' /proc/$child/stat)\" > \"$PBI_RS_TEST_ROOT/descendant.identity\"\nwait \"$child\"",
-            Duration::from_millis(100),
-        );
-        assert!(
-            timeout_elapsed < Duration::from_millis(500),
-            "timeout cleanup exceeded bound: {timeout_elapsed:?}"
-        );
-        assert!(matches!(timeout_result, Err(error) if error.code == 124));
-
-        let (early_exit_result, early_exit_elapsed) = run_fixture(
-            "early exit",
-            "sleep 1 &\nchild=$!\nprintf '%s %s\\n' \"$child\" \"$(awk '{print $22}' /proc/$child/stat)\" > \"$PBI_RS_TEST_ROOT/descendant.identity\"\nexit 0",
-            Duration::from_millis(100),
-        );
-        assert!(
-            early_exit_elapsed < Duration::from_millis(500),
-            "early-exit cleanup exceeded bound: {early_exit_elapsed:?}"
-        );
-        assert!(matches!(early_exit_result, Ok(output) if output.status.success()));
-
-        let _ = fs::remove_dir_all(root);
     }
 }

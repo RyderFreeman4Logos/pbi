@@ -183,7 +183,7 @@ pub fn verify_probe_evidence(
     max_results: usize,
 ) -> Result<EvidenceReport, EvidenceError> {
     if probe_output.trim().is_empty() {
-        return Err(EvidenceError::EmptyProbeOutput);
+        return Err(EvidenceError::NoSourceLocations);
     }
     if max_results == 0 {
         return Err(EvidenceError::NoSourceLocations);

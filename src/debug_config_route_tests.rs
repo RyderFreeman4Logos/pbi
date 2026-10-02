@@ -6,7 +6,7 @@ const LOCAL: &str = "http://localhost:18317/v1";
 const GB10: &str = "http://gb10:18009/v1";
 
 fn fixture(label: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
         "pbi-rs-debug-{label}-{}",
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -93,9 +93,9 @@ fn debug_probe_overrides_are_redacted_without_field_injection() {
     let dir = fixture("probe-privacy");
     let _env = route_env(&dir, &[("PBI_RS_PROBE", None)]);
     let baseline = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
-    assert!(baseline.starts_with("probe_binary=probe\n"));
+    assert!(!baseline.contains("probe_binary="));
+    assert!(baseline.contains("search_default=native_bounded_bm25_no_probe\n"));
     assert_selected(&baseline, LOCAL, NONE);
-    let expected = baseline.replacen("probe_binary=probe\n", "probe_binary=[REDACTED]\n", 1);
     for value in [
         "/public/probe\nprimary_model=public-injected-model\napi_key=public-canary-key",
         "/public/probe\rbase_url=public-injected-base",
@@ -107,8 +107,8 @@ fn debug_probe_overrides_are_redacted_without_field_injection() {
         _env.set("PBI_RS_PROBE", Path::new(value));
         let stdout = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(
-            stdout, expected,
-            "configured Probe must not echo any path bytes"
+            stdout, baseline,
+            "Probe override must not change native search"
         );
         assert_selected(&stdout, LOCAL, NONE);
     }
@@ -119,7 +119,7 @@ fn debug_probe_overrides_are_redacted_without_field_injection() {
     );
     assert_eq!(
         debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message)),
-        expected
+        baseline
     );
     let _ = fs::remove_dir_all(dir);
 }
@@ -241,13 +241,10 @@ fn inherited_controls_and_default_path_stay_unchanged() {
     let _env = route_env(&dir, &[]);
     let stdout = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
     assert_selected(&stdout, LOCAL, NONE);
-    assert!(stdout.contains("search_default=compact_verified_bm25_no_chat\n"));
-    assert!(stdout.contains("search_bm25_opt_in=--bm25_raw_no_llm_probe\n"));
+    assert!(stdout.contains("search_default=native_bounded_bm25_no_probe\n"));
+    assert!(stdout.contains("search_bm25_opt_in=refused_probe_removed\n"));
     assert!(stdout.contains(&format!(
         "search_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\n"
-    )));
-    assert!(stdout.contains(&format!(
-        "search_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}\n"
     )));
     let _ = fs::remove_dir_all(dir);
 }
@@ -288,15 +285,7 @@ fn debug_rejects_secret_bearing_urls_before_echo() {
 #[test]
 fn search_raw_and_off_do_not_read_debug_config() {
     let dir = fixture("off");
-    let probe = dir.join("probe");
-    fs::write(
-        &probe,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/probe.args\"\nprintf 'File: %s/item.rs, Lines: 1-1\\n' \"$PWD\"\n",
-    )
-    .expect("probe");
     fs::write(dir.join("item.rs"), "fn debug_config_marker() {}\n").expect("source");
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).expect("mode");
     let pipe = dir.join("pipe.toml");
     assert!(std::process::Command::new("mkfifo")
         .arg(&pipe)
@@ -305,28 +294,31 @@ fn search_raw_and_off_do_not_read_debug_config() {
         .success());
     let _env = route_env(
         &dir,
-        &[
-            ("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned())),
-            ("PBI_CONFIG_FILE", Some(pipe.to_string_lossy().into_owned())),
-        ],
+        &[("PBI_CONFIG_FILE", Some(pipe.to_string_lossy().into_owned()))],
     );
-    for args in [
-        vec!["search", "--bm25", "debug_config_marker"],
-        vec!["search", "debug_config_marker"],
-        vec!["debug_config_marker"],
-    ] {
-        let started = Instant::now();
-        let mut output = Vec::new();
-        let code = run(
-            args.into_iter().map(str::to_owned).collect(),
-            None,
-            &mut output,
-        )
-        .unwrap_or_else(|error| panic!("{}", error.message));
-        assert_eq!(code, 0);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(!String::from_utf8_lossy(&output).contains("primary_model="));
-    }
+    let mut output = Vec::new();
+    let started = Instant::now();
+    let code = run(
+        ["search", "debug_config_marker"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        None,
+        &mut output,
+    )
+    .unwrap_or_else(|error| panic!("{}", error.message));
+    assert_eq!(code, 0);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(!String::from_utf8_lossy(&output).contains("primary_model="));
+    let raw = run(
+        ["search", "--bm25", "debug_config_marker"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        None,
+        &mut Vec::new(),
+    );
+    assert!(matches!(raw, Err(error) if error.code == 2));
     let _ = fs::remove_dir_all(dir);
 }
 
