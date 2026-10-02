@@ -716,12 +716,13 @@ fn decode_answer(
 /// inside the pair distinguishes `(a.py:1)` from the filename `(a.py):1`.
 /// A comma/semicolon follows a complete numeric location or excluded atom;
 /// a malformed prefix cannot manufacture a list boundary.
-/// Two forward scans, O(answer bytes) storage; each token is classified once.
+/// Fixed linear punctuation-index passes, then one atom/owner scan.
+/// O(answer bytes) storage; each whole token is classified once.
 fn answer_body_citations_match(
     answer: &str,
     selected: &[&AllowedCitation],
 ) -> Result<(), SemanticError> {
-    let pairs = body_wrapper_pairs(answer);
+    let wrappers = BodyWrappers::new(answer);
     let mut closers = Vec::new();
     let mut start = 0;
     let mut has_colon = false;
@@ -732,19 +733,13 @@ fn answer_body_citations_match(
         let ch = answer[cursor..].chars().next().unwrap_or('\n');
         let width = ch.len_utf8();
         let closing = closers.last().is_some_and(|&(end, _)| end == cursor);
-        if cursor == start {
-            if let Some((end, marker_width, contains_colon)) = pairs.get(cursor).copied().flatten()
-            {
-                let after = end + marker_width;
-                // A link label and destination are separate whole contexts.
-                let link = ch == '[' && answer[after..].starts_with('(');
-                let destination = ch == '(' && cursor > 0 && answer.as_bytes()[cursor - 1] == b']';
-                if link || (destination || body_wrapper_end(&answer[after..])) && contains_colon {
-                    closers.push((end, marker_width));
-                    cursor += marker_width;
-                    start = cursor;
-                    continue;
-                }
+        if cursor == start && !closing {
+            let limit = closers.last().map_or(answer.len(), |&(end, _)| end);
+            if let Some((end, marker_width)) = wrappers.pair(answer, cursor, limit) {
+                closers.push((end, marker_width));
+                cursor += marker_width;
+                start = cursor;
+                continue;
             }
         }
         let separator =
@@ -799,82 +794,144 @@ fn body_wrapper_end(tail: &str) -> bool {
         || matches!(ch, '.' | '!' | '?' | '。') && chars.next().is_none_or(|ch| ch.is_whitespace())
 }
 
-/// Symmetric openers belong at an atom's start, never after filename
-/// punctuation. Only the boundary scan promotes pairs to presentation markup.
-fn body_wrapper_pairs(answer: &str) -> Vec<Option<(usize, usize, bool)>> {
-    let mut pairs = vec![None; answer.len()];
-    let mut stacks: [Vec<(usize, usize, usize)>; 7] = std::array::from_fn(|_| Vec::new());
-    let mut cursor = 0;
-    let mut colons = 0;
-    let mut start = 0;
-    let mut has_colon = false;
-    let mut separator_checked = false;
-    while cursor < answer.len() {
-        let ch = answer[cursor..].chars().next().expect("character boundary");
-        let byte = answer.as_bytes()[cursor];
-        let mut width = ch.len_utf8();
-        if matches!(byte, b'*' | b'`' | b'\'' | b'"') {
-            while answer.as_bytes().get(cursor + width) == Some(&byte) {
-                width += 1;
-            }
-        }
-        let separator = if matches!(ch, ',' | ';') && has_colon && !separator_checked {
-            separator_checked = true;
-            body_separator_after(&answer[start..cursor])
-        } else {
-            matches!(ch, ',' | ';') && cursor == start
-        };
-        if ch.is_whitespace() || separator {
-            start = cursor + width;
-            has_colon = false;
-            separator_checked = false;
-        }
-        colons += usize::from(byte == b':');
-        has_colon |= byte == b':';
-        let kind = match byte {
-            b'(' | b')' => Some(0),
-            b'[' | b']' => Some(1),
-            b'{' | b'}' => Some(2),
-            b'*' => Some(3),
-            b'`' => Some(4),
-            b'\'' => Some(5),
-            b'"' => Some(6),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            let stack = &mut stacks[kind];
-            let closing = matches!(byte, b')' | b']' | b'}')
-                || kind >= 3
-                    && body_wrapper_end(&answer[cursor + width..])
-                    && stack.last().is_some_and(|&(_, length, prior_colons)| {
-                        length >= width && (has_colon || cursor == start && colons > prior_colons)
-                    });
-            if closing {
-                if let Some((open, _, prior_colons)) = stack.pop() {
-                    pairs[open] = Some((cursor, width, colons > prior_colons));
-                    if colons > prior_colons {
-                        start = cursor + width;
-                        has_colon = false;
-                        separator_checked = false;
+/// Index punctuation, not speculative atoms. Only the shared boundary scan
+/// admits an opener; its ordered owner stack reserves each enclosing close.
+struct BodyWrappers {
+    brackets: Vec<usize>,
+    runs: Vec<usize>,
+    next_close: Vec<[usize; 4]>,
+    colons: Vec<usize>,
+}
+
+fn body_marker(byte: u8) -> Option<usize> {
+    match byte {
+        b'*' => Some(0),
+        b'`' => Some(1),
+        b'\'' => Some(2),
+        b'"' => Some(3),
+        _ => None,
+    }
+}
+
+impl BodyWrappers {
+    fn new(answer: &str) -> Self {
+        let length = answer.len();
+        let mut brackets = vec![length; length];
+        let mut colons = vec![0; length + 1];
+        let mut stack = Vec::new();
+        for (index, byte) in answer.bytes().enumerate() {
+            colons[index + 1] = colons[index] + usize::from(byte == b':');
+            match byte {
+                b'(' | b'[' | b'{' => stack.push((index, byte)),
+                b')' | b']' | b'}' => {
+                    let open = match byte {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
+                    };
+                    if stack.last().is_some_and(|&(_, byte)| byte == open) {
+                        let (start, _) = stack.pop().expect("matching bracket");
+                        brackets[start] = index;
+                        brackets[index] = start;
                     }
                 }
-            } else if kind < 3
-                || cursor == start
-                    && stack
-                        .last()
-                        .is_none_or(|&(_, _, prior_colons)| colons == prior_colons)
-            {
-                // Once a wrapper contains a location, same-marker bytes at a
-                // later list atom's start are filename data, not new openers.
-                stack.push((cursor, width, colons));
-                if cursor == start {
-                    start += width;
-                }
+                _ => {}
             }
         }
-        cursor += width;
+        let mut runs = vec![0; length];
+        let mut closing = vec![false; length];
+        let mut cursor = 0;
+        let mut content_before = false;
+        let mut start = 0;
+        let mut has_colon = false;
+        let mut separator_checked = false;
+        let mut after_close = false;
+        while cursor < length {
+            let ch = answer[cursor..].chars().next().expect("character boundary");
+            let byte = answer.as_bytes()[cursor];
+            let mut width = ch.len_utf8();
+            if body_marker(byte).is_some() {
+                while answer.as_bytes().get(cursor + width) == Some(&byte) {
+                    width += 1;
+                }
+                runs[cursor] = width;
+                closing[cursor] =
+                    has_colon && content_before && body_wrapper_end(&answer[cursor + width..]);
+                content_before = closing[cursor];
+                after_close = closing[cursor];
+            } else {
+                let separator = matches!(ch, ',' | ';')
+                    && !separator_checked
+                    && (after_close || has_colon && body_separator_after(&answer[start..cursor]));
+                separator_checked |= matches!(ch, ',' | ';') && (has_colon || after_close);
+                if ch.is_whitespace() || separator {
+                    start = cursor + width;
+                    has_colon = false;
+                    separator_checked = false;
+                }
+                has_colon |= ch == ':';
+                // A closing run can include bracket bytes before its list
+                // separator; those bytes do not begin another filename.
+                after_close = after_close && brackets[cursor] < cursor;
+                content_before = !ch.is_whitespace() && !matches!(ch, ',' | ';' | '(' | '[' | '{');
+            }
+            cursor += width;
+        }
+        let mut next_close = vec![[length; 4]; length + 1];
+        for index in (0..length).rev() {
+            next_close[index] = if brackets[index] > index && brackets[index] < length {
+                next_close[brackets[index] + 1]
+            } else if brackets[index] < index {
+                [length; 4]
+            } else {
+                next_close[index + 1]
+            };
+            if closing[index] {
+                let kind = body_marker(answer.as_bytes()[index]).expect("closing marker");
+                next_close[index][kind] = index;
+            }
+        }
+        Self {
+            brackets,
+            runs,
+            next_close,
+            colons,
+        }
     }
-    pairs
+
+    fn pair(&self, answer: &str, start: usize, limit: usize) -> Option<(usize, usize)> {
+        let byte = *answer.as_bytes().get(start)?;
+        if let Some(kind) = body_marker(byte) {
+            let run = self.runs[start];
+            if run == 0 {
+                return None; // Unconsumed opening-run bytes are filename data.
+            }
+            let close = self.next_close[start + run][kind];
+            if close >= limit {
+                return None;
+            }
+            // Earlier enclosing-list interpretation wins ambiguous spellings,
+            // even with balanced filename markers before the first colon.
+            // Reserve trailing close bytes for this owner; later nested pairs
+            // get only their own bytes before this limit. Width is fixed here,
+            // never shrunk by a later opener or another owner's closer.
+            let after = (close + self.runs[close]).min(limit);
+            let width = run.min(after - close);
+            let end = after - width;
+            return (self.colons[end] > self.colons[start]).then_some((end, width));
+        }
+        let end = self.brackets[start];
+        if end <= start || end >= limit {
+            return None;
+        }
+        let after = end + 1;
+        let link = byte == b'[' && answer[after..].starts_with('(');
+        let destination = byte == b'(' && start > 0 && answer.as_bytes()[start - 1] == b']';
+        (link
+            || (destination || body_wrapper_end(&answer[after..]))
+                && self.colons[end] > self.colons[start])
+            .then_some((end, 1))
+    }
 }
 
 /// None is prose; a recognized but invalid whole reference is an error.

@@ -1239,15 +1239,52 @@ mod tests {
                 vec!["--message".to_owned(), query.to_owned()],
             ] {
                 let mut output = Vec::new();
+                let response = json!({
+                    "answer": answer,
+                    "uncertainty": "missing.rs:999 stays escaped",
+                    "citations": citations,
+                });
+                let calls = Arc::new(AtomicUsize::new(0));
+                let fallback_calls = Arc::new(AtomicUsize::new(0));
+                let publisher = if class.starts_with("ownership-") {
+                    let routes = admit_local_routes(vec![
+                        LocalModelRoute::new(
+                            DEFAULT_LOCAL_BASE_URL,
+                            DEFAULT_LOCAL_MODEL,
+                            "CLIPROXY_API_KEY",
+                        ),
+                        LocalModelRoute::new(
+                            DEFAULT_LOCAL_BASE_URL,
+                            DEFAULT_LOCAL_MODEL,
+                            "OPENAI_API_KEY",
+                        ),
+                    ])
+                    .expect("approved test routes");
+                    cli_route_publisher(
+                        &routes,
+                        &response.to_string(),
+                        true,
+                        TestModelBehavior::Respond(response.to_string()),
+                        calls.clone(),
+                        fallback_calls.clone(),
+                    )
+                    .expect("counted publisher")
+                } else {
+                    test_publisher(response)
+                };
                 let result = run(
                     arguments.clone(),
-                    Some(TestRouteInjection::Publisher(&test_publisher(json!({
-                        "answer": answer,
-                        "uncertainty": "missing.rs:999 stays escaped",
-                        "citations": citations,
-                    })))),
+                    Some(TestRouteInjection::Publisher(&publisher)),
                     &mut output,
                 );
+                if class.starts_with("ownership-") {
+                    assert_eq!(calls.load(Ordering::SeqCst), 1, "one synthesis");
+                    assert_eq!(
+                        fallback_calls.load(Ordering::SeqCst),
+                        0,
+                        "no parser retry or fallback"
+                    );
+                }
                 let passed = if accepted {
                     matches!(result, Ok(0)) && !output.is_empty()
                 } else {
@@ -1315,6 +1352,159 @@ mod tests {
             citations,
             json!([{"path":"receipt.py","start_line":1,"end_line":1}])
         );
+        // Same-marker ownership is lexical, never chosen by selected paths.
+        // Each nested pair needs its own close; enclosing widths stay fixed.
+        for (outer, inner) in [("**", "*"), ("*", "**"), ("**", "**")] {
+            for separator in [", ", ",", ";", " "] {
+                for (path, line, accepted) in [
+                    ("receipt.py", "1", true),
+                    ("missing.rs", "99", false),
+                    ("receipt.py", "0", false),
+                ] {
+                    check("ownership-N1", question, &citations,
+                        &format!("See {outer}(receipt.py:1{separator}{inner}{path}:{line}{inner}){outer}."), accepted);
+                }
+            }
+        }
+        for (class, body, accepted) in [
+            (
+                "ownership-A1",
+                "See **(receipt.py:1, *'receipt.py:1'*)**.",
+                true,
+            ),
+            (
+                "ownership-A1",
+                "See **(receipt.py:1, *'missing.rs:99'*)**.",
+                false,
+            ),
+            ("ownership-N3", "See 'receipt.py:1, 'receipt.py:1''.", true),
+            (
+                "ownership-N3",
+                "See \"receipt.py:1, \"receipt.py:1\"\".",
+                true,
+            ),
+            ("ownership-N3", "See 'receipt.py:1, 'receipt.py:0''.", false),
+            (
+                "ownership-N3",
+                "See 'receipt.py:1, 'missing.rs:99''.",
+                false,
+            ),
+            (
+                "ownership-N1-quote",
+                "See '[receipt.py:1, 'receipt.py:1']'.",
+                true,
+            ),
+            (
+                "ownership-N1-quote",
+                "See \"[receipt.py:1, \"receipt.py:1\"]\".",
+                true,
+            ),
+            (
+                "ownership-N1-quote",
+                "See '[receipt.py:1, 'missing.rs:99']'.",
+                false,
+            ),
+            (
+                "ownership-C1",
+                "See **(receipt.py:1, 'receipt.py:1')**.",
+                true,
+            ),
+            ("ownership-C1", "See '*receipt.py:1*'.", true),
+        ] {
+            check(class, question, &citations, body, accepted);
+        }
+        // Parent oracle correction: the earlier enclosing list wins even when
+        // a balanced marker pair occurs before the first colon (old N2).
+        for marker in ["'", "\"", "*"] {
+            let first = format!("receipt{marker}.py");
+            let second = format!("{marker}receipt.py");
+            let alternative = format!("{marker}receipt{marker}.py");
+            for path in [&first, &second, &alternative] {
+                fs::write(
+                    root.join(path),
+                    "def exact_reuse_receipt():\n    return True\n",
+                )
+                .expect("ambiguous literal source");
+            }
+            let body = format!("See `{marker}receipt{marker}.py:1, {marker}receipt.py:1{marker}`.");
+            let reading_one = verified(&[&first, &second], question);
+            check(
+                "ownership-N2-precedence",
+                question,
+                &reading_one,
+                &body,
+                true,
+            );
+            let reading_two = verified(&[&alternative, "receipt.py"], question);
+            check(
+                "ownership-N2-no-retry",
+                question,
+                &reading_two,
+                &body,
+                false,
+            );
+            check(
+                "ownership-N2-distinct",
+                question,
+                &reading_two,
+                &format!("See `{alternative}:1`, `receipt.py:1`."),
+                true,
+            );
+            if marker == "'" {
+                let exact = "See *'receipt'.py:1, 'receipt.py:1'*.";
+                let reading_one = verified(&[&first, &second], question);
+                check("ownership-N2-exact", question, &reading_one, exact, true);
+                let reading_two = verified(&[&alternative, "receipt.py"], question);
+                check(
+                    "ownership-N2-exact-no-retry",
+                    question,
+                    &reading_two,
+                    exact,
+                    false,
+                );
+                check(
+                    "ownership-N2-exact-distinct",
+                    question,
+                    &reading_two,
+                    "See *`'receipt'.py:1`, `receipt.py:1`*.",
+                    true,
+                );
+            }
+            let marked_a = format!("{marker}a.py");
+            let marked_b = format!("{marker}b.py");
+            for path in ["a.py", "b.py", &marked_a, &marked_b] {
+                fs::write(
+                    root.join(path),
+                    "def exact_reuse_receipt():\n    return True\n",
+                )
+                .expect("three-marker source");
+            }
+            let body = format!("See {marker}a.py:1,{marker}b.py:1{marker}.");
+            let reading_one = verified(&["a.py", &marked_b], question);
+            check(
+                "ownership-three-marker",
+                question,
+                &reading_one,
+                &body,
+                true,
+            );
+            let reading_two = verified(&[&marked_a, "b.py"], question);
+            check(
+                "ownership-three-marker-no-retry",
+                question,
+                &reading_two,
+                &body,
+                false,
+            );
+            check(
+                "ownership-three-marker-distinct",
+                question,
+                &reading_two,
+                &format!("See `{marked_a}:1`, `b.py:1`."),
+                true,
+            );
+        }
+        verified(&["receipt.py"], question);
         for answer in [
             "See receipt.py:0.",
             "See receipt.py:18446744073709551616.",
