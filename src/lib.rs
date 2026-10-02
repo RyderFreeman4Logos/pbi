@@ -118,8 +118,8 @@ impl EvidenceReport {
         &self.missing_targets
     }
 
-    /// Include one bounded following window for each selected source span.
-    /// Each window is reread and confined to the same repository before a model sees it.
+    /// Extend selected source spans with bounded following lines. The combined
+    /// range is reread and confined to the same repository before a model sees it.
     pub fn with_following_lines(
         mut self,
         root: &Path,
@@ -127,13 +127,8 @@ impl EvidenceReport {
     ) -> Result<Self, EvidenceError> {
         let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
         let count = max_total.saturating_sub(self.evidence.len());
-        let originals = self
-            .evidence
-            .iter()
-            .take(count)
-            .cloned()
-            .collect::<Vec<_>>();
-        for item in originals {
+        for index in 0..count.min(self.evidence.len()) {
+            let item = self.evidence[index].clone();
             let path = resolve_candidate_path(item.location().path(), &root)
                 .ok_or(EvidenceError::SourceOutsideRoot)?;
             if source_is_too_large(&path) {
@@ -148,18 +143,18 @@ impl EvidenceReport {
             let end = start
                 .saturating_add(MAX_FOLLOWING_LINES - 1)
                 .min(lines.len());
-            let snippet = lines[start - 1..end].join("\n");
+            let first = item.location().start_line();
+            let snippet = lines[first - 1..end].join("\n");
             if snippet.len() > 4096 {
                 continue;
             }
-            self.evidence.push(SourceEvidence {
-                location: SourceLocation::new(path, start, end),
+            self.evidence[index] = SourceEvidence {
+                location: SourceLocation::new(path, first, end),
                 target: item.target().to_owned(),
                 snippet,
                 symbol: item.symbol().map(str::to_owned),
-                relevance: "following verified source lines".to_owned(),
-            });
-            self.cited.push(start);
+                relevance: item.relevance().to_owned(),
+            };
         }
         Ok(self)
     }
@@ -2365,6 +2360,9 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         let report = report
             .with_following_lines(&fixture.root, 8)
             .expect("bounded adjacent source");
+        assert!(report.evidence().iter().any(|evidence| {
+            evidence.location().start_line() == 1 && evidence.location().end_line() >= 9
+        }));
         assert!(report.evidence().iter().any(|evidence| {
             evidence.location().start_line() <= 8
                 && evidence.location().end_line() >= 9
