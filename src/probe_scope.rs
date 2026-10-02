@@ -376,17 +376,6 @@ pub(crate) fn run_probe_command(
     })
 }
 
-fn probe_output_is_relevant(output: &Output, root: &Path, query: &str, max_results: usize) -> bool {
-    output.status.success()
-        && pbi_rs::verify_probe_evidence(
-            &String::from_utf8_lossy(&output.stdout),
-            root,
-            query,
-            max_results,
-        )
-        .is_ok_and(|report| !report.evidence().is_empty())
-}
-
 fn ignored_scope_path(root: &Path, path: &Path, ignores: &[String]) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
@@ -516,22 +505,6 @@ fn invoke_probe_scope(
         }
         ledger.stdout = strip_ignored_file_records(root, &ledger.stdout, &options.ignores);
         ledger.stderr.extend_from_slice(&output.stderr);
-        let retained = Output {
-            status: output.status,
-            stdout: ledger.stdout.clone(),
-            stderr: ledger.stderr.clone(),
-        };
-        if probe_output_is_relevant(&retained, root, query, options.max_results)
-            && pbi_rs::verify_probe_evidence(
-                &String::from_utf8_lossy(&retained.stdout),
-                root,
-                query,
-                options.max_results,
-            )
-            .is_ok_and(|report| report.is_complete())
-        {
-            return Ok(retained);
-        }
     }
     let Some(status) = ledger.status else {
         return Err(CliError::compatibility_failed("no source locations found"));

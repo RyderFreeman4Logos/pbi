@@ -123,7 +123,7 @@ impl ScopeFixture {
   ignored) last=; for arg do last=$arg; done; case \"$last\" in
     *.rs) printf 'fallback-hit|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\"; printf 'File: %s, Lines: 1-1\\n' \"$last\" ;;
     *) printf 'root-miss|%s\\n' \"$last\" >> \"$PBI_TEST_EVENTS\" ;;
-  esac ;;\n  decoy) printf 'File: %s/src/decoy.rs, Lines: 1-2\\n' \"$PWD\" ;;\n  overflow) printf 'root-miss|overflow\\n' >> \"$PBI_TEST_EVENTS\" ;;\nesac\n",
+  esac ;;\n  files) last=; for arg do last=$arg; done; case \"$last\" in\n    */nested/invocation/root) ;;\n    *.rs) printf 'File: %s, Lines: 1-1\\n' \"$last\" ;;\n    *) ;;\n  esac ;;\n  decoy) printf 'File: %s/src/decoy.rs, Lines: 1-2\\n' \"$PWD\" ;;\n  overflow) printf 'root-miss|overflow\\n' >> \"$PBI_TEST_EVENTS\" ;;\nesac\n",
         )
         .expect("write scoped fake Probe");
         let mut permissions = fs::metadata(&probe)
@@ -338,7 +338,7 @@ fn question_parity_discards_route_overrides_without_activation() {
                 .any(|arg| arg.contains("unapproved") || arg == "remote"));
             assert_eq!(
                 output.stdout,
-                b"fixture.rs:1-2\n",
+                b"fixture.rs:1\n",
                 "{args:?}: {}",
                 String::from_utf8_lossy(&output.stdout)
             );
@@ -744,7 +744,7 @@ fn search_budget_values_preserve_native_numbers_and_formatting() {
                 if raw {
                     assert_eq!(output.stdout, b"raw Probe bytes\n");
                 } else {
-                    assert_eq!(output.stdout, b"fixture.rs:1-2\n");
+                    assert_eq!(output.stdout, b"fixture.rs:1\n");
                 }
             }
         }
@@ -1699,7 +1699,7 @@ fn compact_output_keeps_qualified_owner_and_root_boundary() {
         "{}",
         String::from_utf8_lossy(&positive.stderr)
     );
-    assert_eq!(positive.stdout, b"src/lib.rs:1-2\n");
+    assert_eq!(positive.stdout, b"src/lib.rs:2\n");
     let negative = fixture.run_args("saturated", &["search", "SourceLocation absent_member"]);
     assert_eq!(negative.status.code(), Some(1));
     assert!(negative.stdout.is_empty());
@@ -1727,4 +1727,49 @@ fn compact_output_keeps_qualified_owner_and_root_boundary() {
         String::from_utf8_lossy(&boundary.stderr).trim(),
         "pbi: no source locations found"
     );
+}
+
+#[test]
+fn compact_output_cites_member_line_and_keeps_both_files() {
+    let fixture = ScopeFixture::new();
+    fs::create_dir(fixture.root.join("src")).expect("src");
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "impl SourceLocation {\n    fn display_relative(&self) {}\n}\n",
+    )
+    .expect("member");
+    let member = fixture.run_args("saturated", &["search", "SourceLocation display_relative"]);
+    assert_eq!(
+        member.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&member.stderr)
+    );
+    assert_eq!(member.stdout, b"src/lib.rs:2\n");
+
+    fs::write(fixture.root.join("b.rs"), "fn parse_search() {}\n").expect("b");
+    fs::write(fixture.root.join("a.rs"), "fn parse_search() {}\n").expect("a");
+    let both = fixture.run_args("files", &["search", "where is parse_search"]);
+    assert_eq!(
+        both.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+    assert_eq!(both.stdout, b"a.rs:1\nb.rs:1\n");
+
+    let repeated = ScopeFixture::new();
+    fs::write(
+        repeated.root.join("twice.rs"),
+        "fn parse_search() {}\nfn parse_search() {}\n",
+    )
+    .expect("twice");
+    let twice = repeated.run_args("files", &["search", "where is parse_search"]);
+    assert_eq!(
+        twice.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&twice.stderr)
+    );
+    assert_eq!(twice.stdout, b"twice.rs:1\n");
 }

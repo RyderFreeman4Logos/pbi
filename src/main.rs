@@ -341,18 +341,22 @@ fn run(
             return Ok(0);
         }
     }
-    print_evidence(report.evidence(), &root)?;
+    print_evidence(&report, &root)?;
     Ok(if report.is_complete() { 0 } else { 1 })
 }
 
-fn print_evidence(evidence: &[SourceEvidence], root: &Path) -> Result<(), CliError> {
+fn print_evidence(report: &pbi_rs::EvidenceReport, root: &Path) -> Result<(), CliError> {
     let mut output = Vec::new();
-    for item in evidence {
-        let location = item
+    for (index, item) in report.evidence().iter().enumerate() {
+        let relative = item
             .location()
-            .display_relative(root)
-            .map_err(evidence_cli_error)?;
-        writeln!(output, "{location}")
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| CliError::failed("source location is outside the repository"))?;
+        let line = report
+            .cited_line(index)
+            .unwrap_or_else(|| item.location().start_line());
+        writeln!(output, "{}:{line}", relative.to_string_lossy())
             .map_err(|_| CliError::failed("cannot write source evidence"))?;
     }
     io::stdout()

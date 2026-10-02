@@ -12,7 +12,7 @@ pub mod semantic;
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVIDENCE_LINES: usize = 4;
 
-/// A verified source path and the exact line span returned to a caller.
+/// A verified source path and the exact cited line returned to a caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceLocation {
     path: PathBuf,
@@ -97,6 +97,7 @@ pub struct EvidenceReport {
     complete: bool,
     evidence: Vec<SourceEvidence>,
     missing_targets: Vec<String>,
+    cited: Vec<usize>,
 }
 
 impl EvidenceReport {
@@ -106,6 +107,10 @@ impl EvidenceReport {
 
     pub fn evidence(&self) -> &[SourceEvidence] {
         &self.evidence
+    }
+
+    pub fn cited_line(&self, index: usize) -> Option<usize> {
+        self.cited.get(index).copied()
     }
 
     pub fn missing_targets(&self) -> &[String] {
@@ -162,6 +167,7 @@ struct ScoredEvidence {
     evidence: SourceEvidence,
     score: i32,
     order: usize,
+    cited: usize,
 }
 
 /// Parse Probe output, inspect the cited files, and return compact evidence.
@@ -232,6 +238,7 @@ pub fn verify_probe_evidence(
     }
 
     let mut evidence = Vec::new();
+    let mut cited = Vec::new();
     let mut covered = vec![false; groups.len()];
     for (group_index, group_choices) in choices.iter_mut().enumerate() {
         group_choices.sort_by(|left, right| {
@@ -246,22 +253,26 @@ pub fn verify_probe_evidence(
                         .cmp(&right.evidence.location.start_line)
                 })
         });
-        let Some(choice) = group_choices.first().cloned() else {
-            continue;
-        };
-        if let Some(existing) = evidence
-            .iter()
-            .position(|candidate: &SourceEvidence| candidate.location == choice.evidence.location)
-        {
-            let _ = existing;
+        for choice in group_choices.iter().cloned() {
+            if let Some(existing) = evidence.iter().position(|candidate: &SourceEvidence| {
+                candidate.location.path == choice.evidence.location.path
+            }) {
+                if choice.evidence.snippet.lines().count()
+                    > evidence[existing].snippet.lines().count()
+                {
+                    evidence[existing] = choice.evidence;
+                    cited[existing] = choice.cited;
+                }
+                covered[group_index] = true;
+                continue;
+            }
+            if evidence.len() >= max_results {
+                continue;
+            }
+            cited.push(choice.cited);
+            evidence.push(choice.evidence);
             covered[group_index] = true;
-            continue;
         }
-        if evidence.len() >= max_results {
-            continue;
-        }
-        evidence.push(choice.evidence);
-        covered[group_index] = true;
     }
 
     let missing_targets = if any_of && covered.iter().any(|covered| *covered) {
@@ -281,6 +292,7 @@ pub fn verify_probe_evidence(
         complete: missing_targets.is_empty(),
         evidence,
         missing_targets,
+        cited,
     })
 }
 
@@ -1309,6 +1321,41 @@ fn best_window(
                     0
                 }
                 - length as i32;
+            let cited = lines[start..end]
+                .iter()
+                .enumerate()
+                .find(|(offset, line)| {
+                    defines_requested(
+                        line,
+                        group,
+                        &code_lines,
+                        start + offset,
+                        relative,
+                        &declarations,
+                    ) || declaration_names(
+                        line,
+                        code_lines[start + offset],
+                        relative,
+                        start + offset + 1,
+                        &declarations,
+                    )
+                    .iter()
+                    .any(|name| same_name(name, group))
+                })
+                .or_else(|| {
+                    lines[start..end].iter().enumerate().find(|(offset, _)| {
+                        let code = code_lines[start + offset].trim_start();
+                        !code.starts_with("//")
+                            && !code.starts_with('#')
+                            && group.terms.iter().any(|term| {
+                                code_lines[start + offset]
+                                    .to_ascii_lowercase()
+                                    .contains(term)
+                            })
+                    })
+                })
+                .map(|(offset, _)| start + offset + 1)
+                .unwrap_or(start + 1);
             let location = SourceLocation::new(path.to_path_buf(), start + 1, end);
             let symbol = lines[start..end]
                 .iter()
@@ -1375,6 +1422,7 @@ fn best_window(
                 },
                 score,
                 order,
+                cited,
             };
             if match best.as_ref() {
                 None => true,
