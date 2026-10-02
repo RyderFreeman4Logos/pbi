@@ -416,9 +416,9 @@ fn print_semantic(
     json_output: bool,
 ) -> Result<(), CliError> {
     if json_output {
-        // Probe Chat's sessionId is replaced by this ADK invocation identity;
-        // token usage is unavailable from the validated answer contract.
-        let output = json!({"response": answer.answer(), "sessionId": answer.invocation_identity(), "tokenUsage": null});
+        // No conversational session is stored. The ADK invocation identity is
+        // not a session, and the validated answer has no provider token usage.
+        let output = json!({"response": answer.answer(), "sessionId": null, "tokenUsage": null});
         let mut bytes = serde_json::to_vec(&output)
             .map_err(|_| CliError::failed("cannot serialize semantic answer"))?;
         bytes.push(b'\n');
@@ -1305,9 +1305,8 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                     let parsed: serde_json::Value =
                         serde_json::from_slice(&output).expect("valid JSON with escaped answer");
                     assert_eq!(parsed["response"], answer);
-                    assert!(parsed["sessionId"]
-                        .as_str()
-                        .is_some_and(|id| !id.is_empty()));
+                    // No conversational session exists; invocation identity is not one.
+                    assert!(parsed["sessionId"].is_null());
                     assert!(parsed["tokenUsage"].is_null());
                 } else {
                     assert_eq!(
