@@ -63,6 +63,13 @@ const OUTPUT_SCHEMA: &str = r#"{
   }
 }"#;
 
+const SEARCH_PLAN_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["query"],
+  "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 128}}
+}"#;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticAnswer {
     answer: String,
@@ -510,6 +517,85 @@ struct AllowedCitation {
 #[cfg(test)]
 #[path = "explicit_config_route_tests.rs"]
 mod explicit_config_route_tests;
+
+/// Ask the authorized kit route for one short source search when literal retrieval has no hits.
+/// The resulting text is only a query; repository reads and citation admission stay in Rust.
+pub async fn plan_search_query(
+    question: &str,
+    policy: &ModelRoutePolicy,
+    deadline: Instant,
+    cancellation: &ModelRouteCancellation,
+) -> Result<String, SemanticError> {
+    if question.trim().is_empty() {
+        return Err(SemanticError::EmptyQuestion);
+    }
+    if Instant::now() >= deadline {
+        return Err(SemanticError::DeadlineExceeded);
+    }
+    let schema: Value =
+        serde_json::from_str(SEARCH_PLAN_SCHEMA).map_err(|_| SemanticError::Protocol)?;
+    let protocol = PromptProtocol::new(
+        "Choose one likely source identifier or two related code terms for a bounded repository search. The user's term may describe behavior rather than match code spelling. Return only the query field; do not answer the question or invent source citations.",
+        Vec::new(),
+        schema.clone(),
+        json!({"question": question}),
+        TrustDomain::ConditionallyTrustedContent,
+    )
+    .map_err(|_| SemanticError::Protocol)?;
+    let output = StructuredOutputContract::new(schema, 512).map_err(|_| SemanticError::Protocol)?;
+    let budget = InferenceBudget::new(ReasoningEffort::Low, 128, 0)
+        .map(|budget| budget.with_escalation(EscalationPolicy::None))
+        .map_err(|_| SemanticError::Protocol)?;
+    let route_placeholder = ProviderRouteIdentity::new(
+        ModelProfileIdentity::new("pbi-rs-route-placeholder", "1"),
+        "openai",
+        "pbi-rs-route-placeholder",
+        "pbi-rs-route-placeholder",
+        "pbi-rs-route-placeholder",
+    );
+    let spec = ModelInvocationSpec::new(
+        protocol,
+        question.to_owned(),
+        route_placeholder,
+        budget,
+        output,
+    )
+    .map_err(|_| SemanticError::Protocol)?;
+    let broker = CredentialBroker::new();
+    let result = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        policy.invoke(&spec, &broker, cancellation),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return Err(match error.kind() {
+                ModelRouteTerminalErrorKind::Cancelled => SemanticError::Cancelled,
+                ModelRouteTerminalErrorKind::DeadlineExceeded => SemanticError::DeadlineExceeded,
+                kind => SemanticError::Route {
+                    kind,
+                    attempts: error.attempts().len(),
+                },
+            });
+        }
+        Err(_) => return Err(SemanticError::DeadlineExceeded),
+    };
+    let value = result.into_output();
+    let query = value
+        .as_object()
+        .and_then(|object| object.get("query"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| {
+            !query.is_empty()
+                && query.len() <= 128
+                && !query.chars().any(char::is_control)
+                && *query != question.trim()
+        })
+        .ok_or(SemanticError::InvalidOutput)?;
+    Ok(query.to_owned())
+}
 
 pub async fn investigate(
     question: &str,

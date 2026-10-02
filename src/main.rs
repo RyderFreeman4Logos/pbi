@@ -1,7 +1,7 @@
 use pbi_rs::semantic::{
     admit_local_routes, investigate, local_route_from_environment,
-    local_route_publisher_from_cli_routes, local_route_publisher_from_environment, LocalModelRoute,
-    SemanticAnswer, SemanticError, SemanticRouteError,
+    local_route_publisher_from_cli_routes, local_route_publisher_from_environment,
+    plan_search_query, LocalModelRoute, SemanticAnswer, SemanticError, SemanticRouteError,
 };
 #[cfg(test)]
 use pbi_rs::semantic::{
@@ -298,59 +298,15 @@ fn run(
             "raw Probe search was removed; use verified search without --bm25 or Probe format flags",
         ));
     }
-    let collect_evidence = || -> Result<pbi_rs::EvidenceReport, CliError> {
-        let found = search_repository(
-            &root,
-            &query,
-            &SearchLimits {
-                deadline,
-                max_results: options.max_results,
-                language: options.language.clone(),
-                ignores: options.ignores.clone(),
-            },
-        )
-        .map_err(|failure| match failure {
-            SearchFailure::Deadline => {
-                CliError::failed("native search exceeded its bounded deadline")
-            }
-            SearchFailure::Limit => CliError::failed("native search exceeded its bounded limit"),
-            SearchFailure::TargetLimit => {
-                CliError::failed("native search exceeded the bounded target limit")
-            }
-            SearchFailure::Unavailable => {
-                CliError::failed("native search could not read the repository")
-            }
-        })?;
-        verify_probe_evidence(&found, &root, &query, options.max_results)
-            .map_err(evidence_cli_error)
+    #[cfg(test)]
+    let injected_publisher = match _test_route_injection {
+        Some(TestRouteInjection::Publisher(publisher)) => Some(publisher),
+        Some(TestRouteInjection::PublisherWithEvidence { publisher, .. }) => Some(publisher),
+        Some(TestRouteInjection::Factory { .. }) | None => None,
     };
     #[cfg(test)]
-    let report = match _test_route_injection {
-        Some(TestRouteInjection::PublisherWithEvidence { report, .. }) => report.clone(),
-        _ => collect_evidence()?,
-    };
-    #[cfg(not(test))]
-    let report = collect_evidence()?;
-    if semantic {
-        let expanded_report = if query.trim_start().to_ascii_lowercase().starts_with("why ") {
-            Some(
-                report
-                    .clone()
-                    .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
-                    .map_err(evidence_cli_error)?,
-            )
-        } else {
-            None
-        };
-        let report = expanded_report.as_ref().unwrap_or(&report);
-        #[cfg(test)]
-        let injected_publisher = match _test_route_injection {
-            Some(TestRouteInjection::Publisher(publisher)) => Some(publisher),
-            Some(TestRouteInjection::PublisherWithEvidence { publisher, .. }) => Some(publisher),
-            Some(TestRouteInjection::Factory { .. }) | None => None,
-        };
-        #[cfg(test)]
-        let owned_publisher = match _test_route_injection {
+    let owned_publisher = if semantic {
+        match _test_route_injection {
             Some(TestRouteInjection::Factory { build, .. }) => {
                 let routes = match admitted_routes.as_ref() {
                     Some(routes) => routes.clone(),
@@ -368,18 +324,97 @@ fn run(
                 }
                 None => local_route_publisher_from_environment().map_err(route_cli_error)?,
             },
-        };
-        #[cfg(not(test))]
-        let owned_publisher = match admitted_routes.as_deref() {
+        }
+    } else {
+        None
+    };
+    #[cfg(not(test))]
+    let owned_publisher = if semantic {
+        match admitted_routes.as_deref() {
             Some(routes) => {
                 local_route_publisher_from_cli_routes(routes).map_err(route_cli_error)?
             }
             None => local_route_publisher_from_environment().map_err(route_cli_error)?,
+        }
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let publisher = injected_publisher.or(owned_publisher.as_ref());
+    #[cfg(not(test))]
+    let publisher = owned_publisher.as_ref();
+
+    let collect_evidence =
+        |search_query: &str| -> Result<Option<pbi_rs::EvidenceReport>, CliError> {
+            let found = search_repository(
+                &root,
+                search_query,
+                &SearchLimits {
+                    deadline,
+                    max_results: options.max_results,
+                    language: options.language.clone(),
+                    ignores: options.ignores.clone(),
+                },
+            )
+            .map_err(|failure| match failure {
+                SearchFailure::Deadline => {
+                    CliError::failed("native search exceeded its bounded deadline")
+                }
+                SearchFailure::Limit => {
+                    CliError::failed("native search exceeded its bounded limit")
+                }
+                SearchFailure::TargetLimit => {
+                    CliError::failed("native search exceeded the bounded target limit")
+                }
+                SearchFailure::Unavailable => {
+                    CliError::failed("native search could not read the repository")
+                }
+            })?;
+            match verify_probe_evidence(&found, &root, search_query, options.max_results) {
+                Ok(report) => Ok(Some(report)),
+                Err(EvidenceError::NoSourceLocations) => Ok(None),
+                Err(error) => Err(evidence_cli_error(error)),
+            }
         };
-        #[cfg(test)]
-        let publisher = injected_publisher.or(owned_publisher.as_ref());
-        #[cfg(not(test))]
-        let publisher = owned_publisher.as_ref();
+    #[cfg(test)]
+    let report = match _test_route_injection {
+        Some(TestRouteInjection::PublisherWithEvidence { report, .. }) => Some(report.clone()),
+        _ => collect_evidence(&query)?,
+    };
+    #[cfg(not(test))]
+    let report = collect_evidence(&query)?;
+    let report = match report {
+        Some(report) => report,
+        None if semantic => {
+            let Some(publisher) = publisher else {
+                return Err(evidence_cli_error(EvidenceError::NoSourceLocations));
+            };
+            let policy = publisher.policy(deadline);
+            let cancellation = ModelRouteCancellation::new();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| CliError::failed("semantic runtime could not be created"))?;
+            let revised = runtime
+                .block_on(plan_search_query(&query, &policy, deadline, &cancellation))
+                .map_err(semantic_cli_error)?;
+            collect_evidence(&revised)?
+                .ok_or_else(|| evidence_cli_error(EvidenceError::NoSourceLocations))?
+        }
+        None => return Err(evidence_cli_error(EvidenceError::NoSourceLocations)),
+    };
+    if semantic {
+        let expanded_report = if query.trim_start().to_ascii_lowercase().starts_with("why ") {
+            Some(
+                report
+                    .clone()
+                    .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
+                    .map_err(evidence_cli_error)?,
+            )
+        } else {
+            None
+        };
+        let report = expanded_report.as_ref().unwrap_or(&report);
         if let Some(publisher) = publisher {
             let cancellation = ModelRouteCancellation::new();
             let policy = publisher.policy(deadline);
@@ -887,6 +922,7 @@ mod tests {
         AdkError, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse,
     };
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::fs;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -1013,6 +1049,7 @@ mod tests {
         Internal,
         Pending,
         Respond(String),
+        Responses(Mutex<VecDeque<String>>),
     }
 
     struct TestRouteLlm {
@@ -1055,6 +1092,11 @@ mod tests {
                 }
                 TestModelBehavior::Pending => return std::future::pending().await,
                 TestModelBehavior::Respond(response) => response.clone(),
+                TestModelBehavior::Responses(responses) => responses
+                    .lock()
+                    .expect("scripted responses")
+                    .pop_front()
+                    .expect("one response per model call"),
             };
             Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
                 LlmResponse::new(Content::new("assistant").with_text(response)),
@@ -2863,6 +2905,69 @@ mod tests {
         publish_answer_body_citations(&root, &question);
         drop(_env);
         fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn semantic_question_replans_one_no_hit_with_the_same_kit_route() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-replan-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("outage_hold.rs"),
+            "fn is_outage() -> bool { true }\n",
+        )
+        .expect("source");
+        let _env = RouteConfigEnvGuard::new(&root, &[]);
+        let profile = FakeModelProfile::new("pbi-test", "1", "fake-model", ["unused"]);
+        let registry = ModelProfileRegistry::new()
+            .with_worker(profile)
+            .expect("profile");
+        let candidate = ModelRouteCandidate::new(ModelRole::Worker, "pbi-test", "1");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let snapshot = ModelRouteSnapshot::new(
+            registry,
+            vec![candidate.clone()],
+            ModelRouteAuthorization::new(vec![candidate.clone()]),
+        )
+        .expect("authorized test snapshot")
+        .with_test_llm(
+            candidate,
+            Arc::new(TestRouteLlm {
+                calls: Arc::clone(&calls),
+                behavior: TestModelBehavior::Responses(Mutex::new(VecDeque::from([
+                    json!({"query":"is_outage"}).to_string(),
+                    json!({
+                        "answer":"The outage hold controls the stop condition.",
+                        "uncertainty":"Only the verified function was inspected.",
+                        "citations":[{"path":"outage_hold.rs","start_line":1,"end_line":1}]
+                    })
+                    .to_string(),
+                ]))),
+                seen: None,
+            }),
+        )
+        .expect("scripted kit route");
+        let publisher = ModelRoutePublisher::new(snapshot);
+        let mut output = Vec::new();
+        let result = run(
+            vec!["Why does persistent_outage_hold stop with attempts left?".to_owned()],
+            Some(TestRouteInjection::Publisher(&publisher)),
+            &mut output,
+        );
+        if let Err(error) = &result {
+            panic!("replanned answer failed: {}", error.message);
+        }
+        assert!(matches!(result, Ok(0)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(String::from_utf8_lossy(&output)
+            .contains("The outage hold controls the stop condition."));
+        drop(_env);
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
