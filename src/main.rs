@@ -1221,6 +1221,164 @@ mod tests {
         }
     }
 
+    fn publish_answer_body_citations(root: &Path, question: &str) {
+        let modes = [
+            vec![question.to_owned()],
+            vec![question.to_owned(), "--json".to_owned()],
+            vec![
+                "--message".to_owned(),
+                question.to_owned(),
+                "--json".to_owned(),
+            ],
+            vec!["--message".to_owned(), question.to_owned()],
+        ];
+        let citations = json!([{
+            "path": "receipt.py",
+            "start_line": 1,
+            "end_line": 1
+        }]);
+        let mut red = Vec::new();
+        for arguments in &modes {
+            let mut output = Vec::new();
+            let result = run(
+                arguments.clone(),
+                Some(TestRouteInjection::Publisher(&test_publisher(json!({
+                    "answer": "The check is not in `missing.rs:99`.",
+                    "uncertainty": "Only the verified source span was inspected.",
+                    "citations": citations.clone(),
+                })))),
+                &mut output,
+            );
+            if !matches!(result, Err(CliError { code: 1, .. })) || !output.is_empty() {
+                let status = match &result {
+                    Ok(code) => format!("ok:{code}"),
+                    Err(error) => format!("err:{}:{}", error.code, error.message),
+                };
+                red.push(format!("{arguments:?}: {status} bytes={}", output.len()));
+            }
+        }
+        assert!(
+            red.is_empty(),
+            "invalid answer-body citations must fail closed: {red:#?}"
+        );
+        for answer in [
+            "See `receipt.py:1`.",
+            "The helper returns the receipt. No inline location.",
+            "See version:1, OWNER:MEMBER, http://host/file.rs:9, and 2020-01-02T03:04:05Z.",
+            "Probe listens on localhost:9 and 127.0.0.1:9.",
+            "See ../missing.rs:99 only as a non-candidate suffix.",
+        ] {
+            for arguments in &modes {
+                let mut output = Vec::new();
+                assert!(
+                    matches!(
+                        run(
+                            arguments.clone(),
+                            Some(TestRouteInjection::Publisher(&test_publisher(json!({
+                                "answer": answer,
+                                "uncertainty": "missing.rs:999 stays escaped",
+                                "citations": citations.clone(),
+                            })))),
+                            &mut output,
+                        ),
+                        Ok(0)
+                    ),
+                    "{answer:?} {arguments:?}"
+                );
+                let published = String::from_utf8(output).expect("utf8");
+                assert!(published.contains("receipt.py:1"), "{published}");
+                if arguments.iter().any(|argument| argument == "--json") {
+                    assert!(published.contains("missing.rs:999"));
+                }
+            }
+        }
+        let source = "fn decode(line: &str) {\n    let decoded = parse_jsonl_value(line).map_err(|error| {\n        Error::new(JsonlDecodeError { source: error })\n    })?;\n    use_value(decoded);\n}\n";
+        fs::write(root.join("receipt.py"), source).expect("multiline source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-6\n", root.join("receipt.py").display()),
+            root,
+            "where is JSONL parser error conversion",
+            DEFAULT_MAX_RESULTS,
+        )
+        .expect("verified multiline evidence");
+        let evidence = &report.evidence()[0];
+        let start = evidence.location().start_line();
+        let end = evidence.location().end_line();
+        assert!(end > start, "verifier must keep a real multiline window");
+        let span = format!("receipt.py:{start}-{end}");
+        let inside = format!("receipt.py:{start}");
+        let multiline = json!([{
+            "path": "receipt.py",
+            "start_line": start,
+            "end_line": end
+        }]);
+        let multiline_question = "where is JSONL parser error conversion";
+        let multiline_modes = [
+            vec![multiline_question.to_owned()],
+            vec![multiline_question.to_owned(), "--json".to_owned()],
+            vec![
+                "--message".to_owned(),
+                multiline_question.to_owned(),
+                "--json".to_owned(),
+            ],
+            vec!["--message".to_owned(), multiline_question.to_owned()],
+        ];
+        let mut multiline_failures = Vec::new();
+        for arguments in &multiline_modes {
+            let accepted_body = format!("See `{span}` and {inside}.");
+            let mut output = Vec::new();
+            let accepted = run(
+                arguments.clone(),
+                Some(TestRouteInjection::Publisher(&test_publisher(json!({
+                    "answer": accepted_body,
+                    "uncertainty": "window only",
+                    "citations": multiline.clone(),
+                })))),
+                &mut output,
+            );
+            let accepted_status = match &accepted {
+                Ok(code) => format!("ok:{code}"),
+                Err(error) => format!("err:{}:{}", error.code, error.message),
+            };
+            if !matches!(accepted, Ok(0)) || !String::from_utf8_lossy(&output).contains(&span) {
+                multiline_failures.push(format!(
+                    "accepted {arguments:?} body={accepted_body:?} status={accepted_status} out={}",
+                    String::from_utf8_lossy(&output)
+                ));
+            }
+            let rejected_body = format!("See receipt.py:{} and receipt.py:0.", end + 1);
+            let mut rejected = Vec::new();
+            let result = run(
+                arguments.clone(),
+                Some(TestRouteInjection::Publisher(&test_publisher(json!({
+                    "answer": rejected_body,
+                    "uncertainty": "window only",
+                    "citations": multiline.clone(),
+                })))),
+                &mut rejected,
+            );
+            let rejected_status = match &result {
+                Ok(code) => format!("ok:{code}"),
+                Err(error) => format!("err:{}:{}", error.code, error.message),
+            };
+            if !matches!(result, Err(CliError { code: 1, .. })) || !rejected.is_empty() {
+                multiline_failures.push(format!(
+                    "rejected {arguments:?} body={rejected_body:?} status={rejected_status} bytes={}",
+                    rejected.len()
+                ));
+            }
+        }
+        assert!(
+            multiline_failures.is_empty(),
+            "multiline citation outcomes: {multiline_failures:#?}"
+        );
+        fs::write(
+            root.join("receipt.py"),
+            "def exact_reuse_receipt():\n    return True\n",
+        )
+        .expect("restore source");
+    }
+
     fn assert_semantic_message_output(output: &[u8], answer: &str) {
         let output = String::from_utf8(output.to_vec()).expect("semantic message output");
         assert!(output.starts_with("Stage: semantic_adk_model\nInvocation attestation: sha256:"));
@@ -1790,6 +1948,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             Err(CliError { code: 1, .. })
         ));
         assert!(invalid_output.is_empty());
+        publish_answer_body_citations(&root, &question);
         let mut no_hit = Vec::new();
         let miss = run(
             vec!["unfindable_xyz".to_owned(), "--json".to_owned()],
