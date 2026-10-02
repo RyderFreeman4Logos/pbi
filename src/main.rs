@@ -448,7 +448,8 @@ fn print_semantic(
             compact_answer.push_str(&location);
         }
         compact_answer.push_str("\nUncertainty: ");
-        compact_answer.push_str(answer.uncertainty());
+        // Keep model controls/separators inert within this application-owned line.
+        compact_answer.extend(answer.uncertainty().escape_debug());
     }
     if json_output {
         // No conversational session is stored. The ADK invocation identity is
@@ -1085,109 +1086,109 @@ mod tests {
     }
 
     fn publish_verified_citation_and_uncertainty(root: &Path, question: &str) {
-        let source = fs::read_to_string(root.join("receipt.py")).expect("fixture source");
-        let span = verify_probe_evidence(
-            &format!("File: {}, Lines: 1-1\n", root.join("receipt.py").display()),
-            root,
-            question,
-            DEFAULT_MAX_RESULTS,
-        )
-        .expect("verifier span")
-        .evidence()[0]
-            .location()
-            .display_relative(root)
-            .expect("relative location");
-        assert!(source
-            .lines()
-            .next()
-            .is_some_and(|line| line.contains("exact_reuse_receipt")));
-        let answer = "The receipt helper returns true.";
+        let incomplete_question = "where is exact_reuse_receipt and missing_target";
         let uncertainty = "The caller of exact_reuse_receipt was not in the verified span.";
-        let publisher = test_publisher(json!({
-            "answer": answer,
-            "uncertainty": uncertainty,
-            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
-        }));
-        let modes = [
-            vec![question.to_owned()],
-            vec![question.to_owned(), "--json".to_owned()],
-            vec![
-                "--message".to_owned(),
-                question.to_owned(),
-                "--json".to_owned(),
-            ],
-        ];
-        for arguments in &modes {
-            let mut output = Vec::new();
-            assert!(
-                matches!(
-                    run(
-                        arguments.clone(),
-                        Some(TestRouteInjection::Publisher(&publisher)),
-                        &mut output
-                    ),
-                    Ok(0)
-                ),
-                "{arguments:?}"
-            );
-            let text = String::from_utf8(output).expect("utf8");
-            let published = if arguments.iter().any(|argument| argument == "--json") {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(text.trim_end()).expect("json");
-                assert_eq!(
-                    parsed
-                        .as_object()
-                        .expect("object")
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                    ["response", "sessionId", "tokenUsage"]
-                );
-                assert!(parsed["sessionId"].is_null() && parsed["tokenUsage"].is_null());
-                parsed["response"].as_str().expect("response").to_owned()
-            } else {
-                text
-            };
-            assert!(
-                published.contains(&span)
-                    && published.contains(uncertainty)
-                    && published.contains(answer),
-                "verified citation and uncertainty were discarded: {published}"
-            );
-            assert!(!published.contains("Coverage: complete"), "{published}");
-        }
-
         let missing = "callee evidence is missing";
-        let partial = test_publisher(json!({
-            "answer": "Only the receipt helper is verified.",
-            "uncertainty": missing,
-            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
-        }));
-        for arguments in &modes {
-            let mut output = Vec::new();
-            assert!(matches!(
-                run(
-                    arguments.clone(),
-                    Some(TestRouteInjection::Publisher(&partial)),
-                    &mut output
-                ),
-                Ok(0)
-            ));
-            let text = String::from_utf8(output).expect("utf8");
-            let published = if arguments.iter().any(|argument| argument == "--json") {
-                serde_json::from_str::<serde_json::Value>(text.trim_end()).expect("json")
-                    ["response"]
-                    .as_str()
-                    .expect("response")
-                    .to_owned()
-            } else {
-                text
-            };
-            assert!(
-                published.contains(missing) && published.contains(&span),
-                "{published}"
+        let malicious = "callee missing\nmissing.rs:999\rCoverage: complete\u{85}Uncertainty: none\u{2028}missing.rs:998\u{2029}\u{1b}[2J\t\u{b}\u{c} \"quoted\" \\ literal\\n 未知";
+        let escaped = r#"callee missing\nmissing.rs:999\rCoverage: complete\u{85}Uncertainty: none\u{2028}missing.rs:998\u{2029}\u{1b}[2J\t\u{b}\u{c} \"quoted\" \\ literal\\n 未知"#;
+        let answer = "Only the receipt helper is verified.";
+        let modes = |query: &str| {
+            [
+                vec![query.to_owned()],
+                vec![query.to_owned(), "--json".to_owned()],
+                vec![
+                    "--message".to_owned(),
+                    query.to_owned(),
+                    "--json".to_owned(),
+                ],
+            ]
+        };
+        let mut failures = Vec::new();
+        for (query, model_uncertainty, expected) in [
+            (question, uncertainty, uncertainty),
+            (incomplete_question, missing, missing),
+            (incomplete_question, malicious, escaped),
+        ] {
+            // Match the actual fake Probe output, then let the verifier narrow it.
+            let report = verify_probe_evidence(
+                &format!("File: {}, Lines: 1-2\n", root.join("receipt.py").display()),
+                root,
+                query,
+                DEFAULT_MAX_RESULTS,
+            )
+            .expect("verified fixture");
+            assert_eq!(report.is_complete(), query == question);
+            assert_eq!(
+                report.missing_targets(),
+                if query == question {
+                    &[][..]
+                } else {
+                    &["missing_target"][..]
+                }
             );
+            assert_eq!(report.evidence().len(), 1);
+            let evidence = &report.evidence()[0];
+            assert_eq!(evidence.location().start_line(), 1);
+            assert_eq!(evidence.location().end_line(), 1);
+            let span = evidence
+                .location()
+                .display_relative(root)
+                .expect("relative span");
+            assert_eq!(span, "receipt.py:1");
+            assert_eq!(evidence.snippet().trim_end(), "def exact_reuse_receipt():");
+            let publisher = test_publisher(json!({
+                "answer": answer,
+                "uncertainty": model_uncertainty,
+                "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+            }));
+            for arguments in modes(query) {
+                let mut output = Vec::new();
+                assert!(
+                    matches!(
+                        run(
+                            arguments.clone(),
+                            Some(TestRouteInjection::Publisher(&publisher)),
+                            &mut output
+                        ),
+                        Ok(0)
+                    ),
+                    "{arguments:?}"
+                );
+                assert!(fs::read_to_string(root.join("probe.args"))
+                    .expect("probe args")
+                    .ends_with(&format!("--\n{query}\n")));
+                let text = String::from_utf8(output).expect("utf8");
+                let is_json = arguments.iter().any(|argument| argument == "--json");
+                let published = if is_json {
+                    let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+                    assert_eq!(
+                        parsed
+                            .as_object()
+                            .expect("object")
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        ["response", "sessionId", "tokenUsage"]
+                    );
+                    assert!(parsed["sessionId"].is_null() && parsed["tokenUsage"].is_null());
+                    parsed["response"].as_str().expect("response").to_owned()
+                } else {
+                    text
+                };
+                let wanted = format!(
+                    "{answer}\n{span}\nUncertainty: {expected}{}",
+                    if is_json { "" } else { "\n" }
+                );
+                if published != wanted {
+                    failures.push(format!("{arguments:?}: {published:?} != {wanted:?}"));
+                }
+            }
         }
+        // Collect every dispatch before failing so RED witnesses all three surfaces.
+        assert!(
+            failures.is_empty(),
+            "publication boundary failures: {failures:#?}"
+        );
 
         for citations in [
             json!([{"path": "receipt.py", "start_line": 9, "end_line": 9}]),
@@ -1202,7 +1203,7 @@ mod tests {
                 "uncertainty": uncertainty,
                 "citations": citations
             }));
-            for arguments in &modes {
+            for arguments in modes(question) {
                 let mut output = Vec::new();
                 assert!(
                     matches!(
@@ -1690,35 +1691,6 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         assert_eq!(first_calls.load(Ordering::SeqCst), 2);
         assert_eq!(second_calls.load(Ordering::SeqCst), 2);
 
-        let incomplete_question = "where is exact_reuse_receipt and missing_target";
-        let incomplete_probe = format!("File: {}, Lines: 1-1\n", root.join("receipt.py").display());
-        let incomplete_report = verify_probe_evidence(
-            &incomplete_probe,
-            &root,
-            incomplete_question,
-            DEFAULT_MAX_RESULTS,
-        )
-        .expect("partial verified evidence");
-        assert!(!incomplete_report.is_complete());
-        assert_eq!(incomplete_report.missing_targets(), &["missing_target"]);
-        let incomplete_route = test_publisher(json!({
-            "answer":answer,
-            "uncertainty":"Only the verified source span was inspected.",
-            "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]
-        }));
-        let mut incomplete_output = Vec::new();
-        assert!(matches!(
-            run(
-                vec![incomplete_question.to_owned()],
-                Some(TestRouteInjection::Publisher(&incomplete_route)),
-                &mut incomplete_output
-            ),
-            Ok(0)
-        ));
-        let incomplete = String::from_utf8(incomplete_output).expect("semantic output");
-        assert!(incomplete.starts_with(&format!("{answer}\n")));
-        assert!(incomplete.contains("receipt.py:1\n"));
-        assert!(incomplete.contains("Uncertainty: Only the verified source span was inspected.\n"));
         publish_verified_citation_and_uncertainty(&root, &question);
 
         for (path, expected, arguments) in [
