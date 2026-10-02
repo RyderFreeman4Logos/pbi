@@ -1362,6 +1362,13 @@ mod tests {
             citations,
             json!([{"path":"receipt.py","start_line":1,"end_line":1}])
         );
+        check(
+            "ownership-cross-marker-exact",
+            question,
+            &citations,
+            "See '*receipt.py:1, ('receipt.py:1')*'.",
+            true,
+        );
         // Interior filename brackets never own independently quoted atoms or prose.
         fs::create_dir_all(root.join("src")).expect("bracket source directory");
         for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
@@ -1518,6 +1525,60 @@ mod tests {
             "See 'source/源.rs:1, ('source/源.rs:0')'.",
             false,
         );
+        let available = verified(&["receipt.py", "source/源.rs"], question);
+        let receipt_only = json!([available[0]]);
+        for (outer, inner) in [("'", "*"), ("\"", "`"), ("*", "'")] {
+            for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+                for middle in [false, true] {
+                    let before = if middle { "receipt.py:1, " } else { "" };
+                    let body = |first: &str, last: &str| {
+                        format!(
+                            "See {outer}{before}{inner}{first}:1, {open}{outer}{last}{outer}{close}{inner}{outer}."
+                        )
+                    };
+                    check(
+                        "ownership-cross-marker-list",
+                        question,
+                        &available,
+                        &body("receipt.py", "receipt.py:1"),
+                        true,
+                    );
+                    check(
+                        "ownership-cross-marker-utf8",
+                        question,
+                        &available,
+                        &body("source/源.rs", "source/源.rs:1"),
+                        true,
+                    );
+                    check(
+                        "ownership-cross-marker-unselected",
+                        question,
+                        &receipt_only,
+                        &body("receipt.py", "source/源.rs:1"),
+                        false,
+                    );
+                    check(
+                        "ownership-cross-marker-invalid",
+                        question,
+                        &available,
+                        &body("receipt.py", "receipt.py:0"),
+                        false,
+                    );
+                }
+            }
+        }
+        for body in [
+            "See '\"*receipt.py:1, ('receipt.py:1')*\"'.",
+            "See '**receipt.py:1, ('receipt.py:1')**'.",
+        ] {
+            check(
+                "ownership-cross-marker-depth",
+                question,
+                &available,
+                body,
+                true,
+            );
+        }
         verified(&["receipt.py"], question);
         // Same-marker ownership is lexical, never chosen by selected paths.
         // Baseline L: a short mixed-prefix close leaves literal filename bytes.

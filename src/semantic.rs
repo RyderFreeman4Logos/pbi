@@ -802,6 +802,9 @@ struct BodyWrappers {
     runs: Vec<usize>,
     next_close: Vec<[usize; 4]>,
     colons: Vec<usize>,
+    // Neutral candidates only; the forward owner scan still admits brackets.
+    enclosing_atom_bracket: Vec<usize>,
+    previous_prefix_marker: Vec<usize>,
 }
 
 fn body_marker(byte: u8) -> Option<usize> {
@@ -1024,8 +1027,11 @@ impl BodyWrappers {
         }
         let mut runs = vec![0; length];
         let mut closing = vec![false; length];
+        let mut prefix_markers = vec![false; length];
+        let mut atom_brackets = vec![false; length];
         let mut cursor = 0;
         let mut content_before = false;
+        let mut prefix_only = true;
         let mut start = 0;
         let mut has_colon = false;
         let mut separator_checked = false;
@@ -1041,9 +1047,12 @@ impl BodyWrappers {
                 runs[cursor] = width;
                 closing[cursor] =
                     has_colon && content_before && body_wrapper_end(&answer[cursor + width..]);
+                prefix_markers[cursor] = prefix_only && !closing[cursor];
+                prefix_only &= !closing[cursor];
                 content_before = closing[cursor];
                 after_close = closing[cursor];
             } else {
+                atom_brackets[cursor] = prefix_only && matches!(byte, b'(' | b'[' | b'{');
                 let separator = matches!(ch, ',' | ';')
                     && !separator_checked
                     && (after_close || has_colon && body_separator_after(&answer[start..cursor]));
@@ -1052,6 +1061,9 @@ impl BodyWrappers {
                     start = cursor + width;
                     has_colon = false;
                     separator_checked = false;
+                    prefix_only = true;
+                } else {
+                    prefix_only = false;
                 }
                 has_colon |= ch == ':';
                 // A closing run can include bracket bytes before its list
@@ -1069,12 +1081,33 @@ impl BodyWrappers {
                 next_close[index][kind] = index;
             }
         }
-        Self {
+        let mut wrappers = Self {
             brackets,
             runs,
             next_close,
             colons,
+            enclosing_atom_bracket: vec![length; length],
+            previous_prefix_marker: vec![length; length + 1],
+        };
+        let mut active = Vec::new();
+        for index in 0..length {
+            while active
+                .last()
+                .is_some_and(|&open| wrappers.brackets[open] <= index)
+            {
+                active.pop();
+            }
+            if atom_brackets[index] && wrappers.bracket_pair(answer, index, length).is_some() {
+                active.push(index);
+            }
+            wrappers.enclosing_atom_bracket[index] = active.last().copied().unwrap_or(length);
+            wrappers.previous_prefix_marker[index + 1] = if prefix_markers[index] {
+                index
+            } else {
+                wrappers.previous_prefix_marker[index]
+            };
         }
+        wrappers
     }
 
     fn pair(&self, answer: &str, start: usize, limit: usize) -> Option<(usize, usize)> {
@@ -1103,6 +1136,44 @@ impl BodyWrappers {
             let after = (close + self.runs[close]).min(limit);
             let width = run.min(after - close);
             let end = after - width;
+            // A different marker before an atom-start bracket can keep this
+            // close inside the bracket. Both later closes must fit their full
+            // opening widths; a partial run retains the literal reading.
+            if width == run {
+                let bracket = self.enclosing_atom_bracket[close];
+                if bracket < answer.len() && bracket > content {
+                    let marker = self.previous_prefix_marker[bracket];
+                    if marker > start && marker < bracket {
+                        if let Some(inner_kind) = body_marker(answer.as_bytes()[marker]) {
+                            if inner_kind != kind {
+                                let bracket_end = self.brackets[bracket];
+                                let inner_close = self.next_close[bracket_end + 1][inner_kind];
+                                let inner_width = self.runs[marker];
+                                if inner_close < limit
+                                    && self.runs[inner_close].min(limit - inner_close)
+                                        >= inner_width
+                                    && self.next_close[marker + inner_width][inner_kind]
+                                        == inner_close
+                                    && self.colons[inner_close] > self.colons[marker]
+                                {
+                                    let outer_close =
+                                        self.next_close[inner_close + inner_width][kind];
+                                    if outer_close < limit
+                                        && self.runs[outer_close].min(limit - outer_close) >= run
+                                    {
+                                        return Some((
+                                            outer_close
+                                                + self.runs[outer_close].min(limit - outer_close)
+                                                - run,
+                                            run,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             return (self.colons[end] > self.colons[start]).then_some((end, width));
         }
         self.bracket_pair(answer, start, limit)
