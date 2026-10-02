@@ -437,10 +437,23 @@ fn print_semantic(
     compact: bool,
     json_output: bool,
 ) -> Result<(), CliError> {
+    let mut compact_answer = answer.answer().to_owned();
+    if compact || json_output {
+        for citation in answer.citations() {
+            let location = citation
+                .location()
+                .display_relative(root)
+                .map_err(evidence_cli_error)?;
+            compact_answer.push('\n');
+            compact_answer.push_str(&location);
+        }
+        compact_answer.push_str("\nUncertainty: ");
+        compact_answer.push_str(answer.uncertainty());
+    }
     if json_output {
         // No conversational session is stored. The ADK invocation identity is
         // not a session, and the validated answer has no provider token usage.
-        let output = json!({"response": answer.answer(), "sessionId": null, "tokenUsage": null});
+        let output = json!({"response": compact_answer, "sessionId": null, "tokenUsage": null});
         let mut bytes = serde_json::to_vec(&output)
             .map_err(|_| CliError::failed("cannot serialize semantic answer"))?;
         bytes.push(b'\n');
@@ -449,7 +462,7 @@ fn print_semantic(
             .map_err(|_| CliError::failed("cannot write semantic answer"));
     }
     if compact {
-        return writeln!(writer, "{}", answer.answer())
+        return writeln!(writer, "{compact_answer}")
             .map_err(|_| CliError::failed("cannot write semantic answer"));
     }
     let mut output = Vec::new();
@@ -1071,6 +1084,142 @@ mod tests {
         .collect()
     }
 
+    fn publish_verified_citation_and_uncertainty(root: &Path, question: &str) {
+        let source = fs::read_to_string(root.join("receipt.py")).expect("fixture source");
+        let span = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-1\n", root.join("receipt.py").display()),
+            root,
+            question,
+            DEFAULT_MAX_RESULTS,
+        )
+        .expect("verifier span")
+        .evidence()[0]
+            .location()
+            .display_relative(root)
+            .expect("relative location");
+        assert!(source
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains("exact_reuse_receipt")));
+        let answer = "The receipt helper returns true.";
+        let uncertainty = "The caller of exact_reuse_receipt was not in the verified span.";
+        let publisher = test_publisher(json!({
+            "answer": answer,
+            "uncertainty": uncertainty,
+            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+        }));
+        let modes = [
+            vec![question.to_owned()],
+            vec![question.to_owned(), "--json".to_owned()],
+            vec![
+                "--message".to_owned(),
+                question.to_owned(),
+                "--json".to_owned(),
+            ],
+        ];
+        for arguments in &modes {
+            let mut output = Vec::new();
+            assert!(
+                matches!(
+                    run(
+                        arguments.clone(),
+                        Some(TestRouteInjection::Publisher(&publisher)),
+                        &mut output
+                    ),
+                    Ok(0)
+                ),
+                "{arguments:?}"
+            );
+            let text = String::from_utf8(output).expect("utf8");
+            let published = if arguments.iter().any(|argument| argument == "--json") {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(text.trim_end()).expect("json");
+                assert_eq!(
+                    parsed
+                        .as_object()
+                        .expect("object")
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    ["response", "sessionId", "tokenUsage"]
+                );
+                assert!(parsed["sessionId"].is_null() && parsed["tokenUsage"].is_null());
+                parsed["response"].as_str().expect("response").to_owned()
+            } else {
+                text
+            };
+            assert!(
+                published.contains(&span)
+                    && published.contains(uncertainty)
+                    && published.contains(answer),
+                "verified citation and uncertainty were discarded: {published}"
+            );
+            assert!(!published.contains("Coverage: complete"), "{published}");
+        }
+
+        let missing = "callee evidence is missing";
+        let partial = test_publisher(json!({
+            "answer": "Only the receipt helper is verified.",
+            "uncertainty": missing,
+            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+        }));
+        for arguments in &modes {
+            let mut output = Vec::new();
+            assert!(matches!(
+                run(
+                    arguments.clone(),
+                    Some(TestRouteInjection::Publisher(&partial)),
+                    &mut output
+                ),
+                Ok(0)
+            ));
+            let text = String::from_utf8(output).expect("utf8");
+            let published = if arguments.iter().any(|argument| argument == "--json") {
+                serde_json::from_str::<serde_json::Value>(text.trim_end()).expect("json")
+                    ["response"]
+                    .as_str()
+                    .expect("response")
+                    .to_owned()
+            } else {
+                text
+            };
+            assert!(
+                published.contains(missing) && published.contains(&span),
+                "{published}"
+            );
+        }
+
+        for citations in [
+            json!([{"path": "receipt.py", "start_line": 9, "end_line": 9}]),
+            json!([{"path": "missing.rs", "start_line": 1, "end_line": 1}]),
+            json!([
+                {"path": "receipt.py", "start_line": 1, "end_line": 1},
+                {"path": "receipt.py", "start_line": 1, "end_line": 1}
+            ]),
+        ] {
+            let rejected = test_publisher(json!({
+                "answer": answer,
+                "uncertainty": uncertainty,
+                "citations": citations
+            }));
+            for arguments in &modes {
+                let mut output = Vec::new();
+                assert!(
+                    matches!(
+                        run(
+                            arguments.clone(),
+                            Some(TestRouteInjection::Publisher(&rejected)),
+                            &mut output
+                        ),
+                        Err(CliError { code: 1, .. })
+                    ),
+                    "{arguments:?} {citations}"
+                );
+                assert!(output.is_empty(), "{arguments:?}");
+            }
+        }
+    }
+
     fn assert_semantic_message_output(output: &[u8], answer: &str) {
         let output = String::from_utf8(output.to_vec()).expect("semantic message output");
         assert!(output.starts_with("Stage: semantic_adk_model\nInvocation attestation: sha256:"));
@@ -1533,7 +1682,10 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             .ends_with(&format!("--\n{question}\n")));
         let parsed: serde_json::Value =
             serde_json::from_slice(&override_output).expect("explicit JSON");
-        assert_eq!(parsed["response"], answer);
+        let response = parsed["response"].as_str().expect("response");
+        assert!(response.starts_with(answer));
+        assert!(response.contains("receipt.py:1"));
+        assert!(response.contains("Only the verified source span was inspected."));
         assert!(parsed["tokenUsage"].is_null());
         assert_eq!(first_calls.load(Ordering::SeqCst), 2);
         assert_eq!(second_calls.load(Ordering::SeqCst), 2);
@@ -1563,10 +1715,11 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             ),
             Ok(0)
         ));
-        assert_eq!(
-            String::from_utf8(incomplete_output).expect("semantic output"),
-            format!("{answer}\n")
-        );
+        let incomplete = String::from_utf8(incomplete_output).expect("semantic output");
+        assert!(incomplete.starts_with(&format!("{answer}\n")));
+        assert!(incomplete.contains("receipt.py:1\n"));
+        assert!(incomplete.contains("Uncertainty: Only the verified source span was inspected.\n"));
+        publish_verified_citation_and_uncertainty(&root, &question);
 
         for (path, expected, arguments) in [
             ("receipt.py", true, vec![question.clone()]),
@@ -1603,15 +1756,18 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                 if arguments.contains(&"--json".to_owned()) {
                     let parsed: serde_json::Value =
                         serde_json::from_slice(&output).expect("valid JSON with escaped answer");
-                    assert_eq!(parsed["response"], answer);
+                    let response = parsed["response"].as_str().expect("response");
+                    assert!(response.starts_with(answer));
+                    assert!(response.contains("receipt.py:1"));
+                    assert!(response.contains("Only the verified source was inspected."));
                     // No conversational session exists; invocation identity is not one.
                     assert!(parsed["sessionId"].is_null());
                     assert!(parsed["tokenUsage"].is_null());
                 } else {
-                    assert_eq!(
-                        String::from_utf8(output).expect("utf8"),
-                        format!("{answer}\n")
-                    );
+                    let text = String::from_utf8(output).expect("utf8");
+                    assert!(text.starts_with(&format!("{answer}\n")));
+                    assert!(text.contains("receipt.py:1\n"));
+                    assert!(text.contains("Uncertainty: Only the verified source was inspected.\n"));
                 }
             } else {
                 assert!(
@@ -1641,10 +1797,13 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                 ),
                 Ok(0)
             ));
-            assert_eq!(
-                output,
-                format!("{answer}\n").as_bytes(),
-                "discarded/literal JSON must not activate output mode"
+            let text = String::from_utf8(output).expect("utf8");
+            assert!(text.starts_with(&format!("{answer}\n")));
+            assert!(text.contains("receipt.py:1\n"));
+            assert!(text.contains("Uncertainty: Only the verified source was inspected.\n"));
+            assert!(
+                !text.starts_with('{'),
+                "literal JSON must not activate output mode"
             );
         }
         let invalid = json!({"answer":"", "uncertainty":"unknown", "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]});
