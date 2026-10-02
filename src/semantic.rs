@@ -666,6 +666,7 @@ fn decode_answer(
         return Err(SemanticError::InvalidOutput);
     }
     let mut citations = Vec::with_capacity(citation_values.len());
+    let mut selected = Vec::with_capacity(citation_values.len());
     for citation in citation_values {
         let citation = citation
             .as_object()
@@ -699,8 +700,9 @@ fn decode_answer(
             return Err(SemanticError::CitationMismatch);
         }
         citations.push(evidence[matched.evidence_index].clone());
+        selected.push(matched);
     }
-    answer_body_citations_match(&answer, allowed)?;
+    answer_body_citations_match(&answer, &selected)?;
     Ok(SemanticAnswer {
         answer,
         uncertainty,
@@ -709,91 +711,89 @@ fn decode_answer(
     })
 }
 
+/// Check only model-selected spans. Delimiters bound both references and URL
+/// exemptions; path separators and colons stay intact so invalid paths cannot
+/// be rescued by scanning a valid suffix. The schema bounds answer length.
 fn answer_body_citations_match(
     answer: &str,
-    allowed: &[AllowedCitation],
+    selected: &[&AllowedCitation],
 ) -> Result<(), SemanticError> {
-    let chars: Vec<char> = answer.chars().collect();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index].is_whitespace() {
-            index += 1;
-            continue;
+    for token in answer.split(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\''
+            )
+    }) {
+        let mut token = token.trim_end_matches(['.', '!', '?', '。']);
+        // Peel only paired outer markup, never an interior path fragment.
+        while let Some(marker @ (b'`' | b'*')) = token.as_bytes().first().copied() {
+            if token.len() < 2 || token.as_bytes().last() != Some(&marker) {
+                break;
+            }
+            token = &token[1..token.len() - 1];
         }
-        let start = index;
-        let mut end = index;
-        while end < chars.len() && !chars[end].is_whitespace() && chars[end] != '`' {
-            end += 1;
-        }
-        if end == start {
-            index += 1;
-            continue;
-        }
-        let token: String = chars[start..end].iter().collect();
-        let body = token
-            .trim_start_matches('`')
-            .trim_end_matches(|character: char| {
-                matches!(
-                    character,
-                    '.' | ',' | ';' | ':' | ')' | ']' | '}' | '!' | '?' | '`'
-                )
-            });
-        if let Some(citation) = body_citation(body) {
-            let contained = allowed.iter().any(|item| {
-                item.path == citation.0
-                    && citation.1 >= item.start_line
-                    && citation.2 <= item.end_line
-            });
-            if !contained {
+        if let Some((path, start, end)) = body_citation(token, selected)? {
+            if !selected
+                .iter()
+                .any(|item| item.path == path && start >= item.start_line && end <= item.end_line)
+            {
                 return Err(SemanticError::CitationMismatch);
             }
         }
-        index = end;
     }
     Ok(())
 }
 
-fn body_citation(token: &str) -> Option<(&str, usize, usize)> {
-    let (path, spec) = token.rsplit_once(':')?;
-    if !citation_path(path) || excluded_body_context(token) {
-        return None;
+/// None is prose; a recognized but invalid whole reference is an error.
+fn body_citation<'a>(
+    token: &'a str,
+    selected: &[&AllowedCitation],
+) -> Result<Option<(&'a str, usize, usize)>, SemanticError> {
+    let Some((path, spec)) = token.rsplit_once(':') else {
+        return Ok(None);
+    };
+    if excluded_body_context(token)
+        || !(path.contains('/')
+            || path.contains('\\')
+            || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
+            || path
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| !extension.is_empty())
+            || selected.iter().any(|item| item.path == path))
+    {
+        return Ok(None);
     }
-    let (start_text, end_text) = spec.split_once('-').unwrap_or((spec, spec));
-    let start = parse_body_line(start_text)?;
-    let end = parse_body_line(end_text)?;
-    (start <= end).then_some((path, start, end))
-}
-
-fn citation_path(path: &str) -> bool {
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.starts_with('.')
-        || path.contains('\\')
-        || path.contains(':')
+    if path.contains(['\\', ':'])
         || path
             .split('/')
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
-        return false;
+        return Err(SemanticError::CitationMismatch);
     }
-    path.contains('/')
-        || path.rsplit('.').next().is_some_and(|extension| {
-            matches!(
-                extension,
-                "py" | "rs" | "toml" | "md" | "json" | "yml" | "yaml" | "sh" | "txt"
-            )
-        })
+    let (start_text, end_text) = spec.split_once('-').unwrap_or((spec, spec));
+    let start = parse_body_line(start_text).ok_or(SemanticError::CitationMismatch)?;
+    let end = parse_body_line(end_text).ok_or(SemanticError::CitationMismatch)?;
+    if start > end {
+        return Err(SemanticError::CitationMismatch);
+    }
+    Ok(Some((path, start, end)))
 }
 
 fn excluded_body_context(token: &str) -> bool {
-    token.contains("://")
-        || token.split_once(':').is_some_and(|(prefix, _)| {
-            prefix.eq_ignore_ascii_case("localhost")
-                || prefix.parse::<std::net::Ipv4Addr>().is_ok()
-                || (prefix.len() == 10
-                    && prefix.as_bytes()[4] == b'-'
-                    && prefix.as_bytes()[7] == b'-')
-        })
+    token.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
+            && scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    }) || token.split_once(':').is_some_and(|(prefix, _)| {
+        prefix.eq_ignore_ascii_case("localhost")
+            || prefix.parse::<std::net::Ipv4Addr>().is_ok()
+            || (prefix.len() == 13
+                && prefix.as_bytes()[4] == b'-'
+                && prefix.as_bytes()[7] == b'-'
+                && prefix.as_bytes()[10] == b'T')
+    })
 }
 
 fn parse_body_line(text: &str) -> Option<usize> {

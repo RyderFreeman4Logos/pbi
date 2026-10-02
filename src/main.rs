@@ -1222,161 +1222,249 @@ mod tests {
     }
 
     fn publish_answer_body_citations(root: &Path, question: &str) {
-        let modes = [
-            vec![question.to_owned()],
-            vec![question.to_owned(), "--json".to_owned()],
-            vec![
-                "--message".to_owned(),
-                question.to_owned(),
-                "--json".to_owned(),
-            ],
-            vec!["--message".to_owned(), question.to_owned()],
-        ];
-        let citations = json!([{
-            "path": "receipt.py",
-            "start_line": 1,
-            "end_line": 1
-        }]);
-        let mut red = Vec::new();
-        for arguments in &modes {
-            let mut output = Vec::new();
-            let result = run(
-                arguments.clone(),
-                Some(TestRouteInjection::Publisher(&test_publisher(json!({
-                    "answer": "The check is not in `missing.rs:99`.",
-                    "uncertainty": "Only the verified source span was inspected.",
-                    "citations": citations.clone(),
-                })))),
-                &mut output,
-            );
-            if !matches!(result, Err(CliError { code: 1, .. })) || !output.is_empty() {
-                let status = match &result {
+        let mut failures = Vec::new();
+        let mut check = |class: &str,
+                         query: &str,
+                         citations: &serde_json::Value,
+                         answer: &str,
+                         accepted: bool| {
+            for arguments in [
+                vec![query.to_owned()],
+                vec![query.to_owned(), "--json".to_owned()],
+                vec![
+                    "--message".to_owned(),
+                    query.to_owned(),
+                    "--json".to_owned(),
+                ],
+                vec!["--message".to_owned(), query.to_owned()],
+            ] {
+                let mut output = Vec::new();
+                let result = run(
+                    arguments.clone(),
+                    Some(TestRouteInjection::Publisher(&test_publisher(json!({
+                        "answer": answer,
+                        "uncertainty": "missing.rs:999 stays escaped",
+                        "citations": citations,
+                    })))),
+                    &mut output,
+                );
+                let passed = if accepted {
+                    matches!(result, Ok(0)) && !output.is_empty()
+                } else {
+                    matches!(&result, Err(error) if error.code == 1 && error.message == SemanticError::CitationMismatch.to_string())
+                        && output.is_empty()
+                };
+                if accepted && matches!(result, Ok(0)) {
+                    let text = String::from_utf8(output.clone()).expect("utf8");
+                    let published = if arguments.iter().any(|arg| arg == "--json") {
+                        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+                        assert!(parsed["sessionId"].is_null() && parsed["tokenUsage"].is_null());
+                        parsed["response"].as_str().expect("response").to_owned()
+                    } else {
+                        text
+                    };
+                    assert!(published.contains(answer), "body must be preserved");
+                    for citation in citations.as_array().expect("citations") {
+                        let path = citation["path"].as_str().expect("path");
+                        let start = citation["start_line"].as_u64().expect("start");
+                        assert!(
+                            published.contains(&format!("{path}:{start}")),
+                            "verified appendix"
+                        );
+                    }
+                    assert!(
+                        published.contains("missing.rs:999"),
+                        "uncertainty is not scanned"
+                    );
+                }
+                let status = match result {
                     Ok(code) => format!("ok:{code}"),
                     Err(error) => format!("err:{}:{}", error.code, error.message),
                 };
-                red.push(format!("{arguments:?}: {status} bytes={}", output.len()));
-            }
-        }
-        assert!(
-            red.is_empty(),
-            "invalid answer-body citations must fail closed: {red:#?}"
-        );
-        for answer in [
-            "See `receipt.py:1`.",
-            "The helper returns the receipt. No inline location.",
-            "See version:1, OWNER:MEMBER, http://host/file.rs:9, and 2020-01-02T03:04:05Z.",
-            "Probe listens on localhost:9 and 127.0.0.1:9.",
-            "See ../missing.rs:99 only as a non-candidate suffix.",
-        ] {
-            for arguments in &modes {
-                let mut output = Vec::new();
-                assert!(
-                    matches!(
-                        run(
-                            arguments.clone(),
-                            Some(TestRouteInjection::Publisher(&test_publisher(json!({
-                                "answer": answer,
-                                "uncertainty": "missing.rs:999 stays escaped",
-                                "citations": citations.clone(),
-                            })))),
-                            &mut output,
-                        ),
-                        Ok(0)
-                    ),
-                    "{answer:?} {arguments:?}"
-                );
-                let published = String::from_utf8(output).expect("utf8");
-                assert!(published.contains("receipt.py:1"), "{published}");
-                if arguments.iter().any(|argument| argument == "--json") {
-                    assert!(published.contains("missing.rs:999"));
+                eprintln!("body-case {class} {arguments:?} {answer:?} accepted={accepted} passed={passed} {status} bytes={}", output.len());
+                if !passed {
+                    failures.push(format!(
+                        "{class} {arguments:?} {answer:?} accepted={accepted}: {status} bytes={}",
+                        output.len()
+                    ));
                 }
             }
+        };
+        let verified = |paths: &[&str], query: &str| {
+            let probe_output: String = paths
+                .iter()
+                .map(|path| format!("File: {}, Lines: 1-6\n", root.join(path).display()))
+                .collect();
+            fs::write(root.join("probe"), format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/probe.args\"\nprintf '%s' '{probe_output}'\n")).expect("fake Probe");
+            let report = verify_probe_evidence(&probe_output, root, query, DEFAULT_MAX_RESULTS)
+                .expect("real verifier");
+            assert_eq!(
+                report.evidence().len(),
+                paths.len(),
+                "fixture must verify every candidate"
+            );
+            let citations: Vec<_> = report.evidence().iter().map(|item| {
+                let location = item.location();
+                json!({"path": location.path().strip_prefix(root).expect("relative").to_str().expect("utf8"), "start_line": location.start_line(), "end_line": location.end_line()})
+            }).collect();
+            serde_json::Value::Array(citations)
+        };
+        let citations = verified(&["receipt.py"], question);
+        assert_eq!(
+            citations,
+            json!([{"path":"receipt.py","start_line":1,"end_line":1}])
+        );
+        for answer in [
+            "See receipt.py:0.",
+            "See receipt.py:18446744073709551616.",
+            "See receipt.py:2-1.",
+            "See receipt.py:1-2-3.",
+            "See receipt.py:1-.",
+            "See receipt.py:line.",
+            "See receipt.py:+1.",
+            "See receipt.py:-1.",
+            "See /receipt.py:1.",
+            "See ../receipt.py:1.",
+            "See ./receipt.py:1.",
+            "See src//receipt.py:1.",
+            "See src/../receipt.py:1.",
+            "See src/./receipt.py:1.",
+            "See C:\\receipt.py:1.",
+            "See C:/receipt.py:1.",
+            "See ../missing.rs:99.",
+        ] {
+            check("F2", question, &citations, answer, false);
+        }
+        for answer in [
+            "missing.ts:99",
+            "missing.go:99",
+            "missing.c:99",
+            "missing.cfg:99",
+            ".config.toml:99",
+            "src/missing:99",
+        ] {
+            check("F3", question, &citations, answer, false);
+        }
+        for answer in [
+            "See (receipt.py:1).", "See [receipt.py:1].", "See `receipt.py:1`.",
+            "See **receipt.py:1**.", "See *receipt.py:1*.", "See receipt.py:1,receipt.py:1.",
+            "See version:1, OWNER:MEMBER, path:line, token:value.",
+            "http://host/file.rs:9 https://example.test/file.rs:99 localhost:9 127.0.0.1:9 2020-01-02T03:04:05Z",
+            "See [docs](https://example.test),receipt.py:1.",
+            "See https://example.test/file.rs:99,receipt.py:1.",
+            "未知 `receipt.py:01`。", "The helper returns the receipt. No inline location.",
+        ] { check("F4-positive", question, &citations, answer, true); }
+        for answer in [
+            "See (missing.rs:99).",
+            "See [missing.rs:99].",
+            "See `missing.rs:99`.",
+            "See **missing.rs:99**.",
+            "See *missing.rs:99*.",
+            "See missing.rs:99,receipt.py:1.",
+            "See receipt.py:1,missing.rs:99.",
+            "See missing*receipt.py:1.",
+            "See src/*receipt.py:1.",
+            "See missing`receipt.py:1.",
+            "See [docs](https://example.test),missing.rs:99.",
+            "See [docs](https://example.test)missing.rs:99.",
+            "See https://example.test/file.rs:99,missing.rs:99.",
+            "未知 `missing.rs:99`。",
+        ] {
+            check("F4-negative", question, &citations, answer, false);
+        }
+        fs::write(
+            root.join("other.py"),
+            "def secondary_receipt():\n    return True\n",
+        )
+        .expect("second candidate");
+        let two_question = "where is exact_reuse_receipt and secondary_receipt";
+        let both = verified(&["receipt.py", "other.py"], two_question);
+        let selected = json!([both
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|item| item["path"] == "receipt.py")
+            .expect("selected A")]);
+        let other = both
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|item| item["path"] == "other.py")
+            .expect("verified B");
+        let body = format!("See other.py:{}.", other["start_line"]);
+        check("F1", two_question, &selected, &body, false);
+        check("F1-positive", two_question, &both, &body, true);
+        for path in [
+            "Makefile",
+            ".config.toml",
+            "notes.md",
+            "receipt.cfg",
+            "source/源.rs",
+        ] {
+            fs::create_dir_all(root.join(path).parent().expect("parent"))
+                .expect("parent directory");
+            fs::write(
+                root.join(path),
+                "def exact_reuse_receipt():\n    return True\n",
+            )
+            .expect("approved source");
+            let known = verified(&[path], question);
+            check(
+                "F3-positive",
+                question,
+                &known,
+                &format!("See {path}:1."),
+                true,
+            );
+            check("F3", question, &known, &format!("See {path}:99."), false);
+            check(
+                "F2-drive",
+                question,
+                &known,
+                &format!("See C:{path}:1."),
+                false,
+            );
         }
         let source = "fn decode(line: &str) {\n    let decoded = parse_jsonl_value(line).map_err(|error| {\n        Error::new(JsonlDecodeError { source: error })\n    })?;\n    use_value(decoded);\n}\n";
         fs::write(root.join("receipt.py"), source).expect("multiline source");
-        let report = verify_probe_evidence(
-            &format!("File: {}, Lines: 1-6\n", root.join("receipt.py").display()),
-            root,
-            "where is JSONL parser error conversion",
-            DEFAULT_MAX_RESULTS,
-        )
-        .expect("verified multiline evidence");
-        let evidence = &report.evidence()[0];
-        let start = evidence.location().start_line();
-        let end = evidence.location().end_line();
-        assert!(end > start, "verifier must keep a real multiline window");
-        let span = format!("receipt.py:{start}-{end}");
-        let inside = format!("receipt.py:{start}");
-        let multiline = json!([{
-            "path": "receipt.py",
-            "start_line": start,
-            "end_line": end
-        }]);
         let multiline_question = "where is JSONL parser error conversion";
-        let multiline_modes = [
-            vec![multiline_question.to_owned()],
-            vec![multiline_question.to_owned(), "--json".to_owned()],
-            vec![
-                "--message".to_owned(),
-                multiline_question.to_owned(),
-                "--json".to_owned(),
-            ],
-            vec!["--message".to_owned(), multiline_question.to_owned()],
-        ];
-        let mut multiline_failures = Vec::new();
-        for arguments in &multiline_modes {
-            let accepted_body = format!("See `{span}` and {inside}.");
-            let mut output = Vec::new();
-            let accepted = run(
-                arguments.clone(),
-                Some(TestRouteInjection::Publisher(&test_publisher(json!({
-                    "answer": accepted_body,
-                    "uncertainty": "window only",
-                    "citations": multiline.clone(),
-                })))),
-                &mut output,
-            );
-            let accepted_status = match &accepted {
-                Ok(code) => format!("ok:{code}"),
-                Err(error) => format!("err:{}:{}", error.code, error.message),
-            };
-            if !matches!(accepted, Ok(0)) || !String::from_utf8_lossy(&output).contains(&span) {
-                multiline_failures.push(format!(
-                    "accepted {arguments:?} body={accepted_body:?} status={accepted_status} out={}",
-                    String::from_utf8_lossy(&output)
-                ));
-            }
-            let rejected_body = format!("See receipt.py:{} and receipt.py:0.", end + 1);
-            let mut rejected = Vec::new();
-            let result = run(
-                arguments.clone(),
-                Some(TestRouteInjection::Publisher(&test_publisher(json!({
-                    "answer": rejected_body,
-                    "uncertainty": "window only",
-                    "citations": multiline.clone(),
-                })))),
-                &mut rejected,
-            );
-            let rejected_status = match &result {
-                Ok(code) => format!("ok:{code}"),
-                Err(error) => format!("err:{}:{}", error.code, error.message),
-            };
-            if !matches!(result, Err(CliError { code: 1, .. })) || !rejected.is_empty() {
-                multiline_failures.push(format!(
-                    "rejected {arguments:?} body={rejected_body:?} status={rejected_status} bytes={}",
-                    rejected.len()
-                ));
-            }
-        }
+        let multiline = verified(&["receipt.py"], multiline_question);
+        let start = multiline[0]["start_line"].as_u64().expect("start");
+        let end = multiline[0]["end_line"].as_u64().expect("end");
         assert!(
-            multiline_failures.is_empty(),
-            "multiline citation outcomes: {multiline_failures:#?}"
+            end > start && end < 6,
+            "real bounded multiline window: {multiline}"
         );
+        check(
+            "window-positive",
+            multiline_question,
+            &multiline,
+            &format!("See `receipt.py:{start}-{end}` and receipt.py:{start}."),
+            true,
+        );
+        for body in [
+            format!("See receipt.py:{}.", end + 1),
+            format!("See receipt.py:{start}-{}.", end + 1),
+            "See receipt.py:0.".to_owned(),
+        ] {
+            check(
+                "window-negative",
+                multiline_question,
+                &multiline,
+                &body,
+                false,
+            );
+        }
         fs::write(
             root.join("receipt.py"),
             "def exact_reuse_receipt():\n    return True\n",
         )
         .expect("restore source");
+        verified(&["receipt.py"], question);
+        assert!(
+            failures.is_empty(),
+            "independent answer-body cases: {failures:#?}"
+        );
     }
 
     fn assert_semantic_message_output(output: &[u8], answer: &str) {
