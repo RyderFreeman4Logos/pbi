@@ -169,6 +169,19 @@ pub(crate) fn probe_command(
     } else if let Some(format) = &options.format {
         command.args(["--format", format]);
     }
+    if raw {
+        for (enabled, flag) in [
+            (options.files_only, "--files-only"),
+            (options.exact, "--exact"),
+            (options.frequency, "--frequency"),
+            (options.exclude_filenames, "--exclude-filenames"),
+            (options.strict_elastic_syntax, "--strict-elastic-syntax"),
+        ] {
+            if enabled {
+                command.arg(flag);
+            }
+        }
+    }
     command.args(["--", query]);
     command
 }

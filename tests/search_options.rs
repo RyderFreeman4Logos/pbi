@@ -1048,6 +1048,177 @@ fn total_probe_deadline_bounds_long_backend_timeout() {
 }
 
 #[test]
+fn raw_search_forwards_closed_safe_flags_once() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        &[
+            "search",
+            "--files-only",
+            "-e",
+            "--frequency",
+            "-n",
+            "--strict-elastic-syntax",
+            "--bm25",
+            "--format",
+            "json",
+            "--",
+            "parse_search",
+        ],
+        "raw",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"raw Probe bytes\n");
+    let argv = fixture.argv();
+    for flag in [
+        "--files-only",
+        "--exact",
+        "--frequency",
+        "--exclude-filenames",
+        "--strict-elastic-syntax",
+    ] {
+        assert_eq!(
+            argv.iter().filter(|arg| arg.as_str() == flag).count(),
+            1,
+            "{argv:?}"
+        );
+    }
+    assert_eq!(option_value(&argv, "--reranker"), Some("bm25"));
+    assert_eq!(option_value(&argv, "--format"), Some("json"));
+    assert!(!argv.contains(&"--dry-run".to_owned()));
+    assert_eq!(argv.last().map(String::as_str), Some("parse_search"));
+}
+
+#[test]
+fn raw_search_rejects_repeated_safe_flags_before_probe() {
+    for tail in [
+        vec!["--files-only", "--files-only"],
+        vec!["-f", "-f"],
+        vec!["--files-only", "-f"],
+        vec!["--exact", "--exact"],
+        vec!["-e", "-e"],
+        vec!["--exact", "-e"],
+        vec!["--frequency", "--frequency"],
+        vec!["-s", "-s"],
+        vec!["--frequency", "-s"],
+        vec!["--exclude-filenames", "--exclude-filenames"],
+        vec!["-n", "-n"],
+        vec!["--exclude-filenames", "-n"],
+        vec!["--strict-elastic-syntax", "--strict-elastic-syntax"],
+    ] {
+        let fixture = Fixture::new();
+        let mut args = vec!["search", "--bm25"];
+        args.extend(tail);
+        args.extend(["--", "parse_search"]);
+        let output = fixture.run(&args, "raw");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used multiple times"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!fixture.root.join("probe-argv").exists(), "{args:?}");
+    }
+}
+
+#[test]
+fn raw_search_keeps_exact_with_frequency_and_literal_separator() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--exact",
+            "--frequency",
+            "--",
+            "parse_search",
+        ],
+        "raw",
+    );
+    assert!(output.status.success());
+    let argv = fixture.argv();
+    assert!(argv.contains(&"--exact".to_owned()));
+    assert!(argv.contains(&"--frequency".to_owned()));
+    assert_eq!(argv.last().map(String::as_str), Some("parse_search"));
+
+    let output = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--",
+            "--files-only",
+            "-e",
+            "--frequency",
+        ],
+        "raw",
+    );
+    assert!(output.status.success());
+    let argv = fixture.argv();
+    for flag in ["--files-only", "--exact", "--frequency"] {
+        assert!(!argv.contains(&flag.to_owned()), "{argv:?}");
+    }
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some("--files-only -e --frequency")
+    );
+}
+
+#[test]
+fn safe_flags_without_bm25_and_deferred_flags_stop_before_probe() {
+    for args in [
+        vec![
+            "search",
+            "--files-only",
+            "--format",
+            "json",
+            "--",
+            "parse_search",
+        ],
+        vec!["search", "-f", "--", "parse_search"],
+        vec!["search", "--exact", "--", "parse_search"],
+        vec!["search", "-e", "--", "parse_search"],
+        vec!["search", "--frequency", "--", "parse_search"],
+        vec!["search", "-s", "--", "parse_search"],
+        vec!["search", "--exclude-filenames", "--", "parse_search"],
+        vec!["search", "-n", "--", "parse_search"],
+        vec!["search", "--strict-elastic-syntax", "--", "parse_search"],
+        vec!["search", "--bm25", "--allow-tests", "--", "parse_search"],
+        vec!["search", "--bm25", "--no-gitignore", "--", "parse_search"],
+        vec!["search", "--bm25", "--no-merge", "--", "parse_search"],
+        vec!["search", "--bm25", "--lsp", "--", "parse_search"],
+        vec![
+            "search",
+            "--bm25",
+            "--not-a-real-flag",
+            "--",
+            "parse_search",
+        ],
+        vec![
+            "search",
+            "--bm25",
+            "--files-only=json",
+            "--",
+            "parse_search",
+        ],
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(&args, "raw");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unsupported search option"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!fixture.root.join("probe-argv").exists(), "{args:?}");
+    }
+}
+
+#[test]
 fn probe_scope_uses_nested_invocation_root() {
     let fixture = ScopeFixture::new();
     fs::write(

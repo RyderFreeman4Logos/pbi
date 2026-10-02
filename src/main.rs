@@ -45,6 +45,11 @@ struct SearchOptions {
     language: Option<String>,
     ignores: Vec<String>,
     format: Option<String>,
+    files_only: bool,
+    exact: bool,
+    frequency: bool,
+    exclude_filenames: bool,
+    strict_elastic_syntax: bool,
 }
 
 impl Default for SearchOptions {
@@ -59,6 +64,11 @@ impl Default for SearchOptions {
             language: None,
             ignores: Vec::new(),
             format: None,
+            files_only: false,
+            exact: false,
+            frequency: false,
+            exclude_filenames: false,
+            strict_elastic_syntax: false,
         }
     }
 }
@@ -67,7 +77,7 @@ fn usage() {
     println!(
         "pbi-rs {VERSION} — Probe-backed source evidence\n\
          Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
-                pbi-rs search [--bm25 [--format/-o <FORMAT>]] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs search [--bm25 [--files-only/-f] [--exact/-e] [--frequency/-s] [--exclude-filenames/-n] [--strict-elastic-syntax] [--format/-o <FORMAT>]] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
          Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Search --question accepts one split/inline operand (including empty), consumed without inference because BM25 ignores it; BERT reranking is not enabled. Search --session refuses durable cache writes, not Chat resumability; ambient PROBE_SESSION_ID is removed from Probe children. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches use the same bounded scope and pass those options to every Probe call. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
@@ -603,6 +613,18 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 }
                 index += 1;
             }
+            "--files-only"
+            | "-f"
+            | "--exact"
+            | "-e"
+            | "--frequency"
+            | "-s"
+            | "--exclude-filenames"
+            | "-n"
+            | "--strict-elastic-syntax" => {
+                set_raw_safe_flag(&mut options, argument)?;
+                index += 1;
+            }
             value if value.starts_with('-') => {
                 return Err(CliError::usage(format!(
                     "unsupported search option: {value}"
@@ -615,6 +637,21 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
         }
     }
     let mut query = query_parts.join(" ");
+    if !raw && !options.help {
+        for (enabled, name) in [
+            (options.files_only, "--files-only"),
+            (options.exact, "--exact"),
+            (options.frequency, "--frequency"),
+            (options.exclude_filenames, "--exclude-filenames"),
+            (options.strict_elastic_syntax, "--strict-elastic-syntax"),
+        ] {
+            if enabled {
+                return Err(CliError::usage(format!(
+                    "unsupported search option: {name}"
+                )));
+            }
+        }
+    }
     // Legacy pbi:4598 appends plain even to a user format. Installed Probe
     // rejects that duplicate; validate here rather than launching doomed work.
     if !raw && options.format.is_some() && !options.help {
@@ -652,6 +689,31 @@ fn next_value(arguments: &[String], index: &mut usize, option: &str) -> Result<S
         .ok_or_else(|| CliError::usage(format!("{option} requires a value")))?;
     *index += 1;
     Ok(value)
+}
+
+fn set_raw_safe_flag(options: &mut SearchOptions, option: &str) -> Result<(), CliError> {
+    let (slot, canonical) = match option {
+        "--files-only" | "-f" => (&mut options.files_only, "--files-only"),
+        "--exact" | "-e" => (&mut options.exact, "--exact"),
+        "--frequency" | "-s" => (&mut options.frequency, "--frequency"),
+        "--exclude-filenames" | "-n" => (&mut options.exclude_filenames, "--exclude-filenames"),
+        "--strict-elastic-syntax" => (
+            &mut options.strict_elastic_syntax,
+            "--strict-elastic-syntax",
+        ),
+        _ => {
+            return Err(CliError::usage(format!(
+                "unsupported search option: {option}"
+            )))
+        }
+    };
+    if *slot {
+        return Err(CliError::usage(format!(
+            "{canonical} cannot be used multiple times"
+        )));
+    }
+    *slot = true;
+    Ok(())
 }
 
 fn set_search_format(options: &mut SearchOptions, value: String) -> Result<(), CliError> {
