@@ -1223,11 +1223,21 @@ mod tests {
 
     fn publish_answer_body_citations(root: &Path, question: &str) {
         let mut failures = Vec::new();
+        let filter = env::var("PBI_RS_BODY_CASE_FILTER").ok();
+        let mut checked = 0;
         let mut check = |class: &str,
                          query: &str,
                          citations: &serde_json::Value,
                          answer: &str,
                          accepted: bool| {
+            if filter.as_ref().is_some_and(|filter| {
+                !filter
+                    .split('|')
+                    .any(|part| format!("{class} {answer}").contains(part))
+            }) {
+                return;
+            }
+            checked += 1;
             for arguments in [
                 vec![query.to_owned()],
                 vec![query.to_owned(), "--json".to_owned()],
@@ -1423,8 +1433,187 @@ mod tests {
                 );
             }
         }
+        // Later list atoms are admitted owners even when the wrapper does not
+        // begin with a bracket. Selected paths do not choose the parse.
+        let known = verified(&["receipt.py"], question);
+        for path in ["src/*a*.py", "source/源.rs"] {
+            fs::create_dir_all(root.join(path).parent().expect("parent")).expect("directory");
+            fs::write(
+                root.join(path),
+                "def exact_reuse_receipt():\n    return True\n",
+            )
+            .expect("later-owner source");
+        }
+        let marked = verified(&["src/*a*.py"], question);
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            verified(&["receipt.py"], question);
+            for marker in ["'", "\"", "*", "`"] {
+                for body in [
+                    format!("See {marker}receipt.py:1, {open}{marker}receipt.py:1{marker}{close}{marker}."),
+                    format!("See {marker}receipt.py:1, {open}{marker}receipt.py:1{marker}{close}, receipt.py:1{marker}."),
+                    format!("See {marker}receipt.py:1,{open}{marker}receipt.py:1{marker}{close}{marker}."),
+                    format!("See {marker}receipt.py:1;{open}{marker}receipt.py:1{marker}{close}{marker}."),
+                ] {
+                    check("ownership-bracket-later", question, &known, &body, true);
+                    check(
+                        "ownership-bracket-later-unselected",
+                        question,
+                        &known,
+                        &format!("See {marker}receipt.py:1, {open}{marker}missing.rs:99{marker}{close}{marker}."),
+                        false,
+                    );
+                    check(
+                        "ownership-bracket-later-invalid",
+                        question,
+                        &known,
+                        &format!("See {marker}receipt.py:1, {open}{marker}receipt.py:0{marker}{close}{marker}."),
+                        false,
+                    );
+                }
+            }
+            check(
+                "ownership-bracket-later",
+                question,
+                &known,
+                &format!("See 'receipt.py:1, **{open}'receipt.py:1'{close}**'."),
+                true,
+            );
+            check(
+                "ownership-bracket-later",
+                question,
+                &known,
+                &format!(
+                    "See 'receipt.py:1, {open}'receipt.py:1, {open}'receipt.py:1'{close}'{close}'."
+                ),
+                true,
+            );
+            let both = verified(&["receipt.py", "src/*a*.py"], question);
+            check(
+                "ownership-bracket-later",
+                question,
+                &both,
+                &format!("See 'receipt.py:1, {open}'src/*a*.py:1'{close}'."),
+                true,
+            );
+            check(
+                "ownership-bracket-later-unselected",
+                question,
+                &marked,
+                &format!("See 'receipt.py:1, {open}'src/*a*.py:1'{close}'."),
+                false,
+            );
+        }
+        let utf8 = verified(&["source/源.rs"], question);
+        check(
+            "ownership-bracket-later-utf8",
+            question,
+            &utf8,
+            "See 'source/源.rs:1, ('source/源.rs:1')'.",
+            true,
+        );
+        check(
+            "ownership-bracket-later-utf8-invalid",
+            question,
+            &utf8,
+            "See 'source/源.rs:1, ('source/源.rs:0')'.",
+            false,
+        );
         verified(&["receipt.py"], question);
         // Same-marker ownership is lexical, never chosen by selected paths.
+        // Baseline L: a short mixed-prefix close leaves literal filename bytes.
+        for path in ["'*('a.py", "(a.py", "a.py"] {
+            fs::write(
+                root.join(path),
+                "def exact_reuse_receipt():\n    return True\n",
+            )
+            .expect("policy source");
+        }
+        for (body, path, alternative, distinct) in [
+            (
+                "See ''*('a.py:1')*''.",
+                "'*('a.py",
+                "a.py",
+                "See \"*('a.py:1')*\".",
+            ),
+            ("''(a.py:1'')'", "(a.py", "a.py", "See \"(a.py:1)\"."),
+        ] {
+            let chosen = verified(&[path], question);
+            assert_eq!(chosen, json!([{"path":path,"start_line":1,"end_line":1}]));
+            check("ownership-policy-chosen", question, &chosen, body, true);
+            let other = verified(&[alternative], question);
+            assert_eq!(
+                other,
+                json!([{"path":alternative,"start_line":1,"end_line":1}])
+            );
+            check("ownership-policy-no-retry", question, &other, body, false);
+            check(
+                "ownership-policy-distinct",
+                question,
+                &other,
+                distinct,
+                true,
+            );
+        }
+        let known = verified(&["receipt.py", "source/源.rs"], question);
+        let only_receipt = json!([known[0]]);
+        for marker in ["'", "\"", "*", "`"] {
+            for width in [1, 2, 4] {
+                let outer = marker.repeat(width);
+                let marker = outer.as_str(); // Full-width scopes, independent of promotion.
+                for separator in [",", ";", ", ", " "] {
+                    for (path, line, selected, accepted) in [
+                        ("source/源.rs", "1", &known, true),
+                        ("source/源.rs", "1", &only_receipt, false),
+                        ("source/源.rs", "0", &known, false),
+                    ] {
+                        for atoms in [
+                            format!("({marker}{path}:{line}{marker}){separator}receipt.py:1"),
+                            format!("receipt.py:1{separator}({marker}{path}:{line}{marker}){separator}receipt.py:1"),
+                            format!("receipt.py:1{separator}({marker}{path}:{line}{marker})"),
+                            format!("receipt.py:1{separator}({marker}{path}:{line}{marker}){separator}[{marker}{path}:{line}{marker}]"),
+                            format!("receipt.py:1{separator}([{{{marker}{path}:{line}{marker}}}])"),
+                        ] {
+                            check("ownership-policy-positions", question, selected,
+                                &format!("See {outer}{atoms}{outer}."), accepted);
+                        }
+                    }
+                }
+            }
+        }
+        let known = verified(&["receipt.py"], question);
+        // Public schema caps answer length at 4096; larger S_m depths are
+        // exercised directly by body_owner_shared_suffix_work_is_linear.
+        for depth in [1, 16, 128, 256] {
+            // S_m: every opener shares one suffix and one terminal close run.
+            let body = format!(
+                "'{}receipt.py:1{}",
+                "receipt.py:1, '".repeat(depth - 1),
+                "'".repeat(depth)
+            );
+            assert!(
+                body.chars().count() <= 4096,
+                "exercise decoder, not schema refusal"
+            );
+            check(
+                "ownership-policy-shared-suffix",
+                question,
+                &known,
+                &body,
+                true,
+            );
+        }
+        for depth in [1, 8, 32] {
+            let markers = "'".repeat(depth);
+            let body = format!("'{}receipt.py:1, ({markers}receipt.py:1{markers}), [{markers}receipt.py:1{markers}]{markers}",
+                "receipt.py:1, '".repeat(depth - 1));
+            check(
+                "ownership-policy-shared-moves",
+                question,
+                &known,
+                &body,
+                true,
+            );
+        }
         // Each nested pair needs its own close; enclosing widths stay fixed.
         for (outer, inner) in [("**", "*"), ("*", "**"), ("**", "**")] {
             for separator in [", ", ",", ";", " "] {
@@ -1993,6 +2182,7 @@ mod tests {
         )
         .expect("restore source");
         verified(&["receipt.py"], question);
+        assert!(checked > 0, "body case filter must execute an assertion");
         assert!(
             failures.is_empty(),
             "independent answer-body cases: {failures:#?}"

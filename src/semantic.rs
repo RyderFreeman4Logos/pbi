@@ -723,7 +723,7 @@ fn answer_body_citations_match(
     selected: &[&AllowedCitation],
 ) -> Result<(), SemanticError> {
     let wrappers = BodyWrappers::new(answer);
-    let mut closers = Vec::new();
+    let mut owners = BodyOwners::default();
     let mut start = 0;
     let mut has_colon = false;
     let mut separator_checked = false;
@@ -732,11 +732,16 @@ fn answer_body_citations_match(
     while cursor <= answer.len() {
         let ch = answer[cursor..].chars().next().unwrap_or('\n');
         let width = ch.len_utf8();
-        let closing = closers.last().is_some_and(|&(end, _)| end == cursor);
+        let closing = owners.limit(answer.len()) == cursor && !owners.groups.is_empty();
         if cursor == start && !closing {
-            let limit = closers.last().map_or(answer.len(), |&(end, _)| end);
+            if let Some(content) = owners.bracket_prefix(&wrappers, answer, cursor) {
+                cursor = content;
+                start = cursor;
+                continue;
+            }
+            let limit = owners.limit(answer.len());
             if let Some((end, marker_width)) = wrappers.pair(answer, cursor, limit) {
-                closers.push((end, marker_width));
+                owners.push(body_marker(answer.as_bytes()[cursor]), end, marker_width);
                 cursor += marker_width;
                 start = cursor;
                 continue;
@@ -752,11 +757,7 @@ fn answer_body_citations_match(
         if ch.is_whitespace() || closing || separator {
             let token = answer[start..cursor].trim_end_matches(['.', '!', '?', '。']);
             body_citation(token, selected)?;
-            let consumed = if closing {
-                closers.pop().expect("active wrapper").1
-            } else {
-                width
-            };
+            let consumed = if closing { owners.pop() } else { width };
             cursor += consumed;
             start = cursor;
             has_colon = false;
@@ -810,6 +811,189 @@ fn body_marker(byte: u8) -> Option<usize> {
         b'\'' => Some(2),
         b'"' => Some(3),
         _ => None,
+    }
+}
+
+/// Consecutive same-kind owners share a width sum. Relocating their reserved
+/// run does not walk the owners: old entries use the shared end, newer entries
+/// retain their explicit end until the next relocation.
+struct BodyOwnerGroup {
+    kind: Option<usize>,
+    entries: Vec<(usize, usize)>,
+    width: usize,
+    moved: usize,
+    after: usize,
+}
+
+impl BodyOwnerGroup {
+    fn end(&self) -> usize {
+        if self.entries.len() <= self.moved {
+            self.after - self.width
+        } else {
+            self.entries.last().expect("nonempty owner group").0
+        }
+    }
+}
+
+#[derive(Default)]
+struct BodyOwners {
+    groups: Vec<BodyOwnerGroup>,
+    brackets: Vec<usize>,
+    #[cfg(test)]
+    examined: usize,
+}
+
+impl BodyOwners {
+    fn limit(&self, length: usize) -> usize {
+        self.groups.last().map_or(length, BodyOwnerGroup::end)
+    }
+
+    fn push(&mut self, kind: Option<usize>, end: usize, width: usize) {
+        if kind.is_none() {
+            self.brackets.push(end);
+        }
+        if kind.is_none() || self.groups.last().is_none_or(|group| group.kind != kind) {
+            self.groups.push(BodyOwnerGroup {
+                kind,
+                entries: Vec::new(),
+                width: 0,
+                moved: 0,
+                after: 0,
+            });
+        }
+        let group = self.groups.last_mut().expect("new or existing group");
+        group.entries.push((end, width));
+        group.width += width;
+    }
+
+    fn pop(&mut self) -> usize {
+        let group = self.groups.last_mut().expect("active wrapper");
+        let (_, width) = group.entries.pop().expect("active wrapper entry");
+        group.width -= width;
+        group.moved = group.moved.min(group.entries.len());
+        if group.kind.is_none() {
+            self.brackets.pop();
+        }
+        if group.entries.is_empty() {
+            self.groups.pop();
+        }
+        width
+    }
+
+    /// Admit a bracket only at an actual atom start, possibly behind a fully
+    /// consumed marker prefix. Existing owners keep their opening widths.
+    /// Earlier owners reserve trailing close bytes first, before the bracket
+    /// gets authority to hide any close. Failure leaves all reservations intact.
+    ///
+    /// Every marker kind uses its first candidate after this bracket. Those
+    /// candidate offsets must decrease inward; a nonconsecutive repeated kind
+    /// is therefore impossible. At most four groups/prefix runs are examined,
+    /// including failed proposals. Same-kind depth is summarized by width, not
+    /// rescanned. Along with the punctuation indexes and one forward traversal
+    /// this bounds total work and storage by O(answer bytes), including S_m.
+    fn bracket_prefix(
+        &mut self,
+        wrappers: &BodyWrappers,
+        answer: &str,
+        start: usize,
+    ) -> Option<usize> {
+        #[cfg(test)]
+        {
+            self.examined += 1;
+        }
+        let structural_limit = self.brackets.last().copied().unwrap_or(answer.len());
+        let mut cursor = start;
+        let mut prefix = Vec::new();
+        let mut seen = [false; 4];
+        while let Some(kind) = answer.as_bytes().get(cursor).copied().and_then(body_marker) {
+            #[cfg(test)]
+            {
+                self.examined += 1;
+            }
+            if seen[kind] {
+                return None;
+            }
+            seen[kind] = true;
+            let (_, width) = wrappers.pair(answer, cursor, structural_limit)?;
+            if width != wrappers.runs[cursor] {
+                return None; // Literal remainder wins; never bootstrap a wider prefix.
+            }
+            prefix.push((kind, width));
+            cursor += width;
+        }
+        let (bracket_end, _) = wrappers.bracket_pair(answer, cursor, structural_limit)?;
+
+        let mut first = self.groups.len();
+        seen = [false; 4];
+        while first > 0 && self.groups[first - 1].end() <= bracket_end {
+            #[cfg(test)]
+            {
+                self.examined += 1;
+            }
+            let kind = self.groups[first - 1].kind?;
+            if seen[kind] {
+                return None;
+            }
+            seen[kind] = true;
+            first -= 1;
+        }
+        let mut proposed: Vec<(usize, usize, Option<usize>)> = self.groups[first..]
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                (
+                    group.kind.expect("marker group"),
+                    group.width,
+                    Some(first + index),
+                )
+            })
+            .collect();
+        for &(kind, width) in &prefix {
+            if let Some(group) = proposed.last_mut().filter(|group| group.0 == kind) {
+                group.1 += width;
+            } else {
+                proposed.push((kind, width, None));
+            }
+        }
+        let mut limit = first
+            .checked_sub(1)
+            .map_or(answer.len(), |index| self.groups[index].end());
+        let mut moves = Vec::new();
+        seen = [false; 4];
+        for (kind, width, group) in proposed {
+            #[cfg(test)]
+            {
+                self.examined += 1;
+            }
+            if seen[kind] {
+                return None;
+            }
+            seen[kind] = true;
+            let close = wrappers.next_close[bracket_end + 1][kind];
+            if close >= limit {
+                return None;
+            }
+            let after = (close + wrappers.runs[close]).min(limit);
+            if after - close < width {
+                return None;
+            }
+            if let Some(group) = group {
+                moves.push((group, after));
+            }
+            limit = after - width;
+        }
+        for (index, after) in moves {
+            let group = &mut self.groups[index];
+            group.after = after;
+            group.moved = group.entries.len();
+        }
+        for (kind, width) in prefix {
+            let close = wrappers.next_close[bracket_end + 1][kind];
+            let after = (close + wrappers.runs[close]).min(self.limit(answer.len()));
+            self.push(Some(kind), after - width, width);
+        }
+        self.push(None, bracket_end, 1);
+        Some(cursor + 1)
     }
 }
 
@@ -900,10 +1084,8 @@ impl BodyWrappers {
             if run == 0 {
                 return None; // Unconsumed opening-run bytes are filename data.
             }
-            // Admit a structural content prefix by the same rule as the next
-            // atom/owner step. Its close precedes this owner's close, so the
-            // next step necessarily admits it under the newly reserved limit.
-            // Interior filename brackets never participate in this decision.
+            // Direct bracket prefixes retain the baseline full-width feasibility
+            // rule. A shorter close cannot bootstrap a wider opening prefix.
             let content = start + run;
             let close = self
                 .bracket_pair(answer, content, limit)
@@ -1041,6 +1223,75 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use workflow_adk::model_profiles::{FakeModelProfile, ModelProfileRegistry};
+
+    #[test]
+    fn body_owner_shared_suffix_work_is_linear() {
+        let citation = AllowedCitation {
+            path: "a.py".to_owned(),
+            start_line: 1,
+            end_line: 1,
+            evidence_index: 0,
+        };
+        for depth in [1, 32, 1024, 4096] {
+            let mut answer = String::new();
+            let mut starts = Vec::new();
+            for index in 0..depth {
+                starts.push(answer.len());
+                answer.push_str("'a.py:1");
+                if index + 1 < depth {
+                    answer.push_str(", ");
+                }
+            }
+            answer.push_str(&"'".repeat(depth));
+            let wrappers = BodyWrappers::new(&answer);
+            let mut owners = BodyOwners::default();
+            for &start in &starts {
+                assert_eq!(owners.bracket_prefix(&wrappers, &answer, start), None);
+                let (end, width) = wrappers
+                    .pair(&answer, start, owners.limit(answer.len()))
+                    .expect("distinct reserved byte");
+                owners.push(Some(2), end, width);
+            }
+            assert_eq!(owners.groups.len(), 1);
+            assert_eq!(owners.groups[0].entries.len(), depth);
+            assert!(
+                owners.examined <= 3 * depth,
+                "actual prefix/group checks: {}",
+                owners.examined
+            );
+            assert!(answer_body_citations_match(&answer, &[&citation]).is_ok());
+            answer.truncate(answer.len() - depth);
+            answer.push_str(", ");
+            let bracket = answer.len();
+            let markers = "'".repeat(depth);
+            answer.push_str(&format!("({markers}a.py:1{markers})"));
+            for enough in [false, true] {
+                if enough {
+                    answer.push_str(&markers);
+                }
+                let wrappers = BodyWrappers::new(&answer);
+                let mut owners = BodyOwners::default();
+                for &start in &starts {
+                    let (end, width) = wrappers
+                        .pair(&answer, start, owners.limit(answer.len()))
+                        .expect("reserved byte inside bracket");
+                    owners.push(Some(2), end, width);
+                }
+                assert_eq!(
+                    owners.bracket_prefix(&wrappers, &answer, bracket),
+                    enough.then_some(bracket + 1)
+                );
+                assert!(
+                    owners.examined <= 3,
+                    "one shared group, regardless of depth"
+                );
+                assert_eq!(
+                    answer_body_citations_match(&answer, &[&citation]).is_ok(),
+                    enough
+                );
+            }
+        }
+    }
 
     struct FailingAdapter {
         calls: AtomicUsize,
