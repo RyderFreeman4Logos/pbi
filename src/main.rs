@@ -1461,6 +1461,12 @@ mod tests {
             ("src/(receipt.py:1)tail", false),
             ("src/[receipt.py:1]tail", false),
             ("[docs](https://example.test),src/{receipt.py}:99", false),
+            ("localhost:missing,receipt.py:1", false),
+            ("127.0.0.1:missing,receipt.py:1", false),
+            ("2020-01-02T03:missing,receipt.py:1", false),
+            ("localhost:missing;receipt.py:1", false),
+            ("receipt.py:1,receipt.py:1", true),
+            ("https://example.test,receipt.py:1", true),
         ] {
             check("sweep", question, &citations, body, accepted);
         }

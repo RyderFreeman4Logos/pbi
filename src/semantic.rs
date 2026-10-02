@@ -714,7 +714,8 @@ fn decode_answer(
 /// One contextual boundary: retain filename punctuation until the whole token
 /// is classified. Paired outer wrappers may enclose a citation list; a colon
 /// inside the pair distinguishes `(a.py:1)` from the filename `(a.py):1`.
-/// A comma/semicolon separates only after a colon (never inside a filename).
+/// A comma/semicolon follows a complete numeric location or excluded atom;
+/// a malformed prefix cannot manufacture a list boundary.
 /// Two forward scans, O(answer bytes) storage; each token is classified once.
 fn answer_body_citations_match(
     answer: &str,
@@ -724,6 +725,7 @@ fn answer_body_citations_match(
     let mut closers = Vec::new();
     let mut start = 0;
     let mut has_colon = false;
+    let mut separator_checked = false;
     let mut after_wrapper = false;
     let mut cursor = 0;
     while cursor <= answer.len() {
@@ -745,10 +747,14 @@ fn answer_body_citations_match(
                 }
             }
         }
-        if ch.is_whitespace()
-            || closing
-            || ((has_colon || after_wrapper) && matches!(ch, ',' | ';'))
-        {
+        let separator =
+            if matches!(ch, ',' | ';') && (has_colon || after_wrapper) && !separator_checked {
+                separator_checked = true;
+                after_wrapper || body_separator_after(&answer[start..cursor])
+            } else {
+                false
+            };
+        if ch.is_whitespace() || closing || separator {
             let token = answer[start..cursor].trim_end_matches(['.', '!', '?', '。']);
             body_citation(token, selected)?;
             let consumed = if closing {
@@ -759,6 +765,7 @@ fn answer_body_citations_match(
             cursor += consumed;
             start = cursor;
             has_colon = false;
+            separator_checked = false;
             after_wrapper = closing;
         } else {
             after_wrapper = false;
@@ -767,6 +774,19 @@ fn answer_body_citations_match(
         }
     }
     Ok(())
+}
+
+/// Test at most the first prospective separator of an atom. On failure the
+/// remainder stays in that atom, preventing both suffix rescue and rescanning.
+fn body_separator_after(token: &str) -> bool {
+    if excluded_body_context(token) {
+        return true;
+    }
+    let Some((_, spec)) = token.rsplit_once(':') else {
+        return false;
+    };
+    let (first, last) = spec.split_once('-').unwrap_or((spec, spec));
+    parse_body_line(first).is_some() && parse_body_line(last).is_some()
 }
 
 fn body_wrapper_end(tail: &str) -> bool {
