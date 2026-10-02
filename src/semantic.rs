@@ -252,11 +252,9 @@ pub fn validate_local_route(base_url: &str, model: &str) -> Result<(), SemanticR
     Ok(())
 }
 
-pub fn explicit_admitted_routes_from_environment(
-) -> Result<Option<Vec<AdmittedLocalModelRoute>>, SemanticRouteError> {
-    if !semantic_route_opted_in()? {
-        return Ok(None);
-    }
+/// Select and validate public route fields without probing credentials or enabling ADK.
+/// Only an explicit PBI_CONFIG_FILE is read; complete environment fields bypass it.
+pub fn local_route_from_environment() -> Result<(String, String), SemanticRouteError> {
     let env_base = first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?;
     let env_model = first_value(&["LOCAL_MODEL", "LLM_MODEL"])?;
     let (base_url, model) = if let (Some(base_url), Some(model)) = (&env_base, &env_model) {
@@ -276,6 +274,15 @@ pub fn explicit_admitted_routes_from_environment(
         }
     };
     validate_local_route(&base_url, &model)?;
+    Ok((base_url, model))
+}
+
+pub fn explicit_admitted_routes_from_environment(
+) -> Result<Option<Vec<AdmittedLocalModelRoute>>, SemanticRouteError> {
+    if !semantic_route_opted_in()? {
+        return Ok(None);
+    }
+    let (base_url, model) = local_route_from_environment()?;
     let credential_name = if let Some(name) = env::var_os("PBI_RS_CREDENTIAL_HANDLE") {
         let name = name
             .into_string()

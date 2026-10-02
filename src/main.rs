@@ -1,7 +1,7 @@
 use pbi_rs::semantic::{
-    admit_local_routes, investigate, local_route_publisher_from_cli_routes,
-    local_route_publisher_from_environment, LocalModelRoute, SemanticAnswer, SemanticError,
-    SemanticRouteError,
+    admit_local_routes, investigate, local_route_from_environment,
+    local_route_publisher_from_cli_routes, local_route_publisher_from_environment, LocalModelRoute,
+    SemanticAnswer, SemanticError, SemanticRouteError,
 };
 #[cfg(test)]
 use pbi_rs::semantic::{
@@ -188,11 +188,20 @@ fn parse_local_route_prefix(
     Ok((arguments[index..].to_vec(), routes))
 }
 
-fn debug_config_output() -> String {
-    format!(
-        "probe_binary={}\nsearch_default=compact_verified_bm25_no_chat\nsearch_bm25_opt_in=--bm25_raw_no_llm_probe\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nsearch_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\napi_key=[REDACTED]\n",
+fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, SemanticRouteError> {
+    let (base_url, model) = if route_specs.is_empty() {
+        local_route_from_environment()?
+    } else {
+        let route = admit_local_routes(route_specs)?
+            .into_iter()
+            .next()
+            .ok_or(SemanticRouteError::IncompleteConfig)?;
+        (route.base_url().to_owned(), route.model().to_owned())
+    };
+    Ok(format!(
+        "probe_binary={}\nsearch_default=compact_verified_bm25_no_chat\nsearch_bm25_opt_in=--bm25_raw_no_llm_probe\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nsearch_scoped_target_limit={MAX_SCOPED_PROBE_TARGETS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
         env::var("PBI_RS_PROBE").unwrap_or_else(|_| "probe".to_owned())
-    )
+    ))
 }
 
 fn run(
@@ -217,7 +226,14 @@ fn run(
         return Ok(0);
     }
     if arguments[0] == "--debug-config" {
-        print!("{}", debug_config_output());
+        let output = debug_config_output(route_specs).map_err(route_cli_error)?;
+        #[cfg(test)]
+        let writer = _semantic_output;
+        #[cfg(not(test))]
+        let mut writer = io::stdout();
+        writer
+            .write_all(output.as_bytes())
+            .map_err(|_| CliError::failed("cannot write debug configuration"))?;
         return Ok(0);
     }
 
@@ -1693,6 +1709,10 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         assert_eq!(env::var_os("PBI_RS_PROBE"), saved_probe);
         drop(check);
         let _ = fs::remove_dir_all(root);
+    }
+
+    mod debug_config_route {
+        include!("debug_config_route_tests.rs");
     }
 
     #[cfg(target_os = "linux")]
