@@ -668,3 +668,20 @@ fn native_search_honors_gitignore_root_cap_and_symlink() {
     assert_eq!(capped.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&capped.stderr).contains("bounded target limit"));
 }
+
+#[test]
+fn native_search_refuses_symlinked_gitignore_outside_root() {
+    let fixture = ScopeFixture::new();
+    let outside = fixture.base.join("outside-ignore");
+    fs::write(&outside, "secret.rs\n").expect("outside ignore file");
+    symlink(&outside, fixture.root.join(".gitignore")).expect("linked ignore file");
+    fs::write(
+        fixture.root.join("secret.rs"),
+        format!("fn secret() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("source");
+    let output = fixture.run_args("unused", &["search", SCOPE_QUERY]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not read the repository"));
+    assert!(output.stdout.is_empty());
+}

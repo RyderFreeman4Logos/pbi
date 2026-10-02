@@ -13,6 +13,7 @@ use std::time::Instant;
 
 const EXCLUDED: [&str; 5] = [".git", "target", "drafts", "node_modules", "__pycache__"];
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_WALK_FILES: usize = 20_000;
 const MAX_ROOT_TARGETS: usize = 16;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
@@ -53,7 +54,7 @@ pub fn search_repository(
         root,
         root_meta.dev(),
         limits,
-        &gitignore_patterns(root),
+        &gitignore_patterns(root, root_meta.dev())?,
         true,
         &mut files,
     )?;
@@ -165,20 +166,36 @@ fn walk(
                 walk(root, &path, device, limits, gitignore, false, files)?;
             }
         } else if metadata.len() <= MAX_FILE_BYTES {
+            if files.len() == MAX_WALK_FILES {
+                return Err(SearchFailure::Limit);
+            }
             files.push(path);
         }
     }
     Ok(())
 }
 
-fn gitignore_patterns(root: &Path) -> Vec<String> {
-    fs::read_to_string(root.join(".gitignore"))
-        .unwrap_or_default()
+fn gitignore_patterns(root: &Path, device: u64) -> Result<Vec<String>, SearchFailure> {
+    let path = root.join(".gitignore");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(SearchFailure::Unavailable),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.dev() != device
+        || metadata.len() > MAX_FILE_BYTES
+    {
+        return Err(SearchFailure::Unavailable);
+    }
+    Ok(fs::read_to_string(path)
+        .map_err(|_| SearchFailure::Unavailable)?
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
-        .collect()
+        .collect())
 }
 
 fn query_terms(query: &str) -> Vec<String> {

@@ -73,12 +73,12 @@ impl Default for SearchOptions {
 
 fn usage() {
     println!(
-        "pbi-rs {VERSION} — Probe-backed source evidence\n\
+        "pbi-rs {VERSION} — bounded native source search and cited answers\n\
          Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
-                pbi-rs search [--bm25 [--files-only/-f] [--exact/-e] [--frequency/-s] [--exclude-filenames/-n] [--strict-elastic-syntax] [--format/-o <FORMAT>]] [--timeout <SECONDS>] [--max-results <N>] [--max-bytes <N>] [--max-tokens <N>] [--merge-threshold <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs search [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
                 pbi-rs --debug-config\n\
-         Repeat --model-route in order for approved local candidates (maximum 8). Flags must precede the question. Names only; the credential broker resolves secrets. Search does not accept model routes. Positional questions use source-verified synthesis when explicitly opted in; search remains BM25-only and expands OWNER:MEMBER to OWNER MEMBER; --bm25 relays raw Probe output without that expansion. Search --help/-h relays native Probe help under the same bounded deadline. Legacy --reranker/-r operands are discarded; BM25 is always forced. Search --question accepts one split/inline operand (including empty), consumed without inference because BM25 ignores it; BERT reranking is not enabled. Search --session refuses durable cache writes, not Chat resumability; ambient PROBE_SESSION_ID is removed from Probe children. Question --model-name/--force-provider operands (split or inline) are discarded, not activated. --message takes exactly one question operand; only --json and discarded routing options are supported afterward, not Chat sessions or arbitrary Chat flags. Positional -- preserves literal question text; top-level --help/-h must be first (search help may follow the command). Language is a single Probe language/alias; ignores are repeatable Probe patterns. Mandatory scope exclusions cannot be overridden. Filtered or budget/merge-controlled searches use the same bounded scope and pass those options to every Probe call. Code byte/token limits and merge distance accept zero and optional leading +, once per option, in split or inline syntax; they never raise wrapper deadline/output/citation caps. Probe limits code before merging, not the final formatted stream; verified evidence retains its own snippet limits. Search help is parsed after supported operand validation; -- preserves literal query operands."
+         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. Search is read-only and bounded. Source citations are verified before a model sees them."
     );
 }
 
@@ -198,7 +198,7 @@ fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, Sema
         (route.base_url().to_owned(), route.model().to_owned())
     };
     Ok(format!(
-        "search_default=native_bounded_bm25_no_probe\nsearch_bm25_opt_in=refused_probe_removed\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
+        "search_default=native_bounded_term_frequency_no_probe\nsearch_bm25_opt_in=refused_probe_removed\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
     ))
 }
 
@@ -244,9 +244,9 @@ fn run(
         let (raw, query, options) = parse_search(&arguments[1..])?;
         if options.help {
             println!(
-                "pbi-rs search is in-process. Probe and probe-chat are not invoked.\n\
+                "pbi-rs search is bounded and in-process.\n\
                  Supported: --timeout --max-results --language/-l --ignore/-i\n\
-                 Refused: --bm25 --help relay, --format, raw Probe flags."
+                 Raw and format-changing legacy flags are refused."
             );
             return Ok(0);
         }
