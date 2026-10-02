@@ -682,6 +682,61 @@ fn native_search_refuses_symlinked_gitignore_outside_root() {
     .expect("source");
     let output = fixture.run_args("unused", &["search", SCOPE_QUERY]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("could not read the repository"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not read the repository"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn native_search_respects_nested_gitignore_and_negation() {
+    let fixture = ScopeFixture::new();
+    let src = fixture.root.join("src");
+    fs::create_dir(&src).expect("source directory");
+    fs::write(
+        fixture.root.join(".gitignore"),
+        "src/*.rs\n!src/kept.rs\n!src/hidden.rs\n",
+    )
+    .expect("root gitignore");
+    fs::write(src.join(".gitignore"), "hidden.rs\n").expect("nested gitignore");
+    for name in ["kept.rs", "hidden.rs", "blocked.rs"] {
+        fs::write(
+            src.join(name),
+            format!("fn matching() {{ /* {SCOPE_QUERY} */ }}\n"),
+        )
+        .expect("fixture source");
+    }
+    let output = fixture.run_args("unused", &["search", SCOPE_QUERY]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout} {:?}", output.stderr);
+    assert!(stdout.contains("src/kept.rs"), "{stdout}");
+    assert!(
+        !stdout.contains("hidden.rs") && !stdout.contains("blocked.rs"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn native_search_refuses_symlinked_nested_gitignore_outside_root() {
+    let fixture = ScopeFixture::new();
+    let src = fixture.root.join("src");
+    fs::create_dir(&src).expect("source directory");
+    let outside = fixture.base.join("outside-ignore");
+    fs::write(&outside, "secret.rs\n").expect("outside ignore file");
+    symlink(&outside, src.join(".gitignore")).expect("linked ignore file");
+    fs::write(
+        src.join("secret.rs"),
+        format!("fn secret() {{ /* {SCOPE_QUERY} */ }}\n"),
+    )
+    .expect("source");
+    let output = fixture.run_args("unused", &["search", SCOPE_QUERY]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not read the repository"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stdout.is_empty());
 }

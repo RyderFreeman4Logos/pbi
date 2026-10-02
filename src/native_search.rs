@@ -6,9 +6,12 @@
 //! ponytail: one lexical pass, term frequency over document frequency.
 //! Replace with a real inverted index if a repository walk exceeds the deadline.
 
+use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 const EXCLUDED: [&str; 5] = [".git", "target", "drafts", "node_modules", "__pycache__"];
@@ -52,24 +55,13 @@ pub fn search_repository(
         return Ok(String::new());
     }
     let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
-    let mut files = Vec::new();
-    walk(
-        root,
-        root,
-        root_meta.dev(),
-        limits,
-        &gitignore_patterns(root, root_meta.dev())?,
-        true,
-        &mut files,
-    )?;
+    let files = walk(root, root_meta.dev(), limits)?;
     let mut hits = Vec::new();
     for path in files {
         if Instant::now() >= limits.deadline {
             return Err(SearchFailure::Deadline);
         }
-        if ignored(root, &path, &limits.ignores)
-            || !language_matches(&path, limits.language.as_deref())
-        {
+        if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
         let metadata = fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
@@ -143,16 +135,7 @@ pub fn candidate_symbols(
         return Ok(Vec::new());
     }
     let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
-    let mut files = Vec::new();
-    walk(
-        root,
-        root,
-        root_meta.dev(),
-        limits,
-        &gitignore_patterns(root, root_meta.dev())?,
-        true,
-        &mut files,
-    )?;
+    let files = walk(root, root_meta.dev(), limits)?;
     let mut ranked = files
         .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
@@ -230,25 +213,11 @@ pub fn candidate_symbols(
     Ok(symbols)
 }
 
-fn walk(
-    root: &Path,
-    dir: &Path,
-    device: u64,
-    limits: &SearchLimits,
-    gitignore: &[String],
-    count_root: bool,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), SearchFailure> {
-    if Instant::now() >= limits.deadline {
-        return Err(SearchFailure::Deadline);
-    }
-    let mut children = fs::read_dir(dir)
-        .map_err(|_| SearchFailure::Unavailable)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    children.sort_by_key(|entry| entry.file_name());
+fn walk(root: &Path, device: u64, limits: &SearchLimits) -> Result<Vec<PathBuf>, SearchFailure> {
+    validate_gitignore(&root.join(".gitignore"), device)?;
     let mut root_targets = 0usize;
-    for entry in children {
+    for entry in fs::read_dir(root).map_err(|_| SearchFailure::Unavailable)? {
+        let entry = entry.map_err(|_| SearchFailure::Unavailable)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -256,43 +225,97 @@ fn walk(
         if name.starts_with('.') || EXCLUDED.contains(&name) {
             continue;
         }
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
-        if metadata.file_type().is_symlink() || metadata.dev() != device || !path.starts_with(root)
-        {
+        let metadata =
+            fs::symlink_metadata(entry.path()).map_err(|_| SearchFailure::Unavailable)?;
+        if metadata.file_type().is_symlink() || metadata.dev() != device {
             continue;
         }
         if !metadata.is_dir() && !metadata.is_file() {
             continue;
         }
-        if count_root {
-            if root_targets == MAX_ROOT_TARGETS {
-                return Err(SearchFailure::TargetLimit);
-            }
-            root_targets += 1;
+        if root_targets == MAX_ROOT_TARGETS {
+            return Err(SearchFailure::TargetLimit);
         }
-        if ignored(root, &path, gitignore) || ignored(root, &path, &limits.ignores) {
+        root_targets += 1;
+    }
+    let mut user_ignores = GitignoreBuilder::new(root);
+    for pattern in &limits.ignores {
+        user_ignores
+            .add_line(None, pattern)
+            .map_err(|_| SearchFailure::Unavailable)?;
+    }
+    let user_ignores = user_ignores
+        .build()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let unsafe_ignore = Arc::new(AtomicBool::new(false));
+    let unsafe_ignore_filter = Arc::clone(&unsafe_ignore);
+    let mut walker = WalkBuilder::new(root);
+    walker
+        .follow_links(false)
+        .same_file_system(true)
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .sort_by_file_name(|left, right| left.cmp(right))
+        .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| EXCLUDED.contains(&name))
+                || user_ignores
+                    .matched_path_or_any_parents(entry.path(), is_dir)
+                    .is_ignore()
+            {
+                return false;
+            }
+            if is_dir && validate_gitignore(&entry.path().join(".gitignore"), device).is_err() {
+                unsafe_ignore_filter.store(true, Ordering::Relaxed);
+                return false;
+            }
+            true
+        });
+    let mut files = Vec::new();
+    let mut file_count = 0usize;
+    for entry in walker.build() {
+        if unsafe_ignore.load(Ordering::Relaxed) {
+            return Err(SearchFailure::Unavailable);
+        }
+        if Instant::now() >= limits.deadline {
+            return Err(SearchFailure::Deadline);
+        }
+        let entry = entry.map_err(|_| SearchFailure::Unavailable)?;
+        if entry.depth() == 0 {
             continue;
         }
-        if metadata.is_dir() {
-            if !ignored_directory(root, &path, &limits.ignores) {
-                walk(root, &path, device, limits, gitignore, false, files)?;
-            }
-        } else if metadata.len() <= MAX_FILE_BYTES {
-            if files.len() == MAX_WALK_FILES {
-                return Err(SearchFailure::Limit);
-            }
-            files.push(path);
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
+        if metadata.file_type().is_symlink() || metadata.dev() != device || !metadata.is_file() {
+            continue;
+        }
+        file_count += 1;
+        if file_count > MAX_WALK_FILES {
+            return Err(SearchFailure::Limit);
+        }
+        if metadata.len() <= MAX_FILE_BYTES {
+            files.push(path.to_path_buf());
         }
     }
-    Ok(())
+    if unsafe_ignore.load(Ordering::Relaxed) {
+        return Err(SearchFailure::Unavailable);
+    }
+    Ok(files)
 }
 
-fn gitignore_patterns(root: &Path, device: u64) -> Result<Vec<String>, SearchFailure> {
-    let path = root.join(".gitignore");
-    let metadata = match fs::symlink_metadata(&path) {
+fn validate_gitignore(path: &Path, device: u64) -> Result<(), SearchFailure> {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(SearchFailure::Unavailable),
     };
     if !metadata.is_file()
@@ -302,13 +325,7 @@ fn gitignore_patterns(root: &Path, device: u64) -> Result<Vec<String>, SearchFai
     {
         return Err(SearchFailure::Unavailable);
     }
-    Ok(fs::read_to_string(path)
-        .map_err(|_| SearchFailure::Unavailable)?
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect())
+    Ok(())
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -374,74 +391,4 @@ fn language_matches(path: &Path, language: Option<&str>) -> bool {
         "python" | "py" => extension == "py",
         other => extension.eq_ignore_ascii_case(other),
     }
-}
-
-fn ignored(root: &Path, path: &Path, ignores: &[String]) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    let mut ignored = false;
-    for pattern in ignores {
-        let negated = pattern.starts_with('!');
-        let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
-        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-        if glob_match(pattern, &relative) {
-            ignored = !negated;
-        }
-    }
-    ignored
-}
-
-fn glob_match(pattern: &str, path: &str) -> bool {
-    if pattern.is_empty() {
-        return false;
-    }
-    let doubled = pattern.contains("**");
-    let pattern = pattern.trim_end_matches('/');
-    if doubled {
-        let (prefix, suffix) = pattern.split_once("**").unwrap_or((pattern, ""));
-        let prefix = prefix.trim_end_matches('/');
-        let suffix = suffix.trim_start_matches('/');
-        let rest = if prefix.is_empty() {
-            Some(path)
-        } else {
-            path.strip_prefix(prefix)
-                .and_then(|rest| rest.strip_prefix('/').or(Some("")))
-                .filter(|_| path == prefix || path.starts_with(&format!("{prefix}/")))
-        };
-        return rest.is_some_and(|rest| suffix.is_empty() || glob_match(suffix, rest));
-    }
-    let mut path_parts = path.split('/');
-    for part in pattern.split('/') {
-        let Some(candidate) = path_parts.next() else {
-            return false;
-        };
-        if part == "*" {
-            continue;
-        }
-        if part.starts_with('*') && !part[1..].contains('*') && candidate.ends_with(&part[1..]) {
-            continue;
-        }
-        if part != candidate {
-            return false;
-        }
-    }
-    path_parts.next().is_none()
-}
-
-fn ignored_directory(root: &Path, path: &Path, ignores: &[String]) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    ignores.iter().any(|pattern| {
-        let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
-        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-        let Some((prefix, _)) = pattern.split_once("/**") else {
-            return false;
-        };
-        let prefix = prefix.trim_end_matches('/');
-        !prefix.is_empty() && (relative == prefix || relative.starts_with(&format!("{prefix}/")))
-    })
 }
