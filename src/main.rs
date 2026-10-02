@@ -1673,17 +1673,21 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         ));
         fs::create_dir_all(&root).expect("dir");
         let probe = root.join("probe");
-        let outside = env::current_dir().expect("cwd");
-        let saved_probe = env::var_os("PBI_RS_PROBE");
+        let guard = RouteConfigEnvGuard::new(
+            &root,
+            &[("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned()))],
+        );
+        // The guard captured the baseline under the same lock as every writer.
+        let outside = guard.previous_dir.clone();
+        let saved_probe = guard.previous_env.first().expect("saved probe").1.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _env = RouteConfigEnvGuard::new(
-                &root,
-                &[("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned()))],
-            );
+            let _env = guard;
             assert_eq!(env::current_dir().expect("cwd"), root);
+            assert_eq!(env::var_os("PBI_RS_PROBE"), Some(probe.into_os_string()));
             panic!("controlled unwind");
         }));
-        assert!(result.is_err());
+        let panic = result.expect_err("controlled unwind must panic");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"controlled unwind"));
         let check = RouteConfigEnvGuard::lock();
         assert_eq!(env::current_dir().expect("cwd"), outside);
         assert_eq!(env::var_os("PBI_RS_PROBE"), saved_probe);
