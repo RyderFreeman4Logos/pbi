@@ -239,8 +239,8 @@ pub fn verify_probe_evidence(
 
     let mut evidence = Vec::new();
     let mut cited = Vec::new();
-    let mut covered = vec![false; groups.len()];
-    for (group_index, group_choices) in choices.iter_mut().enumerate() {
+    let mut owners: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
+    for group_choices in choices.iter_mut() {
         group_choices.sort_by(|left, right| {
             right
                 .score
@@ -253,28 +253,95 @@ pub fn verify_probe_evidence(
                         .cmp(&right.evidence.location.start_line)
                 })
         });
-        for choice in group_choices.iter().cloned() {
-            if let Some(existing) = evidence.iter().position(|candidate: &SourceEvidence| {
-                candidate.location.path == choice.evidence.location.path
-            }) {
-                if choice.evidence.snippet.lines().count()
-                    > evidence[existing].snippet.lines().count()
-                {
-                    evidence[existing] = choice.evidence;
-                    cited[existing] = choice.cited;
+        group_choices.dedup_by(|left, right| {
+            left.evidence.location.path == right.evidence.location.path
+                && left.evidence.location.start_line == right.evidence.location.start_line
+                && left.evidence.location.end_line == right.evidence.location.end_line
+        });
+    }
+    let passes = if any_of { 1 } else { 2 };
+    for pass in 0..passes {
+        for (group_index, group_choices) in choices.iter().enumerate() {
+            for choice in group_choices {
+                let same_window = evidence.iter().position(|candidate: &SourceEvidence| {
+                    candidate.location.path == choice.evidence.location.path
+                        && candidate.location.start_line == choice.evidence.location.start_line
+                        && candidate.location.end_line == choice.evidence.location.end_line
+                });
+                if let Some(existing) = same_window {
+                    if !owners[group_index].contains(&existing) {
+                        owners[group_index].push(existing);
+                    }
+                    continue;
                 }
-                covered[group_index] = true;
-                continue;
+                let same_file = evidence.iter().position(|candidate: &SourceEvidence| {
+                    candidate.location.path == choice.evidence.location.path
+                });
+                if let Some(existing) = same_file {
+                    let covers_prior =
+                        owners
+                            .iter()
+                            .enumerate()
+                            .all(|(owner_index, group_owners)| {
+                                !group_owners.contains(&existing)
+                                    || (choice.evidence.target == groups[owner_index].label
+                                        && evidence[existing].snippet.lines().all(|line| {
+                                            choice.evidence.snippet.lines().any(|kept| kept == line)
+                                        }))
+                            });
+                    if covers_prior
+                        && choice.evidence.snippet.lines().count()
+                            > evidence[existing].snippet.lines().count()
+                    {
+                        evidence[existing] = choice.evidence.clone();
+                        cited[existing] = choice.cited;
+                        if !owners[group_index].contains(&existing) {
+                            owners[group_index].push(existing);
+                        }
+                        continue;
+                    }
+                    if !covers_prior {
+                        let representative_only = pass == 0 && !any_of;
+                        let distinct_group =
+                            !owners
+                                .iter()
+                                .enumerate()
+                                .any(|(owner_index, group_owners)| {
+                                    !group_owners.is_empty()
+                                        && groups[owner_index].label == choice.evidence.target
+                                });
+                        if !distinct_group
+                            || (representative_only && !owners[group_index].is_empty())
+                        {
+                            continue;
+                        }
+                        if evidence.len() >= max_results {
+                            continue;
+                        }
+                        owners[group_index].push(evidence.len());
+                        cited.push(choice.cited);
+                        evidence.push(choice.evidence.clone());
+                    }
+                    continue;
+                }
+                let representative_only = pass == 0 && !any_of;
+                if representative_only && !owners[group_index].is_empty() {
+                    continue;
+                }
+                if evidence.len() >= max_results {
+                    continue;
+                }
+                owners[group_index].push(evidence.len());
+                cited.push(choice.cited);
+                evidence.push(choice.evidence.clone());
             }
-            if evidence.len() >= max_results {
-                continue;
-            }
-            cited.push(choice.cited);
-            evidence.push(choice.evidence);
-            covered[group_index] = true;
         }
     }
 
+    let covered = owners
+        .iter()
+        .map(|group_owners| !group_owners.is_empty())
+        .collect::<Vec<_>>();
     let missing_targets = if any_of && covered.iter().any(|covered| *covered) {
         Vec::new()
     } else {
@@ -2084,5 +2151,151 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             );
         }
         let _ = fs::remove_file(&outside);
+    }
+
+    fn probe_file(path: &Path) -> String {
+        format!("File: {}, Lines: 1-99\n", path.display())
+    }
+
+    #[test]
+    fn same_file_and_windows_keep_each_required_snippet() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/lib.rs");
+        let mut source = String::from("fn alpha_function() {}\n");
+        source.push_str(&"\n".repeat(12));
+        source.push_str("fn beta_function() {}\n");
+        fs::write(&path, source).expect("distant declarations");
+        let output = probe_file(&path);
+        for (query, limit, complete, snippets) in [
+            (
+                "alpha_function AND beta_function",
+                1_usize,
+                false,
+                vec!["alpha_function"],
+            ),
+            (
+                "alpha_function AND beta_function",
+                8,
+                true,
+                vec!["alpha_function", "beta_function"],
+            ),
+            (
+                "beta_function AND alpha_function",
+                1,
+                false,
+                vec!["beta_function"],
+            ),
+            (
+                "beta_function AND alpha_function",
+                8,
+                true,
+                vec!["beta_function", "alpha_function"],
+            ),
+        ] {
+            let report = verify_probe_evidence(&output, &fixture.root, query, limit)
+                .expect("same-file windows");
+            assert_eq!(report.is_complete(), complete, "{query} limit={limit}");
+            assert_eq!(
+                report.evidence().len(),
+                snippets.len(),
+                "{query} limit={limit}"
+            );
+            for (item, snippet) in report.evidence().iter().zip(snippets) {
+                assert!(
+                    item.snippet().contains(snippet) && item.target().contains(snippet),
+                    "{query} limit={limit} kept {} for {snippet}",
+                    item.snippet()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn longer_same_file_window_keeps_the_prior_proof() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/lib.rs");
+        let mut source = String::from("fn alpha_function() {}\n");
+        source.push_str(&"\n".repeat(3));
+        source.push_str("fn beta_function() {}\nfn beta_function() {}\n");
+        fs::write(&path, source).expect("two proofs");
+        let output = probe_file(&path);
+        let report = verify_probe_evidence(
+            &output,
+            &fixture.root,
+            "alpha_function AND beta_function",
+            8,
+        )
+        .expect("retained proofs");
+        let alpha = report
+            .evidence()
+            .iter()
+            .find(|item| item.target().contains("alpha_function"));
+        let beta = report
+            .evidence()
+            .iter()
+            .find(|item| item.target().contains("beta_function"));
+        assert!(
+            alpha.is_some_and(|item| item.snippet().contains("fn alpha_function()")),
+            "alpha={:?}",
+            alpha.map(|item| item.snippet())
+        );
+        assert!(
+            beta.is_some_and(|item| item.snippet().contains("fn beta_function()")),
+            "beta={:?}",
+            beta.map(|item| item.snippet())
+        );
+    }
+
+    #[test]
+    fn necessary_groups_take_a_representative_before_alternatives() {
+        let fixture = Fixture::new();
+        let mut output = String::new();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            let path = fixture.root.join("src").join(name);
+            fs::write(&path, "fn alpha_function() {}\nfn beta_function() {}\n").expect(name);
+            output.push_str(&probe_file(&path));
+        }
+        for (query, expected) in [
+            (
+                "alpha_function AND beta_function",
+                ["alpha_function", "beta_function"],
+            ),
+            (
+                "beta_function AND alpha_function",
+                ["beta_function", "alpha_function"],
+            ),
+        ] {
+            let report =
+                verify_probe_evidence(&output, &fixture.root, query, 2).expect("two groups");
+            assert!(report.is_complete(), "{query}");
+            assert_eq!(report.evidence().len(), 2, "{query}");
+            for (item, target) in report.evidence().iter().zip(expected) {
+                assert!(
+                    item.target().contains(target) && item.snippet().contains(target),
+                    "{query} kept {} / {}",
+                    item.target(),
+                    item.snippet()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_group_two_files_keeps_legacy_file_compact() {
+        let fixture = Fixture::new();
+        let mut output = String::new();
+        for name in ["a.rs", "b.rs"] {
+            let path = fixture.root.join("src").join(name);
+            fs::write(&path, "fn alpha_function() {}\n").expect(name);
+            output.push_str(&probe_file(&path));
+        }
+        let report =
+            verify_probe_evidence(&output, &fixture.root, "alpha_function", 8).expect("one group");
+        assert!(report.is_complete());
+        assert_eq!(report.evidence().len(), 2);
+        assert!(report
+            .evidence()
+            .iter()
+            .all(|item| item.snippet().contains("alpha_function")));
     }
 }
