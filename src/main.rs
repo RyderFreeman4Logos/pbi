@@ -1352,6 +1352,78 @@ mod tests {
             citations,
             json!([{"path":"receipt.py","start_line":1,"end_line":1}])
         );
+        // Interior filename brackets never own independently quoted atoms or prose.
+        fs::create_dir_all(root.join("src")).expect("bracket source directory");
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            let first = format!("src/{open}a.py");
+            let second = format!("src/b{close}.py");
+            let single = format!("src/{open}receipt.py");
+            for path in [&first, &second, &single] {
+                fs::write(
+                    root.join(path),
+                    "def exact_reuse_receipt():\n    return True\n",
+                )
+                .expect("literal bracket source");
+            }
+            let both = verified(&[&first, &second], question);
+            assert_eq!(
+                both,
+                json!([
+                    {"path":first,"start_line":1,"end_line":1},
+                    {"path":second,"start_line":1,"end_line":1}
+                ])
+            );
+            let selected = json!([both[0]]);
+            for marker in ["'", "\"", "*", "`"] {
+                let body = format!("See {marker}{first}:1{marker}, {marker}{second}:1{marker}.");
+                check("ownership-bracket-crossing", question, &both, &body, true);
+                check(
+                    "ownership-bracket-unselected",
+                    question,
+                    &selected,
+                    &body,
+                    false,
+                );
+                check(
+                    "ownership-bracket-invalid",
+                    question,
+                    &both,
+                    &format!("See {marker}{first}:1{marker}, {marker}{second}:0{marker}."),
+                    false,
+                );
+            }
+            let known = verified(&[&single], question);
+            assert_eq!(known, json!([{"path":single,"start_line":1,"end_line":1}]));
+            for marker in ["'", "\"", "*", "`"] {
+                for (line, accepted) in [("1", true), ("0", false)] {
+                    check(
+                        "ownership-bracket-prose",
+                        question,
+                        &known,
+                        &format!("See {marker}{single}:{line}{marker} done{close}."),
+                        accepted,
+                    );
+                }
+            }
+            let known = verified(&["receipt.py"], question);
+            for (path, accepted) in [("receipt.py", true), ("missing.rs", false)] {
+                check(
+                    "ownership-bracket-structural",
+                    question,
+                    &known,
+                    &format!("See '{open}receipt.py:1, '{path}:1'{close}'."),
+                    accepted,
+                );
+                check(
+                    "ownership-bracket-nested",
+                    question,
+                    &known,
+                    &format!("See **{open}[receipt.py:1, *{path}:1*]{close}**."),
+                    accepted,
+                );
+            }
+        }
+        verified(&["receipt.py"], question);
         // Same-marker ownership is lexical, never chosen by selected paths.
         // Each nested pair needs its own close; enclosing widths stay fixed.
         for (outer, inner) in [("**", "*"), ("*", "**"), ("**", "**")] {

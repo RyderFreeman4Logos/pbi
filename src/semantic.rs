@@ -879,13 +879,7 @@ impl BodyWrappers {
         }
         let mut next_close = vec![[length; 4]; length + 1];
         for index in (0..length).rev() {
-            next_close[index] = if brackets[index] > index && brackets[index] < length {
-                next_close[brackets[index] + 1]
-            } else if brackets[index] < index {
-                [length; 4]
-            } else {
-                next_close[index + 1]
-            };
+            next_close[index] = next_close[index + 1];
             if closing[index] {
                 let kind = body_marker(answer.as_bytes()[index]).expect("closing marker");
                 next_close[index][kind] = index;
@@ -906,7 +900,16 @@ impl BodyWrappers {
             if run == 0 {
                 return None; // Unconsumed opening-run bytes are filename data.
             }
-            let close = self.next_close[start + run][kind];
+            // Admit a structural content prefix by the same rule as the next
+            // atom/owner step. Its close precedes this owner's close, so the
+            // next step necessarily admits it under the newly reserved limit.
+            // Interior filename brackets never participate in this decision.
+            let content = start + run;
+            let close = self
+                .bracket_pair(answer, content, limit)
+                .map(|(end, _)| self.next_close[end + 1][kind])
+                .filter(|&close| close < limit && self.runs[close].min(limit - close) >= run)
+                .unwrap_or(self.next_close[content][kind]);
             if close >= limit {
                 return None;
             }
@@ -920,6 +923,11 @@ impl BodyWrappers {
             let end = after - width;
             return (self.colons[end] > self.colons[start]).then_some((end, width));
         }
+        self.bracket_pair(answer, start, limit)
+    }
+
+    fn bracket_pair(&self, answer: &str, start: usize, limit: usize) -> Option<(usize, usize)> {
+        let byte = *answer.as_bytes().get(start)?;
         let end = self.brackets[start];
         if end <= start || end >= limit {
             return None;
