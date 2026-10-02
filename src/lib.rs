@@ -116,6 +116,52 @@ impl EvidenceReport {
     pub fn missing_targets(&self) -> &[String] {
         &self.missing_targets
     }
+
+    /// Include one bounded following window for each selected source span.
+    /// Each window is reread and confined to the same repository before a model sees it.
+    pub fn with_following_lines(
+        mut self,
+        root: &Path,
+        max_total: usize,
+    ) -> Result<Self, EvidenceError> {
+        let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
+        let count = max_total.saturating_sub(self.evidence.len());
+        let originals = self
+            .evidence
+            .iter()
+            .take(count)
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in originals {
+            let path = resolve_candidate_path(item.location().path(), &root)
+                .ok_or(EvidenceError::SourceOutsideRoot)?;
+            if source_is_too_large(&path) {
+                return Err(EvidenceError::SourceUnavailable);
+            }
+            let source = fs::read_to_string(&path).map_err(|_| EvidenceError::SourceUnavailable)?;
+            let lines = source.lines().collect::<Vec<_>>();
+            let start = item.location().end_line().saturating_add(1);
+            if start > lines.len() {
+                continue;
+            }
+            let end = start
+                .saturating_add(MAX_EVIDENCE_LINES - 1)
+                .min(lines.len());
+            let snippet = lines[start - 1..end].join("\n");
+            if snippet.len() > 4096 {
+                continue;
+            }
+            self.evidence.push(SourceEvidence {
+                location: SourceLocation::new(path, start, end),
+                target: item.target().to_owned(),
+                snippet,
+                symbol: item.symbol().map(str::to_owned),
+                relevance: "following verified source lines".to_owned(),
+            });
+            self.cited.push(start);
+        }
+        Ok(self)
+    }
 }
 
 /// Privacy-safe failures from deterministic source verification.
@@ -2297,5 +2343,31 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             .evidence()
             .iter()
             .all(|item| item.snippet().contains("alpha_function")));
+    }
+
+    #[test]
+    fn semantic_following_lines_include_the_guard_after_a_signature() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("src/lib.rs");
+        fs::write(
+            &source,
+            "fn display_relative() {\n    let relative = source\n        .strip_prefix(root)\n        .unwrap();\n    if relative.as_os_str().is_empty() {\n        return Err(SourceOutsideRoot);\n    }\n}\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-1\n", source.display()),
+            &fixture.root,
+            "where is display_relative?",
+            8,
+        )
+        .expect("verified signature");
+        let report = report
+            .with_following_lines(&fixture.root, 8)
+            .expect("bounded adjacent source");
+        assert!(report.evidence().iter().any(|evidence| {
+            evidence.location().start_line() <= 5
+                && evidence.location().end_line() >= 6
+                && evidence.snippet().contains("SourceOutsideRoot")
+        }));
     }
 }

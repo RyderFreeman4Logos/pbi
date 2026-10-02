@@ -332,6 +332,17 @@ fn run(
     #[cfg(not(test))]
     let report = collect_evidence()?;
     if semantic {
+        let expanded_report = if query.trim_start().to_ascii_lowercase().starts_with("why ") {
+            Some(
+                report
+                    .clone()
+                    .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
+                    .map_err(evidence_cli_error)?,
+            )
+        } else {
+            None
+        };
+        let report = expanded_report.as_ref().unwrap_or(&report);
         #[cfg(test)]
         let injected_publisher = match _test_route_injection {
             Some(TestRouteInjection::Publisher(publisher)) => Some(publisher),
@@ -380,7 +391,7 @@ fn run(
                 .block_on(investigate(
                     &query,
                     &root,
-                    &report,
+                    report,
                     &policy,
                     deadline,
                     &cancellation,
