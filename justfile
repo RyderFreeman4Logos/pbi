@@ -16,6 +16,9 @@ lock-online:
 test:
     ionice -c 3 cargo test --locked
 
+test-lib filter='':
+    ionice -c 3 cargo test --locked --lib {{filter}}
+
 test-definition filter='':
     ionice -c 3 cargo test --locked --lib definition_intent {{filter}}
 

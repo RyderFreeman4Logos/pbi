@@ -2,6 +2,9 @@ use crate::{EvidenceReport, SourceEvidence};
 use serde_json::{json, Value};
 use std::env;
 use std::fmt;
+use std::fs;
+use std::io::Read;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use workflow_adk::model_profiles::{
@@ -135,6 +138,7 @@ pub enum SemanticRouteError {
     UnapprovedCredentialHandle,
     MissingCredential,
     Profile,
+    InvalidConfig,
 }
 
 impl fmt::Display for SemanticRouteError {
@@ -148,6 +152,7 @@ impl fmt::Display for SemanticRouteError {
             Self::UnapprovedCredentialHandle => "semantic credential handle is not approved",
             Self::MissingCredential => "semantic route requires an available credential handle",
             Self::Profile => "semantic model profile could not be bound",
+            Self::InvalidConfig => "semantic route configuration file is invalid",
         })
     }
 }
@@ -186,6 +191,10 @@ pub struct AdmittedLocalModelRoute {
 impl AdmittedLocalModelRoute {
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     pub fn profile_name(&self) -> &str {
@@ -240,15 +249,21 @@ pub fn validate_local_route(base_url: &str, model: &str) -> Result<(), SemanticR
     Ok(())
 }
 
-pub fn local_route_publisher_from_environment(
-) -> Result<Option<ModelRoutePublisher>, SemanticRouteError> {
+pub fn explicit_admitted_routes_from_environment(
+) -> Result<Option<Vec<AdmittedLocalModelRoute>>, SemanticRouteError> {
     if !semantic_route_opted_in()? {
         return Ok(None);
     }
-    let (base_url, model) = local_route_from_values(
-        first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?,
-        first_value(&["LOCAL_MODEL", "LLM_MODEL"])?,
-    )?;
+    let env_base = first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?;
+    let env_model = first_value(&["LOCAL_MODEL", "LLM_MODEL"])?;
+    let (base_url, model) = if env_base.is_none() && env_model.is_none() {
+        match explicit_config_route()? {
+            Some(route) => route,
+            None => local_route_from_values(None, None)?,
+        }
+    } else {
+        local_route_from_values(env_base, env_model)?
+    };
     let credential_name = if let Some(name) = env::var_os("PBI_RS_CREDENTIAL_HANDLE") {
         let name = name
             .into_string()
@@ -262,7 +277,14 @@ pub fn local_route_publisher_from_environment(
             .to_owned()
     };
     let routes = admit_local_routes(vec![LocalModelRoute::new(base_url, model, credential_name)])?;
-    Ok(Some(local_route_publisher_from_admitted_routes(&routes)?))
+    Ok(Some(routes))
+}
+
+pub fn local_route_publisher_from_environment(
+) -> Result<Option<ModelRoutePublisher>, SemanticRouteError> {
+    explicit_admitted_routes_from_environment()?
+        .map(|routes| local_route_publisher_from_admitted_routes(&routes))
+        .transpose()
 }
 
 pub fn local_route_publisher_from_cli_routes(
@@ -336,6 +358,54 @@ fn local_route_from_values(
     let model = model.unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned());
     validate_local_route(&base_url, &model)?;
     Ok((base_url, model))
+}
+
+const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+
+fn explicit_config_route() -> Result<Option<(String, String)>, SemanticRouteError> {
+    let Some(path) = env::var_os("PBI_CONFIG_FILE") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let file = fs::File::open(&path).map_err(|_| SemanticRouteError::InvalidConfig)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| SemanticRouteError::InvalidConfig)?;
+    let kind = metadata.file_type();
+    if !kind.is_file() || kind.is_fifo() || metadata.len() > MAX_CONFIG_BYTES {
+        return Err(SemanticRouteError::InvalidConfig);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SemanticRouteError::InvalidConfig)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| SemanticRouteError::InvalidConfig)?;
+    let table: toml::Table = text
+        .parse()
+        .map_err(|_| SemanticRouteError::InvalidConfig)?;
+    let selected = table
+        .get("primary_model")
+        .or_else(|| table.get("model"))
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(SemanticRouteError::InvalidConfig)?;
+    let endpoints = table
+        .get("endpoints")
+        .and_then(toml::Value::as_array)
+        .ok_or(SemanticRouteError::InvalidConfig)?;
+    let endpoint = endpoints
+        .iter()
+        .filter_map(toml::Value::as_table)
+        .find(|endpoint| endpoint.get("model").and_then(toml::Value::as_str) == Some(selected))
+        .ok_or(SemanticRouteError::InvalidConfig)?;
+    let base_url = endpoint
+        .get("base_url")
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(SemanticRouteError::InvalidConfig)?;
+    Ok(Some((base_url.to_owned(), selected.to_owned())))
 }
 
 fn select_explicit_credential_handle(name: &str) -> Result<&str, SemanticRouteError> {
@@ -946,5 +1016,72 @@ mod tests {
             &active,
         ));
         assert_eq!(expired_result, Err(SemanticError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn explicit_config_selects_primary_model_endpoint_not_the_first_table() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join("config.toml");
+        fs::write(
+            &config,
+            "\
+# comment and escaped quote must survive a real parser
+primary_model = \"abliterated-qwen-latest-27b-low\"
+model = \"abliterated-qwen-latest-27b-none\"
+
+[[endpoints]]
+model = \"abliterated-qwen-latest-27b-none\"
+base_url = \"http://localhost:18317/v1\"
+api_key = \"not-a-credential\"
+
+[[endpoints]]
+model = \"abliterated-qwen-latest-27b-low\"
+base_url = \"http://gb10:18009/v1\"
+key = \"also-not-read\"
+",
+        )
+        .expect("fixture config");
+        let previous_enable = env::var_os("PBI_RS_ADK_ENABLE");
+        let previous_config = env::var_os("PBI_CONFIG_FILE");
+        let previous_base = env::var_os("CLIPROXY_BASE_URL");
+        let previous_model = env::var_os("LOCAL_MODEL");
+        let previous_handle = env::var_os("PBI_RS_CREDENTIAL_HANDLE");
+        env::set_var("PBI_RS_ADK_ENABLE", "1");
+        env::set_var("PBI_CONFIG_FILE", &config);
+        env::remove_var("CLIPROXY_BASE_URL");
+        env::remove_var("LOCAL_ROUTER_BASEURL");
+        env::remove_var("LOCAL_MODEL");
+        env::remove_var("LLM_MODEL");
+        env::set_var("PBI_RS_CREDENTIAL_HANDLE", "CLIPROXY_API_KEY");
+        let routes = explicit_admitted_routes_from_environment()
+            .expect("explicit config route")
+            .expect("publisher when ADK is enabled");
+        let publisher = local_route_publisher_from_admitted_routes(&routes);
+        if let Some(value) = previous_enable {
+            env::set_var("PBI_RS_ADK_ENABLE", value);
+        } else {
+            env::remove_var("PBI_RS_ADK_ENABLE");
+        }
+        if let Some(value) = previous_config {
+            env::set_var("PBI_CONFIG_FILE", value);
+        } else {
+            env::remove_var("PBI_CONFIG_FILE");
+        }
+        if let Some(value) = previous_base {
+            env::set_var("CLIPROXY_BASE_URL", value);
+        }
+        if let Some(value) = previous_model {
+            env::set_var("LOCAL_MODEL", value);
+        }
+        if let Some(value) = previous_handle {
+            env::set_var("PBI_RS_CREDENTIAL_HANDLE", value);
+        } else {
+            env::remove_var("PBI_RS_CREDENTIAL_HANDLE");
+        }
+        let publisher = publisher.expect("publisher from selected route");
+        let _publisher = publisher;
+        let selected = routes.first().expect("selected endpoint");
+        assert_eq!(selected.model(), "abliterated-qwen-latest-27b-low");
+        assert_eq!(selected.base_url(), "http://gb10:18009/v1");
     }
 }

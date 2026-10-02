@@ -16,6 +16,7 @@ path = "src/lib.rs"
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 serde_json = "=1.0.149"
+toml = "=0.9.12"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
 workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "a8d5c826bd58b22406d4f5d4f2266ca1c9f702a1" }
 workflow-runtime = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "a8d5c826bd58b22406d4f5d4f2266ca1c9f702a1" }
