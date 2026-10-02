@@ -6,6 +6,8 @@ Bare positional questions and `--message` request answer synthesis and are evide
 
 ## Local commands
 
+`--debug-config` intentionally hardens privacy: any configured `PBI_RS_PROBE` is shown as `probe_binary=[REDACTED]`, never its path (even escaped); only an unset override shows `probe_binary=probe`. This diagnostic-only compatibility change does not alter Probe selection or execution.
+
 All Cargo commands run through `just` so the repository's idle-I/O and canonical SSD target rules remain active:
 
 ```text

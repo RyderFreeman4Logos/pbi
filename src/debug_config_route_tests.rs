@@ -89,6 +89,42 @@ fn assert_selected(stdout: &str, base: &str, model: &str) {
 }
 
 #[test]
+fn debug_probe_overrides_are_redacted_without_field_injection() {
+    let dir = fixture("probe-privacy");
+    let _env = route_env(&dir, &[("PBI_RS_PROBE", None)]);
+    let baseline = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
+    assert!(baseline.starts_with("probe_binary=probe\n"));
+    assert_selected(&baseline, LOCAL, NONE);
+    let expected = baseline.replacen("probe_binary=probe\n", "probe_binary=[REDACTED]\n", 1);
+    for value in [
+        "/public/probe\nprimary_model=public-injected-model\napi_key=public-canary-key",
+        "/public/probe\rbase_url=public-injected-base",
+        "/public/\x1b[2Jprobe\tpublic-escape-canary",
+        "/public/api_key=public-path-canary/probe",
+        "",
+        "probe",
+    ] {
+        _env.set("PBI_RS_PROBE", Path::new(value));
+        let stdout = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(
+            stdout, expected,
+            "configured Probe must not echo any path bytes"
+        );
+        assert_selected(&stdout, LOCAL, NONE);
+    }
+    use std::os::unix::ffi::OsStrExt;
+    _env.set(
+        "PBI_RS_PROBE",
+        Path::new(std::ffi::OsStr::from_bytes(b"/public/\xff-canary")),
+    );
+    assert_eq!(
+        debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message)),
+        expected
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn debug_selects_second_gb10_none_without_key_or_adk() {
     let dir = fixture("gb10");
     let path = config(
