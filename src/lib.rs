@@ -140,8 +140,19 @@ impl EvidenceReport {
             if start > lines.len() {
                 continue;
             }
-            let end = start
-                .saturating_add(MAX_FOLLOWING_LINES - 1)
+            let next_declaration =
+                if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                    declaration_identity::declarations(&source)
+                        .into_iter()
+                        .map(|declaration| declaration.line)
+                        .find(|line| *line >= start)
+                } else {
+                    None
+                };
+            let end = next_declaration
+                .map(|line| line.saturating_sub(1))
+                .unwrap_or(start.saturating_add(MAX_FOLLOWING_LINES - 1))
+                .max(item.location().end_line())
                 .min(lines.len());
             let first = item.location().start_line();
             let snippet = lines[first - 1..end].join("\n");
@@ -2368,5 +2379,80 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
                 && evidence.location().end_line() >= 9
                 && evidence.snippet().contains("SourceOutsideRoot")
         }));
+    }
+
+    #[test]
+    fn why_question_keeps_the_called_stop_not_only_the_predicate() {
+        let fixture = Fixture::new();
+        let hold = fixture.root.join("src/hold.rs");
+        let caller = fixture.root.join("src/caller.rs");
+        let noise = fixture.root.join("src/other.rs");
+        fs::write(
+            &hold,
+            "fn persistent_outage_hold_left(started: bool) -> u64 {\n    \
+             if started { 0 } else { 9 }\n}\n\n\
+             /// Stop with attempts left when the hold budget is gone.\n\
+             async fn persistent_outage_hold_wait(started: bool) -> bool {\n    \
+             let left = persistent_outage_hold_left(started);\n    \
+             // The hold shares one wall-clock cap with selection.\n    \
+             // A closed shutdown ends the wait immediately.\n    \
+             // The cadence stays inside the remaining budget.\n    \
+             // Cancellation is checked before the sleep returns.\n    \
+             // A dropped downstream signal also ends the hold.\n    \
+             // A committed downstream signal also ends the hold.\n    \
+             // The ordinary retry ladder is not used after this.\n    \
+             // Probe count increases only when the wait completes.\n    \
+             let expired = left == 0;\n    \
+             if expired {\n        return false;\n    }\n    \
+             left > 0\n}\n\n\
+             fn persistent_outage_hold_active(started: bool) -> bool {\n    \
+             // A started hold stays on after its budget ends.\n    \
+             started || persistent_outage_hold_left(started) > 0\n}\n\n\
+             pub async fn persistent_outage_hold_continue(started: bool) -> bool {\n    \
+             persistent_outage_hold_wait(started).await\n}\n",
+        )
+        .expect("hold");
+        fs::write(
+            &caller,
+            "fn step(started: bool) {\n    \
+             if persistent_outage_hold_active(started) {\n        \
+             let again = persistent_outage_hold_continue(started);\n        \
+             let _ = again;\n    }\n}\n",
+        )
+        .expect("caller");
+        fs::write(
+            &noise,
+            "/// Why persistent_outage_hold stop with attempts left.\n\
+             fn note() {\n    assert!(true);\n}\n",
+        )
+        .expect("noise");
+        let mut located = String::new();
+        for path in [&hold, &caller, &noise] {
+            located.push_str(&probe_file(path));
+        }
+        let query = "Why does persistent_outage_hold stop with attempts left?";
+        let report = verify_probe_evidence(&located, &fixture.root, query, 8)
+            .expect("ranked windows")
+            .with_following_lines(&fixture.root, 8)
+            .expect("existing why extension");
+        let snippets = report
+            .evidence()
+            .iter()
+            .map(|item| item.snippet())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            snippets.contains("return false"),
+            "stop decision missing from {:?}",
+            report
+                .evidence()
+                .iter()
+                .map(|item| (item.location().start_line(), item.location().end_line()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !snippets.contains("persistent_outage_hold_active"),
+            "next function admitted: {snippets}"
+        );
     }
 }
