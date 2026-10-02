@@ -711,38 +711,122 @@ fn decode_answer(
     })
 }
 
-/// Check only model-selected spans. Delimiters bound both references and URL
-/// exemptions; path separators and colons stay intact so invalid paths cannot
-/// be rescued by scanning a valid suffix. The schema bounds answer length.
+/// One contextual boundary: retain filename punctuation until the whole token
+/// is classified. Paired outer wrappers may enclose a citation list; a colon
+/// inside the pair distinguishes `(a.py:1)` from the filename `(a.py):1`.
+/// A comma/semicolon separates only after a colon (never inside a filename).
+/// Two forward scans, O(answer bytes) storage; each token is classified once.
 fn answer_body_citations_match(
     answer: &str,
     selected: &[&AllowedCitation],
 ) -> Result<(), SemanticError> {
-    for token in answer.split(|ch: char| {
-        ch.is_whitespace()
-            || matches!(
-                ch,
-                '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\''
-            )
-    }) {
-        let mut token = token.trim_end_matches(['.', '!', '?', '。']);
-        // Peel only paired outer markup, never an interior path fragment.
-        while let Some(marker @ (b'`' | b'*')) = token.as_bytes().first().copied() {
-            if token.len() < 2 || token.as_bytes().last() != Some(&marker) {
-                break;
-            }
-            token = &token[1..token.len() - 1];
-        }
-        if let Some((path, start, end)) = body_citation(token, selected)? {
-            if !selected
-                .iter()
-                .any(|item| item.path == path && start >= item.start_line && end <= item.end_line)
+    let pairs = body_wrapper_pairs(answer);
+    let mut closers = Vec::new();
+    let mut start = 0;
+    let mut has_colon = false;
+    let mut after_wrapper = false;
+    let mut cursor = 0;
+    while cursor <= answer.len() {
+        let ch = answer[cursor..].chars().next().unwrap_or('\n');
+        let width = ch.len_utf8();
+        let closing = closers.last().is_some_and(|&(end, _)| end == cursor);
+        if cursor == start {
+            if let Some((end, marker_width, contains_colon)) = pairs.get(cursor).copied().flatten()
             {
-                return Err(SemanticError::CitationMismatch);
+                let after = end + marker_width;
+                // A link label and destination are separate whole contexts.
+                let link = ch == '[' && answer[after..].starts_with('(');
+                let destination = ch == '(' && cursor > 0 && answer.as_bytes()[cursor - 1] == b']';
+                if link || (destination || body_wrapper_end(&answer[after..])) && contains_colon {
+                    closers.push((end, marker_width));
+                    cursor += marker_width;
+                    start = cursor;
+                    continue;
+                }
             }
+        }
+        if ch.is_whitespace()
+            || closing
+            || ((has_colon || after_wrapper) && matches!(ch, ',' | ';'))
+        {
+            let token = answer[start..cursor].trim_end_matches(['.', '!', '?', '。']);
+            body_citation(token, selected)?;
+            let consumed = if closing {
+                closers.pop().expect("active wrapper").1
+            } else {
+                width
+            };
+            cursor += consumed;
+            start = cursor;
+            has_colon = false;
+            after_wrapper = closing;
+        } else {
+            after_wrapper = false;
+            has_colon |= ch == ':';
+            cursor += width;
         }
     }
     Ok(())
+}
+
+fn body_wrapper_end(tail: &str) -> bool {
+    let mut chars = tail.chars();
+    let Some(ch) = chars.next() else {
+        return true;
+    };
+    ch.is_whitespace()
+        || matches!(ch, ',' | ';' | ')' | ']' | '}' | '*' | '`' | '\'' | '"')
+        || matches!(ch, '.' | '!' | '?' | '。') && chars.next().is_none_or(|ch| ch.is_whitespace())
+}
+
+/// Pair punctuation without interpreting paths. Only the boundary scan may
+/// promote a pair to presentation markup; interior pairs remain path bytes.
+fn body_wrapper_pairs(answer: &str) -> Vec<Option<(usize, usize, bool)>> {
+    let mut pairs = vec![None; answer.len()];
+    let mut stacks: [Vec<(usize, usize, usize)>; 7] = std::array::from_fn(|_| Vec::new());
+    let mut cursor = 0;
+    let mut colons = 0;
+    while cursor < answer.len() {
+        let byte = answer.as_bytes()[cursor];
+        colons += usize::from(byte == b':');
+        let mut width = 1;
+        if matches!(byte, b'*' | b'`') {
+            while answer.as_bytes().get(cursor + width) == Some(&byte) {
+                width += 1;
+            }
+        }
+        let kind = match byte {
+            b'(' | b')' => Some(0),
+            b'[' | b']' => Some(1),
+            b'{' | b'}' => Some(2),
+            b'*' => Some(3),
+            b'`' => Some(4),
+            b'\'' => Some(5),
+            b'"' => Some(6),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let stack = &mut stacks[kind];
+            let closing = matches!(byte, b')' | b']' | b'}')
+                || kind >= 3
+                    && body_wrapper_end(&answer[cursor + width..])
+                    && stack.last().is_some_and(|&(_, length, _)| length == width);
+            if closing {
+                if let Some((open, _, prior_colons)) = stack.pop() {
+                    pairs[open] = Some((cursor, width, colons > prior_colons));
+                }
+            } else if kind < 3
+                || answer[..cursor].chars().next_back().is_none_or(|ch| {
+                    ch.is_whitespace()
+                        || matches!(ch, '(' | '[' | '{' | ',' | ';' | '*' | '`' | '\'' | '"')
+                })
+            {
+                stack.push((cursor, width, colons));
+            }
+        }
+        cursor += width;
+    }
+    pairs
 }
 
 /// None is prose; a recognized but invalid whole reference is an error.
@@ -753,47 +837,77 @@ fn body_citation<'a>(
     let Some((path, spec)) = token.rsplit_once(':') else {
         return Ok(None);
     };
+    let (start_text, end_text) = spec.split_once('-').unwrap_or((spec, spec));
+    let span = parse_body_line(start_text).zip(parse_body_line(end_text));
+    // One bounded pass over selected evidence, including disjoint same-file spans.
+    let mut known = false;
+    let mut contained = false;
+    for item in selected {
+        if token
+            .strip_prefix(&item.path)
+            .is_some_and(|tail| tail.starts_with(':'))
+        {
+            known = true;
+            contained |= item.path == path
+                && span.is_some_and(|(start, end)| {
+                    start <= end && start >= item.start_line && end <= item.end_line
+                });
+        }
+    }
     if excluded_body_context(token)
-        || !(path.contains('/')
+        || !(known
+            || path.contains('/')
             || path.contains('\\')
             || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
             || path
                 .rsplit_once('.')
-                .is_some_and(|(_, extension)| !extension.is_empty())
-            || selected.iter().any(|item| item.path == path))
+                .is_some_and(|(_, extension)| !extension.is_empty()))
     {
         return Ok(None);
     }
-    if path.contains(['\\', ':'])
+    if path.contains(['\\', ':', '`'])
         || path
             .split('/')
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(SemanticError::CitationMismatch);
     }
-    let (start_text, end_text) = spec.split_once('-').unwrap_or((spec, spec));
-    let start = parse_body_line(start_text).ok_or(SemanticError::CitationMismatch)?;
-    let end = parse_body_line(end_text).ok_or(SemanticError::CitationMismatch)?;
-    if start > end {
+    if !contained {
         return Err(SemanticError::CitationMismatch);
     }
+    let (start, end) = span.ok_or(SemanticError::CitationMismatch)?;
     Ok(Some((path, start, end)))
 }
 
 fn excluded_body_context(token: &str) -> bool {
-    token.split_once("://").is_some_and(|(scheme, _)| {
-        scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
+    if token.split_once("://").is_some_and(|(scheme, rest)| {
+        // Single-letter slash forms are drives, not URI escape hatches.
+        scheme.len() > 1
+            && !rest.is_empty()
+            && scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
             && scheme
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-    }) || token.split_once(':').is_some_and(|(prefix, _)| {
-        prefix.eq_ignore_ascii_case("localhost")
-            || prefix.parse::<std::net::Ipv4Addr>().is_ok()
-            || (prefix.len() == 13
-                && prefix.as_bytes()[4] == b'-'
-                && prefix.as_bytes()[7] == b'-'
-                && prefix.as_bytes()[10] == b'T')
-    })
+    }) {
+        return true;
+    }
+    if token.split_once(':').is_some_and(|(host, port)| {
+        (host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::Ipv4Addr>().is_ok())
+            && !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok()
+    }) {
+        return true;
+    }
+    // Whole numeric ISO-like timestamp: YYYY-MM-DDThh:mm[:ss][Z].
+    let time = token.strip_suffix('Z').unwrap_or(token).as_bytes();
+    matches!(time.len(), 16 | 19)
+        && time.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        })
 }
 
 fn parse_body_line(text: &str) -> Option<usize> {

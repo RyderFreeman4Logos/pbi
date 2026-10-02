@@ -1295,7 +1295,8 @@ mod tests {
                 .iter()
                 .map(|path| format!("File: {}, Lines: 1-6\n", root.join(path).display()))
                 .collect();
-            fs::write(root.join("probe"), format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/probe.args\"\nprintf '%s' '{probe_output}'\n")).expect("fake Probe");
+            let quoted_output = probe_output.replace('\'', "'\\''");
+            fs::write(root.join("probe"), format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/probe.args\"\nprintf '%s' '{quoted_output}'\n")).expect("fake Probe");
             let report = verify_probe_evidence(&probe_output, root, query, DEFAULT_MAX_RESULTS)
                 .expect("real verifier");
             assert_eq!(
@@ -1372,6 +1373,143 @@ mod tests {
         ] {
             check("F4-negative", question, &citations, answer, false);
         }
+        for token in [
+            "src/(receipt.py):99",
+            "src/(receipt.py:1)",
+            "../(receipt.py):99",
+            "src/[receipt.py]:99",
+            "src/[receipt.py:1]",
+            "src/{receipt.py}:99",
+            "src/{receipt.py:1}",
+            "src/*(receipt.py:1)*",
+            "prefix,receipt.py:1",
+            "src/,receipt.py:1",
+            "../,receipt.py:1",
+            "src/;receipt.py:1",
+            "src/'receipt.py:1",
+            "src/\"receipt.py:1",
+            "C:\\(receipt.py):99",
+            "src/(receipt.py):0",
+            "src/[receipt.py]:1-",
+            "src/{receipt.py}:1:99",
+        ] {
+            check(
+                "BOUNDARY-1",
+                question,
+                &citations,
+                &format!("See {token}."),
+                false,
+            );
+        }
+        for prefix in ["localhost", "LOCALHOST", "127.0.0.1"] {
+            for tail in [
+                "missing.rs:99",
+                "9/../missing.rs:0",
+                "missing.rs:18446744073709551616",
+                "missing.rs:9-1",
+            ] {
+                check(
+                    "EX-1",
+                    question,
+                    &citations,
+                    &format!("See {prefix}:{tail}."),
+                    false,
+                );
+            }
+        }
+        for token in [
+            "2020-01-02T03:missing.rs:99",
+            "2020-01-02T03:04:05Z/../missing.rs:99",
+            "abcd-ef-ghTij:missing.rs:99",
+        ] {
+            check("EX-2", question, &citations, token, false);
+        }
+        // Parent policy: ASCII single-letter schemes with slash are drives.
+        for token in [
+            "C://missing.rs:99",
+            "C:///missing.rs:99",
+            "c://receipt.py:1",
+            "z:///receipt.py:1",
+        ] {
+            check("EX-4", question, &citations, token, false);
+        }
+        for body in [
+            "ftp://host/file.rs:99 git+ssh://host/file.rs:99 custom.scheme://host/file.rs:99",
+            "localhost:8080 LOCALHOST:0 127.0.0.1:65535 2020-01-02T03:04 2020-01-02T03:04:05Z 12:34:56",
+            "(receipt.py:1,receipt.py:1)", "**receipt.py:1, receipt.py:1**",
+            "[receipt.py:1;receipt.py:1]", "{receipt.py:1}", "\"receipt.py:1\"", "'receipt.py:1'",
+            "[docs](https://example.test)receipt.py:1",
+        ] { check("boundary-positive", question, &citations, body, true); }
+        for body in [
+            "(receipt.py:1,missing.rs:99)",
+            "**receipt.py:1, missing.rs:99**",
+            "[missing.rs:99;receipt.py:1]",
+            "{receipt.py:1,missing.rs:99}",
+            "[docs](https://example.test)src/(receipt.py:1)",
+        ] {
+            check("boundary-negative", question, &citations, body, false);
+        }
+        for (body, accepted) in [
+            ("Here's 'receipt.py:1'.", true),
+            ("Here's **receipt.py:1**.", true),
+            ("(*receipt.py:1*)", true),
+            ("`(receipt.py:1, receipt.py:1)`", true),
+            ("[receipt.py:1, missing.rs:99]", false),
+            ("receipt.py:1suffix", false),
+            ("receipt.py:1-", false),
+            ("receipt.py:1:99", false),
+            ("src/(receipt.py:1)tail", false),
+            ("src/[receipt.py:1]tail", false),
+            ("[docs](https://example.test),src/{receipt.py}:99", false),
+        ] {
+            check("sweep", question, &citations, body, accepted);
+        }
+        for path in [
+            "src/(receipt.py)",
+            "src/[receipt.py]",
+            "src/{receipt.py}",
+            "src/a,b.py",
+            "src/a;b.py",
+            "src/a'b.py",
+            "src/a\"b.py",
+            "src/*a*.py",
+            "(receipt.py)",
+            "src/源,(a).rs",
+        ] {
+            fs::create_dir_all(root.join(path).parent().expect("parent")).expect("directory");
+            fs::write(
+                root.join(path),
+                "def exact_reuse_receipt():\n    return True\n",
+            )
+            .expect("punctuated source");
+            let known = verified(&[path], question);
+            for (left, right) in [
+                ("(", ")"),
+                ("[", "]"),
+                ("*", "*"),
+                ("**", "**"),
+                ("'", "'"),
+                ("`", "`"),
+            ] {
+                check(
+                    "punctuated-wrapped",
+                    question,
+                    &known,
+                    &format!("See {left}{path}:1{right}."),
+                    true,
+                );
+            }
+            for (suffix, accepted) in [("1", true), ("99", false), ("0", false), ("1-", false)] {
+                check(
+                    "punctuated-selected",
+                    question,
+                    &known,
+                    &format!("See {path}:{suffix}."),
+                    accepted,
+                );
+            }
+        }
+        verified(&["receipt.py"], question);
         fs::write(
             root.join("other.py"),
             "def secondary_receipt():\n    return True\n",
@@ -1409,6 +1547,25 @@ mod tests {
             )
             .expect("approved source");
             let known = verified(&[path], question);
+            if path == "Makefile" {
+                for tail in ["1:99", ":99", "0:99", "1-:99", "18446744073709551616:99"] {
+                    check(
+                        "EX-3",
+                        question,
+                        &known,
+                        &format!("See Makefile:{tail}."),
+                        false,
+                    );
+                }
+                check("EX-4-selected", question, &known, "C:Makefile:1", false);
+                check(
+                    "EX-3-prose",
+                    question,
+                    &known,
+                    "MakefileX:1:99 version:1 OWNER:MEMBER",
+                    true,
+                );
+            }
             check(
                 "F3-positive",
                 question,
