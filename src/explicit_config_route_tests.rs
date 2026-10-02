@@ -77,6 +77,47 @@ fn matching_config(dir: &Path, primary: &str, second_base: &str) -> std::path::P
     config
 }
 
+fn fixture_dir(label: &str) -> std::path::PathBuf {
+    let dir = env::temp_dir().join(format!(
+        "pbi-rs-{label}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir(&dir).expect("dir");
+    dir
+}
+
+fn malformed(dir: &Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, "primary_model = [").expect("malformed");
+    path
+}
+
+fn fifo(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("pipe.toml");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    path
+}
+
+fn assert_ignores_config(path: &str, alias: &[(&'static str, Option<&'static str>)]) {
+    let started = Instant::now();
+    let _env = enabled(
+        &[("PBI_CONFIG_FILE", Some(path))]
+            .into_iter()
+            .chain(alias.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(route(), (LOCAL.to_owned(), NONE.to_owned()));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
 #[test]
 fn fifo_without_writer_is_bounded_invalid_config() {
     let dir = env::temp_dir().join(format!("pbi-rs-fifo-{}", std::process::id()));
@@ -177,5 +218,89 @@ fn exactly_limit_bytes_still_parse() {
     fs::write(&path, bytes).expect("limit");
     let _env = enabled(&[("PBI_CONFIG_FILE", Some(path.to_str().expect("utf8")))]);
     assert_eq!(route(), (GB10.to_owned(), LOW.to_owned()));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn complete_env_bypasses_malformed_and_fifo_for_both_aliases() {
+    let dir = fixture_dir("both-env");
+    let bad = malformed(&dir, "bad.toml");
+    let pipe = fifo(&dir);
+    for path in [bad.to_str().expect("utf8"), pipe.to_str().expect("utf8")] {
+        assert_ignores_config(
+            path,
+            &[
+                ("CLIPROXY_BASE_URL", Some(LOCAL)),
+                ("LOCAL_MODEL", Some(NONE)),
+            ],
+        );
+        assert_ignores_config(
+            path,
+            &[
+                ("LOCAL_ROUTER_BASEURL", Some(LOCAL)),
+                ("LLM_MODEL", Some(NONE)),
+            ],
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn model_env_matches_its_endpoint_not_primary() {
+    let dir = fixture_dir("model-select");
+    let approved = matching_config(&dir, LOW, "http://unapproved.example/v1");
+    let path = approved.to_str().expect("utf8").to_owned();
+    {
+        let _env = enabled(&[
+            ("PBI_CONFIG_FILE", Some(&path)),
+            ("LOCAL_MODEL", Some(NONE)),
+        ]);
+        assert_eq!(route(), (LOCAL.to_owned(), NONE.to_owned()));
+    }
+    let rejected = dir.join("rejected.toml");
+    fs::write(
+        &rejected,
+        format!(
+            "primary_model = \"{LOW}\"\n[[endpoints]]\nmodel = \"{LOW}\"\nbase_url = \"{GB10}\"\n\n\
+             [[endpoints]]\nmodel = \"{NONE}\"\nbase_url = \"http://unapproved.example/v1\"\n"
+        ),
+    )
+    .expect("rejected");
+    {
+        let _env = enabled(&[
+            ("PBI_CONFIG_FILE", Some(rejected.to_str().expect("utf8"))),
+            ("LOCAL_MODEL", Some(NONE)),
+        ]);
+        assert_eq!(
+            explicit_admitted_routes_from_environment().expect_err("unapproved match"),
+            SemanticRouteError::UnapprovedRoute
+        );
+    }
+    let missing = dir.join("missing.toml");
+    fs::write(
+        &missing,
+        format!(
+            "primary_model = \"{LOW}\"\n[[endpoints]]\nmodel = \"{LOW}\"\nbase_url = \"{GB10}\"\n"
+        ),
+    )
+    .expect("missing");
+    {
+        let _env = enabled(&[
+            ("PBI_CONFIG_FILE", Some(missing.to_str().expect("utf8"))),
+            ("LLM_MODEL", Some(NONE)),
+        ]);
+        assert_eq!(
+            explicit_admitted_routes_from_environment().expect_err("missing match"),
+            SemanticRouteError::InvalidConfig
+        );
+    }
+    {
+        let _env = enabled(&[
+            ("PBI_CONFIG_FILE", Some(&path)),
+            ("CLIPROXY_BASE_URL", Some(GB10)),
+            ("LOCAL_MODEL", Some(NONE)),
+        ]);
+        assert_eq!(route(), (GB10.to_owned(), NONE.to_owned()));
+    }
     let _ = fs::remove_dir_all(&dir);
 }

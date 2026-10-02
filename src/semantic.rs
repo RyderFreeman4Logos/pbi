@@ -259,13 +259,21 @@ pub fn explicit_admitted_routes_from_environment(
     }
     let env_base = first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?;
     let env_model = first_value(&["LOCAL_MODEL", "LLM_MODEL"])?;
-    let configured = explicit_config_route()?;
-    let (base_url, model) = match (env_base, env_model, configured) {
-        (Some(base_url), Some(model), _) => (base_url, model),
-        (Some(base_url), None, Some((_, model))) => (base_url, model),
-        (None, Some(model), Some((base_url, _))) => (base_url, model),
-        (None, None, Some(route)) => route,
-        (base_url, model, None) => local_route_from_values(base_url, model)?,
+    let (base_url, model) = if let (Some(base_url), Some(model)) = (&env_base, &env_model) {
+        (base_url.clone(), model.clone())
+    } else {
+        let configured = explicit_config_route()?;
+        match (env_base, env_model, configured) {
+            (Some(base_url), None, Some((model, _))) => (base_url, model),
+            (None, Some(model), Some((_, endpoints))) => {
+                endpoint_base_for_model(&endpoints, &model)?
+            }
+            (None, None, Some((primary, endpoints))) => {
+                endpoint_base_for_model(&endpoints, &primary)?
+            }
+            (base_url, model, None) => local_route_from_values(base_url, model)?,
+            (Some(_), Some(_), Some(_)) => unreachable!("both fields returned before config"),
+        }
     };
     validate_local_route(&base_url, &model)?;
     let credential_name = if let Some(name) = env::var_os("PBI_RS_CREDENTIAL_HANDLE") {
@@ -385,7 +393,7 @@ unsafe fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
     }
 }
 
-fn explicit_config_route() -> Result<Option<(String, String)>, SemanticRouteError> {
+fn explicit_config_route() -> Result<Option<(String, Vec<(String, String)>)>, SemanticRouteError> {
     let Some(path) = env::var_os("PBI_CONFIG_FILE") else {
         return Ok(None);
     };
@@ -429,17 +437,31 @@ fn explicit_config_route() -> Result<Option<(String, String)>, SemanticRouteErro
         .get("endpoints")
         .and_then(toml::Value::as_array)
         .ok_or(SemanticRouteError::InvalidConfig)?;
-    let endpoint = endpoints
+    let parsed = endpoints
         .iter()
         .filter_map(toml::Value::as_table)
-        .find(|endpoint| endpoint.get("model").and_then(toml::Value::as_str) == Some(selected))
-        .ok_or(SemanticRouteError::InvalidConfig)?;
-    let base_url = endpoint
-        .get("base_url")
-        .and_then(toml::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(SemanticRouteError::InvalidConfig)?;
-    Ok(Some((base_url.to_owned(), selected.to_owned())))
+        .filter_map(|endpoint| {
+            let model = endpoint.get("model").and_then(toml::Value::as_str)?;
+            let base_url = endpoint.get("base_url").and_then(toml::Value::as_str)?;
+            (!model.is_empty() && !base_url.is_empty())
+                .then(|| (model.to_owned(), base_url.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        return Err(SemanticRouteError::InvalidConfig);
+    }
+    Ok(Some((selected.to_owned(), parsed)))
+}
+
+fn endpoint_base_for_model(
+    endpoints: &[(String, String)],
+    model: &str,
+) -> Result<(String, String), SemanticRouteError> {
+    endpoints
+        .iter()
+        .find(|(endpoint_model, _)| endpoint_model == model)
+        .map(|(_, base_url)| (base_url.clone(), model.to_owned()))
+        .ok_or(SemanticRouteError::InvalidConfig)
 }
 
 fn select_explicit_credential_handle(name: &str) -> Result<&str, SemanticRouteError> {

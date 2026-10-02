@@ -867,6 +867,7 @@ mod tests {
         routes: &[AdmittedLocalModelRoute],
         response: &str,
         calls: &Arc<AtomicUsize>,
+        seen: &Arc<Mutex<Vec<String>>>,
     ) -> Result<ModelRoutePublisher, SemanticRouteError> {
         let route = routes.first().ok_or(SemanticRouteError::IncompleteConfig)?;
         let real = local_route_publisher_from_admitted_routes(routes)?;
@@ -877,12 +878,15 @@ mod tests {
             real_snapshot.candidates().contains(&candidate),
             "owning snapshot must keep the selected route identity"
         );
+        let seen = Arc::clone(seen);
+        let calls = Arc::clone(calls);
         let profile = FakeModelProfile::new(
             candidate.profile().name(),
             candidate.profile().version(),
-            "fake-model",
+            route.model(),
             [response.to_owned()],
-        );
+        )
+        .with_resolved_model(route.model());
         let registry = ModelProfileRegistry::new()
             .with_worker(profile)
             .map_err(|_| SemanticRouteError::Profile)?;
@@ -895,8 +899,9 @@ mod tests {
         .with_test_llm(
             candidate,
             Arc::new(TestRouteLlm {
-                calls: calls.clone(),
+                calls,
                 behavior: TestModelBehavior::Respond(response.to_owned()),
+                seen: Some(seen),
             }),
         )
         .map_err(|_| SemanticRouteError::Profile)?;
@@ -928,6 +933,7 @@ mod tests {
     struct TestRouteLlm {
         calls: Arc<AtomicUsize>,
         behavior: TestModelBehavior,
+        seen: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     #[adk_rust::async_trait]
@@ -938,10 +944,13 @@ mod tests {
 
         async fn generate_content(
             &self,
-            _request: LlmRequest,
+            request: LlmRequest,
             _stream: bool,
         ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(seen) = &self.seen {
+                seen.lock().expect("seen models").push(request.model);
+            }
             let response = match &self.behavior {
                 TestModelBehavior::RateLimited => {
                     return Err(AdkError::new(
@@ -1008,6 +1017,7 @@ mod tests {
             Arc::new(TestRouteLlm {
                 calls: first_calls,
                 behavior: first_behavior,
+                seen: None,
             }),
         )
         .map_err(|_| SemanticRouteError::Profile)?
@@ -1016,6 +1026,7 @@ mod tests {
             Arc::new(TestRouteLlm {
                 calls: second_calls,
                 behavior: TestModelBehavior::Respond(response.to_owned()),
+                seen: None,
             }),
         )
         .map_err(|_| SemanticRouteError::Profile)?;
@@ -1079,10 +1090,11 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
 
         let toml_path = root.join("models.toml");
         let selected_model = "abliterated-qwen-latest-27b-low";
+        let decoy_model = "abliterated-qwen-latest-27b-none";
         fs::write(
             &toml_path,
             format!(
-                "primary_model = \"{selected_model}\"\n\n[[endpoints]]\nmodel = \"{selected_model}\"\nbase_url = \"http://gb10:18009/v1\"\n"
+                "primary_model = \"{selected_model}\"\n\n[[endpoints]]\nmodel = \"{decoy_model}\"\nbase_url = \"http://localhost:18317/v1\"\n\n[[endpoints]]\nmodel = \"{selected_model}\"\nbase_url = \"http://gb10:18009/v1\"\n"
             ),
         )
         .expect("isolated config fixture");
@@ -1099,7 +1111,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                     Some(toml_path.to_string_lossy().into_owned()),
                 ),
                 ("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned())),
-                ("LOCAL_MODEL", Some(selected_model.to_owned())),
+                ("LOCAL_MODEL", None),
                 ("LLM_MODEL", None),
                 ("CLIPROXY_BASE_URL", None),
                 ("LOCAL_ROUTER_BASEURL", None),
@@ -1116,6 +1128,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         .to_string();
         let observed = Mutex::new(Vec::<(String, String)>::new());
         let env_calls = Arc::new(AtomicUsize::new(0));
+        let env_seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let env_factory = |routes: &[AdmittedLocalModelRoute]| {
             let route = routes.first().ok_or(SemanticRouteError::IncompleteConfig)?;
             observed
@@ -1123,7 +1136,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                 .expect("route observations")
                 .push((route.base_url().to_owned(), route.model().to_owned()));
             assert_eq!(routes.len(), 1, "owning env/TOML selector emits one route");
-            owning_snapshot_publisher(routes, &response, &env_calls)
+            owning_snapshot_publisher(routes, &response, &env_calls, &env_seen)
         };
         let mut env_output = Vec::new();
         assert!(matches!(
@@ -1143,11 +1156,16 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             &[("http://gb10:18009/v1".to_owned(), selected_model.to_owned())]
         );
         assert_eq!(env_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            env_seen.lock().expect("seen").as_slice(),
+            &[selected_model.to_owned()]
+        );
 
         let invalid_toml = root.join("invalid.toml");
         fs::write(&invalid_toml, "primary_model = [\n").expect("invalid config fixture");
         _env.set("PBI_CONFIG_FILE", &invalid_toml);
         let cli_calls = Arc::new(AtomicUsize::new(0));
+        let cli_seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let cli_factory = |routes: &[AdmittedLocalModelRoute]| {
             let route = routes.first().ok_or(SemanticRouteError::IncompleteConfig)?;
             observed
@@ -1155,7 +1173,7 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                 .expect("route observations")
                 .push((route.base_url().to_owned(), route.model().to_owned()));
             assert_eq!(routes.len(), 1, "owning CLI selector emits one route");
-            owning_snapshot_publisher(routes, &response, &cli_calls)
+            owning_snapshot_publisher(routes, &response, &cli_calls, &cli_seen)
         };
         let cli_arguments = [
             "--model-route",
@@ -1192,6 +1210,10 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             ]
         );
         assert_eq!(cli_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cli_seen.lock().expect("seen").as_slice(),
+            &[DEFAULT_LOCAL_MODEL.to_owned()]
+        );
 
         let mut failed_output = Vec::new();
         let failure = run(
@@ -1217,9 +1239,6 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
 
     #[test]
     fn positional_question_dispatches_through_adk_and_checks_citations() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = env::temp_dir().join(format!(
             "pbi-rs-answer-{}",
             SystemTime::now()
@@ -1244,10 +1263,10 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         .expect("probe");
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).expect("probe mode");
-        let previous_dir = env::current_dir().expect("cwd");
-        let previous_probe = env::var_os("PBI_RS_PROBE");
-        env::set_current_dir(&root).expect("fixture cwd");
-        env::set_var("PBI_RS_PROBE", &probe);
+        let _env = RouteConfigEnvGuard::new(
+            &root,
+            &[("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned()))],
+        );
         let question = "where is exact_reuse_receipt?".to_owned();
         let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1. Quoted: \"back\\slash\".";
         let search_route = test_publisher(json!({
@@ -1635,13 +1654,39 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
             })
         ));
         assert!(no_hit.is_empty());
-        env::set_current_dir(previous_dir).expect("restore cwd");
-        if let Some(value) = previous_probe {
-            env::set_var("PBI_RS_PROBE", value);
-        } else {
-            env::remove_var("PBI_RS_PROBE");
-        }
+        drop(_env);
         fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn route_config_guard_restores_env_and_cwd_on_unwind() {
+        let outside = env::current_dir().expect("cwd");
+        let saved_probe = env::var_os("PBI_RS_PROBE");
+        let root = env::temp_dir().join(format!(
+            "pbi-rs-unwind-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("dir");
+        let probe = root.join("probe");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _env = RouteConfigEnvGuard::new(
+                &root,
+                &[("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned()))],
+            );
+            assert_eq!(env::current_dir().expect("cwd"), root);
+            assert_eq!(
+                env::var_os("PBI_RS_PROBE").as_deref(),
+                Some(probe.as_os_str())
+            );
+            panic!("controlled unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(env::current_dir().expect("cwd"), outside);
+        assert_eq!(env::var_os("PBI_RS_PROBE"), saved_probe);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "linux")]
