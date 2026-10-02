@@ -11,7 +11,7 @@ use pbi_rs::semantic::{
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
 mod native_search;
-use native_search::{search_repository, SearchFailure, SearchLimits};
+use native_search::{candidate_symbols, search_repository, SearchFailure, SearchLimits};
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -202,6 +202,26 @@ fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, Sema
     ))
 }
 
+fn question_code_anchor_missing(question: &str, report: &pbi_rs::EvidenceReport) -> bool {
+    if !question
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("why ")
+    {
+        return false;
+    }
+    // ponytail: exact snake_case anchors; broaden only if identifier-free questions miss often.
+    question
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|word| word.len() >= 4 && word.contains('_'))
+        .any(|word| {
+            !report
+                .evidence()
+                .iter()
+                .any(|item| item.symbol() == Some(word) || item.snippet().contains(word))
+        })
+}
+
 fn run(
     arguments: Vec<String>,
     #[cfg(test)] _test_route_injection: Option<TestRouteInjection<'_>>,
@@ -356,20 +376,7 @@ fn run(
                     ignores: options.ignores.clone(),
                 },
             )
-            .map_err(|failure| match failure {
-                SearchFailure::Deadline => {
-                    CliError::failed("native search exceeded its bounded deadline")
-                }
-                SearchFailure::Limit => {
-                    CliError::failed("native search exceeded its bounded limit")
-                }
-                SearchFailure::TargetLimit => {
-                    CliError::failed("native search exceeded the bounded target limit")
-                }
-                SearchFailure::Unavailable => {
-                    CliError::failed("native search could not read the repository")
-                }
-            })?;
+            .map_err(search_cli_error)?;
             match verify_probe_evidence(&found, &root, search_query, options.max_results) {
                 Ok(report) => Ok(Some(report)),
                 Err(EvidenceError::NoSourceLocations) => Ok(None),
@@ -383,6 +390,7 @@ fn run(
     };
     #[cfg(not(test))]
     let report = collect_evidence(&query)?;
+    let report = report.filter(|report| !semantic || !question_code_anchor_missing(&query, report));
     let report = match report {
         Some(report) => report,
         None if semantic => {
@@ -395,8 +403,25 @@ fn run(
                 .enable_all()
                 .build()
                 .map_err(|_| CliError::failed("semantic runtime could not be created"))?;
+            let candidates = candidate_symbols(
+                &root,
+                &query,
+                &SearchLimits {
+                    deadline,
+                    max_results: options.max_results,
+                    language: options.language.clone(),
+                    ignores: options.ignores.clone(),
+                },
+            )
+            .map_err(search_cli_error)?;
             let revised = runtime
-                .block_on(plan_search_query(&query, &policy, deadline, &cancellation))
+                .block_on(plan_search_query(
+                    &query,
+                    &candidates,
+                    &policy,
+                    deadline,
+                    &cancellation,
+                ))
                 .map_err(semantic_cli_error)?;
             collect_evidence(&revised)?
                 .ok_or_else(|| evidence_cli_error(EvidenceError::NoSourceLocations))?
@@ -460,6 +485,19 @@ fn evidence_cli_error(error: EvidenceError) -> CliError {
         CliError::compatibility_failed(error.to_string())
     } else {
         CliError::failed(error.to_string())
+    }
+}
+
+fn search_cli_error(failure: SearchFailure) -> CliError {
+    match failure {
+        SearchFailure::Deadline => CliError::failed("native search exceeded its bounded deadline"),
+        SearchFailure::Limit => CliError::failed("native search exceeded its bounded limit"),
+        SearchFailure::TargetLimit => {
+            CliError::failed("native search exceeded the bounded target limit")
+        }
+        SearchFailure::Unavailable => {
+            CliError::failed("native search could not read the repository")
+        }
     }
 }
 
@@ -2967,6 +3005,69 @@ mod tests {
         assert!(String::from_utf8_lossy(&output)
             .contains("The outage hold controls the stop condition."));
         drop(_env);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn semantic_question_replans_when_its_code_anchor_is_missing_from_evidence() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-anchor-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        let source = root.join("metrics.rs");
+        fs::write(&source, "fn exact_reuse_receipt() { }\n").expect("source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-1\n", source.display()),
+            &root,
+            "where is exact_reuse_receipt?",
+            DEFAULT_MAX_RESULTS,
+        )
+        .expect("verified but unrelated evidence");
+        assert!(question_code_anchor_missing(
+            "Why does persistent_outage_hold stop with attempts left?",
+            &report
+        ));
+        assert!(!question_code_anchor_missing(
+            "Why does exact_reuse_receipt() return?",
+            &report
+        ));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn candidate_tool_exposes_implementation_names_from_matching_source_files() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-candidates-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(
+            root.join("src/outage_hold.rs"),
+            "fn start() {}\nfn classify() {}\nfn remember() {}\nfn finish() {}\nfn probe() {}\nfn reload() {}\nfn count() {}\nfn wait() {}\nfn remaining() {}\nfn is_outage() -> bool { true }\n",
+        )
+        .expect("implementation");
+        fs::write(root.join("src/metrics.rs"), "fn unrelated() {}\n").expect("noise");
+        let candidates = candidate_symbols(
+            &root,
+            "Why does persistent_outage_hold stop with attempts left?",
+            &SearchLimits {
+                deadline: Instant::now() + Duration::from_secs(2),
+                max_results: DEFAULT_MAX_RESULTS,
+                language: None,
+                ignores: Vec::new(),
+            },
+        )
+        .expect("bounded source names");
+        assert!(candidates.contains(&("src/outage_hold.rs".to_owned(), "is_outage".to_owned())));
+        assert!(candidates.len() <= 8);
+        assert!(candidates.iter().all(|(path, _)| path != "src/metrics.rs"));
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

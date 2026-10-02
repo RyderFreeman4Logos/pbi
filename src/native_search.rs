@@ -16,6 +16,9 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 20_000;
 const MAX_ROOT_TARGETS: usize = 16;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+const MAX_PLAN_FILES: usize = 1;
+const MAX_PARSED_FUNCTIONS: usize = 512;
+const MAX_PLAN_SYMBOLS: usize = 8;
 
 pub struct SearchLimits {
     pub deadline: Instant,
@@ -24,6 +27,7 @@ pub struct SearchLimits {
     pub ignores: Vec<String>,
 }
 
+#[derive(Debug)]
 pub enum SearchFailure {
     Deadline,
     Limit,
@@ -115,6 +119,115 @@ pub fn search_repository(
         output.push_str(&line);
     }
     Ok(output)
+}
+
+/// List bounded, parsed Rust function names from source files whose names match
+/// a question's code-like term. The model can choose a name; it cannot choose
+/// an unchecked file read or supply evidence directly.
+pub fn candidate_symbols(
+    root: &Path,
+    question: &str,
+    limits: &SearchLimits,
+) -> Result<Vec<(String, String)>, SearchFailure> {
+    let anchor = question
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|word| word.contains('_'))
+        .max_by_key(|word| word.len())
+        .unwrap_or("");
+    let parts = anchor
+        .split('_')
+        .filter(|part| part.len() >= 3)
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
+    let mut files = Vec::new();
+    walk(
+        root,
+        root,
+        root_meta.dev(),
+        limits,
+        &gitignore_patterns(root, root_meta.dev())?,
+        true,
+        &mut files,
+    )?;
+    let mut ranked = files
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .filter_map(|path| {
+            let name = path.file_stem()?.to_string_lossy().to_lowercase();
+            let score = parts
+                .iter()
+                .filter(|part| name.contains(part.as_str()))
+                .count();
+            (score > 0).then_some((score, path))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut symbols = Vec::new();
+    for (_, path) in ranked.into_iter().take(MAX_PLAN_FILES) {
+        if Instant::now() >= limits.deadline {
+            return Err(SearchFailure::Deadline);
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.dev() != root_meta.dev()
+            || metadata.len() > MAX_FILE_BYTES
+        {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|_| SearchFailure::Unavailable)?;
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(source) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| SearchFailure::Unavailable)?
+            .to_string_lossy()
+            .into_owned();
+        for item in parsed.items {
+            match item {
+                syn::Item::Fn(function) => {
+                    symbols.push((relative.clone(), function.sig.ident.to_string()));
+                }
+                syn::Item::Impl(block) => {
+                    for item in block.items {
+                        if let syn::ImplItem::Fn(function) = item {
+                            symbols.push((relative.clone(), function.sig.ident.to_string()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if symbols.len() >= MAX_PARSED_FUNCTIONS {
+                break;
+            }
+        }
+        if symbols.len() >= MAX_PARSED_FUNCTIONS {
+            break;
+        }
+    }
+    let question_lower = question.to_lowercase();
+    let score = |name: &str| {
+        usize::from(name.starts_with("is_") || name.starts_with("should_"))
+            + name
+                .split('_')
+                .filter(|part| part.len() >= 3 && question_lower.contains(part))
+                .count()
+    };
+    symbols.sort_by(|left, right| {
+        score(&right.1)
+            .cmp(&score(&left.1))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    symbols.truncate(MAX_PLAN_SYMBOLS);
+    Ok(symbols)
 }
 
 fn walk(

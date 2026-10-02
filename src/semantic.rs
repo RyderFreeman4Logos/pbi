@@ -522,6 +522,7 @@ mod explicit_config_route_tests;
 /// The resulting text is only a query; repository reads and citation admission stay in Rust.
 pub async fn plan_search_query(
     question: &str,
+    candidates: &[(String, String)],
     policy: &ModelRoutePolicy,
     deadline: Instant,
     cancellation: &ModelRouteCancellation,
@@ -535,15 +536,18 @@ pub async fn plan_search_query(
     let schema: Value =
         serde_json::from_str(SEARCH_PLAN_SCHEMA).map_err(|_| SemanticError::Protocol)?;
     let protocol = PromptProtocol::new(
-        "Choose one likely source identifier or two related code terms for a bounded repository search. The user's term may describe behavior rather than match code spelling. Return only the query field; do not answer the question or invent source citations.",
+        "A literal search did not find trustworthy implementation evidence. If candidate_functions are supplied, choose exactly one listed function name and return it verbatim as query. For why/stop questions, prefer a state-classifying predicate over the function that drains or records attempts. Prefer implementation functions over metrics and tests. If there are no candidates, choose a different likely identifier without repeating a snake_case name from the question. Do not answer or invent citations.",
         Vec::new(),
         schema.clone(),
-        json!({"question": question}),
+        json!({
+            "question": question,
+            "candidate_functions": candidates.iter().map(|(path, name)| json!({"path":path,"name":name})).collect::<Vec<_>>(),
+        }),
         TrustDomain::ConditionallyTrustedContent,
     )
     .map_err(|_| SemanticError::Protocol)?;
     let output = StructuredOutputContract::new(schema, 512).map_err(|_| SemanticError::Protocol)?;
-    let budget = InferenceBudget::new(ReasoningEffort::Low, 128, 0)
+    let budget = InferenceBudget::new(ReasoningEffort::Low, 512, 0)
         .map(|budget| budget.with_escalation(EscalationPolicy::None))
         .map_err(|_| SemanticError::Protocol)?;
     let route_placeholder = ProviderRouteIdentity::new(
@@ -592,6 +596,7 @@ pub async fn plan_search_query(
                 && query.len() <= 128
                 && !query.chars().any(char::is_control)
                 && *query != question.trim()
+                && (candidates.is_empty() || candidates.iter().any(|(_, name)| name == query))
         })
         .ok_or(SemanticError::InvalidOutput)?;
     Ok(query.to_owned())
