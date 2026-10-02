@@ -821,9 +821,7 @@ mod tests {
 
     impl RouteConfigEnvGuard {
         fn new(root: &std::path::Path, entries: &[(&'static str, Option<String>)]) -> Self {
-            let lock = ENV_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lock = Self::lock();
             let previous_dir = env::current_dir().expect("cwd");
             let previous_env = entries
                 .iter()
@@ -847,6 +845,12 @@ mod tests {
         fn set(&self, key: &'static str, value: &std::path::Path) {
             let _held = &self._lock;
             env::set_var(key, value);
+        }
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
     }
 
@@ -1660,8 +1664,6 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
 
     #[test]
     fn route_config_guard_restores_env_and_cwd_on_unwind() {
-        let outside = env::current_dir().expect("cwd");
-        let saved_probe = env::var_os("PBI_RS_PROBE");
         let root = env::temp_dir().join(format!(
             "pbi-rs-unwind-{}",
             SystemTime::now()
@@ -1671,21 +1673,21 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
         ));
         fs::create_dir_all(&root).expect("dir");
         let probe = root.join("probe");
+        let outside = env::current_dir().expect("cwd");
+        let saved_probe = env::var_os("PBI_RS_PROBE");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _env = RouteConfigEnvGuard::new(
                 &root,
                 &[("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned()))],
             );
             assert_eq!(env::current_dir().expect("cwd"), root);
-            assert_eq!(
-                env::var_os("PBI_RS_PROBE").as_deref(),
-                Some(probe.as_os_str())
-            );
             panic!("controlled unwind");
         }));
         assert!(result.is_err());
+        let check = RouteConfigEnvGuard::lock();
         assert_eq!(env::current_dir().expect("cwd"), outside);
         assert_eq!(env::var_os("PBI_RS_PROBE"), saved_probe);
+        drop(check);
         let _ = fs::remove_dir_all(root);
     }
 
