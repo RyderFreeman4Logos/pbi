@@ -4,7 +4,8 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::FileTypeExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use workflow_adk::model_profiles::{
@@ -256,14 +257,15 @@ pub fn explicit_admitted_routes_from_environment(
     }
     let env_base = first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?;
     let env_model = first_value(&["LOCAL_MODEL", "LLM_MODEL"])?;
-    let (base_url, model) = if env_base.is_none() && env_model.is_none() {
-        match explicit_config_route()? {
-            Some(route) => route,
-            None => local_route_from_values(None, None)?,
-        }
-    } else {
-        local_route_from_values(env_base, env_model)?
+    let configured = explicit_config_route()?;
+    let (base_url, model) = match (env_base, env_model, configured) {
+        (Some(base_url), Some(model), _) => (base_url, model),
+        (Some(base_url), None, Some((_, model))) => (base_url, model),
+        (None, Some(model), Some((base_url, _))) => (base_url, model),
+        (None, None, Some(route)) => route,
+        (base_url, model, None) => local_route_from_values(base_url, model)?,
     };
+    validate_local_route(&base_url, &model)?;
     let credential_name = if let Some(name) = env::var_os("PBI_RS_CREDENTIAL_HANDLE") {
         let name = name
             .into_string()
@@ -361,6 +363,25 @@ fn local_route_from_values(
 }
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const O_NONBLOCK: i32 = 0x800;
+
+fn set_blocking(fd: i32) -> Result<(), SemanticRouteError> {
+    let flags = unsafe { libc_fcntl(fd, 3, 0) };
+    if flags < 0 || unsafe { libc_fcntl(fd, 4, flags & !O_NONBLOCK) } < 0 {
+        return Err(SemanticRouteError::InvalidConfig);
+    }
+    Ok(())
+}
+
+unsafe fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
+    // SAFETY: fd is owned by the caller; F_GETFL/F_SETFL only read or clear O_NONBLOCK.
+    unsafe {
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        fcntl(fd, cmd, arg)
+    }
+}
 
 fn explicit_config_route() -> Result<Option<(String, String)>, SemanticRouteError> {
     let Some(path) = env::var_os("PBI_CONFIG_FILE") else {
@@ -369,18 +390,29 @@ fn explicit_config_route() -> Result<Option<(String, String)>, SemanticRouteErro
     if path.is_empty() {
         return Ok(None);
     }
-    let file = fs::File::open(&path).map_err(|_| SemanticRouteError::InvalidConfig)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(&path)
+        .map_err(|_| SemanticRouteError::InvalidConfig)?;
     let metadata = file
         .metadata()
         .map_err(|_| SemanticRouteError::InvalidConfig)?;
     let kind = metadata.file_type();
-    if !kind.is_file() || kind.is_fifo() || metadata.len() > MAX_CONFIG_BYTES {
+    if !kind.is_file() || kind.is_fifo() {
         return Err(SemanticRouteError::InvalidConfig);
     }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(SemanticRouteError::InvalidConfig);
+    }
+    set_blocking(file.as_raw_fd())?;
     let mut bytes = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| SemanticRouteError::InvalidConfig)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(SemanticRouteError::InvalidConfig);
+    }
     let text = std::str::from_utf8(&bytes).map_err(|_| SemanticRouteError::InvalidConfig)?;
     let table: toml::Table = text
         .parse()
@@ -435,6 +467,10 @@ struct AllowedCitation {
     end_line: usize,
     evidence_index: usize,
 }
+
+#[cfg(test)]
+#[path = "explicit_config_route_tests.rs"]
+mod explicit_config_route_tests;
 
 pub async fn investigate(
     question: &str,
