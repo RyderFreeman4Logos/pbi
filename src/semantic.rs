@@ -775,8 +775,9 @@ fn decode_answer(
             .iter()
             .find(|allowed| {
                 allowed.path == path
-                    && allowed.start_line == start_line
-                    && allowed.end_line == end_line
+                    && start_line <= end_line
+                    && allowed.start_line <= start_line
+                    && end_line <= allowed.end_line
             })
             .ok_or(SemanticError::CitationMismatch)?;
         if citations
@@ -786,9 +787,14 @@ fn decode_answer(
             return Err(SemanticError::CitationMismatch);
         }
         citations.push(evidence[matched.evidence_index].clone());
-        selected.push(matched);
+        selected.push(AllowedCitation {
+            path: matched.path.clone(),
+            start_line,
+            end_line,
+            evidence_index: matched.evidence_index,
+        });
     }
-    answer_body_citations_match(&answer, &selected)?;
+    answer_body_citations_match(&answer, &selected.iter().collect::<Vec<_>>())?;
     Ok(SemanticAnswer {
         answer,
         uncertainty,
@@ -1557,6 +1563,50 @@ mod tests {
         assert!(answer.answer().contains("parser"));
         assert!(!answer.uncertainty().is_empty());
         assert!(!answer.invocation_identity().is_empty());
+    }
+
+    #[test]
+    fn model_citation_within_verified_span_is_grounded() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("src/lib.rs");
+        fs::write(
+            &source,
+            "fn empty_guard() {\n    if empty { return Err(SourceOutsideRoot); }\n}\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-3\n", source.display()),
+            &fixture.root,
+            "empty_guard",
+            8,
+        )
+        .expect("verified span");
+        let item = &report.evidence()[0];
+        assert_eq!(item.location().start_line(), 1);
+        assert_eq!(item.location().end_line(), 2);
+        let allowed = [AllowedCitation {
+            path: "src/lib.rs".to_owned(),
+            start_line: 1,
+            end_line: 2,
+            evidence_index: 0,
+        }];
+        let response = json!({
+            "answer":"The guard at src/lib.rs:2 returns SourceOutsideRoot for an empty path.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[{"path":"src/lib.rs","start_line":2,"end_line":2}]
+        });
+        let answer = decode_answer(response, &allowed, &[item], "test-route".to_owned())
+            .expect("the precise subspan remains verified");
+        assert_eq!(answer.citations().len(), 1);
+        let outside = json!({
+            "answer":"The guard returns SourceOutsideRoot.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[{"path":"src/lib.rs","start_line":3,"end_line":3}]
+        });
+        assert_eq!(
+            decode_answer(outside, &allowed, &[item], "test-route".to_owned()),
+            Err(SemanticError::CitationMismatch)
+        );
     }
 
     #[test]

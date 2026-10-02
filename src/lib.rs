@@ -11,6 +11,7 @@ pub mod semantic;
 
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVIDENCE_LINES: usize = 4;
+const MAX_FOLLOWING_LINES: usize = 8;
 
 /// A verified source path and the exact cited line returned to a caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,7 +146,7 @@ impl EvidenceReport {
                 continue;
             }
             let end = start
-                .saturating_add(MAX_EVIDENCE_LINES - 1)
+                .saturating_add(MAX_FOLLOWING_LINES - 1)
                 .min(lines.len());
             let snippet = lines[start - 1..end].join("\n");
             if snippet.len() > 4096 {
@@ -2351,7 +2352,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         let source = fixture.root.join("src/lib.rs");
         fs::write(
             &source,
-            "fn display_relative() {\n    let relative = source\n        .strip_prefix(root)\n        .unwrap();\n    if relative.as_os_str().is_empty() {\n        return Err(SourceOutsideRoot);\n    }\n}\n",
+            "fn display_relative() {\n    let relative = source\n        .strip_prefix(root)\n        .unwrap();\n    // Validate the relative path.\n    // Keep citations inside this function.\n    // The guard follows this setup.\n    if relative.as_os_str().is_empty() {\n        return Err(SourceOutsideRoot);\n    }\n}\n",
         )
         .expect("source");
         let report = verify_probe_evidence(
@@ -2365,8 +2366,8 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             .with_following_lines(&fixture.root, 8)
             .expect("bounded adjacent source");
         assert!(report.evidence().iter().any(|evidence| {
-            evidence.location().start_line() <= 5
-                && evidence.location().end_line() >= 6
+            evidence.location().start_line() <= 8
+                && evidence.location().end_line() >= 9
                 && evidence.snippet().contains("SourceOutsideRoot")
         }));
     }
