@@ -36,6 +36,8 @@ pub const MODEL_CREDENTIAL_HANDLES: [&str; 3] =
     ["CLIPROXY_API_KEY", "OPENAI_API_KEY", "LOCAL_ROUTER_API_KEY"];
 const ADK_ENABLE_ENV: &str = "PBI_RS_ADK_ENABLE";
 
+pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const OUTPUT_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
@@ -1077,47 +1079,18 @@ key = \"also-not-read\"
 ",
         )
         .expect("fixture config");
-        let previous_enable = env::var_os("PBI_RS_ADK_ENABLE");
-        let previous_config = env::var_os("PBI_CONFIG_FILE");
-        let previous_base = env::var_os("CLIPROXY_BASE_URL");
-        let previous_model = env::var_os("LOCAL_MODEL");
-        let previous_handle = env::var_os("PBI_RS_CREDENTIAL_HANDLE");
-        env::set_var("PBI_RS_ADK_ENABLE", "1");
-        env::set_var("PBI_CONFIG_FILE", &config);
-        env::remove_var("CLIPROXY_BASE_URL");
-        env::remove_var("LOCAL_ROUTER_BASEURL");
-        env::remove_var("LOCAL_MODEL");
-        env::remove_var("LLM_MODEL");
-        env::set_var("PBI_RS_CREDENTIAL_HANDLE", "CLIPROXY_API_KEY");
+        let _env = explicit_config_route_tests::enabled(&[(
+            "PBI_CONFIG_FILE",
+            Some(config.to_str().expect("utf8")),
+        )]);
         let routes = explicit_admitted_routes_from_environment()
             .expect("explicit config route")
             .expect("publisher when ADK is enabled");
-        let publisher = local_route_publisher_from_admitted_routes(&routes);
-        if let Some(value) = previous_enable {
-            env::set_var("PBI_RS_ADK_ENABLE", value);
-        } else {
-            env::remove_var("PBI_RS_ADK_ENABLE");
-        }
-        if let Some(value) = previous_config {
-            env::set_var("PBI_CONFIG_FILE", value);
-        } else {
-            env::remove_var("PBI_CONFIG_FILE");
-        }
-        if let Some(value) = previous_base {
-            env::set_var("CLIPROXY_BASE_URL", value);
-        }
-        if let Some(value) = previous_model {
-            env::set_var("LOCAL_MODEL", value);
-        }
-        if let Some(value) = previous_handle {
-            env::set_var("PBI_RS_CREDENTIAL_HANDLE", value);
-        } else {
-            env::remove_var("PBI_RS_CREDENTIAL_HANDLE");
-        }
-        let publisher = publisher.expect("publisher from selected route");
-        let _publisher = publisher;
+        let publisher = local_route_publisher_from_admitted_routes(&routes)
+            .expect("publisher from selected route");
         let selected = routes.first().expect("selected endpoint");
         assert_eq!(selected.model(), "abliterated-qwen-latest-27b-low");
         assert_eq!(selected.base_url(), "http://gb10:18009/v1");
+        let _publisher = publisher;
     }
 }

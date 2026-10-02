@@ -4,7 +4,10 @@ use pbi_rs::semantic::{
     SemanticRouteError,
 };
 #[cfg(test)]
-use pbi_rs::semantic::{AdmittedLocalModelRoute, DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL};
+use pbi_rs::semantic::{
+    explicit_admitted_routes_from_environment, local_route_publisher_from_admitted_routes,
+    AdmittedLocalModelRoute, DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, ENV_TEST_LOCK,
+};
 use pbi_rs::{verify_probe_evidence, SourceEvidence};
 
 mod probe_scope;
@@ -291,10 +294,13 @@ fn run(
         #[cfg(test)]
         let owned_publisher = match _test_route_injection {
             Some(TestRouteInjection::Factory { build, .. }) => {
-                let routes = admitted_routes
-                    .as_deref()
-                    .ok_or_else(|| route_cli_error(SemanticRouteError::IncompleteConfig))?;
-                Some(build(routes).map_err(route_cli_error)?)
+                let routes = match admitted_routes.as_ref() {
+                    Some(routes) => routes.clone(),
+                    None => explicit_admitted_routes_from_environment()
+                        .map_err(route_cli_error)?
+                        .ok_or_else(|| route_cli_error(SemanticRouteError::IncompleteConfig))?,
+                };
+                Some(build(&routes).map_err(route_cli_error)?)
             }
             Some(TestRouteInjection::Publisher(_)) => None,
             None => match admitted_routes.as_deref() {
@@ -803,9 +809,99 @@ mod tests {
     use std::fs;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     use std::time::SystemTime;
+
+    struct RouteConfigEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous_dir: std::path::PathBuf,
+        previous_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl RouteConfigEnvGuard {
+        fn new(root: &std::path::Path, entries: &[(&'static str, Option<String>)]) -> Self {
+            let lock = ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous_dir = env::current_dir().expect("cwd");
+            let previous_env = entries
+                .iter()
+                .map(|(key, _)| (*key, env::var_os(key)))
+                .collect();
+            env::set_current_dir(root).expect("fixture cwd");
+            for (key, value) in entries {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+            Self {
+                _lock: lock,
+                previous_dir,
+                previous_env,
+            }
+        }
+
+        fn set(&self, key: &'static str, value: &std::path::Path) {
+            let _held = &self._lock;
+            env::set_var(key, value);
+        }
+    }
+
+    impl Drop for RouteConfigEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous_env {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+            let _ = env::set_current_dir(&self.previous_dir);
+        }
+    }
+
+    fn owning_snapshot_publisher(
+        routes: &[AdmittedLocalModelRoute],
+        response: &str,
+        calls: &Arc<AtomicUsize>,
+    ) -> Result<ModelRoutePublisher, SemanticRouteError> {
+        let route = routes.first().ok_or(SemanticRouteError::IncompleteConfig)?;
+        let real = local_route_publisher_from_admitted_routes(routes)?;
+        let policy = real.policy(Instant::now());
+        let real_snapshot = policy.snapshot();
+        let candidate = route.candidate();
+        assert!(
+            real_snapshot.candidates().contains(&candidate),
+            "owning snapshot must keep the selected route identity"
+        );
+        let profile = FakeModelProfile::new(
+            candidate.profile().name(),
+            candidate.profile().version(),
+            "fake-model",
+            [response.to_owned()],
+        );
+        let registry = ModelProfileRegistry::new()
+            .with_worker(profile)
+            .map_err(|_| SemanticRouteError::Profile)?;
+        let snapshot = ModelRouteSnapshot::new(
+            registry,
+            vec![candidate.clone()],
+            ModelRouteAuthorization::new(vec![candidate.clone()]),
+        )
+        .map_err(|_| SemanticRouteError::Profile)?
+        .with_test_llm(
+            candidate,
+            Arc::new(TestRouteLlm {
+                calls: calls.clone(),
+                behavior: TestModelBehavior::Respond(response.to_owned()),
+            }),
+        )
+        .map_err(|_| SemanticRouteError::Profile)?;
+        Ok(ModelRoutePublisher::new(snapshot))
+    }
 
     fn test_publisher(response: serde_json::Value) -> ModelRoutePublisher {
         let profile = FakeModelProfile::new("pbi-test", "1", "fake-model", [response.to_string()]);
@@ -883,21 +979,14 @@ mod tests {
         if routes.len() != 2 {
             return Err(SemanticRouteError::IncompleteConfig);
         }
+        let test_profile = |route: &AdmittedLocalModelRoute, response: String| {
+            FakeModelProfile::new(route.profile_name(), "1", "fake-model", [response])
+        };
         let mut registry = ModelProfileRegistry::new()
-            .with_worker(FakeModelProfile::new(
-                routes[0].profile_name(),
-                "1",
-                routes[0].model(),
-                [response],
-            ))
+            .with_worker(test_profile(&routes[0], response.to_owned()))
             .map_err(|_| SemanticRouteError::Profile)?;
         registry
-            .register(FakeModelProfile::new(
-                routes[1].profile_name(),
-                "1",
-                routes[1].model(),
-                [response],
-            ))
+            .register(test_profile(&routes[1], response.to_owned()))
             .map_err(|_| SemanticRouteError::Profile)?;
         let candidates = routes
             .iter()
@@ -962,7 +1051,175 @@ mod tests {
     }
 
     #[test]
+    fn env_toml_route_reaches_adk_snapshot_and_cli_route_wins() {
+        let root = env::temp_dir().join(format!(
+            "pbi-rs-route-contract-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("receipt.py"),
+            "def exact_reuse_receipt():\n    return True\n",
+        )
+        .expect("source");
+        let probe = root.join("probe");
+        fs::write(
+            &probe,
+            r##"#!/bin/sh
+printf '%s\n' "$@" > "$PWD/probe.args"
+printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
+"##,
+        )
+        .expect("probe");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).expect("probe mode");
+
+        let toml_path = root.join("models.toml");
+        let selected_model = "abliterated-qwen-latest-27b-low";
+        fs::write(
+            &toml_path,
+            format!(
+                "primary_model = \"{selected_model}\"\n\n[[endpoints]]\nmodel = \"{selected_model}\"\nbase_url = \"http://gb10:18009/v1\"\n"
+            ),
+        )
+        .expect("isolated config fixture");
+        let _env = RouteConfigEnvGuard::new(
+            &root,
+            &[
+                ("PBI_RS_ADK_ENABLE", Some("1".to_owned())),
+                (
+                    "PBI_RS_CREDENTIAL_HANDLE",
+                    Some("CLIPROXY_API_KEY".to_owned()),
+                ),
+                (
+                    "PBI_CONFIG_FILE",
+                    Some(toml_path.to_string_lossy().into_owned()),
+                ),
+                ("PBI_RS_PROBE", Some(probe.to_string_lossy().into_owned())),
+                ("LOCAL_MODEL", Some(selected_model.to_owned())),
+                ("LLM_MODEL", None),
+                ("CLIPROXY_BASE_URL", None),
+                ("LOCAL_ROUTER_BASEURL", None),
+            ],
+        );
+
+        let question = "where is exact_reuse_receipt?".to_owned();
+        let answer = "Resolved route identity reached the ADK test model.";
+        let response = json!({
+            "answer": answer,
+            "uncertainty": "Only the verified source span was inspected.",
+            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+        })
+        .to_string();
+        let observed = Mutex::new(Vec::<(String, String)>::new());
+        let env_calls = Arc::new(AtomicUsize::new(0));
+        let env_factory = |routes: &[AdmittedLocalModelRoute]| {
+            let route = routes.first().ok_or(SemanticRouteError::IncompleteConfig)?;
+            observed
+                .lock()
+                .expect("route observations")
+                .push((route.base_url().to_owned(), route.model().to_owned()));
+            assert_eq!(routes.len(), 1, "owning env/TOML selector emits one route");
+            owning_snapshot_publisher(routes, &response, &env_calls)
+        };
+        let mut env_output = Vec::new();
+        assert!(matches!(
+            run(
+                vec!["--message".to_owned(), question.clone()],
+                Some(TestRouteInjection::Factory {
+                    build: &env_factory,
+                    deadline: Duration::from_secs(30),
+                }),
+                &mut env_output,
+            ),
+            Ok(0)
+        ));
+        assert_semantic_message_output(&env_output, answer);
+        assert_eq!(
+            observed.lock().expect("route observations").as_slice(),
+            &[("http://gb10:18009/v1".to_owned(), selected_model.to_owned())]
+        );
+        assert_eq!(env_calls.load(Ordering::SeqCst), 1);
+
+        let invalid_toml = root.join("invalid.toml");
+        fs::write(&invalid_toml, "primary_model = [\n").expect("invalid config fixture");
+        _env.set("PBI_CONFIG_FILE", &invalid_toml);
+        let cli_calls = Arc::new(AtomicUsize::new(0));
+        let cli_factory = |routes: &[AdmittedLocalModelRoute]| {
+            let route = routes.first().ok_or(SemanticRouteError::IncompleteConfig)?;
+            observed
+                .lock()
+                .expect("route observations")
+                .push((route.base_url().to_owned(), route.model().to_owned()));
+            assert_eq!(routes.len(), 1, "owning CLI selector emits one route");
+            owning_snapshot_publisher(routes, &response, &cli_calls)
+        };
+        let cli_arguments = [
+            "--model-route",
+            DEFAULT_LOCAL_BASE_URL,
+            DEFAULT_LOCAL_MODEL,
+            "CLIPROXY_API_KEY",
+            "--message",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once(question.clone()))
+        .collect();
+        let mut cli_output = Vec::new();
+        assert!(matches!(
+            run(
+                cli_arguments,
+                Some(TestRouteInjection::Factory {
+                    build: &cli_factory,
+                    deadline: Duration::from_secs(30),
+                }),
+                &mut cli_output,
+            ),
+            Ok(0)
+        ));
+        assert_semantic_message_output(&cli_output, answer);
+        assert_eq!(
+            observed.lock().expect("route observations").as_slice(),
+            &[
+                ("http://gb10:18009/v1".to_owned(), selected_model.to_owned()),
+                (
+                    DEFAULT_LOCAL_BASE_URL.to_owned(),
+                    DEFAULT_LOCAL_MODEL.to_owned()
+                ),
+            ]
+        );
+        assert_eq!(cli_calls.load(Ordering::SeqCst), 1);
+
+        let mut failed_output = Vec::new();
+        let failure = run(
+            vec!["--message".to_owned(), question],
+            Some(TestRouteInjection::Factory {
+                build: &env_factory,
+                deadline: Duration::from_secs(30),
+            }),
+            &mut failed_output,
+        )
+        .expect_err("an explicitly malformed config must fail closed");
+        assert_eq!(failure.code, 78);
+        assert!(failed_output.is_empty());
+        assert_eq!(
+            observed.lock().expect("route observations").len(),
+            2,
+            "invalid config must be rejected before publisher construction"
+        );
+
+        drop(_env);
+        fs::remove_dir_all(root).expect("remove isolated fixture");
+    }
+
+    #[test]
     fn positional_question_dispatches_through_adk_and_checks_citations() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = env::temp_dir().join(format!(
             "pbi-rs-answer-{}",
             SystemTime::now()
@@ -1066,7 +1323,10 @@ printf 'File: %s/receipt.py, Lines: 1-2\n' "$PWD"
                 }),
                 &mut fallback_output,
             )
-            .unwrap_or_else(|_| panic!("authorized local route fallback failed")),
+            .unwrap_or_else(|error| panic!(
+                "authorized local route fallback failed: {}",
+                error.message
+            )),
             0
         );
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);

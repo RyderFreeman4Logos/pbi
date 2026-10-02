@@ -1,22 +1,21 @@
 use super::*;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 const LOW: &str = "abliterated-qwen-latest-27b-low";
 const NONE: &str = "abliterated-qwen-latest-27b-none";
 const LOCAL: &str = "http://localhost:18317/v1";
 const GB10: &str = "http://gb10:18009/v1";
 
-struct EnvGuard {
+pub(super) struct EnvGuard {
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
-        let lock = ENV_LOCK.lock().expect("env lock");
+        let lock = super::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved = pairs
             .iter()
             .map(|(name, _)| (*name, env::var_os(name)))
@@ -42,7 +41,7 @@ impl Drop for EnvGuard {
     }
 }
 
-fn enabled(extra: &[(&'static str, Option<&str>)]) -> EnvGuard {
+pub(super) fn enabled(extra: &[(&'static str, Option<&str>)]) -> EnvGuard {
     let mut pairs = vec![
         ("PBI_RS_ADK_ENABLE", Some("1")),
         ("PBI_RS_CREDENTIAL_HANDLE", Some("CLIPROXY_API_KEY")),
