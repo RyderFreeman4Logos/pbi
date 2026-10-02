@@ -1515,6 +1515,113 @@ mod tests {
                 );
             }
         }
+        // Quotes/stars are legal filename bytes, including after punctuation;
+        // backticks are not. Obtain every selected span from the real verifier.
+        for path in [
+            "src/a,'b.py",
+            "src/a,\"b.py",
+            "'receipt'.py",
+            "\"receipt\".py",
+            "src/a;'b.py",
+            "src/a;\"b.py",
+            "src/('b.py)",
+            "src/[\"b.py]",
+            "src/a,*b.py",
+            "*receipt*.py",
+            "src/源,'b.py",
+            "src/a,'b',c.py",
+            "src/[\"b\"].py",
+            "src/a;*b.py",
+            "src/(*b.py)",
+            "src/a,\"b\",c.py",
+        ] {
+            fs::create_dir_all(root.join(path).parent().expect("parent")).expect("directory");
+            fs::write(
+                root.join(path),
+                "def exact_reuse_receipt():\n    return True\n",
+            )
+            .expect("quote source");
+            let known = verified(&[path], question);
+            assert_eq!(known, json!([{"path":path,"start_line":1,"end_line":1}]));
+            for (left, right) in [
+                ("", ""),
+                ("'", "'"),
+                ("\"", "\""),
+                ("*", "*"),
+                ("**", "**"),
+                ("`", "`"),
+                ("['", "']"),
+                ("(\"", "\")"),
+            ] {
+                for (suffix, accepted) in [
+                    ("1", true),
+                    ("01", true),
+                    ("1-1", true),
+                    ("99", false),
+                    ("0", false),
+                    ("1-", false),
+                    ("1-2", false),
+                    ("2-1", false),
+                    ("+1", false),
+                    ("18446744073709551616", false),
+                    ("１", false),
+                ] {
+                    check(
+                        "quote-context",
+                        question,
+                        &known,
+                        &format!("See {left}{path}:{suffix}{right}."),
+                        accepted,
+                    );
+                }
+                for body in [
+                    format!("See {left}{path}:1{right},{left}{path}:1{right}."),
+                    format!("See {left}{path}:1;{path}:1{right}."),
+                    format!("See `{left}{path}:1{right}`."),
+                ] {
+                    check("quote-adjacent", question, &known, &body, true);
+                }
+                for (tail, accepted) in [
+                    (format!("{path}:1"), true),
+                    ("missing.rs:99".to_owned(), false),
+                ] {
+                    check(
+                        "quote-list",
+                        question,
+                        &known,
+                        &format!("See {left}{path}:1,{tail}{right}."),
+                        accepted,
+                    );
+                }
+            }
+            for prefix in ["../", "missing,", "src/`"] {
+                check(
+                    "quote-whole-path",
+                    question,
+                    &known,
+                    &format!("See '{prefix}{path}:1'."),
+                    false,
+                );
+            }
+        }
+        for path in ["src/a,`b.py", "src/a;`b.py", "src/[`b.py]", "`receipt`.py"] {
+            fs::create_dir_all(root.join(path).parent().expect("parent")).expect("directory");
+            fs::write(
+                root.join(path),
+                "def exact_reuse_receipt():\n    return True\n",
+            )
+            .expect("backtick source");
+            let known = verified(&[path], question);
+            for marker in ["", "'", "\"", "*", "`"] {
+                check(
+                    "quote-forbidden",
+                    question,
+                    &known,
+                    &format!("See {marker}{path}:1{marker}."),
+                    false,
+                );
+            }
+        }
         verified(&["receipt.py"], question);
         fs::write(
             root.join("other.py"),
