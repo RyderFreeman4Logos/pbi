@@ -719,6 +719,23 @@ fn native_search_respects_nested_gitignore_and_negation() {
 }
 
 #[test]
+fn native_search_finds_checkout_source() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["search", "display_relative"])
+        .output()
+        .expect("search checkout");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("src/lib.rs"));
+}
+
+#[test]
 fn native_search_refuses_symlinked_nested_gitignore_outside_root() {
     let fixture = ScopeFixture::new();
     let src = fixture.root.join("src");

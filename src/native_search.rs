@@ -258,7 +258,6 @@ fn walk(root: &Path, device: u64, limits: &SearchLimits) -> Result<Vec<PathBuf>,
         .git_global(false)
         .git_exclude(false)
         .require_git(false)
-        .sort_by_file_name(|left, right| left.cmp(right))
         .filter_entry(move |entry| {
             if entry.depth() == 0 {
                 return true;
