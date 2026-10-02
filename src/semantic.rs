@@ -264,12 +264,12 @@ pub fn explicit_admitted_routes_from_environment(
     } else {
         let configured = explicit_config_route()?;
         match (env_base, env_model, configured) {
-            (Some(base_url), None, Some((model, _))) => (base_url, model),
-            (None, Some(model), Some((_, endpoints))) => {
-                endpoint_base_for_model(&endpoints, &model)?
+            (Some(base_url), None, Some(config)) => (base_url, config.primary),
+            (None, Some(model), Some(config)) => {
+                endpoint_base_for_model(&config.endpoints, &model)?
             }
-            (None, None, Some((primary, endpoints))) => {
-                endpoint_base_for_model(&endpoints, &primary)?
+            (None, None, Some(config)) => {
+                endpoint_base_for_model(&config.endpoints, &config.primary)?
             }
             (base_url, model, None) => local_route_from_values(base_url, model)?,
             (Some(_), Some(_), Some(_)) => unreachable!("both fields returned before config"),
@@ -393,7 +393,12 @@ unsafe fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
     }
 }
 
-fn explicit_config_route() -> Result<Option<(String, Vec<(String, String)>)>, SemanticRouteError> {
+struct ExplicitConfig {
+    primary: String,
+    endpoints: Vec<(String, String)>,
+}
+
+fn explicit_config_route() -> Result<Option<ExplicitConfig>, SemanticRouteError> {
     let Some(path) = env::var_os("PBI_CONFIG_FILE") else {
         return Ok(None);
     };
@@ -450,7 +455,10 @@ fn explicit_config_route() -> Result<Option<(String, Vec<(String, String)>)>, Se
     if parsed.is_empty() {
         return Err(SemanticRouteError::InvalidConfig);
     }
-    Ok(Some((selected.to_owned(), parsed)))
+    Ok(Some(ExplicitConfig {
+        primary: selected.to_owned(),
+        endpoints: parsed,
+    }))
 }
 
 fn endpoint_base_for_model(
