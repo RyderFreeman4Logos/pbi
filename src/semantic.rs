@@ -668,7 +668,7 @@ pub async fn investigate(
     let output_schema: Value =
         serde_json::from_str(OUTPUT_SCHEMA).map_err(|_| SemanticError::Protocol)?;
     let protocol = PromptProtocol::new(
-        "Answer only from VERIFIED_EVIDENCE. For why questions, state the direct stop condition and cite its calculation; also state how the caller uses the return value and cite that caller. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
+        "Answer only from VERIFIED_EVIDENCE. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
         Vec::new(),
         output_schema.clone(),
         common_data,
