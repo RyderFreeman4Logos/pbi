@@ -231,7 +231,49 @@ impl EvidenceReport {
             let calls = declaration_identity::calls(&source);
             sources.push((path, source, declarations, calls));
         }
-        let fields = sources
+        let mut module_files = Vec::new();
+        for (path, source, _, calls) in &sources {
+            let Some(parent_dir) = path.parent() else {
+                continue;
+            };
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            for call in calls {
+                let Some(module) = call.marker.split("::").next() else {
+                    continue;
+                };
+                if module.is_empty() || module.contains('.') || module == call.marker {
+                    continue;
+                }
+                let candidate = parent_dir.join(stem).join(format!("{module}.rs"));
+                if sources.iter().any(|(seen, _, _, _)| seen == &candidate)
+                    || module_files.iter().any(|seen| seen == &candidate)
+                {
+                    continue;
+                }
+                let Some(resolved) = resolve_candidate_path(&candidate, &root) else {
+                    continue;
+                };
+                if source_is_too_large(&resolved)
+                    || fs::metadata(&resolved)
+                        .map_err(|_| EvidenceError::SourceUnavailable)?
+                        .dev()
+                        != root_device
+                {
+                    return Err(EvidenceError::SourceUnavailable);
+                }
+                module_files.push(resolved);
+            }
+            let _ = source;
+        }
+        for path in module_files {
+            let source = fs::read_to_string(&path).map_err(|_| EvidenceError::SourceUnavailable)?;
+            let declarations = declaration_identity::declarations(&source);
+            let calls = declaration_identity::calls(&source);
+            sources.push((path, source, declarations, calls));
+        }
+        let all_fields = sources
             .iter()
             .flat_map(|(_, source, _, _)| declaration_identity::field_types(source))
             .collect::<Vec<_>>();
@@ -259,6 +301,13 @@ impl EvidenceReport {
                 })
                 .unwrap_or_default();
             calls.sort_by_key(|call| {
+                let fields = declaration_identity::field_types(
+                    sources
+                        .iter()
+                        .find(|(path, _, _, _)| path == item.location().path())
+                        .map(|(_, source, _, _)| source.as_str())
+                        .unwrap_or(""),
+                );
                 let specificity = if call.marker.starts_with('.') {
                     usize::from(declaration_identity::receiver_owner(call, &fields).is_none())
                 } else if call.marker.contains("::") {
@@ -278,7 +327,15 @@ impl EvidenceReport {
                         ("bare", "", call.marker.as_str())
                     };
                 let receiver = if kind == "method" {
-                    let Some(owner) = declaration_identity::receiver_owner(&call, &fields) else {
+                    let own = declaration_identity::field_types(
+                        sources
+                            .iter()
+                            .find(|(path, _, _, _)| path == item.location().path())
+                            .map(|(_, source, _, _)| source.as_str())
+                            .unwrap_or(""),
+                    );
+                    let fields = if own.is_empty() { &all_fields } else { &own };
+                    let Some(owner) = declaration_identity::receiver_owner(&call, fields) else {
                         continue;
                     };
                     Some(owner)
@@ -289,8 +346,19 @@ impl EvidenceReport {
                 for (source_index, (path, _, declarations, _)) in sources.iter().enumerate() {
                     let same_file = path == item.location().path();
                     let file_stem = path.file_stem().and_then(|stem| stem.to_str());
+                    let child_module = item.location().path().parent().is_some_and(|parent| {
+                        path.parent()
+                            == Some(
+                                &parent
+                                    .join(item.location().path().file_stem().unwrap_or_default()),
+                            )
+                            && file_stem == Some(qualifier)
+                    });
                     if (kind != "qualified" && !same_file)
-                        || (kind == "qualified" && file_stem != Some(qualifier) && !same_file)
+                        || (kind == "qualified"
+                            && file_stem != Some(qualifier)
+                            && !same_file
+                            && !child_module)
                     {
                         continue;
                     }
@@ -2923,6 +2991,72 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             assert!(text.contains(required), "missing {required}: {text}");
         }
         assert!(report.evidence().len() <= 8);
+        let stop = report
+            .evidence()
+            .iter()
+            .position(|item| item.snippet().contains("return false"))
+            .expect("stop branch");
+        let selected = report.causal_indices(stop);
+        let selected_text = selected
+            .iter()
+            .map(|index| report.evidence()[*index].snippet())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            selected_text.contains("can_retry = hold::wait(runtime).await"),
+            "assignment use left the stop path: {selected_text}"
+        );
+        assert!(
+            !selected_text.contains("fn later"),
+            "an independent caller stayed on the stop path: {selected_text}"
+        );
+    }
+
+    #[test]
+    fn child_module_method_call_keeps_the_assignment_on_the_stop_path() {
+        let fixture = Fixture::new();
+        let caller = fixture.root.join("src/proxy.rs");
+        let module = fixture.root.join("src/proxy");
+        fs::create_dir(&module).expect("module dir");
+        fs::write(
+            &caller,
+            "mod outage_hold;\nstruct Runtime { hold: outage_hold::Hold }\nasync fn attempt(runtime: &Runtime) -> bool {\n    let mut can_retry = true;\n    if outage_hold::is_outage(runtime) {\n        can_retry = outage_hold::wait(runtime).await;\n    }\n    can_retry\n}\n",
+        )
+        .expect("caller");
+        fs::write(
+            module.join("outage_hold.rs"),
+            "struct Hold;\nimpl Hold {\n    fn remaining(&self) -> u64 { 0 }\n    async fn wait(&self) -> bool {\n        if self.remaining() == 0 { return false; }\n        true\n    }\n}\npub(super) async fn wait(runtime: &super::Runtime) -> bool {\n    runtime.hold.wait().await\n}\npub(super) fn is_outage(runtime: &super::Runtime) -> bool { true }\n",
+        )
+        .expect("module");
+        let report = verify_probe_evidence(&probe_file(&caller), &fixture.root, "outage_hold", 8)
+            .expect("caller seed")
+            .with_following_lines(&fixture.root, 8)
+            .expect("module follow");
+        let text = report
+            .evidence()
+            .iter()
+            .map(SourceEvidence::snippet)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("return false"),
+            "child module stop was not followed: {text}"
+        );
+        let stop = report
+            .evidence()
+            .iter()
+            .position(|item| item.snippet().contains("return false"))
+            .expect("stop");
+        let selected = report
+            .causal_indices(stop)
+            .iter()
+            .map(|index| report.evidence()[*index].snippet())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            selected.contains("can_retry = outage_hold::wait(runtime).await"),
+            "assignment use left the module stop path: {selected}"
+        );
     }
 
     #[test]

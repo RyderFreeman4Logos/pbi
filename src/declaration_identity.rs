@@ -34,9 +34,15 @@ impl OwnerPath {
     }
 
     pub(super) fn matches_receiver(&self, query: &str, file_stem: Option<&str>) -> bool {
+        let module_matches = |module: &str| {
+            file_stem
+                == module
+                    .rsplit_once("::")
+                    .map_or(Some(module), |(_, last)| Some(last))
+        };
         self.equals(query)
             || query.rsplit_once("::").is_some_and(|(module, ty)| {
-                file_stem == Some(module) && self.0.len() == 1 && self.0[0] == bare(ty)
+                module_matches(module) && self.0.len() == 1 && self.0[0] == bare(ty)
             })
     }
 
@@ -203,7 +209,11 @@ impl CallCollector<'_> {
                 let Pat::Ident(name) = &*arg.pat else {
                     return None;
                 };
-                Some((name.ident.to_string(), type_path(&arg.ty)?))
+                Some((name.ident.to_string(), {
+                    let resolved = type_path(&arg.ty)
+                        .map(|ty| ty.strip_prefix("super::").unwrap_or(&ty).to_owned());
+                    resolved
+                }?))
             })
             .collect();
     }
