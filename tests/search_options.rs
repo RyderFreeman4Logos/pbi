@@ -199,6 +199,82 @@ fn raw_blocks_merge_only_within_line_threshold_before_result_cap() {
 }
 
 #[test]
+fn raw_strict_elastic_syntax_validates_and_applies_boolean_query() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("alpha.rs"), "fn alpha() {}\n").expect("alpha");
+    fs::write(fixture.root.join("both.rs"), "fn alpha() { beta(); }\n").expect("both");
+    fs::write(fixture.root.join("beta.rs"), "fn beta() {}\n").expect("beta");
+    fs::write(fixture.root.join("quoted.rs"), "fn camelCase() {}\n").expect("quoted");
+    for query in ["alpha beta", "camelCase", "snake_case"] {
+        let output = fixture.run(
+            &["search", "--bm25", "--strict-elastic-syntax", query],
+            "raw",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{query}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let filtered = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--strict-elastic-syntax",
+            "--format=json",
+            "alpha AND NOT beta",
+        ],
+        "raw",
+    );
+    assert!(
+        filtered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&filtered.stdout).expect("strict JSON");
+    assert_eq!(rows.as_array().expect("rows").len(), 1);
+    assert_eq!(rows[0]["file"], "alpha.rs");
+    let quoted = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--strict-elastic-syntax",
+            "--format=json",
+            "\"camelCase\"",
+        ],
+        "raw",
+    );
+    assert!(
+        quoted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&quoted.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&quoted.stdout).expect("quoted JSON");
+    assert_eq!(rows[0]["file"], "quoted.rs");
+    let grouped = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--strict-elastic-syntax",
+            "--files-only",
+            "(alpha OR beta) AND NOT missing",
+        ],
+        "raw",
+    );
+    assert!(
+        grouped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&grouped.stderr)
+    );
+    let paths = String::from_utf8_lossy(&grouped.stdout);
+    assert!(
+        paths.contains("alpha.rs") && paths.contains("both.rs") && paths.contains("beta.rs"),
+        "{paths}"
+    );
+}
+
+#[test]
 fn raw_native_bm25_json_is_bounded_and_scope_safe() {
     let fixture = ScopeFixture::new();
     fs::write(fixture.root.join("kept.rs"), "fn raw_marker() {}\n").expect("kept source");
@@ -753,12 +829,6 @@ fn raw_backend_only_options_are_refused_instead_of_ignored() {
         vec!["search", "--bm25", "--reranker=bert", "search_option"],
         vec!["search", "--bm25", "--reranker", "search_option"],
         vec!["search", "--bm25", "--question", "another", "search_option"],
-        vec![
-            "search",
-            "--bm25",
-            "--strict-elastic-syntax",
-            "search_option",
-        ],
     ] {
         let output = fixture.run(&args, "raw");
         assert_eq!(output.status.code(), Some(2), "{args:?}");

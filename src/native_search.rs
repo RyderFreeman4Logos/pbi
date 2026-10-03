@@ -6,6 +6,7 @@
 //! Verified locations use one lexical pass; raw results rank with BM25 over
 //! the same bounded walk. Neither path creates an index or a model request.
 
+use crate::strict_query::StrictQuery;
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -56,10 +57,11 @@ pub struct RawHit {
 }
 
 /// Raw search shares the walk and file limits with verified search.
-pub struct RawSearchOptions {
+pub struct RawSearchOptions<'a> {
     pub exact: bool,
     pub exclude_filenames: bool,
     pub merge_threshold: usize,
+    pub strict: Option<&'a StrictQuery>,
 }
 
 struct RawCandidate {
@@ -144,9 +146,12 @@ pub fn search_raw_repository(
     root: &Path,
     query: &str,
     limits: &SearchLimits,
-    options: &RawSearchOptions,
+    options: &RawSearchOptions<'_>,
 ) -> Result<(Vec<RawHit>, u64), SearchFailure> {
-    let terms = raw_terms(query);
+    let terms = options
+        .strict
+        .map(|strict| strict.positive_terms().to_vec())
+        .unwrap_or_else(|| raw_terms(query));
     if terms.is_empty() || terms.len() > 32 {
         return Err(SearchFailure::Limit);
     }
@@ -174,6 +179,13 @@ pub fn search_raw_repository(
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };
+        let filename = path.file_name().and_then(|name| name.to_str());
+        let strict_match = options.strict.is_none_or(|strict| {
+            strict.matches(
+                source,
+                (!options.exclude_filenames).then_some(filename).flatten(),
+            )
+        });
         let Some(relative) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
             continue;
         };
@@ -237,6 +249,7 @@ pub fn search_raw_repository(
         }
         if counts.iter().all(|count| *count == 0)
             || (options.exact && !source.to_lowercase().contains(&exact_phrase))
+            || !strict_match
         {
             continue;
         }

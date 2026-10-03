@@ -13,6 +13,7 @@ use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
 mod native_search;
 mod raw_session;
+mod strict_query;
 use native_search::{
     candidate_symbols, search_raw_repository, search_repository, RawHit, RawSearchOptions,
     SearchFailure, SearchLimits,
@@ -26,6 +27,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use strict_query::StrictQuery;
 #[cfg(test)]
 use workflow_adk::model_profiles::{FakeModelProfile, ModelProfileRegistry};
 use workflow_adk::ModelRouteCancellation;
@@ -438,7 +440,7 @@ fn run(
             println!(
                     "pbi-rs search is bounded and in-process.\n\
                  Supported: --timeout --max-results --language/-l --ignore/-i.\n\
-                 --bm25 prints bounded native ranked hits. Raw --merge-threshold merges blocks separated by at most N lines (default 5). Raw --session ID paginates with private source-fresh state. Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
+                 --bm25 prints bounded native ranked hits. Raw --merge-threshold merges blocks separated by at most N lines (default 5). Raw --session ID paginates with private source-fresh state. Raw --strict-elastic-syntax validates and evaluates explicit Boolean or quoted queries. Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
                 );
             return Ok(0);
         }
@@ -494,11 +496,11 @@ fn run(
         }
     }
     if raw {
-        if options.strict_elastic_syntax {
-            return Err(CliError::usage(
-                "--strict-elastic-syntax has no verified historical query contract",
-            ));
-        }
+        let strict_query = options
+            .strict_elastic_syntax
+            .then(|| StrictQuery::parse(&query))
+            .transpose()
+            .map_err(CliError::usage)?;
         let session = options
             .session
             .as_deref()
@@ -524,6 +526,7 @@ fn run(
                     .as_deref()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(5),
+                strict: strict_query.as_ref(),
             },
         )
         .map_err(search_cli_error)?;
@@ -903,6 +906,7 @@ fn raw_session_scope(root: &Path, query: &str, options: &SearchOptions) -> Resul
     options.language.hash(&mut scope);
     options.ignores.hash(&mut scope);
     options.exact.hash(&mut scope);
+    options.strict_elastic_syntax.hash(&mut scope);
     options.exclude_filenames.hash(&mut scope);
     options.files_only.hash(&mut scope);
     options.merge_threshold.hash(&mut scope);
