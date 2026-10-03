@@ -844,21 +844,21 @@ fn decode_answer(
     for citation in citation_values {
         let citation = citation
             .as_object()
-            .ok_or(SemanticError::CitationMismatch)?;
+            .ok_or_else(|| citation_mismatch("citation_object"))?;
         let path = citation
             .get("path")
             .and_then(Value::as_str)
-            .ok_or(SemanticError::CitationMismatch)?;
+            .ok_or_else(|| citation_mismatch("citation_path"))?;
         let start_line = citation
             .get("start_line")
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or(SemanticError::CitationMismatch)?;
+            .ok_or_else(|| citation_mismatch("citation_start"))?;
         let end_line = citation
             .get("end_line")
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or(SemanticError::CitationMismatch)?;
+            .ok_or_else(|| citation_mismatch("citation_end"))?;
         let matched = allowed
             .iter()
             .find(|allowed| {
@@ -867,12 +867,12 @@ fn decode_answer(
                     && allowed.start_line <= start_line
                     && end_line <= allowed.end_line
             })
-            .ok_or(SemanticError::CitationMismatch)?;
+            .ok_or_else(|| citation_mismatch("citation_span"))?;
         if citations
             .iter()
             .any(|item: &SourceEvidence| item == evidence[matched.evidence_index])
         {
-            return Err(SemanticError::CitationMismatch);
+            return Err(citation_mismatch("duplicate_evidence"));
         }
         citations.push(evidence[matched.evidence_index].clone());
         selected.push(AllowedCitation {
@@ -882,7 +882,8 @@ fn decode_answer(
             evidence_index: matched.evidence_index,
         });
     }
-    answer_body_citations_match(&answer, &selected.iter().collect::<Vec<_>>())?;
+    answer_body_citations_match(&answer, &selected.iter().collect::<Vec<_>>())
+        .map_err(|_| citation_mismatch("answer_body"))?;
     let stop_index = if stop_candidates.is_empty() {
         None
     } else {
@@ -890,9 +891,9 @@ fn decode_answer(
             .get("stop_evidence_id")
             .and_then(Value::as_u64)
             .and_then(|index| usize::try_from(index).ok())
-            .ok_or(SemanticError::CitationMismatch)?;
+            .ok_or_else(|| citation_mismatch("stop_id"))?;
         if !stop_candidates.contains(&index) {
-            return Err(SemanticError::CitationMismatch);
+            return Err(citation_mismatch("stop_id_unadmitted"));
         }
         Some(index)
     };
@@ -906,7 +907,7 @@ fn decode_answer(
     if let Some(index) = stop_index {
         if !cited_indices.contains(&index) {
             if citations.len() >= MAX_SEMANTIC_EVIDENCE {
-                return Err(SemanticError::CitationMismatch);
+                return Err(citation_mismatch("stop_evidence_capacity"));
             }
             citations.push(evidence[index].clone());
             cited_indices.push(index);
@@ -916,7 +917,7 @@ fn decode_answer(
     for mut child in roots {
         while let Some(parent) = report.followed_from(child) {
             if parent >= child || parent >= evidence.len() {
-                return Err(SemanticError::CitationMismatch);
+                return Err(citation_mismatch("parent_index"));
             }
             if !visible.get(parent).copied().unwrap_or(false) {
                 break;
@@ -935,7 +936,7 @@ fn decode_answer(
         for (index, included) in visible.iter().copied().enumerate() {
             if included && !cited_indices.contains(&index) {
                 if citations.len() >= MAX_SEMANTIC_EVIDENCE {
-                    return Err(SemanticError::CitationMismatch);
+                    return Err(citation_mismatch("causal_evidence_capacity"));
                 }
                 citations.push(evidence[index].clone());
                 cited_indices.push(index);
@@ -948,6 +949,13 @@ fn decode_answer(
         citations,
         invocation_identity,
     })
+}
+
+fn citation_mismatch(reason: &'static str) -> SemanticError {
+    if env::var("PBI_RS_STAGE_TIMING").as_deref() == Ok("1") {
+        eprintln!("pbi-rs.citation_failure={reason}");
+    }
+    SemanticError::CitationMismatch
 }
 
 fn question_is_about_stopping(question: &str) -> bool {
