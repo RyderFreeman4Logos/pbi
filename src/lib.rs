@@ -18,6 +18,7 @@ const MAX_FOLLOWING_LINES: usize = 8;
 #[cfg(test)]
 std::thread_local! {
     static WINDOW_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FEATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A verified source path and the exact cited line returned to a caller.
@@ -1306,6 +1307,8 @@ fn character_end(source: &str, start: usize) -> Option<usize> {
 }
 
 fn window_features(code: &str, unknown_field_proved: bool) -> Vec<&'static str> {
+    #[cfg(test)]
+    FEATURE_SCANS.with(|scans| scans.set(scans.get() + 1));
     let lower = code.to_lowercase();
     let mut features = Vec::new();
     let add = |features: &mut Vec<&'static str>, feature| {
@@ -1585,6 +1588,21 @@ fn best_windows(
                     .cloned()
                     .collect()
             };
+            // Without requested structural features, a non-definition window
+            // with no query term or exact symbol cannot pass the final relevance guard.
+            let early_exact =
+                if group_matches.is_empty() && requested.is_empty() && !group.definition {
+                    exact_symbol_in_lines(group, &code_lines, start, end)
+                } else {
+                    None
+                };
+            if group_matches.is_empty()
+                && requested.is_empty()
+                && !group.definition
+                && early_exact.is_none()
+            {
+                continue;
+            }
             let any_matches = matching_terms(&all_terms, source_text).len();
             let path_matches = matching_terms(&group.terms, &path_text);
             let path_context = matching_terms(&context_terms, &path_text);
@@ -1608,7 +1626,8 @@ fn best_windows(
                     }
                     markers
                 });
-            let exact_symbol = exact_symbol_in_lines(group, &code_lines, start, end);
+            let exact_symbol =
+                early_exact.or_else(|| exact_symbol_in_lines(group, &code_lines, start, end));
             let test_context = test_window(lines, start, end);
             if exact_symbol.is_none() && lexical_harness_window(&text) {
                 continue;
@@ -2326,6 +2345,32 @@ mod tests {
         .expect("verified evidence");
         assert!(!report.evidence().is_empty());
         WINDOW_SCANS.with(|scans| assert_eq!(scans.get(), 1));
+    }
+
+    #[test]
+    fn unrelated_windows_skip_feature_scoring_when_no_feature_is_requested() {
+        let source = format!(
+            "{}\nfn persistent_outage_hold() {{}}\n",
+            "let unrelated = 42;\n".repeat(1000)
+        );
+        let lines = source.lines().collect::<Vec<_>>();
+        let groups = query_groups("Why does persistent_outage_hold stop with attempts left?")
+            .expect("groups");
+        assert!(requested_features(&groups[0]).is_empty());
+        assert!(!groups[0].definition, "definition");
+        assert_eq!(groups[0].exact_symbols.len(), 1);
+        FEATURE_SCANS.with(|scans| scans.set(0));
+        let evidence = best_windows(
+            &groups[0],
+            &groups,
+            Path::new("src/proxy.rs"),
+            Path::new("src/proxy.rs"),
+            &lines,
+            0,
+            8,
+        );
+        assert!(!evidence.is_empty());
+        FEATURE_SCANS.with(|scans| assert!(scans.get() < 100));
     }
 
     #[test]
