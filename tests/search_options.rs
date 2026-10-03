@@ -736,6 +736,38 @@ fn native_search_finds_checkout_source() {
 }
 
 #[test]
+fn stage_timing_is_opt_in_bounded_and_content_free() {
+    let fixture = Fixture::new();
+    let query = "private_stage_query_marker";
+    fs::write(
+        fixture.root.join("private_stage.rs"),
+        format!("fn {query}() {{}}\n"),
+    )
+    .expect("source");
+    let ordinary = fixture.run(&["search", query], "unused");
+    assert!(ordinary.status.success());
+    assert!(ordinary.stderr.is_empty());
+
+    let traced = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .env("PBI_RS_STAGE_TIMING", "1")
+        .env("LOCAL_ROUTER_API_KEY", "private-credential-canary")
+        .current_dir(&fixture.root)
+        .args(["search", query])
+        .output()
+        .expect("traced search");
+    assert!(traced.status.success());
+    let stderr = String::from_utf8(traced.stderr).expect("UTF-8 telemetry");
+    let lines = stderr.lines().collect::<Vec<_>>();
+    assert!((2..=8).contains(&lines.len()), "{stderr}");
+    assert!(lines.iter().all(|line| line.starts_with("pbi-stage ")));
+    assert!(!stderr.contains(query));
+    assert!(!stderr.contains("private_stage.rs"));
+    assert!(!stderr.contains("private-credential-canary"));
+    assert!(!stderr.contains(&fixture.root.to_string_lossy().to_string()));
+}
+
+#[test]
 fn native_search_refuses_symlinked_nested_gitignore_outside_root() {
     let fixture = ScopeFixture::new();
     let src = fixture.root.join("src");

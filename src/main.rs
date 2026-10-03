@@ -1,18 +1,20 @@
 use pbi_rs::semantic::{
     admit_local_routes, investigate, local_route_from_environment,
     local_route_publisher_from_cli_routes, local_route_publisher_from_environment,
-    plan_search_query, LocalModelRoute, SemanticAnswer, SemanticError, SemanticRouteError,
+    plan_search_query, AdmittedLocalModelRoute, LocalModelRoute, SemanticAnswer, SemanticError,
+    SemanticRouteError,
 };
 #[cfg(test)]
 use pbi_rs::semantic::{
     explicit_admitted_routes_from_environment, local_route_publisher_from_admitted_routes,
-    AdmittedLocalModelRoute, DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, ENV_TEST_LOCK,
+    DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, ENV_TEST_LOCK,
 };
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
 mod native_search;
 use native_search::{candidate_symbols, search_repository, SearchFailure, SearchLimits};
 use serde_json::json;
+use std::cell::Cell;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -32,6 +34,136 @@ const DEFAULT_TIMEOUT: &str = "540";
 const DEFAULT_MAX_RESULTS: usize = 8;
 const PROBE_OUTER_DEADLINE_SECONDS: u64 = 8;
 const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 30;
+const MAX_STAGE_ROWS: usize = 24;
+
+#[derive(Clone, Copy)]
+enum TraceStage {
+    Route,
+    InitialSearch,
+    InitialVerify,
+    Anchor,
+    Candidates,
+    Plan,
+    RevisedSearch,
+    RevisedVerify,
+    Follow,
+    Answer,
+    Terminal,
+}
+
+impl TraceStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Route => "route",
+            Self::InitialSearch => "initial_search",
+            Self::InitialVerify => "initial_verify",
+            Self::Anchor => "anchor",
+            Self::Candidates => "candidates",
+            Self::Plan => "plan",
+            Self::RevisedSearch => "revised_search",
+            Self::RevisedVerify => "revised_verify",
+            Self::Follow => "follow",
+            Self::Answer => "answer",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TraceStatus {
+    Start,
+    Ok,
+    NoSource,
+    Deadline,
+    RouteError,
+    InvalidOutput,
+    OtherError,
+}
+
+impl TraceStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Ok => "ok",
+            Self::NoSource => "no_source",
+            Self::Deadline => "deadline",
+            Self::RouteError => "route_error",
+            Self::InvalidOutput => "invalid_output",
+            Self::OtherError => "other_error",
+        }
+    }
+}
+
+struct StageTrace {
+    enabled: bool,
+    started: Instant,
+    previous: Cell<Instant>,
+    deadline: Instant,
+    rows: Cell<usize>,
+}
+
+impl StageTrace {
+    fn new(deadline: Instant) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: env::var("PBI_RS_STAGE_TIMING").as_deref() == Ok("1"),
+            started: now,
+            previous: Cell::new(now),
+            deadline,
+            rows: Cell::new(0),
+        }
+    }
+
+    fn point(&self, stage: TraceStage, status: TraceStatus, count: usize) {
+        if !self.enabled || self.rows.get() >= MAX_STAGE_ROWS {
+            return;
+        }
+        let now = Instant::now();
+        eprintln!(
+            "pbi-stage stage={} status={} elapsed_ms={} delta_ms={} remaining_ms={} count={}",
+            stage.label(),
+            status.label(),
+            now.duration_since(self.started).as_millis(),
+            now.duration_since(self.previous.replace(now)).as_millis(),
+            self.deadline.saturating_duration_since(now).as_millis(),
+            count,
+        );
+        self.rows.set(self.rows.get() + 1);
+    }
+
+    fn route(&self, index: usize, route: &AdmittedLocalModelRoute) {
+        if !self.enabled || self.rows.get() >= MAX_STAGE_ROWS {
+            return;
+        }
+        let endpoint = match route.base_url() {
+            "http://gb10:18009/v1" => "gb10:18009",
+            "http://localhost:18317/v1" => "localhost:18317",
+            _ => "unapproved",
+        };
+        let model = match route.model() {
+            "abliterated-qwen-latest-27b-none" => "none",
+            "abliterated-qwen-latest-27b-low" => "low",
+            "abliterated-qwen-latest-27b-medium" => "medium",
+            _ => "unapproved",
+        };
+        eprintln!("pbi-stage stage=route_slot slot={index} endpoint={endpoint} model={model}");
+        self.rows.set(self.rows.get() + 1);
+    }
+}
+
+fn semantic_trace_status(error: &SemanticError) -> TraceStatus {
+    match error {
+        SemanticError::PlanningDeadlineExceeded | SemanticError::DeadlineExceeded => {
+            TraceStatus::Deadline
+        }
+        SemanticError::Route { .. } => TraceStatus::RouteError,
+        SemanticError::InvalidOutput | SemanticError::CitationMismatch => {
+            TraceStatus::InvalidOutput
+        }
+        SemanticError::NoEvidence => TraceStatus::NoSource,
+        _ => TraceStatus::OtherError,
+    }
+}
 
 struct SearchOptions {
     timeout: String,
@@ -303,6 +435,13 @@ fn run(
         PROBE_OUTER_DEADLINE_SECONDS
     });
     let deadline = Instant::now() + deadline_duration;
+    let trace = StageTrace::new(deadline);
+    if let Some(routes) = admitted_routes.as_deref() {
+        trace.point(TraceStage::Route, TraceStatus::Ok, routes.len());
+        for (index, route) in routes.iter().enumerate() {
+            trace.route(index, route);
+        }
+    }
     if raw
         || options.format.is_some()
         || options.max_bytes.is_some()
@@ -365,7 +504,13 @@ fn run(
     let publisher = owned_publisher.as_ref();
 
     let collect_evidence =
-        |search_query: &str| -> Result<Option<pbi_rs::EvidenceReport>, CliError> {
+        |search_query: &str, initial: bool| -> Result<Option<pbi_rs::EvidenceReport>, CliError> {
+            let (search_stage, verify_stage) = if initial {
+                (TraceStage::InitialSearch, TraceStage::InitialVerify)
+            } else {
+                (TraceStage::RevisedSearch, TraceStage::RevisedVerify)
+            };
+            trace.point(search_stage, TraceStatus::Start, 0);
             let found = search_repository(
                 &root,
                 search_query,
@@ -376,25 +521,56 @@ fn run(
                     ignores: options.ignores.clone(),
                 },
             )
-            .map_err(search_cli_error)?;
+            .map_err(|error| {
+                let status = if matches!(error, SearchFailure::Deadline) {
+                    TraceStatus::Deadline
+                } else {
+                    TraceStatus::OtherError
+                };
+                trace.point(search_stage, status, 0);
+                search_cli_error(error)
+            })?;
+            trace.point(search_stage, TraceStatus::Ok, found.lines().count());
             match verify_probe_evidence(&found, &root, search_query, options.max_results) {
-                Ok(report) => Ok(Some(report)),
-                Err(EvidenceError::NoSourceLocations) => Ok(None),
-                Err(error) => Err(evidence_cli_error(error)),
+                Ok(report) => {
+                    trace.point(verify_stage, TraceStatus::Ok, report.evidence().len());
+                    Ok(Some(report))
+                }
+                Err(EvidenceError::NoSourceLocations) => {
+                    trace.point(verify_stage, TraceStatus::NoSource, 0);
+                    Ok(None)
+                }
+                Err(error) => {
+                    trace.point(verify_stage, TraceStatus::OtherError, 0);
+                    Err(evidence_cli_error(error))
+                }
             }
         };
     #[cfg(test)]
     let report = match _test_route_injection {
         Some(TestRouteInjection::PublisherWithEvidence { report, .. }) => Some(report.clone()),
-        _ => collect_evidence(&query)?,
+        _ => collect_evidence(&query, true)?,
     };
     #[cfg(not(test))]
-    let report = collect_evidence(&query)?;
-    let report = report.filter(|report| !semantic || !question_code_anchor_missing(&query, report));
+    let report = collect_evidence(&query, true)?;
+    let anchor_missing = report
+        .as_ref()
+        .is_some_and(|report| semantic && question_code_anchor_missing(&query, report));
+    trace.point(
+        TraceStage::Anchor,
+        if anchor_missing {
+            TraceStatus::NoSource
+        } else {
+            TraceStatus::Ok
+        },
+        usize::from(anchor_missing),
+    );
+    let report = report.filter(|_| !anchor_missing);
     let report = match report {
         Some(report) => report,
         None if semantic => {
             let Some(publisher) = publisher else {
+                trace.point(TraceStage::Terminal, TraceStatus::NoSource, 0);
                 return Err(evidence_cli_error(EvidenceError::NoSourceLocations));
             };
             let policy = publisher.policy(deadline);
@@ -403,6 +579,7 @@ fn run(
                 .enable_all()
                 .build()
                 .map_err(|_| CliError::failed("semantic runtime could not be created"))?;
+            trace.point(TraceStage::Candidates, TraceStatus::Start, 0);
             let candidates = candidate_symbols(
                 &root,
                 &query,
@@ -413,7 +590,17 @@ fn run(
                     ignores: options.ignores.clone(),
                 },
             )
-            .map_err(search_cli_error)?;
+            .map_err(|error| {
+                let status = if matches!(error, SearchFailure::Deadline) {
+                    TraceStatus::Deadline
+                } else {
+                    TraceStatus::OtherError
+                };
+                trace.point(TraceStage::Candidates, status, 0);
+                search_cli_error(error)
+            })?;
+            trace.point(TraceStage::Candidates, TraceStatus::Ok, candidates.len());
+            trace.point(TraceStage::Plan, TraceStatus::Start, 1);
             let revised = runtime
                 .block_on(plan_search_query(
                     &query,
@@ -422,30 +609,52 @@ fn run(
                     deadline,
                     &cancellation,
                 ))
-                .map_err(semantic_cli_error)?;
+                .map_err(|error| {
+                    trace.point(TraceStage::Plan, semantic_trace_status(&error), 0);
+                    semantic_cli_error(error)
+                })?;
+            let chosen_index = candidates
+                .iter()
+                .position(|(_, name)| *name == revised)
+                .map_or(0, |index| index + 1);
+            trace.point(TraceStage::Plan, TraceStatus::Ok, chosen_index);
             let search_query = candidates
                 .iter()
                 .find(|(_, name)| *name == revised)
                 .and_then(|(path, _)| Path::new(path).file_stem().and_then(|stem| stem.to_str()))
                 .map(|module| format!("{module}::{revised}"))
                 .unwrap_or(revised);
-            collect_evidence(&search_query)?
-                .ok_or_else(|| evidence_cli_error(EvidenceError::NoSourceLocations))?
+            collect_evidence(&search_query, false)?.ok_or_else(|| {
+                trace.point(TraceStage::Terminal, TraceStatus::NoSource, 0);
+                evidence_cli_error(EvidenceError::NoSourceLocations)
+            })?
         }
-        None => return Err(evidence_cli_error(EvidenceError::NoSourceLocations)),
+        None => {
+            trace.point(TraceStage::Terminal, TraceStatus::NoSource, 0);
+            return Err(evidence_cli_error(EvidenceError::NoSourceLocations));
+        }
     };
     if semantic {
+        trace.point(
+            TraceStage::Follow,
+            TraceStatus::Start,
+            report.evidence().len(),
+        );
         let expanded_report = if query.trim_start().to_ascii_lowercase().starts_with("why ") {
             Some(
                 report
                     .clone()
                     .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
-                    .map_err(evidence_cli_error)?,
+                    .map_err(|error| {
+                        trace.point(TraceStage::Follow, TraceStatus::OtherError, 0);
+                        evidence_cli_error(error)
+                    })?,
             )
         } else {
             None
         };
         let report = expanded_report.as_ref().unwrap_or(&report);
+        trace.point(TraceStage::Follow, TraceStatus::Ok, report.evidence().len());
         if let Some(publisher) = publisher {
             let cancellation = ModelRouteCancellation::new();
             let policy = publisher.policy(deadline);
@@ -453,6 +662,7 @@ fn run(
                 .enable_all()
                 .build()
                 .map_err(|_| CliError::failed("semantic runtime could not be created"))?;
+            trace.point(TraceStage::Answer, TraceStatus::Start, 1);
             let answer = runtime
                 .block_on(investigate(
                     &query,
@@ -462,7 +672,15 @@ fn run(
                     deadline,
                     &cancellation,
                 ))
-                .map_err(semantic_cli_error)?;
+                .map_err(|error| {
+                    trace.point(TraceStage::Answer, semantic_trace_status(&error), 0);
+                    semantic_cli_error(error)
+                })?;
+            trace.point(
+                TraceStage::Answer,
+                TraceStatus::Ok,
+                answer.citations().len(),
+            );
             #[cfg(test)]
             print_semantic(
                 answer,
@@ -479,10 +697,16 @@ fn run(
                 arguments[0] != "--message",
                 json_output,
             )?;
+            trace.point(TraceStage::Terminal, TraceStatus::Ok, 0);
             return Ok(0);
         }
     }
     print_evidence(&report, &root)?;
+    trace.point(
+        TraceStage::Terminal,
+        TraceStatus::Ok,
+        report.evidence().len(),
+    );
     Ok(if report.is_complete() { 0 } else { 1 })
 }
 
