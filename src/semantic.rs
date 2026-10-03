@@ -659,10 +659,28 @@ pub async fn investigate(
             "relevance": item.relevance(),
         }));
     }
+    let stop_question = question_is_about_stopping(question);
+    let stop_candidates = if stop_question {
+        evidence
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                report.followed_from(*index).is_some()
+                    && has_executable_false_return(item.snippet())
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if stop_question && stop_candidates.is_empty() {
+        return Err(SemanticError::NoEvidence);
+    }
     let common_data = json!({
         "question": question,
         "verified_evidence": evidence_json,
         "missing_targets": report.missing_targets(),
+        "direct_stop_candidate_ids": stop_candidates,
     });
     let common_data_bytes =
         serde_json::to_vec(&common_data).map_err(|_| SemanticError::Protocol)?;
@@ -672,17 +690,16 @@ pub async fn investigate(
 
     let mut output_schema: Value =
         serde_json::from_str(OUTPUT_SCHEMA).map_err(|_| SemanticError::Protocol)?;
-    let stop_question = question_is_about_stopping(question);
     if stop_question {
-        let citation_schema = output_schema["properties"]["citations"]["items"].clone();
-        output_schema["properties"]["stop_citation"] = citation_schema;
+        output_schema["properties"]["stop_evidence_id"] =
+            json!({"type":"integer", "enum": stop_candidates});
         output_schema["required"]
             .as_array_mut()
             .ok_or(SemanticError::Protocol)?
-            .push(json!("stop_citation"));
+            .push(json!("stop_evidence_id"));
     }
     let protocol = PromptProtocol::new(
-        "Answer only from VERIFIED_EVIDENCE. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. For why-stop questions, stop_citation must identify the full verified span with the executable return false that directly ends the active operation. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
+        "Answer only from VERIFIED_EVIDENCE. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. For why-stop questions, choose stop_evidence_id from direct_stop_candidate_ids; explain that executable false return and its caller. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
         Vec::new(),
         output_schema.clone(),
         common_data,
@@ -739,7 +756,7 @@ pub async fn investigate(
         &allowed,
         &evidence,
         report,
-        stop_question,
+        &stop_candidates,
         invocation_identity,
     )
 }
@@ -749,7 +766,7 @@ fn decode_answer(
     allowed: &[AllowedCitation],
     evidence: &[&SourceEvidence],
     report: &EvidenceReport,
-    stop_question: bool,
+    stop_candidates: &[usize],
     invocation_identity: String,
 ) -> Result<SemanticAnswer, SemanticError> {
     let object = value.as_object().ok_or(SemanticError::InvalidOutput)?;
@@ -818,41 +835,19 @@ fn decode_answer(
         });
     }
     answer_body_citations_match(&answer, &selected.iter().collect::<Vec<_>>())?;
-    if stop_question {
-        let stop = object
-            .get("stop_citation")
-            .and_then(Value::as_object)
-            .ok_or(SemanticError::CitationMismatch)?;
-        let stop_path = stop
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or(SemanticError::CitationMismatch)?;
-        let stop_start = stop
-            .get("start_line")
+    let stop_index = if stop_candidates.is_empty() {
+        None
+    } else {
+        let index = object
+            .get("stop_evidence_id")
             .and_then(Value::as_u64)
-            .and_then(|line| usize::try_from(line).ok())
+            .and_then(|index| usize::try_from(index).ok())
             .ok_or(SemanticError::CitationMismatch)?;
-        let stop_end = stop
-            .get("end_line")
-            .and_then(Value::as_u64)
-            .and_then(|line| usize::try_from(line).ok())
-            .ok_or(SemanticError::CitationMismatch)?;
-        let stop_index = allowed
-            .iter()
-            .find(|item| {
-                item.path == stop_path && item.start_line == stop_start && item.end_line == stop_end
-            })
-            .map(|item| item.evidence_index)
-            .ok_or(SemanticError::CitationMismatch)?;
-        if !selected
-            .iter()
-            .any(|item| item.evidence_index == stop_index)
-            || report.followed_from(stop_index).is_none()
-            || !has_executable_false_return(evidence[stop_index].snippet())
-        {
+        if !stop_candidates.contains(&index) {
             return Err(SemanticError::CitationMismatch);
         }
-    }
+        Some(index)
+    };
     // A followed definition is admitted only through a parsed call in its
     // parent window. Keep that call site and its ancestors with the model's
     // selected citation so causal claims retain their executable path.
@@ -860,8 +855,17 @@ fn decode_answer(
         .iter()
         .map(|citation| citation.evidence_index)
         .collect::<Vec<_>>();
-    for citation in &selected {
-        let mut child = citation.evidence_index;
+    if let Some(index) = stop_index {
+        if !cited_indices.contains(&index) {
+            if citations.len() >= MAX_SEMANTIC_EVIDENCE {
+                return Err(SemanticError::CitationMismatch);
+            }
+            citations.push(evidence[index].clone());
+            cited_indices.push(index);
+        }
+    }
+    let roots = cited_indices.clone();
+    for mut child in roots {
         while let Some(parent) = report.followed_from(child) {
             if parent >= child || parent >= evidence.len() {
                 return Err(SemanticError::CitationMismatch);
@@ -1716,7 +1720,7 @@ mod tests {
             &allowed,
             &[item],
             &report,
-            false,
+            &[],
             "test-route".to_owned(),
         )
         .expect("the precise subspan remains verified");
@@ -1732,7 +1736,7 @@ mod tests {
                 &allowed,
                 &[item],
                 &report,
-                false,
+                &[],
                 "test-route".to_owned()
             ),
             Err(SemanticError::CitationMismatch)
@@ -1859,7 +1863,7 @@ mod tests {
             "uncertainty": "Only the verified source was inspected.",
             "citations": [stop_citation.clone(), {"path":"src/lib.rs",
                 "start_line":budget.location().start_line(), "end_line":budget.location().end_line()}],
-            "stop_citation": stop_citation
+            "stop_evidence_id": 1
         });
         let accepted_publisher = publisher(response);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1890,7 +1894,7 @@ mod tests {
             "answer": "The caller receives false when wait sees zero remaining budget.",
             "uncertainty": "Only the verified source was inspected.",
             "citations": [wrong_stop.clone()],
-            "stop_citation": wrong_stop
+            "stop_evidence_id": 2
         });
         let publisher = publisher(response);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1902,7 +1906,13 @@ mod tests {
             deadline,
             &ModelRouteCancellation::new(),
         ));
-        assert_eq!(rejected, Err(SemanticError::CitationMismatch));
+        assert!(matches!(
+            rejected,
+            Err(SemanticError::Route {
+                kind: ModelRouteTerminalErrorKind::Protocol,
+                attempts: 1
+            })
+        ));
     }
 
     #[test]

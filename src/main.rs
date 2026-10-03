@@ -2977,10 +2977,11 @@ mod tests {
             .expect("verified search")
             .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
             .expect("verified call chain");
-        let stop = report
+        let (stop_id, stop) = report
             .evidence()
             .iter()
-            .find(|item| item.snippet().contains("return false"))
+            .enumerate()
+            .find(|(_, item)| item.snippet().contains("return false"))
             .expect("direct stop branch");
         let stop_citation = json!({"path":"outage_hold.rs",
             "start_line": stop.location().start_line(),
@@ -3008,7 +3009,7 @@ mod tests {
                         "answer":"The caller stops when wait returns false after the budget reaches zero.",
                         "uncertainty":"Only the verified function was inspected.",
                         "citations":[stop_citation.clone()],
-                        "stop_citation": stop_citation
+                        "stop_evidence_id": stop_id
                     })
                     .to_string(),
                 ]))),
