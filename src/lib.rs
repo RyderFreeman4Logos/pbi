@@ -175,7 +175,7 @@ impl EvidenceReport {
         for item in &self.evidence {
             let path = item.location().path();
             if path.extension().and_then(|value| value.to_str()) != Some("rs")
-                || sources.iter().any(|(seen, _, _)| seen == path)
+                || sources.iter().any(|(seen, _, _, _)| seen == path)
             {
                 continue;
             }
@@ -191,14 +191,34 @@ impl EvidenceReport {
             }
             let source = fs::read_to_string(&path).map_err(|_| EvidenceError::SourceUnavailable)?;
             let declarations = declaration_identity::declarations(&source);
-            sources.push((path, source, declarations));
+            let calls = declaration_identity::calls(&source);
+            sources.push((path, source, declarations, calls));
         }
-        let mut index = 0;
-        while index < self.evidence.len() && self.evidence.len() < max_total {
+        let mut pending = (0..self.evidence.len())
+            .rev()
+            .map(|index| (index, 0))
+            .collect::<Vec<_>>();
+        while let Some((index, next_call)) = pending.pop() {
+            if self.evidence.len() >= max_total {
+                break;
+            }
             let item = self.evidence[index].clone();
-            let code = CodeView::new(item.snippet());
-            let calls = code.code.lines().flat_map(call_markers).collect::<Vec<_>>();
-            for call in calls {
+            let calls = sources
+                .iter()
+                .find(|(path, _, _, _)| path == item.location().path())
+                .map(|(_, _, _, calls)| {
+                    calls
+                        .iter()
+                        .filter(|call| {
+                            call.line >= item.location().start_line()
+                                && call.line <= item.location().end_line()
+                        })
+                        .map(|call| call.marker.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for (call_index, call) in calls.into_iter().enumerate().skip(next_call) {
+                let mut added = false;
                 let (kind, qualifier, name) = if let Some((owner, name)) = call.rsplit_once("::") {
                     ("qualified", owner, name)
                 } else if let Some((_, name)) = call.rsplit_once('.') {
@@ -206,7 +226,7 @@ impl EvidenceReport {
                 } else {
                     ("bare", "", call.as_str())
                 };
-                for (path, source, declarations) in &sources {
+                for (path, source, declarations, _) in &sources {
                     let same_file = path == item.location().path();
                     let file_stem = path.file_stem().and_then(|stem| stem.to_str());
                     if (kind != "qualified" && !same_file)
@@ -256,13 +276,15 @@ impl EvidenceReport {
                         symbol: Some(name.to_owned()),
                         relevance: String::from("called Rust definition candidate"),
                     });
+                    pending.push((index, call_index + 1));
+                    pending.push((self.evidence.len() - 1, 0));
+                    added = true;
                     break;
                 }
-                if self.evidence.len() >= max_total {
+                if added {
                     break;
                 }
             }
-            index += 1;
         }
         Ok(self)
     }
@@ -2799,12 +2821,12 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         let caller = fixture.root.join("src/proxy.rs");
         fs::write(
             &hold,
-            "struct Hold;\nimpl Hold {\n    fn remaining(&self, config: &Config) -> Duration {\n        Duration::from_millis(config.outage_hold_ms).saturating_sub(self.started.elapsed())\n    }\n\n    async fn wait(&self, config: &Config) -> bool {\n        let remaining = self.remaining(config);\n        if remaining.is_zero() {\n            return false;\n        }\n        sleep(remaining).await;\n        !self.remaining(config).is_zero()\n    }\n}\n\nfn is_outage(runtime: &Runtime) -> bool {\n    runtime.hold.remaining(&runtime.config) > Duration::ZERO\n}\n\nasync fn wait(runtime: &Runtime) -> bool {\n    runtime.hold.wait(&runtime.config).await\n}\n",
+            "struct Hold;\nimpl Hold {\n    fn remaining(&self, config: &Config) -> Duration {\n        Duration::from_millis(config.outage_hold_ms).saturating_sub(self.started.elapsed())\n    }\n\n    async fn wait(&self, config: &Config) -> bool {\n        let remaining = self.remaining(config);\n        if remaining.is_zero() {\n            return false;\n        }\n        sleep(remaining).await;\n        !self.remaining(config).is_zero()\n    }\n}\n\nfn is_outage(runtime: &Runtime) -> bool {\n    runtime.hold.remaining(&runtime.config) > Duration::ZERO\n}\n\nasync fn wait(runtime: &Runtime) -> bool {\n    runtime.hold\n        .wait(\n            &runtime.config,\n        )\n        .await\n}\n",
         )
         .expect("hold source");
         fs::write(
             &caller,
-            "async fn attempt(runtime: &Runtime) -> bool {\n    let mut can_retry = true;\n    if hold::is_outage(runtime) {\n        can_retry = hold::wait(runtime).await;\n    }\n    can_retry\n}\n",
+            "async fn attempt(runtime: &Runtime) -> bool {\n    let mut can_retry = true;\n    if hold::is_outage(runtime) {\n        log_failure();\n        can_retry = hold::wait(runtime).await;\n        next_step();\n        record();\n    }\n    can_retry\n}\nfn log_failure() {}\nfn next_step() {}\nfn record() {}\nasync fn later(runtime: &Runtime) -> bool {\n    if hold::is_outage(runtime) {\n        return hold::wait(runtime).await;\n    }\n    false\n}\n",
         )
         .expect("caller source");
         let located = format!("{}{}", probe_file(&hold), probe_file(&caller));
@@ -2820,7 +2842,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             .join("\n");
         for required in [
             "can_retry = hold::wait(runtime).await",
-            "runtime.hold.wait(&runtime.config).await",
+            "runtime.hold\n        .wait(",
             "if remaining.is_zero()",
             "return false",
             "config.outage_hold_ms).saturating_sub",

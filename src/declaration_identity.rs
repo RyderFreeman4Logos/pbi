@@ -1,6 +1,9 @@
 //! Direct associated declarations from one syn parse.
 //! Local functions and declarations inside an ended impl are not owners.
-use syn::{File, ImplItem, Item, TraitItem, Type, UseTree};
+use syn::{
+    visit::{self, Visit},
+    Expr, File, ImplItem, Item, TraitItem, Type, UseTree,
+};
 
 /// Segment identity, shared by lexical owners and directly resolvable impl types.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -40,6 +43,50 @@ pub(super) struct Declaration {
     pub(super) line: usize,
     pub(super) name: String,
     pub(super) owner: Option<OwnerPath>,
+}
+
+pub(super) struct CallSite {
+    pub(super) line: usize,
+    pub(super) marker: String,
+}
+
+pub(super) fn calls(source: &str) -> Vec<CallSite> {
+    let Ok(file) = syn::parse_file(source) else {
+        return Vec::new();
+    };
+    let mut collector = CallCollector(Vec::new());
+    collector.visit_file(&file);
+    collector.0
+}
+
+struct CallCollector(Vec<CallSite>);
+
+impl<'ast> Visit<'ast> for CallCollector {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let Expr::Path(path) = &*call.func {
+            if let Some(first) = path.path.segments.first() {
+                self.0.push(CallSite {
+                    line: first.ident.span().start().line,
+                    marker: path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                });
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.0.push(CallSite {
+            line: call.method.span().start().line,
+            marker: format!(".{}", call.method),
+        });
+        visit::visit_expr_method_call(self, call);
+    }
 }
 
 pub(super) fn declarations(source: &str) -> Vec<Declaration> {
