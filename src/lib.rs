@@ -276,7 +276,7 @@ pub fn verify_probe_evidence(
                 .order
                 .saturating_add(raw.start_line)
                 .saturating_add(raw.end_line);
-            if let Some(choice) = best_window(
+            choices[group_index].extend(best_windows(
                 group,
                 &groups,
                 relative,
@@ -284,9 +284,7 @@ pub fn verify_probe_evidence(
                 &lines,
                 raw_order,
                 test_candidate,
-            ) {
-                choices[group_index].push(choice);
-            }
+            ));
         }
     }
 
@@ -342,7 +340,12 @@ pub fn verify_probe_evidence(
                                             choice.evidence.snippet.lines().any(|kept| kept == line)
                                         }))
                             });
+                    let range_covers = choice.evidence.location.start_line
+                        <= evidence[existing].location.start_line
+                        && choice.evidence.location.end_line
+                            >= evidence[existing].location.end_line;
                     if covers_prior
+                        && range_covers
                         && choice.evidence.snippet.lines().count()
                             > evidence[existing].snippet.lines().count()
                     {
@@ -353,7 +356,7 @@ pub fn verify_probe_evidence(
                         }
                         continue;
                     }
-                    if !covers_prior {
+                    if !(covers_prior && range_covers) {
                         let representative_only = pass == 0 && !any_of;
                         let distinct_group =
                             !owners
@@ -363,8 +366,31 @@ pub fn verify_probe_evidence(
                                     !group_owners.is_empty()
                                         && groups[owner_index].label == choice.evidence.target
                                 });
-                        if !distinct_group
-                            || (representative_only && !owners[group_index].is_empty())
+                        let disjoint_window = evidence
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.location.path == choice.evidence.location.path
+                            })
+                            .all(|candidate| {
+                                choice.evidence.location.start_line > candidate.location.end_line
+                                    || choice.evidence.location.end_line
+                                        < candidate.location.start_line
+                            });
+                        let same_call = choice
+                            .evidence
+                            .symbol
+                            .as_ref()
+                            .filter(|symbol| symbol.contains("::"))
+                            .is_some_and(|symbol| {
+                                evidence.iter().any(|candidate| {
+                                    candidate.location.path == choice.evidence.location.path
+                                        && candidate.symbol.as_deref() == Some(symbol.as_str())
+                                })
+                            });
+                        if (!distinct_group && !disjoint_window)
+                            || (representative_only
+                                && !(disjoint_window && same_call)
+                                && !owners[group_index].is_empty())
                         {
                             continue;
                         }
@@ -1222,7 +1248,7 @@ fn raw_identifiers(text: &str) -> Vec<String> {
     values
 }
 
-fn best_window(
+fn best_windows(
     group: &QueryGroup,
     all_groups: &[QueryGroup],
     relative: &Path,
@@ -1230,7 +1256,7 @@ fn best_window(
     lines: &[&str],
     order: usize,
     test_candidate: bool,
-) -> Option<ScoredEvidence> {
+) -> Vec<ScoredEvidence> {
     let all_terms = all_groups
         .iter()
         .flat_map(|group| group.terms.iter().cloned())
@@ -1263,9 +1289,9 @@ fn best_window(
         Vec::new()
     };
     if requested.contains(&"unknown-field-handling") && scopes.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let mut best: Option<ScoredEvidence> = None;
+    let mut kept = Vec::new();
     for start in 0..lines.len() {
         for length in 1..=MAX_EVIDENCE_LINES.min(lines.len() - start) {
             let end = start + length;
@@ -1400,14 +1426,27 @@ fn best_window(
                                 })
                         })
                     }));
+            let call_of_kept = code_lines[start..end].iter().any(|line| {
+                call_markers(line).iter().any(|marker| {
+                    group.exact_symbols.iter().any(|expected| {
+                        !expected.is_empty()
+                            && (compact_alphanumeric(marker) == *expected
+                                || marker.split("::").any(|part| {
+                                    part.len() >= 3
+                                        && expected.contains(&compact_alphanumeric(part))
+                                }))
+                    })
+                })
+            });
             if !starts_at_declaration
                 && !exact
+                && !call_of_kept
                 && ((behavioral && (!actionable || (direct == 0 && overlap == 0)))
                     || (!behavioral && !simple_lexical))
             {
                 continue;
             }
-            if !starts_at_declaration && direct == 0 && overlap == 0 && !exact {
+            if !starts_at_declaration && direct == 0 && overlap == 0 && !exact && !call_of_kept {
                 continue;
             }
             let score = (direct as i32 * 12)
@@ -1544,15 +1583,50 @@ fn best_window(
                 order,
                 cited,
             };
-            if match best.as_ref() {
-                None => true,
-                Some(current) => candidate.score > current.score,
-            } {
-                best = Some(candidate);
+            let disjoint = |current: &ScoredEvidence| {
+                candidate.evidence.location.start_line > current.evidence.location.end_line
+                    || candidate.evidence.location.end_line < current.evidence.location.start_line
+            };
+            if kept
+                .iter()
+                .any(|current| !disjoint(current) && candidate.score > current.score)
+            {
+                kept.retain(|current| disjoint(current) || candidate.score <= current.score);
+            }
+            let same_symbol = candidate.evidence.symbol.as_deref().is_some_and(|symbol| {
+                symbol.contains("::")
+                    && kept.iter().any(|current| {
+                        current.evidence.symbol.as_deref() == Some(symbol) && disjoint(current)
+                    })
+            });
+            let later_write = candidate.evidence.snippet.contains(".push(")
+                && kept.iter().any(|current| {
+                    !current.evidence.snippet.contains(".push(")
+                        && current.evidence.location.path == candidate.evidence.location.path
+                        && candidate.evidence.location.start_line
+                            > current.evidence.location.end_line
+                });
+            if kept.is_empty() || same_symbol || later_write {
+                if later_write {
+                    kept.retain(|current| {
+                        current.evidence.location.path != candidate.evidence.location.path
+                    });
+                }
+                kept.push(candidate);
+            } else if candidate.score > kept.iter().map(|current| current.score).max().unwrap_or(0)
+            {
+                kept.clear();
+                kept.push(candidate);
             }
         }
     }
-    best
+    kept.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.order.cmp(&right.order))
+    });
+    kept
 }
 
 fn test_window(lines: &[&str], start: usize, end: usize) -> bool {
@@ -2453,6 +2527,90 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         assert!(
             !snippets.contains("persistent_outage_hold_active"),
             "next function admitted: {snippets}"
+        );
+    }
+
+    #[test]
+    fn why_question_keeps_a_second_same_file_stop() {
+        let fixture = Fixture::new();
+        let hold = fixture.root.join("src/hold.rs");
+        let caller = fixture.root.join("src/caller.rs");
+        let noise = fixture.root.join("src/other.rs");
+        fs::write(
+            &hold,
+            "fn persistent_outage_hold_left(started: bool) -> u64 {\n    \
+             if started { 0 } else { 9 }\n}\n\n\
+             /// Stop with attempts left when the hold budget is gone.\n\
+             async fn persistent_outage_hold_wait(started: bool) -> bool {\n    \
+             let left = persistent_outage_hold_left(started);\n    \
+             // The hold shares one wall-clock cap with selection.\n    \
+             // A closed shutdown ends the wait immediately.\n    \
+             // The cadence stays inside the remaining budget.\n    \
+             // Cancellation is checked before the sleep returns.\n    \
+             // A dropped downstream signal also ends the hold.\n    \
+             // A committed downstream signal also ends the hold.\n    \
+             // The ordinary retry ladder is not used after this.\n    \
+             // Probe count increases only when the wait completes.\n    \
+             let expired = left == 0;\n    \
+             if expired {\n        return false;\n    }\n    \
+             left > 0\n}\n\n\
+             fn persistent_outage_hold_active(started: bool) -> bool {\n    \
+             // A started hold stays on after its budget ends.\n    \
+             started || persistent_outage_hold_left(started) > 0\n}\n\n\
+             pub async fn persistent_outage_hold_continue(started: bool) -> bool {\n    \
+             persistent_outage_hold_wait(started).await\n}\n",
+        )
+        .expect("hold");
+        fs::write(
+            &caller,
+            "fn step_start(started: bool) {\n    \
+             if outage_hold::is_outage(started) {\n        \
+             let again = outage_hold::wait(started);\n        \
+             let _ = again;\n    }\n}\n\n\
+             fn distractor(started: bool) {\n    \
+             let note = persistent_outage_hold_left(started);\n    \
+             let _ = note;\n}\n\n\
+             fn step_status(started: bool) {\n    \
+             if outage_hold::is_outage(started) {\n        \
+             let again = outage_hold::wait(started);\n        \
+             let _ = again;\n    }\n}\n",
+        )
+        .expect("caller");
+        fs::write(
+            &noise,
+            "/// Why persistent_outage_hold stop with attempts left.\n\
+             fn note() {\n    assert!(true);\n}\n",
+        )
+        .expect("noise");
+        let mut located = String::new();
+        for path in [&hold, &caller, &noise] {
+            located.push_str(&probe_file(path));
+        }
+        let query = "Why does persistent_outage_hold stop with attempts left?";
+        let report = verify_probe_evidence(&located, &fixture.root, query, 8)
+            .expect("ranked windows")
+            .with_following_lines(&fixture.root, 8)
+            .expect("existing why extension");
+        let stops = report
+            .evidence()
+            .iter()
+            .filter(|item| {
+                item.location().path().ends_with("src/caller.rs")
+                    && item.snippet().contains("outage_hold::wait")
+            })
+            .count();
+        assert!(
+            stops >= 2,
+            "second same-file stop missing from {:?}",
+            report
+                .evidence()
+                .iter()
+                .map(|item| (
+                    item.location().path().display().to_string(),
+                    item.location().start_line(),
+                    item.location().end_line(),
+                ))
+                .collect::<Vec<_>>()
         );
     }
 }
