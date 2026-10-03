@@ -899,6 +899,20 @@ fn decode_answer(
             child = parent;
         }
     }
+    if stop_index.is_some() {
+        // The model may omit an input definition while describing its effect.
+        // Retain each parsed causal window, including shared callees whose
+        // first recorded parent was on a different, excluded path.
+        for (index, included) in visible.iter().copied().enumerate() {
+            if included && !cited_indices.contains(&index) {
+                if citations.len() >= MAX_SEMANTIC_EVIDENCE {
+                    return Err(SemanticError::CitationMismatch);
+                }
+                citations.push(evidence[index].clone());
+                cited_indices.push(index);
+            }
+        }
+    }
     Ok(SemanticAnswer {
         answer,
         uncertainty,
@@ -1934,13 +1948,13 @@ mod tests {
             "citations": [wrong_stop.clone()],
             "stop_evidence_id": 2
         });
-        let publisher = publisher(response);
+        let invalid_publisher = publisher(response);
         let deadline = Instant::now() + Duration::from_secs(2);
         let rejected = runtime.block_on(investigate(
             "Why does the operation stop?",
             &fixture.root,
             &report,
-            &publisher.policy(deadline),
+            &invalid_publisher.policy(deadline),
             deadline,
             &ModelRouteCancellation::new(),
         ));
@@ -1951,6 +1965,29 @@ mod tests {
                 attempts: 1
             })
         ));
+        let stop_only = json!({
+            "answer": "The caller receives false when wait sees zero remaining budget.",
+            "uncertainty": "Only the verified source was inspected.",
+            "citations": [stop_citation],
+            "stop_evidence_id": 1
+        });
+        let publisher = publisher(stop_only);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let answer = runtime
+            .block_on(investigate(
+                "Why does the operation stop?",
+                &fixture.root,
+                &report,
+                &publisher.policy(deadline),
+                deadline,
+                &ModelRouteCancellation::new(),
+            ))
+            .expect("verified stop answer");
+        assert_eq!(answer.citations().len(), 3);
+        assert!(answer
+            .citations()
+            .iter()
+            .any(|item| item.snippet().contains("fn remaining")));
     }
 
     #[test]
