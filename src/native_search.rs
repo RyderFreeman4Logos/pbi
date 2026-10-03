@@ -25,6 +25,8 @@ const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_PLAN_FILES: usize = 1;
 const MAX_PARSED_FUNCTIONS: usize = 512;
 const MAX_PLAN_SYMBOLS: usize = 8;
+const MAX_RAW_BLOCKS: usize = 4096;
+const MAX_RAW_BLOCKS_PER_FILE: usize = 128;
 
 pub struct SearchLimits {
     pub deadline: Instant,
@@ -46,21 +48,23 @@ pub enum SearchFailure {
 pub struct RawHit {
     pub file: String,
     pub line: Option<usize>,
+    pub end_line: Option<usize>,
     pub snippet: String,
     pub score: f64,
     pub occurrences: usize,
 }
 
-/// Raw search changes matching only. It shares the walk and file limits with
-/// verified search and does not create a session or call a model.
+/// Raw search shares the walk and file limits with verified search.
 pub struct RawSearchOptions {
     pub exact: bool,
     pub exclude_filenames: bool,
+    pub merge_threshold: usize,
 }
 
 struct RawCandidate {
     file: String,
     line: Option<usize>,
+    end_line: Option<usize>,
     snippet: String,
     term_counts: Vec<usize>,
     length: usize,
@@ -133,8 +137,8 @@ pub fn search_repository(
     Ok(output)
 }
 
-/// Rank bounded repository files with BM25, retaining one real matching line
-/// per file. This deliberately returns raw hits without citation verification.
+/// Rank bounded repository files with BM25, retaining separate source blocks.
+/// The caller applies its page limit after block merging and optional dedup.
 pub fn search_raw_repository(
     root: &Path,
     query: &str,
@@ -171,8 +175,9 @@ pub fn search_raw_repository(
         documents += 1;
         let mut counts = vec![0usize; terms.len()];
         let mut length = 0usize;
-        let mut best = (0usize, 0usize, "");
-        for (index, line) in source.lines().enumerate() {
+        let source_lines = source.lines().collect::<Vec<_>>();
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        for (index, line) in source_lines.iter().enumerate() {
             if Instant::now() >= limits.deadline {
                 return Err(SearchFailure::Deadline);
             }
@@ -190,10 +195,20 @@ pub fn search_raw_repository(
                     }
                 }
             }
-            if options.exact && normalized.contains(&exact_phrase) {
-                best = (usize::MAX, index + 1, line);
-            } else if line_matches > best.0 {
-                best = (line_matches, index + 1, line);
+            if (options.exact && normalized.contains(&exact_phrase))
+                || (!options.exact && line_matches > 0)
+            {
+                let line_number = index + 1;
+                if let Some(last) = blocks.last_mut() {
+                    if line_number.saturating_sub(last.1 + 1) <= options.merge_threshold {
+                        last.1 = line_number;
+                        continue;
+                    }
+                }
+                if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
+                    return Err(SearchFailure::Limit);
+                }
+                blocks.push((line_number, line_number));
             }
         }
         if !options.exclude_filenames {
@@ -220,16 +235,32 @@ pub fn search_raw_repository(
         {
             continue;
         }
-        let line = (best.1 > 0).then_some(best.1);
-        let snippet = best.2.chars().take(512).collect();
-        candidates.push(RawCandidate {
-            file: relative.to_owned(),
-            line,
-            snippet,
-            occurrences: counts.iter().sum(),
-            term_counts: counts,
-            length,
-        });
+        if blocks.is_empty() {
+            blocks.push((0, 0));
+        }
+        for (start, end) in blocks {
+            if candidates.len() >= MAX_RAW_BLOCKS {
+                return Err(SearchFailure::Limit);
+            }
+            let snippet = if start == 0 {
+                String::new()
+            } else {
+                source_lines[start - 1..end]
+                    .join("\n")
+                    .chars()
+                    .take(512)
+                    .collect()
+            };
+            candidates.push(RawCandidate {
+                file: relative.to_owned(),
+                line: (start != 0).then_some(start),
+                end_line: (start != 0).then_some(end),
+                snippet,
+                occurrences: counts.iter().sum(),
+                term_counts: counts.clone(),
+                length,
+            });
+        }
     }
     if documents == 0 {
         return Ok(Vec::new());
@@ -256,6 +287,7 @@ pub fn search_raw_repository(
             RawHit {
                 file: candidate.file,
                 line: candidate.line,
+                end_line: candidate.end_line,
                 snippet: candidate.snippet,
                 score,
                 occurrences: candidate.occurrences,
@@ -269,7 +301,6 @@ pub fn search_raw_repository(
             .then_with(|| left.file.cmp(&right.file))
             .then_with(|| left.line.cmp(&right.line))
     });
-    hits.truncate(limits.max_results);
     Ok(hits)
 }
 

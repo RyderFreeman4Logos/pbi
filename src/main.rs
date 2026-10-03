@@ -433,7 +433,7 @@ fn run(
             println!(
                     "pbi-rs search is bounded and in-process.\n\
                  Supported: --timeout --max-results --language/-l --ignore/-i.\n\
-                 --bm25 prints bounded native ranked hits. Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
+                 --bm25 prints bounded native ranked hits. Raw --merge-threshold merges blocks separated by at most N lines (default 5). Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
                 );
             return Ok(0);
         }
@@ -489,12 +489,12 @@ fn run(
         }
     }
     if raw {
-        if options.merge_threshold.is_some() || options.strict_elastic_syntax {
+        if options.strict_elastic_syntax {
             return Err(CliError::usage(
-                "--merge-threshold and --strict-elastic-syntax have no defined native BM25 meaning",
+                "--strict-elastic-syntax has no verified historical query contract",
             ));
         }
-        let hits = search_raw_repository(
+        let mut hits = search_raw_repository(
             &root,
             &query,
             &SearchLimits {
@@ -506,9 +506,19 @@ fn run(
             &RawSearchOptions {
                 exact: options.exact,
                 exclude_filenames: options.exclude_filenames,
+                merge_threshold: options
+                    .merge_threshold
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(5),
             },
         )
         .map_err(search_cli_error)?;
+        if options.files_only {
+            let mut seen = std::collections::HashSet::new();
+            hits.retain(|hit| seen.insert(hit.file.clone()));
+        }
+        hits.truncate(options.max_results);
         if hits.is_empty() {
             return Err(evidence_cli_error(EvidenceError::NoSourceLocations));
         }
@@ -905,6 +915,7 @@ fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> 
                     let mut value = json!({
                         "file": hit.file,
                         "line": hit.line,
+                        "end_line": hit.end_line,
                         "score": hit.score,
                         "snippet": hit.snippet,
                     });
@@ -932,14 +943,19 @@ fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> 
         );
         let line_label = hit.line.map_or_else(
             || "Match: filename".to_owned(),
-            |line| format!("Lines: {line}-{line}"),
+            |line| format!("Lines: {line}-{}", hit.end_line.unwrap_or(line)),
         );
         let source_line = hit
             .line
             .map_or_else(String::new, |line| format!("{line}: {snippet}\n"));
         let xml_location = hit.line.map_or_else(
             || " match=\"filename\"".to_owned(),
-            |line| format!(" line=\"{line}\""),
+            |line| {
+                format!(
+                    " line=\"{line}\" end_line=\"{}\"",
+                    hit.end_line.unwrap_or(line)
+                )
+            },
         );
         if options.files_only {
             match format {

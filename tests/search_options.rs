@@ -145,6 +145,59 @@ fn raw_native_bm25_ranks_source_and_returns_real_locations() {
 }
 
 #[test]
+fn raw_blocks_merge_only_within_line_threshold_before_result_cap() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("blocks.rs"),
+        "fn marker() {}\n// gap\nfn marker() {}\n// distant 1\n// distant 2\n// distant 3\nfn marker() {}\n",
+    )
+    .expect("separated matches");
+    let separate = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--format=json",
+            "--merge-threshold=0",
+            "marker",
+        ],
+        "raw",
+    );
+    assert!(
+        separate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&separate.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&separate.stdout).expect("JSON");
+    assert_eq!(rows.as_array().expect("rows").len(), 3);
+    assert_eq!(rows[0]["line"], 1);
+    assert_eq!(rows[1]["line"], 3);
+    assert_eq!(rows[2]["line"], 7);
+
+    let merged = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--format=json",
+            "--merge-threshold=1",
+            "--max-results=1",
+            "marker",
+        ],
+        "raw",
+    );
+    assert!(
+        merged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&merged.stdout).expect("JSON");
+    assert_eq!(rows.as_array().expect("rows").len(), 1);
+    assert_eq!(rows[0]["line"], 1);
+    assert_eq!(rows[0]["end_line"], 3);
+    let files = fixture.run(&["search", "--bm25", "--files-only", "marker"], "raw");
+    assert_eq!(files.stdout, b"blocks.rs\n");
+}
+
+#[test]
 fn raw_native_bm25_json_is_bounded_and_scope_safe() {
     let fixture = ScopeFixture::new();
     fs::write(fixture.root.join("kept.rs"), "fn raw_marker() {}\n").expect("kept source");
@@ -444,7 +497,6 @@ fn raw_backend_only_options_are_refused_instead_of_ignored() {
         vec!["search", "--bm25", "--reranker=bert", "search_option"],
         vec!["search", "--bm25", "--reranker", "search_option"],
         vec!["search", "--bm25", "--question", "another", "search_option"],
-        vec!["search", "--bm25", "--merge-threshold=2", "search_option"],
         vec![
             "search",
             "--bm25",
