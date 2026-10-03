@@ -1,8 +1,8 @@
 # pbi-rs
 
-`pbi-rs` is the first replacement slice for PBI: it delegates BM25 retrieval to the installed Probe binary and emits only source-verified locations inside the current repository. `--bm25` is an explicit raw-retrieval escape hatch and does not invoke a model.
+`pbi-rs` searches source in the current repository with a bounded native walker. `--bm25` returns raw ranked hits and does not invoke a model.
 
-Bare positional questions and `--message` request answer synthesis and are evidence-first: Probe evidence is verified before any semantic call, but complete coverage does not bypass synthesis. When the report has verified evidence and `PBI_RS_ADK_ENABLE=1`, the CLI builds a single authorized local `workflow-adk` `ModelRouteSnapshot`, captures one `ModelRoutePolicy` with the shared absolute deadline, and invokes it with a cancellation token. Local route/model admission precedes profile construction. Only bounded verified evidence reaches the model; structured answer/uncertainty citations must exactly match verified in-root spans. Without explicit opt-in, the CLI emits deterministic evidence. The kit's ordered fallback is exercised with offline fake adapters, but the CLI configures only one route; multi-route configuration, daemon reload, approved-local live inference, and full parity are not claimed.
+Bare positional questions and `--message` synthesize answers from verified source evidence when a discovered config selects an approved local route and an approved credential environment handle is available. `PBI_RS_ADK_ENABLE=0` explicitly disables model use; without a configured route, the CLI emits deterministic evidence. The CLI validates model citations against bounded in-root source spans and shares one deadline across retrieval and synthesis. Explicit `--model-route` candidates require `PBI_RS_ADK_ENABLE=1` when no config is discovered.
 
 ## Local commands
 

@@ -332,7 +332,8 @@ pub fn local_route_publisher_from_cli_routes(
 
 fn semantic_route_opted_in() -> Result<bool, SemanticRouteError> {
     match env::var(ADK_ENABLE_ENV).as_deref() {
-        Err(_) | Ok("0") => Ok(false),
+        Err(_) => Ok(route_config_path()?.is_some()),
+        Ok("0") => Ok(false),
         Ok("1") => Ok(true),
         Ok(_) => Err(SemanticRouteError::InvalidEnable),
     }

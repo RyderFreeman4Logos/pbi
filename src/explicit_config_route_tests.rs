@@ -89,6 +89,59 @@ fn matching_config(dir: &Path, primary: &str, second_base: &str) -> std::path::P
 }
 
 #[test]
+fn ordinary_config_admits_approved_route_without_model_toggles() {
+    let dir = fixture_dir("ordinary-route");
+    let config = matching_config(&dir, LOW, GB10);
+    let path = config.to_str().expect("utf8");
+    let _env = enabled(&[
+        ("PBI_CONFIG_FILE", Some(path)),
+        ("PBI_RS_ADK_ENABLE", None),
+        ("PBI_RS_CREDENTIAL_HANDLE", None),
+        ("CLIPROXY_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("LOCAL_ROUTER_API_KEY", Some("fixture-secret")),
+    ]);
+    let routes = explicit_admitted_routes_from_environment()
+        .expect("configured route")
+        .expect("admitted route");
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].base_url(), GB10);
+    assert_eq!(routes[0].model(), LOW);
+    assert_eq!(routes[0].credential_handle, "LOCAL_ROUTER_API_KEY");
+    drop(_env);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explicit_zero_and_missing_config_keep_ordinary_model_off() {
+    let dir = fixture_dir("ordinary-off");
+    let config = matching_config(&dir, LOW, GB10);
+    let path = config.to_str().expect("utf8");
+    {
+        let _env = enabled(&[
+            ("PBI_CONFIG_FILE", Some(path)),
+            ("PBI_RS_ADK_ENABLE", Some("0")),
+            ("PBI_RS_CREDENTIAL_HANDLE", None),
+            ("LOCAL_ROUTER_API_KEY", Some("fixture-secret")),
+        ]);
+        assert!(explicit_admitted_routes_from_environment()
+            .expect("explicitly disabled")
+            .is_none());
+    }
+    {
+        let _env = enabled(&[
+            ("PBI_RS_ADK_ENABLE", None),
+            ("PBI_RS_CREDENTIAL_HANDLE", None),
+            ("LOCAL_ROUTER_API_KEY", Some("fixture-secret")),
+        ]);
+        assert!(explicit_admitted_routes_from_environment()
+            .expect("unconfigured route")
+            .is_none());
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn discovered_xdg_config_selects_local_route_without_explicit_file() {
     let dir = fixture_dir("xdg-discovery");
     let xdg = dir.join("xdg");

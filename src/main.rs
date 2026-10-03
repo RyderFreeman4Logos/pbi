@@ -220,7 +220,7 @@ fn usage() {
                 pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
-         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Normal source citations are verified; --bm25 prints raw native ranked hits without citation verification or a model."
+         A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Normal source citations are verified; --bm25 prints raw native ranked hits without citation verification or a model."
     );
 }
 
@@ -340,7 +340,7 @@ fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, Sema
         (route.base_url().to_owned(), route.model().to_owned())
     };
     Ok(format!(
-        "search_default=native_bounded_term_frequency_no_probe\nsearch_bm25_opt_in=native_bounded_raw_no_model\nsearch_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
+        "search_default=native_bounded_term_frequency_no_probe\nsearch_bm25_opt_in=native_bounded_raw_no_model\nsearch_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_route_enable=approved_config_or_PBI_RS_ADK_ENABLE_1\nmodel_route_disable=PBI_RS_ADK_ENABLE_0\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
     ))
 }
 
