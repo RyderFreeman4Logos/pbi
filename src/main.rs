@@ -30,7 +30,6 @@ use workflow_adk::{
 };
 
 const VERSION: &str = "0.1.0";
-const DEFAULT_TIMEOUT: &str = "540";
 const DEFAULT_MAX_RESULTS: usize = 8;
 const PROBE_OUTER_DEADLINE_SECONDS: u64 = 8;
 const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 30;
@@ -166,7 +165,7 @@ fn semantic_trace_status(error: &SemanticError) -> TraceStatus {
 }
 
 struct SearchOptions {
-    timeout: String,
+    timeout: Option<u64>,
     max_results: usize,
     max_bytes: Option<String>,
     max_tokens: Option<String>,
@@ -185,7 +184,7 @@ struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
-            timeout: DEFAULT_TIMEOUT.to_owned(),
+            timeout: None,
             max_results: DEFAULT_MAX_RESULTS,
             max_bytes: None,
             max_tokens: None,
@@ -206,11 +205,11 @@ impl Default for SearchOptions {
 fn usage() {
     println!(
         "pbi-rs {VERSION} — bounded native source search and cited answers\n\
-         Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--json]\n\
-                pbi-rs search [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
-                pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--json]\n\
+         Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--timeout <SECONDS>] [--json]\n\
+                pbi-rs search [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
-         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. Search is read-only and bounded. Source citations are verified before a model sees them."
+         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: 30 for answers, 8 for search). Search is read-only and bounded. Source citations are verified before a model sees them."
     );
 }
 
@@ -392,21 +391,30 @@ fn run(
             "--model-route is only supported for semantic questions",
         ));
     }
-    let (raw, semantic, query, options, json_output) = if arguments[0] == "search" {
-        let (raw, query, options) = parse_search(&arguments[1..])?;
-        if options.help {
-            println!(
-                "pbi-rs search is bounded and in-process.\n\
+    let (raw, semantic, query, options, json_output, requested_timeout) =
+        if arguments[0] == "search" {
+            let (raw, query, options) = parse_search(&arguments[1..])?;
+            if options.help {
+                println!(
+                    "pbi-rs search is bounded and in-process.\n\
                  Supported: --timeout --max-results --language/-l --ignore/-i\n\
                  Raw and format-changing legacy flags are refused."
-            );
-            return Ok(0);
-        }
-        (raw, false, query, options, false)
-    } else {
-        let (query, json_output) = parse_question(&arguments)?;
-        (false, true, query, SearchOptions::default(), json_output)
-    };
+                );
+                return Ok(0);
+            }
+            let requested_timeout = options.timeout;
+            (raw, false, query, options, false, requested_timeout)
+        } else {
+            let (query, json_output, requested_timeout) = parse_question(&arguments)?;
+            (
+                false,
+                true,
+                query,
+                SearchOptions::default(),
+                json_output,
+                requested_timeout,
+            )
+        };
 
     let admitted_routes = if route_specs.is_empty() {
         None
@@ -420,8 +428,9 @@ fn run(
                 .map_err(|_| CliError::failed("cannot canonicalize repository root"))
         })?;
     #[cfg(test)]
-    let deadline_duration = match _test_route_injection {
-        Some(TestRouteInjection::Factory { deadline, .. }) => deadline,
+    let deadline_duration = match (_test_route_injection, requested_timeout) {
+        (_, Some(seconds)) => Duration::from_secs(seconds),
+        (Some(TestRouteInjection::Factory { deadline, .. }), None) => deadline,
         _ => Duration::from_secs(if semantic {
             MESSAGE_OUTER_DEADLINE_SECONDS
         } else {
@@ -429,12 +438,14 @@ fn run(
         }),
     };
     #[cfg(not(test))]
-    let deadline_duration = Duration::from_secs(if semantic {
+    let deadline_duration = Duration::from_secs(requested_timeout.unwrap_or(if semantic {
         MESSAGE_OUTER_DEADLINE_SECONDS
     } else {
         PROBE_OUTER_DEADLINE_SECONDS
-    });
-    let deadline = Instant::now() + deadline_duration;
+    }));
+    let deadline = Instant::now()
+        .checked_add(deadline_duration)
+        .ok_or_else(|| CliError::usage("--timeout is too large"))?;
     let trace = StageTrace::new(deadline);
     if let Some(routes) = admitted_routes.as_deref() {
         trace.point(TraceStage::Route, TraceStatus::Ok, routes.len());
@@ -478,10 +489,10 @@ fn run(
             Some(TestRouteInjection::Publisher(_))
             | Some(TestRouteInjection::PublisherWithEvidence { .. }) => None,
             None => match admitted_routes.as_deref() {
-                Some(routes) => {
-                    local_route_publisher_from_cli_routes(routes).map_err(route_cli_error)?
-                }
-                None => local_route_publisher_from_environment().map_err(route_cli_error)?,
+                Some(routes) => local_route_publisher_from_cli_routes(routes, deadline_duration)
+                    .map_err(route_cli_error)?,
+                None => local_route_publisher_from_environment(deadline_duration)
+                    .map_err(route_cli_error)?,
             },
         }
     } else {
@@ -490,10 +501,10 @@ fn run(
     #[cfg(not(test))]
     let owned_publisher = if semantic {
         match admitted_routes.as_deref() {
-            Some(routes) => {
-                local_route_publisher_from_cli_routes(routes).map_err(route_cli_error)?
-            }
-            None => local_route_publisher_from_environment().map_err(route_cli_error)?,
+            Some(routes) => local_route_publisher_from_cli_routes(routes, deadline_duration)
+                .map_err(route_cli_error)?,
+            None => local_route_publisher_from_environment(deadline_duration)
+                .map_err(route_cli_error)?,
         }
     } else {
         None
@@ -543,7 +554,20 @@ fn run(
             } else {
                 options.max_results
             };
-            match verify_probe_evidence(&found, &root, search_query, verify_limit) {
+            if Instant::now() >= deadline {
+                trace.point(verify_stage, TraceStatus::Deadline, 0);
+                return Err(CliError::failed(
+                    "source verification exceeded its bounded deadline",
+                ));
+            }
+            let verified = verify_probe_evidence(&found, &root, search_query, verify_limit);
+            if Instant::now() >= deadline {
+                trace.point(verify_stage, TraceStatus::Deadline, 0);
+                return Err(CliError::failed(
+                    "source verification exceeded its bounded deadline",
+                ));
+            }
+            match verified {
                 Ok(report) => {
                     trace.point(verify_stage, TraceStatus::Ok, report.evidence().len());
                     Ok(Some(report))
@@ -652,6 +676,12 @@ fn run(
             TraceStatus::Start,
             report.evidence().len(),
         );
+        if Instant::now() >= deadline {
+            trace.point(TraceStage::Follow, TraceStatus::Deadline, 0);
+            return Err(CliError::failed(
+                "semantic investigation exceeded its bounded deadline",
+            ));
+        }
         let expanded_report = if explanatory_question {
             Some(
                 report
@@ -665,6 +695,12 @@ fn run(
         } else {
             None
         };
+        if Instant::now() >= deadline {
+            trace.point(TraceStage::Follow, TraceStatus::Deadline, 0);
+            return Err(CliError::failed(
+                "semantic investigation exceeded its bounded deadline",
+            ));
+        }
         let report = expanded_report.as_ref().unwrap_or(&report);
         trace.point(TraceStage::Follow, TraceStatus::Ok, report.evidence().len());
         if let Some(publisher) = publisher {
@@ -853,7 +889,7 @@ fn route_cli_error(error: SemanticRouteError) -> CliError {
     }
 }
 
-fn parse_question(arguments: &[String]) -> Result<(String, bool), CliError> {
+fn parse_question(arguments: &[String]) -> Result<(String, bool, Option<u64>), CliError> {
     let message = arguments.first().is_some_and(|arg| arg == "--message");
     let mut parts = Vec::new();
     let mut index = 0;
@@ -866,11 +902,29 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool), CliError> {
     }
     let mut literal = false;
     let mut json_output = false;
+    let mut timeout = None;
     while let Some(argument) = arguments.get(index) {
         match argument.as_str() {
             value if literal => parts.push(value),
             "--" if !message => literal = true,
             "--json" => json_output = true,
+            "--timeout" => {
+                if timeout.is_some() {
+                    return Err(CliError::usage("--timeout cannot be used multiple times"));
+                }
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| CliError::usage("--timeout requires a value"))?;
+                timeout = Some(parse_timeout_seconds(value)?);
+            }
+            value if value.starts_with("--timeout=") => {
+                if timeout.is_some() {
+                    return Err(CliError::usage("--timeout cannot be used multiple times"));
+                }
+                timeout = Some(parse_timeout_seconds(&value[10..])?);
+            }
             "--model-name" | "--force-provider" => {
                 // Discard exactly one operand if present, even option-looking.
                 index += 1;
@@ -880,7 +934,7 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool), CliError> {
             }
             value if message || value.starts_with('-') => {
                 return Err(CliError::usage(format!(
-                    "unsupported {} option or operand: {value}; only --json and discarded legacy routing options are supported; --model-route must precede the question",
+                    "unsupported {} option or operand: {value}; only --timeout, --json, and discarded legacy routing options are supported; --model-route must precede the question",
                     if message { "Chat" } else { "question" }
                 )));
             }
@@ -894,7 +948,7 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool), CliError> {
             "question is required; interactive mode is disabled",
         ));
     }
-    Ok((query, json_output))
+    Ok((query, json_output, timeout))
 }
 
 fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), CliError> {
@@ -949,12 +1003,14 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 question_seen = true;
             }
             "--timeout" => {
-                options.timeout = next_value(arguments, &mut index, "--timeout")?;
-                validate_decimal(&options.timeout, "--timeout")?;
+                options.timeout = Some(parse_timeout_seconds(&next_value(
+                    arguments,
+                    &mut index,
+                    "--timeout",
+                )?)?);
             }
             value if value.starts_with("--timeout=") => {
-                options.timeout = value[10..].to_owned();
-                validate_decimal(&options.timeout, "--timeout")?;
+                options.timeout = Some(parse_timeout_seconds(&value[10..])?);
                 index += 1;
             }
             "--max-results" => {
@@ -1195,6 +1251,13 @@ fn validate_decimal(value: &str, option: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn parse_timeout_seconds(value: &str) -> Result<u64, CliError> {
+    validate_decimal(value, "--timeout")?;
+    value
+        .parse()
+        .map_err(|_| CliError::usage("--timeout must fit u64 seconds"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1271,7 +1334,7 @@ mod tests {
         seen: &Arc<Mutex<Vec<String>>>,
     ) -> Result<ModelRoutePublisher, SemanticRouteError> {
         let route = routes.first().ok_or(SemanticRouteError::IncompleteConfig)?;
-        let real = local_route_publisher_from_admitted_routes(routes)?;
+        let real = local_route_publisher_from_admitted_routes(routes, Duration::from_secs(30))?;
         let policy = real.policy(Instant::now());
         let real_snapshot = policy.snapshot();
         let candidate = route.candidate();
@@ -1456,6 +1519,58 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn semantic_timeout_option_bounds_a_pending_workflow() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-timeout-option-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("receipt.py"),
+            "def exact_reuse_receipt():\n    return True\n",
+        )
+        .expect("source");
+        let _env = RouteConfigEnvGuard::new(&root, &[("PBI_RS_ADK_ENABLE", Some("1".to_owned()))]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let factory = |routes: &[AdmittedLocalModelRoute]| {
+            cli_route_publisher(
+                routes,
+                "",
+                true,
+                TestModelBehavior::Pending,
+                Arc::clone(&calls),
+                Arc::clone(&fallback_calls),
+            )
+        };
+        let mut arguments = cli_route_arguments("where is exact_reuse_receipt?");
+        arguments.push("--timeout=1".to_owned());
+        let started = Instant::now();
+        let mut output = Vec::new();
+        let error = run(
+            arguments,
+            Some(TestRouteInjection::Factory {
+                build: &factory,
+                deadline: Duration::from_secs(30),
+            }),
+            &mut output,
+        )
+        .expect_err("pending model must reach the requested deadline");
+        assert_eq!(
+            error.message,
+            "semantic investigation exceeded its bounded deadline"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(800));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        assert!(output.is_empty());
     }
 
     fn publish_verified_citation_and_uncertainty(root: &Path, question: &str) {

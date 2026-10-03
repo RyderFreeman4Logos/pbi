@@ -310,19 +310,23 @@ pub fn explicit_admitted_routes_from_environment(
 }
 
 pub fn local_route_publisher_from_environment(
+    timeout: Duration,
 ) -> Result<Option<ModelRoutePublisher>, SemanticRouteError> {
     explicit_admitted_routes_from_environment()?
-        .map(|routes| local_route_publisher_from_admitted_routes(&routes))
+        .map(|routes| local_route_publisher_from_admitted_routes(&routes, timeout))
         .transpose()
 }
 
 pub fn local_route_publisher_from_cli_routes(
     routes: &[AdmittedLocalModelRoute],
+    timeout: Duration,
 ) -> Result<Option<ModelRoutePublisher>, SemanticRouteError> {
     if !semantic_route_opted_in()? {
         return Ok(None);
     }
-    Ok(Some(local_route_publisher_from_admitted_routes(routes)?))
+    Ok(Some(local_route_publisher_from_admitted_routes(
+        routes, timeout,
+    )?))
 }
 
 fn semantic_route_opted_in() -> Result<bool, SemanticRouteError> {
@@ -335,6 +339,7 @@ fn semantic_route_opted_in() -> Result<bool, SemanticRouteError> {
 
 pub fn local_route_publisher_from_admitted_routes(
     routes: &[AdmittedLocalModelRoute],
+    timeout: Duration,
 ) -> Result<ModelRoutePublisher, SemanticRouteError> {
     if routes.is_empty() {
         return Err(SemanticRouteError::IncompleteConfig);
@@ -356,7 +361,7 @@ pub fn local_route_publisher_from_admitted_routes(
             CredentialHandle::environment(route.credential_handle.clone()),
         )
         .with_provider("openai")
-        .with_runtime(ModelRuntimeConfig::default().with_timeout(Duration::from_secs(30)))
+        .with_runtime(ModelRuntimeConfig::default().with_timeout(timeout))
     };
     let mut profiles = ModelProfileRegistry::new()
         .with_worker(make_profile(&routes[0]))
@@ -2090,7 +2095,9 @@ mod tests {
         let admitted = admit_local_routes(routes.clone()).expect("approved ordered routes");
         assert_eq!(admitted[0].profile_name(), "pbi-rs-local");
         assert_eq!(admitted[1].profile_name(), "pbi-rs-local-fallback-2");
-        assert!(local_route_publisher_from_admitted_routes(&admitted).is_ok());
+        assert!(
+            local_route_publisher_from_admitted_routes(&admitted, Duration::from_secs(30)).is_ok()
+        );
 
         let invalid_later = vec![
             routes[0].clone(),
@@ -2287,8 +2294,9 @@ key = \"also-not-read\"
         let routes = explicit_admitted_routes_from_environment()
             .expect("explicit config route")
             .expect("publisher when ADK is enabled");
-        let publisher = local_route_publisher_from_admitted_routes(&routes)
-            .expect("publisher from selected route");
+        let publisher =
+            local_route_publisher_from_admitted_routes(&routes, Duration::from_secs(30))
+                .expect("publisher from selected route");
         let selected = routes.first().expect("selected endpoint");
         assert_eq!(selected.model(), "abliterated-qwen-latest-27b-low");
         assert_eq!(selected.base_url(), "http://gb10:18009/v1");
