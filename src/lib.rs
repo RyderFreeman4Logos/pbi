@@ -101,6 +101,7 @@ pub struct EvidenceReport {
     missing_targets: Vec<String>,
     cited: Vec<usize>,
     followed_from: Vec<Option<usize>>,
+    call_edges: Vec<(usize, usize)>,
 }
 
 impl EvidenceReport {
@@ -118,6 +119,37 @@ impl EvidenceReport {
 
     pub(crate) fn followed_from(&self, index: usize) -> Option<usize> {
         self.followed_from.get(index).copied().flatten()
+    }
+
+    /// Evidence on a parsed call path through the selected stopping branch.
+    /// Ancestors explain who uses its result; descendants explain its inputs.
+    pub(crate) fn causal_indices(&self, stop: usize) -> Vec<usize> {
+        let mut selected = vec![false; self.evidence.len()];
+        if stop >= selected.len() {
+            return Vec::new();
+        }
+        let mut ancestor = Some(stop);
+        while let Some(index) = ancestor {
+            if selected[index] {
+                break;
+            }
+            selected[index] = true;
+            ancestor = self.followed_from(index);
+        }
+        let mut pending = vec![stop];
+        while let Some(parent) = pending.pop() {
+            for &(_, child) in self.call_edges.iter().filter(|(owner, _)| *owner == parent) {
+                if !selected[child] {
+                    selected[child] = true;
+                    pending.push(child);
+                }
+            }
+        }
+        selected
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, keep)| keep.then_some(index))
+            .collect()
     }
 
     pub fn missing_targets(&self) -> &[String] {
@@ -296,15 +328,20 @@ impl EvidenceReport {
                     continue;
                 }
                 let snippet = lines[start - 1..end].join("\n");
-                if snippet.len() > 4096
-                    || self.evidence.iter().any(|existing| {
-                        existing.location().path() == path
-                            && existing.location().start_line() <= start
-                            && existing.location().end_line() >= end
-                    })
-                {
+                if snippet.len() > 4096 {
                     continue;
                 }
+                if let Some(child) = self.evidence.iter().position(|existing| {
+                    existing.location().path() == path
+                        && existing.location().start_line() <= start
+                        && existing.location().end_line() >= end
+                }) {
+                    if child != index && !self.call_edges.contains(&(index, child)) {
+                        self.call_edges.push((index, child));
+                    }
+                    continue;
+                }
+                let child = self.evidence.len();
                 self.evidence.push(SourceEvidence {
                     location: SourceLocation::new(path.clone(), start, end),
                     target: item.target().to_owned(),
@@ -313,6 +350,7 @@ impl EvidenceReport {
                     relevance: String::from("called Rust definition candidate"),
                 });
                 self.followed_from.push(Some(index));
+                self.call_edges.push((index, child));
                 pending.push((index, call_index + 1));
                 pending.push((self.evidence.len() - 1, 0));
                 break;
@@ -589,6 +627,7 @@ pub fn verify_probe_evidence(
         missing_targets,
         cited,
         followed_from: vec![None; evidence_count],
+        call_edges: Vec::new(),
     })
 }
 
@@ -2923,6 +2962,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             missing_targets: Vec::new(),
             cited: vec![5],
             followed_from: vec![None],
+            call_edges: Vec::new(),
         }
         .with_following_lines(&fixture.root, 3)
         .expect("bounded calls");
@@ -2965,9 +3005,53 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             missing_targets: Vec::new(),
             cited: vec![2],
             followed_from: vec![None],
+            call_edges: Vec::new(),
         }
         .with_following_lines(&fixture.root, 2)
         .expect("bounded calls");
         assert_eq!(report.evidence().len(), 1, "{:?}", report.evidence());
+    }
+
+    #[test]
+    fn causal_path_excludes_an_unrelated_predicate_sharing_a_callee() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/flow.rs");
+        let source = "fn predicate() -> bool { remaining() > 0 }\n\n\n\n\n\n\n\n\
+                      fn caller() -> bool { wait() }\n\n\n\n\n\n\n\n\
+                      fn wait() -> bool { if remaining() == 0 { return false; } true }\n\n\n\n\n\n\n\n\
+                      fn remaining() -> u64 { 0 }\n";
+        fs::write(&path, source).expect("source");
+        let evidence = [1, 9]
+            .into_iter()
+            .map(|line| SourceEvidence {
+                location: SourceLocation::new(path.clone(), line, line),
+                target: "hold".to_owned(),
+                snippet: String::new(),
+                symbol: None,
+                relevance: String::new(),
+            })
+            .collect();
+        let report = EvidenceReport {
+            complete: true,
+            evidence,
+            missing_targets: Vec::new(),
+            cited: vec![1, 9],
+            followed_from: vec![None, None],
+            call_edges: Vec::new(),
+        }
+        .with_following_lines(&fixture.root, 5)
+        .expect("bounded call graph");
+        let stop = report
+            .evidence()
+            .iter()
+            .position(|item| item.snippet().contains("return false"))
+            .expect("stop branch");
+        let selected = report.causal_indices(stop);
+        assert_eq!(selected.len(), 3, "{selected:?}");
+        assert!(selected.contains(&1), "caller remains on the path");
+        assert!(!selected.contains(&0), "predicate is a sibling path");
+        assert!(selected
+            .iter()
+            .any(|index| report.evidence()[*index].snippet().contains("fn remaining")));
     }
 }

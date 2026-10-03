@@ -631,9 +631,43 @@ pub async fn investigate(
         .iter()
         .take(MAX_SEMANTIC_EVIDENCE)
         .collect::<Vec<_>>();
+    let stop_question = question_is_about_stopping(question);
+    let stop_candidates = if stop_question {
+        evidence
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                report.followed_from(*index).is_some()
+                    && has_executable_false_return(item.snippet())
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if stop_question && stop_candidates.is_empty() {
+        return Err(SemanticError::NoEvidence);
+    }
+    let mut visible_indices = Vec::with_capacity(evidence.len());
+    if stop_question {
+        for &stop in &stop_candidates {
+            visible_indices.push(stop);
+            for index in report.causal_indices(stop) {
+                if index < evidence.len() && !visible_indices.contains(&index) {
+                    visible_indices.push(index);
+                }
+            }
+        }
+    } else {
+        visible_indices.extend(0..evidence.len());
+    }
+    let visible = (0..evidence.len())
+        .map(|index| visible_indices.contains(&index))
+        .collect::<Vec<_>>();
     let mut allowed = Vec::with_capacity(evidence.len());
     let mut evidence_json = Vec::with_capacity(evidence.len());
-    for (evidence_index, item) in evidence.iter().enumerate() {
+    for evidence_index in visible_indices {
+        let item = evidence[evidence_index];
         let path = item
             .location()
             .path()
@@ -658,23 +692,6 @@ pub async fn investigate(
             "snippet": item.snippet(),
             "relevance": item.relevance(),
         }));
-    }
-    let stop_question = question_is_about_stopping(question);
-    let stop_candidates = if stop_question {
-        evidence
-            .iter()
-            .enumerate()
-            .filter(|(index, item)| {
-                report.followed_from(*index).is_some()
-                    && has_executable_false_return(item.snippet())
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    if stop_question && stop_candidates.is_empty() {
-        return Err(SemanticError::NoEvidence);
     }
     let common_data = json!({
         "question": question,
@@ -757,6 +774,7 @@ pub async fn investigate(
         &evidence,
         report,
         &stop_candidates,
+        &visible,
         invocation_identity,
     )
 }
@@ -767,6 +785,7 @@ fn decode_answer(
     evidence: &[&SourceEvidence],
     report: &EvidenceReport,
     stop_candidates: &[usize],
+    visible: &[bool],
     invocation_identity: String,
 ) -> Result<SemanticAnswer, SemanticError> {
     let object = value.as_object().ok_or(SemanticError::InvalidOutput)?;
@@ -869,6 +888,9 @@ fn decode_answer(
         while let Some(parent) = report.followed_from(child) {
             if parent >= child || parent >= evidence.len() {
                 return Err(SemanticError::CitationMismatch);
+            }
+            if !visible.get(parent).copied().unwrap_or(false) {
+                break;
             }
             if !cited_indices.contains(&parent) {
                 citations.push(evidence[parent].clone());
@@ -1732,6 +1754,7 @@ mod tests {
             &[item],
             &report,
             &[],
+            &[true],
             "test-route".to_owned(),
         )
         .expect("the precise subspan remains verified");
@@ -1748,6 +1771,7 @@ mod tests {
                 &[item],
                 &report,
                 &[],
+                &[true],
                 "test-route".to_owned()
             ),
             Err(SemanticError::CitationMismatch)
