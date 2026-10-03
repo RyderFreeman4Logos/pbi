@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use syn::visit::{self, Visit};
 use workflow_adk::model_profiles::{
@@ -263,7 +263,8 @@ pub fn validate_local_route(base_url: &str, model: &str) -> Result<(), SemanticR
 }
 
 /// Select and validate public route fields without probing credentials or enabling ADK.
-/// Only an explicit PBI_CONFIG_FILE is read; complete environment fields bypass it.
+/// Complete environment fields bypass config discovery. Otherwise select the
+/// explicit file, XDG config, or HOME config in that order without searching CWD.
 pub fn local_route_from_environment() -> Result<(String, String), SemanticRouteError> {
     let env_base = first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?;
     let env_model = first_value(&["LOCAL_MODEL", "LLM_MODEL"])?;
@@ -421,12 +422,9 @@ struct ExplicitConfig {
 }
 
 fn explicit_config_route() -> Result<Option<ExplicitConfig>, SemanticRouteError> {
-    let Some(path) = env::var_os("PBI_CONFIG_FILE") else {
+    let Some(path) = route_config_path()? else {
         return Ok(None);
     };
-    if path.is_empty() {
-        return Ok(None);
-    }
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(O_NONBLOCK)
@@ -481,6 +479,30 @@ fn explicit_config_route() -> Result<Option<ExplicitConfig>, SemanticRouteError>
         primary: selected.to_owned(),
         endpoints: parsed,
     }))
+}
+
+fn route_config_path() -> Result<Option<PathBuf>, SemanticRouteError> {
+    if let Some(explicit) = env::var_os("PBI_CONFIG_FILE") {
+        return Ok((!explicit.is_empty()).then(|| PathBuf::from(explicit)));
+    }
+    let config_root = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".config"))
+        });
+    let Some(root) = config_root else {
+        return Ok(None);
+    };
+    let path = root.join("pbi/config.toml");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(SemanticRouteError::InvalidConfig),
+    }
 }
 
 fn endpoint_base_for_model(

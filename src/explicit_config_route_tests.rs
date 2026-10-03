@@ -42,6 +42,15 @@ impl Drop for EnvGuard {
 }
 
 pub(super) fn enabled(extra: &[(&'static str, Option<&str>)]) -> EnvGuard {
+    let isolated = env::temp_dir().join(format!(
+        "pbi-rs-no-config-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let isolated = isolated.to_str().expect("temp path");
     let mut pairs = vec![
         ("PBI_RS_ADK_ENABLE", Some("1")),
         ("PBI_RS_CREDENTIAL_HANDLE", Some("CLIPROXY_API_KEY")),
@@ -50,6 +59,8 @@ pub(super) fn enabled(extra: &[(&'static str, Option<&str>)]) -> EnvGuard {
         ("LOCAL_MODEL", None),
         ("LLM_MODEL", None),
         ("PBI_CONFIG_FILE", None),
+        ("XDG_CONFIG_HOME", Some(isolated)),
+        ("HOME", Some(isolated)),
     ];
     pairs.extend(extra.iter().copied());
     EnvGuard::set(&pairs)
@@ -75,6 +86,66 @@ fn matching_config(dir: &Path, primary: &str, second_base: &str) -> std::path::P
     )
     .expect("config");
     config
+}
+
+#[test]
+fn discovered_xdg_config_selects_local_route_without_explicit_file() {
+    let dir = fixture_dir("xdg-discovery");
+    let xdg = dir.join("xdg");
+    let config_dir = xdg.join("pbi");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    matching_config(&config_dir, LOW, GB10);
+    let home = dir.join("home");
+    let home_config_dir = home.join(".config/pbi");
+    fs::create_dir_all(&home_config_dir).expect("home config directory");
+    matching_config(&home_config_dir, NONE, LOCAL);
+    let _env = enabled(&[
+        ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("xdg path"))),
+        ("HOME", Some(home.to_str().expect("home path"))),
+    ]);
+    assert_eq!(route(), (GB10.to_owned(), LOW.to_owned()));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn malformed_discovered_config_fails_closed_unless_complete_env_overrides() {
+    let dir = fixture_dir("bad-discovery");
+    let xdg = dir.join("xdg");
+    let config_dir = xdg.join("pbi");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    fs::write(config_dir.join("config.toml"), "primary_model = [").expect("malformed config");
+    let xdg_path = xdg.to_str().expect("xdg path");
+    {
+        let _env = enabled(&[("XDG_CONFIG_HOME", Some(xdg_path))]);
+        assert_eq!(
+            explicit_admitted_routes_from_environment().expect_err("invalid discovered config"),
+            SemanticRouteError::InvalidConfig
+        );
+    }
+    {
+        let _env = enabled(&[
+            ("XDG_CONFIG_HOME", Some(xdg_path)),
+            ("CLIPROXY_BASE_URL", Some(GB10)),
+            ("LOCAL_MODEL", Some(LOW)),
+        ]);
+        assert_eq!(route(), (GB10.to_owned(), LOW.to_owned()));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn discovered_home_config_is_used_when_xdg_is_relative() {
+    let dir = fixture_dir("home-discovery");
+    let home = dir.join("home");
+    let config_dir = home.join(".config/pbi");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    matching_config(&config_dir, LOW, GB10);
+    let _env = enabled(&[
+        ("XDG_CONFIG_HOME", Some("relative-config")),
+        ("HOME", Some(home.to_str().expect("home path"))),
+    ]);
+    assert_eq!(route(), (GB10.to_owned(), LOW.to_owned()));
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn fixture_dir(label: &str) -> std::path::PathBuf {

@@ -1534,12 +1534,20 @@ mod tests {
         fn new(root: &std::path::Path, entries: &[(&'static str, Option<String>)]) -> Self {
             let lock = Self::lock();
             let previous_dir = env::current_dir().expect("cwd");
-            let previous_env = entries
+            let mut scoped = entries.to_vec();
+            for key in ["PBI_CONFIG_FILE", "XDG_CONFIG_HOME", "HOME"] {
+                if !scoped.iter().any(|(present, _)| *present == key) {
+                    let value = (key != "PBI_CONFIG_FILE")
+                        .then(|| root.join("no-config").to_string_lossy().into_owned());
+                    scoped.push((key, value));
+                }
+            }
+            let previous_env = scoped
                 .iter()
                 .map(|(key, _)| (*key, env::var_os(key)))
                 .collect();
             env::set_current_dir(root).expect("fixture cwd");
-            for (key, value) in entries {
+            for (key, value) in &scoped {
                 if let Some(value) = value {
                     env::set_var(key, value);
                 } else {

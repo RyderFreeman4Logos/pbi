@@ -45,6 +45,14 @@ fn route_env(
         ("LOCAL_MODEL", None),
         ("LLM_MODEL", None),
         ("PBI_CONFIG_FILE", None),
+        (
+            "XDG_CONFIG_HOME",
+            Some(root.join("no-xdg-config").to_string_lossy().into_owned()),
+        ),
+        (
+            "HOME",
+            Some(root.join("no-home-config").to_string_lossy().into_owned()),
+        ),
     ];
     for (key, value) in extra {
         entries.retain(|(existing, _)| existing != key);
