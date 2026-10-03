@@ -1571,6 +1571,7 @@ fn best_windows(
             let end = start + length;
             let text = lines[start..end].join("\n");
             let code = code_lines[start..end].join("\n");
+            let lower_code = code.to_ascii_lowercase();
             let source_text = if behavioral { &code } else { &text };
             let relevance_text = format!("{path_text}\n{source_text}");
             let group_matches = if group.exact_symbols.is_empty() {
@@ -1580,6 +1581,9 @@ fn best_windows(
                     .terms
                     .iter()
                     .filter(|term| {
+                        if term.contains("::") && lower_code.contains(term.as_str()) {
+                            return true;
+                        }
                         let expected = compact_alphanumeric(term);
                         raw_identifiers(source_text)
                             .iter()
@@ -2371,6 +2375,24 @@ mod tests {
         );
         assert!(!evidence.is_empty());
         FEATURE_SCANS.with(|scans| assert!(scans.get() < 100));
+    }
+
+    #[test]
+    fn qualified_call_is_verified_without_an_unqualified_call() {
+        let fixture = Fixture::new();
+        let caller = fixture.root.join("src/proxy.rs");
+        fs::write(&caller, "fn attempt() { outage_hold::drain_attempts(); }\n").expect("source");
+        let report = verify_probe_evidence(
+            &probe_file(&caller),
+            &fixture.root,
+            "outage_hold::drain_attempts",
+            8,
+        )
+        .expect("verified qualified call");
+        assert!(report
+            .evidence()
+            .iter()
+            .any(|item| { item.snippet().contains("outage_hold::drain_attempts()") }));
     }
 
     #[test]
