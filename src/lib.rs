@@ -100,6 +100,7 @@ pub struct EvidenceReport {
     evidence: Vec<SourceEvidence>,
     missing_targets: Vec<String>,
     cited: Vec<usize>,
+    followed_from: Vec<Option<usize>>,
 }
 
 impl EvidenceReport {
@@ -113,6 +114,10 @@ impl EvidenceReport {
 
     pub fn cited_line(&self, index: usize) -> Option<usize> {
         self.cited.get(index).copied()
+    }
+
+    pub(crate) fn followed_from(&self, index: usize) -> Option<usize> {
+        self.followed_from.get(index).copied().flatten()
     }
 
     pub fn missing_targets(&self) -> &[String] {
@@ -307,6 +312,7 @@ impl EvidenceReport {
                     symbol: Some(name.to_owned()),
                     relevance: String::from("called Rust definition candidate"),
                 });
+                self.followed_from.push(Some(index));
                 pending.push((index, call_index + 1));
                 pending.push((self.evidence.len() - 1, 0));
                 break;
@@ -576,11 +582,13 @@ pub fn verify_probe_evidence(
     if evidence.is_empty() {
         return Err(EvidenceError::NoSourceLocations);
     }
+    let evidence_count = evidence.len();
     Ok(EvidenceReport {
         complete: missing_targets.is_empty(),
         evidence,
         missing_targets,
         cited,
+        followed_from: vec![None; evidence_count],
     })
 }
 
@@ -2914,6 +2922,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             }],
             missing_targets: Vec::new(),
             cited: vec![5],
+            followed_from: vec![None],
         }
         .with_following_lines(&fixture.root, 3)
         .expect("bounded calls");
@@ -2955,6 +2964,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             }],
             missing_targets: Vec::new(),
             cited: vec![2],
+            followed_from: vec![None],
         }
         .with_following_lines(&fixture.root, 2)
         .expect("bounded calls");

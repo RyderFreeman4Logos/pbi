@@ -728,6 +728,7 @@ pub async fn investigate(
         result.into_output(),
         &allowed,
         &evidence,
+        report,
         invocation_identity,
     )
 }
@@ -736,6 +737,7 @@ fn decode_answer(
     value: Value,
     allowed: &[AllowedCitation],
     evidence: &[&SourceEvidence],
+    report: &EvidenceReport,
     invocation_identity: String,
 ) -> Result<SemanticAnswer, SemanticError> {
     let object = value.as_object().ok_or(SemanticError::InvalidOutput)?;
@@ -804,6 +806,26 @@ fn decode_answer(
         });
     }
     answer_body_citations_match(&answer, &selected.iter().collect::<Vec<_>>())?;
+    // A followed definition is admitted only through a parsed call in its
+    // parent window. Keep that call site and its ancestors with the model's
+    // selected citation so causal claims retain their executable path.
+    let mut cited_indices = selected
+        .iter()
+        .map(|citation| citation.evidence_index)
+        .collect::<Vec<_>>();
+    for citation in &selected {
+        let mut child = citation.evidence_index;
+        while let Some(parent) = report.followed_from(child) {
+            if parent >= child || parent >= evidence.len() {
+                return Err(SemanticError::CitationMismatch);
+            }
+            if !cited_indices.contains(&parent) {
+                citations.push(evidence[parent].clone());
+                cited_indices.push(parent);
+            }
+            child = parent;
+        }
+    }
     Ok(SemanticAnswer {
         answer,
         uncertainty,
@@ -1604,8 +1626,14 @@ mod tests {
             "uncertainty":"Only the verified source span was inspected.",
             "citations":[{"path":"src/lib.rs","start_line":2,"end_line":2}]
         });
-        let answer = decode_answer(response, &allowed, &[item], "test-route".to_owned())
-            .expect("the precise subspan remains verified");
+        let answer = decode_answer(
+            response,
+            &allowed,
+            &[item],
+            &report,
+            "test-route".to_owned(),
+        )
+        .expect("the precise subspan remains verified");
         assert_eq!(answer.citations().len(), 1);
         let outside = json!({
             "answer":"The guard returns SourceOutsideRoot.",
@@ -1613,9 +1641,63 @@ mod tests {
             "citations":[{"path":"src/lib.rs","start_line":3,"end_line":3}]
         });
         assert_eq!(
-            decode_answer(outside, &allowed, &[item], "test-route".to_owned()),
+            decode_answer(outside, &allowed, &[item], &report, "test-route".to_owned()),
             Err(SemanticError::CitationMismatch)
         );
+    }
+
+    #[test]
+    fn cited_callee_retains_verified_caller_chain() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("src/lib.rs");
+        fs::write(
+            &source,
+            "fn caller() -> bool { let retry = wait(); retry }\n\n\n\n\n\n\n\n\
+             fn wait() -> bool { remaining() > 0 }\n\n\n\n\n\n\n\n\
+             fn remaining() -> u64 { 0 }\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-1\n", source.display()),
+            &fixture.root,
+            "caller retry",
+            3,
+        )
+        .expect("caller evidence")
+        .with_following_lines(&fixture.root, 3)
+        .expect("verified call chain");
+        assert_eq!(report.evidence().len(), 3, "{:?}", report.evidence());
+        let callee = report.evidence().last().expect("budget definition");
+        assert_eq!(callee.symbol(), Some("remaining"));
+        let response = json!({
+            "answer": "The caller stops when wait observes zero remaining budget.",
+            "uncertainty": "Only the verified source was inspected.",
+            "citations": [{"path": "src/lib.rs", "start_line": callee.location().start_line(),
+                "end_line": callee.location().end_line()}]
+        });
+        let publisher = publisher(response);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let answer = runtime
+            .block_on(investigate(
+                "where is the remaining budget",
+                &fixture.root,
+                &report,
+                &publisher.policy(deadline),
+                deadline,
+                &ModelRouteCancellation::new(),
+            ))
+            .expect("semantic answer");
+        assert_eq!(answer.citations().len(), 3);
+        assert_eq!(answer.citations()[0].symbol(), Some("remaining"));
+        assert_eq!(answer.citations()[1].symbol(), Some("wait"));
+        assert_eq!(answer.citations()[2].location().start_line(), 1);
+        assert!(answer.citations()[2]
+            .snippet()
+            .contains("let retry = wait()"));
     }
 
     #[test]
