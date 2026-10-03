@@ -531,7 +531,16 @@ fn run(
                 search_cli_error(error)
             })?;
             trace.point(search_stage, TraceStatus::Ok, found.lines().count());
-            match verify_probe_evidence(&found, &root, search_query, options.max_results) {
+            // Leave room for called definitions needed to prove a why answer.
+            let verify_limit =
+                if semantic && query.trim_start().to_ascii_lowercase().starts_with("why ") {
+                    options
+                        .max_results
+                        .min(pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE / 2)
+                } else {
+                    options.max_results
+                };
+            match verify_probe_evidence(&found, &root, search_query, verify_limit) {
                 Ok(report) => {
                     trace.point(verify_stage, TraceStatus::Ok, report.evidence().len());
                     Ok(Some(report))
@@ -3364,7 +3373,7 @@ mod tests {
         fs::create_dir_all(root.join("src")).expect("fixture directory");
         fs::write(
             root.join("src/outage_hold.rs"),
-            "fn start() {}\nfn classify() {}\nfn remember() {}\nfn finish() {}\nfn probe() {}\nfn reload() {}\nfn count() {}\nfn wait() -> bool { if remaining() == 0 { return false; } true }\nfn remaining() -> u64 { 0 }\nfn is_outage() -> bool { true }\n",
+            "fn start() {}\nfn classify() {}\nfn remember() {}\nfn finish() {}\nfn probe() {}\nfn reload() {}\nfn count() {}\nfn wait() -> bool { if remaining() == 0 { return false; } true }\nfn remaining() -> u64 { 0 }\nfn is_outage() -> bool { true }\nfn drain_attempts() -> bool { confirmed() }\n",
         )
         .expect("implementation");
         fs::write(root.join("src/metrics.rs"), "fn unrelated() {}\n").expect("noise");
@@ -3379,8 +3388,10 @@ mod tests {
             },
         )
         .expect("bounded source names");
-        assert!(candidates.contains(&("src/outage_hold.rs".to_owned(), "is_outage".to_owned())));
-        assert!(candidates.contains(&("src/outage_hold.rs".to_owned(), "wait".to_owned())));
+        assert_eq!(
+            candidates,
+            [("src/outage_hold.rs".to_owned(), "wait".to_owned())]
+        );
         assert!(candidates.len() <= 8);
         assert!(candidates.iter().all(|(path, _)| path != "src/metrics.rs"));
         fs::remove_dir_all(root).expect("remove fixture");

@@ -209,6 +209,11 @@ pub fn candidate_symbols(
     let stop_question = question_lower
         .split(|character: char| !character.is_alphabetic())
         .any(|word| matches!(word, "stop" | "stops" | "stopped"));
+    // The answer contract needs an executable false-return branch. When one
+    // is present, do not ask the planner to choose a classifier or drain step.
+    if stop_question && symbols.iter().any(|(_, _, returns_false)| *returns_false) {
+        symbols.retain(|(_, _, returns_false)| *returns_false);
+    }
     let score = |name: &str, returns_false: bool| {
         usize::from(stop_question && returns_false) * 2
             + usize::from(name.starts_with("is_") || name.starts_with("should_"))

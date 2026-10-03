@@ -280,9 +280,13 @@ impl EvidenceReport {
             let calls = declaration_identity::calls(&source);
             sources.push((path, source, declarations, calls));
         }
-        let all_fields = sources
+        let source_fields = sources
             .iter()
-            .flat_map(|(_, source, _, _)| declaration_identity::field_types(source))
+            .map(|(_, source, _, _)| declaration_identity::field_types(source))
+            .collect::<Vec<_>>();
+        let all_fields = source_fields
+            .iter()
+            .flat_map(|fields| fields.iter().cloned())
             .collect::<Vec<_>>();
         let mut pending = (0..self.evidence.len())
             .rev()
@@ -293,9 +297,15 @@ impl EvidenceReport {
                 break;
             }
             let item = self.evidence[index].clone();
-            let mut calls = sources
+            let source_index = sources
                 .iter()
-                .find(|(path, _, _, _)| path == item.location().path())
+                .position(|(path, _, _, _)| path == item.location().path());
+            let own_fields = source_index
+                .and_then(|index| source_fields.get(index))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut calls = source_index
+                .and_then(|index| sources.get(index))
                 .map(|(_, _, _, calls)| {
                     calls
                         .iter()
@@ -308,15 +318,8 @@ impl EvidenceReport {
                 })
                 .unwrap_or_default();
             calls.sort_by_key(|call| {
-                let fields = declaration_identity::field_types(
-                    sources
-                        .iter()
-                        .find(|(path, _, _, _)| path == item.location().path())
-                        .map(|(_, source, _, _)| source.as_str())
-                        .unwrap_or(""),
-                );
                 let specificity = if call.marker.starts_with('.') {
-                    usize::from(declaration_identity::receiver_owner(call, &fields).is_none())
+                    usize::from(declaration_identity::receiver_owner(call, own_fields).is_none())
                 } else if call.marker.contains("::") {
                     1
                 } else {
@@ -334,14 +337,11 @@ impl EvidenceReport {
                         ("bare", "", call.marker.as_str())
                     };
                 let receiver = if kind == "method" {
-                    let own = declaration_identity::field_types(
-                        sources
-                            .iter()
-                            .find(|(path, _, _, _)| path == item.location().path())
-                            .map(|(_, source, _, _)| source.as_str())
-                            .unwrap_or(""),
-                    );
-                    let fields = if own.is_empty() { &all_fields } else { &own };
+                    let fields = if own_fields.is_empty() {
+                        &all_fields
+                    } else {
+                        own_fields
+                    };
                     let Some(owner) = declaration_identity::receiver_owner(&call, fields) else {
                         continue;
                     };
@@ -2393,6 +2393,29 @@ mod tests {
             .evidence()
             .iter()
             .any(|item| { item.snippet().contains("outage_hold::drain_attempts()") }));
+    }
+
+    #[test]
+    fn following_calls_parse_field_types_once_per_source() {
+        let fixture = Fixture::new();
+        let caller = fixture.root.join("src/proxy.rs");
+        fs::write(
+            &caller,
+            "fn attempt() { outage_hold::drain_attempts(); holder::second(); holder::third(); }\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(
+            &probe_file(&caller),
+            &fixture.root,
+            "outage_hold::drain_attempts",
+            4,
+        )
+        .expect("verified call");
+        declaration_identity::FIELD_TYPE_SCANS.with(|scans| scans.set(0));
+        report
+            .with_following_lines(&fixture.root, 8)
+            .expect("bounded following");
+        declaration_identity::FIELD_TYPE_SCANS.with(|scans| assert_eq!(scans.get(), 1));
     }
 
     #[test]

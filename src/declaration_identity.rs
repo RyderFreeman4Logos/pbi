@@ -5,6 +5,11 @@ use syn::{
     Expr, File, FnArg, ImplItem, Item, Member, Pat, Stmt, TraitItem, Type, UseTree,
 };
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static FIELD_TYPE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Segment identity, shared by lexical owners and directly resolvable impl types.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct OwnerPath(Vec<String>);
@@ -86,6 +91,7 @@ pub(super) struct ReceiverPath {
     fields: Vec<String>,
 }
 
+#[derive(Clone)]
 pub(super) struct FieldType {
     owner: String,
     field: String,
@@ -109,6 +115,8 @@ pub(super) fn receiver_owner(call: &CallSite, fields: &[FieldType]) -> Option<St
 }
 
 pub(super) fn field_types(source: &str) -> Vec<FieldType> {
+    #[cfg(test)]
+    FIELD_TYPE_SCANS.with(|scans| scans.set(scans.get() + 1));
     let Ok(file) = syn::parse_file(source) else {
         return Vec::new();
     };
