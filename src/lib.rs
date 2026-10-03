@@ -14,7 +14,6 @@ pub mod semantic;
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVIDENCE_LINES: usize = 4;
 const MAX_FOLLOWING_LINES: usize = 8;
-const MAX_CALLER_CONTEXT_LINES: usize = 40;
 
 #[cfg(test)]
 std::thread_local! {
@@ -172,7 +171,6 @@ impl EvidenceReport {
         max_total: usize,
     ) -> Result<Self, EvidenceError> {
         let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
-        let initial_count = self.evidence.len();
         let count = max_total.saturating_sub(self.evidence.len());
         for index in 0..count.min(self.evidence.len()) {
             let item = self.evidence[index].clone();
@@ -431,47 +429,6 @@ impl EvidenceReport {
                 pending.push((index, call_index + 1));
                 pending.push((self.evidence.len() - 1, 0));
                 break;
-            }
-        }
-        // Follow the original verified spans first so caller context cannot
-        // spend the bounded evidence slots before the stopping definition.
-        for index in 0..initial_count {
-            let item = self.evidence[index].clone();
-            if item.snippet().contains("return false") {
-                continue;
-            }
-            let Some((path, source, declarations, _)) = sources
-                .iter()
-                .find(|(path, _, _, _)| path == item.location().path())
-            else {
-                continue;
-            };
-            let start = item.location().start_line();
-            let first = start.saturating_sub(MAX_CALLER_CONTEXT_LINES).max(
-                declarations
-                    .iter()
-                    .map(|declaration| declaration.line)
-                    .take_while(|line| *line <= start)
-                    .last()
-                    .unwrap_or(1),
-            );
-            if first == start {
-                continue;
-            }
-            let snippet = source
-                .lines()
-                .skip(first - 1)
-                .take(item.location().end_line() - first + 1)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if snippet.len() <= 4096 {
-                self.evidence[index] = SourceEvidence {
-                    location: SourceLocation::new(path.clone(), first, item.location().end_line()),
-                    target: item.target().to_owned(),
-                    snippet,
-                    symbol: item.symbol().map(str::to_owned),
-                    relevance: item.relevance().to_owned(),
-                };
             }
         }
         Ok(self)
@@ -3352,50 +3309,5 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         assert!(selected
             .iter()
             .any(|index| report.evidence()[*index].snippet().contains("fn remaining")));
-    }
-
-    #[test]
-    fn why_stop_admits_the_callers_other_budget_without_unrelated_calls() {
-        let fixture = Fixture::new();
-        let path = fixture.root.join("src/budgets.rs");
-        let source = "fn attempt(used: u32) -> bool {\n    let mut retry = attempt_budget(used);\n    if is_outage() {\n        retry = wait();\n    }\n    if retry { return true; }\n    audit();\n    false\n}\nfn attempt_budget(used: u32) -> bool { used < 3 }\nfn is_outage() -> bool { true }\nfn wait() -> bool { if remaining() == 0 { return false; } true }\nfn remaining() -> u64 { 0 }\nfn audit() {}\nfn noise_budget() -> u64 { 99 }\n";
-        fs::write(&path, source).expect("source");
-        let report = EvidenceReport {
-            complete: true,
-            evidence: vec![SourceEvidence {
-                location: SourceLocation::new(path, 3, 4),
-                target: "wait".to_owned(),
-                snippet: String::new(),
-                symbol: Some("attempt".to_owned()),
-                relevance: String::new(),
-            }],
-            missing_targets: Vec::new(),
-            cited: vec![3],
-            followed_from: vec![None],
-            call_edges: Vec::new(),
-        }
-        .with_following_lines(&fixture.root, 6)
-        .expect("bounded evidence");
-        let stop = report
-            .evidence()
-            .iter()
-            .position(|item| item.snippet().contains("return false"))
-            .expect("stop branch");
-        let selected = report.causal_indices(stop);
-        let selected_text = selected
-            .iter()
-            .map(|index| report.evidence()[*index].snippet())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            selected_text.contains("let mut retry = attempt_budget(used)"),
-            "{selected_text}"
-        );
-        assert!(
-            selected_text.contains("remaining() -> u64"),
-            "{selected_text}"
-        );
-        assert!(!selected_text.contains("noise_budget"), "{selected_text}");
-        assert!(report.evidence().len() <= 6);
     }
 }
