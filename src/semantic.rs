@@ -915,12 +915,23 @@ fn has_executable_false_return(snippet: &str) -> bool {
         fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
     }
 
-    let parsed = syn::parse_file(snippet)
-        .or_else(|_| syn::parse_file(&format!("impl EvidenceOwner {{ {snippet} }}")));
-    let Ok(parsed) = parsed else { return false };
-    let mut visitor = FalseReturn(false);
-    visitor.visit_file(&parsed);
-    visitor.0
+    // A bounded declaration window may include closing braces for its owning
+    // impl or module. Remove only unmatched trailing owner braces, stopping
+    // at the first complete parse of the function fragment.
+    let mut fragment = snippet.trim_end();
+    loop {
+        let parsed = syn::parse_file(fragment)
+            .or_else(|_| syn::parse_file(&format!("impl EvidenceOwner {{ {fragment} }}")));
+        if let Ok(parsed) = parsed {
+            let mut visitor = FalseReturn(false);
+            visitor.visit_file(&parsed);
+            return visitor.0;
+        }
+        let Some(shorter) = fragment.strip_suffix('}') else {
+            return false;
+        };
+        fragment = shorter.trim_end();
+    }
 }
 
 /// One contextual boundary: retain filename punctuation until the whole token
@@ -1829,6 +1840,9 @@ mod tests {
     fn stop_answer_names_a_verified_false_return_and_its_caller() {
         assert!(has_executable_false_return(
             "async fn wait(&self) -> bool { if remaining.is_zero() { return false; } true }"
+        ));
+        assert!(has_executable_false_return(
+            "async fn wait(&self) -> bool { if remaining.is_zero() { return false; } true }\n}"
         ));
         assert!(!has_executable_false_return(
             "fn wait() -> bool { /* return false; */ true }"
