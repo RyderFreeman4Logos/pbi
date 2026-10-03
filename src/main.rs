@@ -503,6 +503,10 @@ fn run(
     #[cfg(not(test))]
     let publisher = owned_publisher.as_ref();
 
+    let explanatory_question = semantic && {
+        let lower = query.trim_start().to_ascii_lowercase();
+        lower.starts_with("why ") || lower.starts_with("how ")
+    };
     let collect_evidence =
         |search_query: &str, initial: bool| -> Result<Option<pbi_rs::EvidenceReport>, CliError> {
             let (search_stage, verify_stage) = if initial {
@@ -532,14 +536,13 @@ fn run(
             })?;
             trace.point(search_stage, TraceStatus::Ok, found.lines().count());
             // Leave room for called definitions needed to prove a why answer.
-            let verify_limit =
-                if semantic && query.trim_start().to_ascii_lowercase().starts_with("why ") {
-                    options
-                        .max_results
-                        .min(pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE / 2)
-                } else {
-                    options.max_results
-                };
+            let verify_limit = if explanatory_question {
+                options
+                    .max_results
+                    .min(pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE / 2)
+            } else {
+                options.max_results
+            };
             match verify_probe_evidence(&found, &root, search_query, verify_limit) {
                 Ok(report) => {
                     trace.point(verify_stage, TraceStatus::Ok, report.evidence().len());
@@ -649,7 +652,7 @@ fn run(
             TraceStatus::Start,
             report.evidence().len(),
         );
-        let expanded_report = if query.trim_start().to_ascii_lowercase().starts_with("why ") {
+        let expanded_report = if explanatory_question {
             Some(
                 report
                     .clone()
