@@ -823,7 +823,7 @@ fn decode_answer(
         .get("answer")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty() && answer_expression_is_complete(value))
+        .filter(|value| !value.is_empty())
         .ok_or(SemanticError::InvalidOutput)?
         .to_owned();
     let uncertainty = object
@@ -950,35 +950,6 @@ fn decode_answer(
         citations,
         invocation_identity,
     })
-}
-
-fn answer_expression_is_complete(answer: &str) -> bool {
-    let mut stack = Vec::new();
-    let mut operator = false;
-    for ch in answer.chars() {
-        match ch {
-            '(' | '[' | '{' => {
-                stack.push(ch);
-                operator = false;
-            }
-            ')' | ']' | '}' => {
-                let open = match ch {
-                    ')' => '(',
-                    ']' => '[',
-                    '}' => '{',
-                    _ => unreachable!(),
-                };
-                if stack.pop() != Some(open) {
-                    return false;
-                }
-                operator = false;
-            }
-            _ if ch.is_whitespace() => {}
-            '=' | '!' | '<' | '>' | '&' | '|' => operator = true,
-            _ => operator = false,
-        }
-    }
-    stack.is_empty() && !operator
 }
 
 fn citation_mismatch(reason: &'static str) -> SemanticError {
@@ -1914,46 +1885,34 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_comparison_answer_is_rejected() {
+    fn complete_model_answers_preserve_code_literals_and_natural_punctuation() {
         let fixture = Fixture::new();
-        let item = &fixture.report.evidence()[0];
-        let allowed = [AllowedCitation {
-            path: "src/lib.rs".to_owned(),
-            start_line: item.location().start_line(),
-            end_line: item.location().end_line(),
-            evidence_index: 0,
-        }];
-        let evidence = [item];
-        for answer in [
-            "The guard returns false when response_metadata[request_deadline_exhausted] ==",
-            "The guard returns false when response_metadata[request_deadline_exhausted] == ",
-            "The guard returns false when value !=",
-            "The guard returns false when value <=",
-            "The guard returns false when value >=",
-            "The guard checks value &&",
-            "The guard checks value ||",
-            "The guard returns false when metadata[",
-            "The guard returns false when metadata[request_deadline_exhausted",
-            "The guard returns false when call(",
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        for text in [
+            "A quoted opening character '(' is valid source text.",
+            "A backtick code literal can contain `[`, `(`, or `{`.",
+            "The prose can end with a smiley :)",
         ] {
-            let response = json!({
-                "answer": answer,
-                "uncertainty": "Only the verified source span was inspected.",
+            let publisher = publisher(json!({
+                "answer": text,
+                "uncertainty": "Only the verified source was inspected.",
                 "citations": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
-            });
-            assert_eq!(
-                decode_answer(
-                    response,
-                    &allowed,
-                    &evidence,
+            }));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let answer = runtime
+                .block_on(investigate(
+                    "where is answer parse error",
+                    &fixture.root,
                     &fixture.report,
-                    &[],
-                    &[true],
-                    "test-route".to_owned(),
-                ),
-                Err(SemanticError::InvalidOutput),
-                "{answer}"
-            );
+                    &publisher.policy(deadline),
+                    deadline,
+                    &ModelRouteCancellation::new(),
+                ))
+                .expect("complete quoted code and prose are not an expression grammar");
+            assert_eq!(answer.answer(), text);
         }
     }
 
