@@ -752,7 +752,7 @@ fn run(
                 "semantic investigation exceeded its bounded deadline",
             ));
         }
-        let expanded_report = if explanatory_question {
+        let expanded_report = if explanatory_question || type_field_subject(&query).is_some() {
             Some(
                 report
                     .clone()
@@ -1813,6 +1813,40 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn field_question_admits_bounded_type_body_before_answer_validation() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-field-body-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("model.rs"),
+            "pub struct LedgerState {\n    pub entries: usize,\n    pub revision: u64,\n}\n",
+        )
+        .expect("type declaration");
+        let _env = RouteConfigEnvGuard::new(&root, &[("PBI_RS_ADK_ENABLE", Some("1".to_owned()))]);
+        let publisher = test_publisher(json!({
+            "answer": "LedgerState stores entries and revision.",
+            "uncertainty": "None; both declared fields are visible.",
+            "citations": [{"path": "model.rs", "start_line": 1, "end_line": 4}]
+        }));
+        let mut output = Vec::new();
+        let result = run(
+            vec!["What fields does LedgerState store?".to_owned()],
+            Some(TestRouteInjection::Publisher(&publisher)),
+            &mut output,
+        );
+        let code = result.unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&output).contains("entries and revision"));
+        drop(_env);
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
