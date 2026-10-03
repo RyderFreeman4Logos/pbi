@@ -98,6 +98,197 @@ fn search_single_rust_type_name_uses_code_identifier() {
     );
 }
 
+#[test]
+fn raw_native_bm25_ranks_source_and_returns_real_locations() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("frequent.rs"),
+        "fn needle() { needle(); needle(); }\n",
+    )
+    .expect("frequent source");
+    fs::write(fixture.root.join("rare.rs"), "fn needle() {}\n").expect("rare source");
+
+    let output = fixture.run(&["search", "--bm25", "needle"], "raw");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.starts_with("File: frequent.rs, Lines: 1-1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("fn needle() { needle(); needle(); }"),
+        "{text}"
+    );
+    assert!(text.contains("File: rare.rs, Lines: 1-1\n"), "{text}");
+}
+
+#[test]
+fn raw_native_bm25_json_is_bounded_and_scope_safe() {
+    let fixture = ScopeFixture::new();
+    fs::write(fixture.root.join("kept.rs"), "fn raw_marker() {}\n").expect("kept source");
+    fs::write(fixture.root.join("ignored.rs"), "fn raw_marker() {}\n").expect("ignored source");
+    fs::write(fixture.base.join("outside.rs"), "fn raw_marker() {}\n").expect("outside source");
+    symlink(
+        fixture.base.join("outside.rs"),
+        fixture.root.join("linked.rs"),
+    )
+    .expect("linked source");
+
+    let output = fixture.run_args(
+        "raw",
+        &[
+            "search",
+            "--bm25",
+            "--format=json",
+            "--max-results=1",
+            "--ignore=ignored.rs",
+            "raw_marker",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hits: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let rows = hits.as_array().expect("array of hits");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["file"], "kept.rs");
+    assert_eq!(rows[0]["line"], 1);
+    assert!(rows[0]["score"].as_f64().is_some());
+    assert!(rows[0]["snippet"]
+        .as_str()
+        .is_some_and(|line| line.contains("raw_marker")));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("outside.rs"));
+}
+
+#[test]
+fn raw_native_result_filters_and_output_budget_change_behavior() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("match.rs"),
+        "fn budget_marker() { budget_marker(); }\n",
+    )
+    .expect("source");
+    let files = fixture.run(
+        &["search", "--bm25", "--files-only", "budget_marker"],
+        "raw",
+    );
+    assert!(
+        files.status.success(),
+        "{}",
+        String::from_utf8_lossy(&files.stderr)
+    );
+    assert_eq!(files.stdout, b"match.rs\n");
+
+    let exact = fixture.run(
+        &[
+            "search",
+            "--bm25",
+            "--exact",
+            "budget_marker() {",
+            "--max-results=1",
+        ],
+        "raw",
+    );
+    assert!(
+        exact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
+    assert!(String::from_utf8_lossy(&exact.stdout).contains("match.rs"));
+
+    let bounded = fixture.run(
+        &["search", "--bm25", "--max-bytes=4", "budget_marker"],
+        "raw",
+    );
+    assert!(!bounded.status.success());
+    assert!(bounded.stdout.len() <= 4);
+}
+
+#[test]
+fn raw_filename_match_does_not_invent_a_source_line() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("artifact_needle.rs"),
+        "fn unrelated() {}\n",
+    )
+    .expect("filename hit");
+    let matched = fixture.run(&["search", "--bm25", "artifact_needle"], "raw");
+    assert!(
+        matched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&matched.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&matched.stdout).lines().next(),
+        Some("File: artifact_needle.rs, Match: filename")
+    );
+    let excluded = fixture.run(
+        &["search", "--bm25", "--exclude-filenames", "artifact_needle"],
+        "raw",
+    );
+    assert_eq!(excluded.status.code(), Some(1));
+    assert!(excluded.stdout.is_empty());
+}
+
+#[test]
+fn raw_formats_frequency_and_token_budget_have_real_outputs() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("formats.rs"),
+        "fn xml_marker() { let x = \"<value>&\"; xml_marker(); }\n",
+    )
+    .expect("format source");
+    for format in [
+        "plain",
+        "terminal",
+        "markdown",
+        "json",
+        "xml",
+        "color",
+        "outline",
+        "outline-xml",
+    ] {
+        let output = fixture.run(
+            &[
+                "search",
+                "--bm25",
+                "--frequency",
+                "--format",
+                format,
+                "xml_marker",
+            ],
+            "raw",
+        );
+        assert!(
+            output.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(rendered.contains("formats.rs"), "{format}: {rendered}");
+        match format {
+            "json" => {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("JSON");
+                assert_eq!(value[0]["occurrences"], 2);
+            }
+            "xml" => assert!(rendered.contains("&lt;value&gt;&amp;"), "{rendered}"),
+            "outline-xml" => assert!(rendered.contains("<results>\n<hit "), "{rendered}"),
+            "color" => assert!(rendered.contains("\x1b[36m"), "{rendered}"),
+            _ => assert!(rendered.contains("2"), "{format}: {rendered}"),
+        }
+    }
+    let too_few_tokens = fixture.run(&["search", "--bm25", "--max-tokens=1", "xml_marker"], "raw");
+    assert_eq!(too_few_tokens.status.code(), Some(1));
+    assert!(too_few_tokens.stdout.is_empty());
+}
+
 fn safe_test_root(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -220,8 +411,32 @@ fn search_session_refuses_durable_cache_before_probe() {
         let output = fixture.run(&args, "evidence");
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
-        assert_eq!(output.stderr, b"pbi-rs: --session requires durable Probe cache writes; search session storage is not supported\n");
+        assert_eq!(
+            output.stderr,
+            b"pbi-rs: --session is unavailable: native raw search is stateless\n"
+        );
         assert!(!fixture.root.join("probe-argv").exists());
+    }
+}
+
+#[test]
+fn raw_backend_only_options_are_refused_instead_of_ignored() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["search", "--bm25", "--reranker=bert", "search_option"],
+        vec!["search", "--bm25", "--reranker", "search_option"],
+        vec!["search", "--bm25", "--question", "another", "search_option"],
+        vec!["search", "--bm25", "--merge-threshold=2", "search_option"],
+        vec![
+            "search",
+            "--bm25",
+            "--strict-elastic-syntax",
+            "search_option",
+        ],
+    ] {
+        let output = fixture.run(&args, "raw");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
     }
 }
 

@@ -242,9 +242,9 @@ fn inherited_controls_and_default_path_stay_unchanged() {
     let stdout = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
     assert_selected(&stdout, LOCAL, NONE);
     assert!(stdout.contains("search_default=native_bounded_term_frequency_no_probe\n"));
-    assert!(stdout.contains("search_bm25_opt_in=refused_probe_removed\n"));
+    assert!(stdout.contains("search_bm25_opt_in=native_bounded_raw_no_model\n"));
     assert!(stdout.contains(&format!(
-        "search_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\n"
+        "search_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\n"
     )));
     let _ = fs::remove_dir_all(dir);
 }
@@ -318,7 +318,8 @@ fn search_raw_and_off_do_not_read_debug_config() {
         None,
         &mut Vec::new(),
     );
-    assert!(matches!(raw, Err(error) if error.code == 2));
+    assert!(matches!(raw, Ok(0)));
+    assert!(started.elapsed() < Duration::from_secs(2));
     let _ = fs::remove_dir_all(dir);
 }
 

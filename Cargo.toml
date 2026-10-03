@@ -17,6 +17,7 @@ syn = { version = "=2.0.119", features = ["full", "visit"] }
 proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 serde_json = "=1.0.149"
 ignore = "=0.4.25"
+libc = "=0.2.189"
 toml = "=0.9.12"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
 workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb" }

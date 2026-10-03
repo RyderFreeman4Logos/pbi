@@ -54,10 +54,12 @@ raw_rc=$?
 set -e
 test "$ignored_rc" -eq 1
 test "$nohit_rc" -eq 1
-test "$raw_rc" -eq 2
+test "$raw_rc" -eq 0
 test ! -s "$fixture/ignored.out"
 test ! -s "$fixture/nohit.out"
-test ! -s "$fixture/raw.out"
+grep -q '^File: chosen.rs, Lines: 1-1$' "$fixture/raw.out"
+grep -q '^File: chosen.py, Lines: 1-1$' "$fixture/raw.out"
+test ! -s "$fixture/raw.err"
 grep -qx 'pbi: no source locations found' "$fixture/nohit.err"
 
 printf '%s\n' 'fn outside_marker() {}' > "$fixture/outside.rs"
@@ -65,9 +67,13 @@ ln -s "$fixture/outside.rs" "$fixture/repo/linked.rs"
 set +e
 (cd "$fixture/repo" && pbi search outside_marker) > "$fixture/linked.out" 2> "$fixture/linked.err"
 linked_rc=$?
+(cd "$fixture/repo" && pbi search --bm25 outside_marker) > "$fixture/raw-linked.out" 2> "$fixture/raw-linked.err"
+raw_linked_rc=$?
 set -e
 test "$linked_rc" -eq 1
 test ! -s "$fixture/linked.out"
+test "$raw_linked_rc" -eq 1
+test ! -s "$fixture/raw-linked.out"
 
 for index in $(seq 1 17); do
     printf '%s\n' 'fn capped_marker() {}' > "$fixture/capped/file-$index.rs"
@@ -75,13 +81,18 @@ done
 set +e
 (cd "$fixture/capped" && pbi search capped_marker) > "$fixture/capped.out" 2> "$fixture/capped.err"
 capped_rc=$?
+(cd "$fixture/capped" && pbi search --bm25 capped_marker) > "$fixture/raw-capped.out" 2> "$fixture/raw-capped.err"
+raw_capped_rc=$?
 set -e
 test "$capped_rc" -eq 1
 grep -q 'bounded target limit' "$fixture/capped.err"
+test "$raw_capped_rc" -eq 1
+test ! -s "$fixture/raw-capped.out"
+grep -q 'bounded target limit' "$fixture/raw-capped.err"
 
 debug=$(pbi --debug-config)
 printf '%s\n' "$debug" | grep -qx 'search_default=native_bounded_term_frequency_no_probe'
 printf '%s\n' "$debug" | grep -qx 'model_path=adk_workflow_kit_authorized_route_snapshot'
 printf '%s\n' "$debug" | grep -qx 'api_key=\[REDACTED\]'
 test ! -e "$marker"
-printf '%s\n' 'acceptance: native bounded search, filters, root cap, no-hit, linked source, raw refusal, and Probe trap passed'
+printf '%s\n' 'acceptance: native bounded search, filters, root cap, no-hit, linked source, raw BM25, and Probe trap passed'

@@ -3,12 +3,14 @@
 //! No Probe binary, probe-chat, or search subprocess. Hits are ordinary
 //! `File:` ranges so the existing verifier remains the citation boundary.
 //!
-//! ponytail: one lexical pass, term frequency over document frequency.
-//! Replace with a real inverted index if a repository walk exceeds the deadline.
+//! Verified locations use one lexical pass; raw results rank with BM25 over
+//! the same bounded walk. Neither path creates an index or a model request.
 
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,6 +41,32 @@ pub enum SearchFailure {
     Unavailable,
 }
 
+/// One native BM25 result. Paths are repository relative and snippets come
+/// from a checked, bounded source file; these are search hits, not citations.
+pub struct RawHit {
+    pub file: String,
+    pub line: Option<usize>,
+    pub snippet: String,
+    pub score: f64,
+    pub occurrences: usize,
+}
+
+/// Raw search changes matching only. It shares the walk and file limits with
+/// verified search and does not create a session or call a model.
+pub struct RawSearchOptions {
+    pub exact: bool,
+    pub exclude_filenames: bool,
+}
+
+struct RawCandidate {
+    file: String,
+    line: Option<usize>,
+    snippet: String,
+    term_counts: Vec<usize>,
+    length: usize,
+    occurrences: usize,
+}
+
 struct Hit {
     path: PathBuf,
     line: usize,
@@ -65,18 +93,9 @@ pub fn search_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let metadata = fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.dev() != root_meta.dev()
-            || metadata.len() > MAX_FILE_BYTES
-        {
+        let Some(bytes) = read_source(&path, root_meta.dev())? else {
             continue;
-        }
-        let bytes = fs::read(&path).map_err(|_| SearchFailure::Unavailable)?;
-        if bytes.len() as u64 > MAX_FILE_BYTES {
-            continue;
-        }
+        };
         let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
@@ -112,6 +131,185 @@ pub fn search_repository(
         output.push_str(&line);
     }
     Ok(output)
+}
+
+/// Rank bounded repository files with BM25, retaining one real matching line
+/// per file. This deliberately returns raw hits without citation verification.
+pub fn search_raw_repository(
+    root: &Path,
+    query: &str,
+    limits: &SearchLimits,
+    options: &RawSearchOptions,
+) -> Result<Vec<RawHit>, SearchFailure> {
+    let terms = raw_terms(query);
+    if terms.is_empty() || terms.len() > 32 {
+        return Err(SearchFailure::Limit);
+    }
+    let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
+    let files = walk(root, root_meta.dev(), limits)?;
+    let mut documents = 0usize;
+    let mut total_length = 0usize;
+    let mut document_frequency = vec![0usize; terms.len()];
+    let mut candidates = Vec::new();
+    let exact_phrase = query.trim().to_lowercase();
+    for path in files {
+        if Instant::now() >= limits.deadline {
+            return Err(SearchFailure::Deadline);
+        }
+        if !language_matches(&path, limits.language.as_deref()) {
+            continue;
+        }
+        let Some(bytes) = read_source(&path, root_meta.dev())? else {
+            continue;
+        };
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Some(relative) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        documents += 1;
+        let mut counts = vec![0usize; terms.len()];
+        let mut length = 0usize;
+        let mut best = (0usize, 0usize, "");
+        for (index, line) in source.lines().enumerate() {
+            if Instant::now() >= limits.deadline {
+                return Err(SearchFailure::Deadline);
+            }
+            let normalized = line.to_lowercase();
+            let mut line_matches = 0usize;
+            for word in normalized
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .filter(|word| !word.is_empty())
+            {
+                length += 1;
+                for (term_index, term) in terms.iter().enumerate() {
+                    if word == term {
+                        counts[term_index] += 1;
+                        line_matches += 1;
+                    }
+                }
+            }
+            if options.exact && normalized.contains(&exact_phrase) {
+                best = (usize::MAX, index + 1, line);
+            } else if line_matches > best.0 {
+                best = (line_matches, index + 1, line);
+            }
+        }
+        if !options.exclude_filenames {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                for word in name
+                    .to_lowercase()
+                    .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                {
+                    length += usize::from(!word.is_empty());
+                    for (term_index, term) in terms.iter().enumerate() {
+                        if word == term {
+                            counts[term_index] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        total_length += length;
+        for (df, count) in document_frequency.iter_mut().zip(&counts) {
+            *df += usize::from(*count > 0);
+        }
+        if counts.iter().all(|count| *count == 0)
+            || (options.exact && !source.to_lowercase().contains(&exact_phrase))
+        {
+            continue;
+        }
+        let line = (best.1 > 0).then_some(best.1);
+        let snippet = best.2.chars().take(512).collect();
+        candidates.push(RawCandidate {
+            file: relative.to_owned(),
+            line,
+            snippet,
+            occurrences: counts.iter().sum(),
+            term_counts: counts,
+            length,
+        });
+    }
+    if documents == 0 {
+        return Ok(Vec::new());
+    }
+    let average_length = (total_length as f64 / documents as f64).max(1.0);
+    let mut hits = candidates
+        .into_iter()
+        .map(|candidate| {
+            let score = candidate
+                .term_counts
+                .iter()
+                .zip(&document_frequency)
+                .map(|(count, frequency)| {
+                    let tf = *count as f64;
+                    let idf = ((documents as f64 - *frequency as f64 + 0.5)
+                        / (*frequency as f64 + 0.5)
+                        + 1.0)
+                        .ln();
+                    let normalization =
+                        1.2 * (0.25 + 0.75 * candidate.length as f64 / average_length);
+                    idf * tf * 2.2 / (tf + normalization)
+                })
+                .sum();
+            RawHit {
+                file: candidate.file,
+                line: candidate.line,
+                snippet: candidate.snippet,
+                score,
+                occurrences: candidate.occurrences,
+            }
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    hits.truncate(limits.max_results);
+    Ok(hits)
+}
+
+fn raw_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for term in query
+        .to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|term| !term.is_empty())
+    {
+        if !terms.iter().any(|known| known == term) {
+            terms.push(term.to_owned());
+        }
+    }
+    terms
+}
+
+fn read_source(path: &Path, device: u64) -> Result<Option<Vec<u8>>, SearchFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.dev() != device
+        || metadata.len() > MAX_FILE_BYTES
+    {
+        return Ok(None);
+    }
+    let file: File = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let opened = file.metadata().map_err(|_| SearchFailure::Unavailable)?;
+    if !opened.is_file() || opened.dev() != device || opened.len() > MAX_FILE_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SearchFailure::Unavailable)?;
+    Ok((bytes.len() as u64 <= MAX_FILE_BYTES).then_some(bytes))
 }
 
 /// List bounded, parsed Rust function names from source files whose names match

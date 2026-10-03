@@ -12,7 +12,10 @@ use pbi_rs::semantic::{
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
 mod native_search;
-use native_search::{candidate_symbols, search_repository, SearchFailure, SearchLimits};
+use native_search::{
+    candidate_symbols, search_raw_repository, search_repository, RawHit, RawSearchOptions,
+    SearchFailure, SearchLimits,
+};
 use serde_json::json;
 use std::cell::Cell;
 use std::env;
@@ -31,9 +34,10 @@ use workflow_adk::{
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_MAX_RESULTS: usize = 8;
-const PROBE_OUTER_DEADLINE_SECONDS: u64 = 8;
+const SEARCH_OUTER_DEADLINE_SECONDS: u64 = 8;
 const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 90;
 const MAX_STAGE_ROWS: usize = 24;
+const MAX_RAW_OUTPUT_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy)]
 enum TraceStage {
@@ -206,10 +210,10 @@ fn usage() {
     println!(
         "pbi-rs {VERSION} — bounded native source search and cited answers\n\
          Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--timeout <SECONDS>] [--json]\n\
-                pbi-rs search [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
-         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {PROBE_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Source citations are verified before a model sees them."
+         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Normal source citations are verified; --bm25 prints raw native ranked hits without citation verification or a model."
     );
 }
 
@@ -329,7 +333,7 @@ fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, Sema
         (route.base_url().to_owned(), route.model().to_owned())
     };
     Ok(format!(
-        "search_default=native_bounded_term_frequency_no_probe\nsearch_bm25_opt_in=refused_probe_removed\nsearch_outer_deadline_seconds={PROBE_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
+        "search_default=native_bounded_term_frequency_no_probe\nsearch_bm25_opt_in=native_bounded_raw_no_model\nsearch_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_opt_in_env=PBI_RS_ADK_ENABLE\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
     ))
 }
 
@@ -391,30 +395,31 @@ fn run(
             "--model-route is only supported for semantic questions",
         ));
     }
-    let (raw, semantic, query, options, json_output, requested_timeout) =
-        if arguments[0] == "search" {
-            let (raw, query, options) = parse_search(&arguments[1..])?;
-            if options.help {
-                println!(
+    let (raw, semantic, query, options, json_output, requested_timeout) = if arguments[0]
+        == "search"
+    {
+        let (raw, query, options) = parse_search(&arguments[1..])?;
+        if options.help {
+            println!(
                     "pbi-rs search is bounded and in-process.\n\
-                 Supported: --timeout --max-results --language/-l --ignore/-i\n\
-                 Raw and format-changing legacy flags are refused."
+                 Supported: --timeout --max-results --language/-l --ignore/-i.\n\
+                 --bm25 prints bounded native ranked hits. Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
                 );
-                return Ok(0);
-            }
-            let requested_timeout = options.timeout;
-            (raw, false, query, options, false, requested_timeout)
-        } else {
-            let (query, json_output, requested_timeout) = parse_question(&arguments)?;
-            (
-                false,
-                true,
-                query,
-                SearchOptions::default(),
-                json_output,
-                requested_timeout,
-            )
-        };
+            return Ok(0);
+        }
+        let requested_timeout = options.timeout;
+        (raw, false, query, options, false, requested_timeout)
+    } else {
+        let (query, json_output, requested_timeout) = parse_question(&arguments)?;
+        (
+            false,
+            true,
+            query,
+            SearchOptions::default(),
+            json_output,
+            requested_timeout,
+        )
+    };
 
     let admitted_routes = if route_specs.is_empty() {
         None
@@ -434,14 +439,14 @@ fn run(
         _ => Duration::from_secs(if semantic {
             MESSAGE_OUTER_DEADLINE_SECONDS
         } else {
-            PROBE_OUTER_DEADLINE_SECONDS
+            SEARCH_OUTER_DEADLINE_SECONDS
         }),
     };
     #[cfg(not(test))]
     let deadline_duration = Duration::from_secs(requested_timeout.unwrap_or(if semantic {
         MESSAGE_OUTER_DEADLINE_SECONDS
     } else {
-        PROBE_OUTER_DEADLINE_SECONDS
+        SEARCH_OUTER_DEADLINE_SECONDS
     }));
     let deadline = Instant::now()
         .checked_add(deadline_duration)
@@ -453,8 +458,38 @@ fn run(
             trace.route(index, route);
         }
     }
-    if raw
-        || options.format.is_some()
+    if raw {
+        if options.merge_threshold.is_some() || options.strict_elastic_syntax {
+            return Err(CliError::usage(
+                "--merge-threshold and --strict-elastic-syntax have no defined native BM25 meaning",
+            ));
+        }
+        let hits = search_raw_repository(
+            &root,
+            &query,
+            &SearchLimits {
+                deadline,
+                max_results: options.max_results,
+                language: options.language.clone(),
+                ignores: options.ignores.clone(),
+            },
+            &RawSearchOptions {
+                exact: options.exact,
+                exclude_filenames: options.exclude_filenames,
+            },
+        )
+        .map_err(search_cli_error)?;
+        if hits.is_empty() {
+            return Err(evidence_cli_error(EvidenceError::NoSourceLocations));
+        }
+        let output = render_raw_hits(&hits, &options, deadline)?;
+        io::stdout()
+            .write_all(&output)
+            .map_err(|_| CliError::failed("cannot write raw search results"))?;
+        trace.point(TraceStage::Terminal, TraceStatus::Ok, hits.len());
+        return Ok(0);
+    }
+    if options.format.is_some()
         || options.max_bytes.is_some()
         || options.max_tokens.is_some()
         || options.merge_threshold.is_some()
@@ -465,7 +500,7 @@ fn run(
         || options.strict_elastic_syntax
     {
         return Err(CliError::usage(
-            "raw Probe search was removed; use verified search without --bm25 or Probe format flags",
+            "raw search options require --bm25; verified search prints compact citations",
         ));
     }
     #[cfg(test)]
@@ -779,6 +814,206 @@ fn search_cli_error(failure: SearchFailure) -> CliError {
     }
 }
 
+fn render_raw_hits(
+    hits: &[RawHit],
+    options: &SearchOptions,
+    deadline: Instant,
+) -> Result<Vec<u8>, CliError> {
+    if options.files_only && options.frequency {
+        return Err(CliError::usage(
+            "--files-only and --frequency cannot be combined",
+        ));
+    }
+    let format = options.format.as_deref().unwrap_or("plain");
+    let byte_limit = options
+        .max_bytes
+        .as_deref()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(MAX_RAW_OUTPUT_BYTES)
+        .min(MAX_RAW_OUTPUT_BYTES);
+    let token_limit = options
+        .max_tokens
+        .as_deref()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    let mut output = Vec::new();
+    for count in 1..=hits.len() {
+        if Instant::now() >= deadline {
+            return Err(CliError::failed(
+                "raw search formatting exceeded its deadline",
+            ));
+        }
+        let next = render_raw_prefix(&hits[..count], format, options);
+        let tokens = String::from_utf8_lossy(&next)
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .filter(|word| !word.is_empty())
+            .count();
+        if next.len() > byte_limit || tokens > token_limit {
+            if output.is_empty() {
+                return Err(CliError::failed("raw search output budget is too small"));
+            }
+            break;
+        }
+        output = next;
+    }
+    Ok(output)
+}
+
+fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> Vec<u8> {
+    if format == "json" {
+        let entries = hits
+            .iter()
+            .map(|hit| {
+                if options.files_only {
+                    json!(hit.file)
+                } else {
+                    let mut value = json!({
+                        "file": hit.file,
+                        "line": hit.line,
+                        "score": hit.score,
+                        "snippet": hit.snippet,
+                    });
+                    if options.frequency {
+                        value["occurrences"] = json!(hit.occurrences);
+                    }
+                    value
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut output = serde_json::Value::Array(entries).to_string().into_bytes();
+        output.push(b'\n');
+        return output;
+    }
+    let mut output = String::new();
+    if matches!(format, "xml" | "outline-xml") {
+        output.push_str("<results>\n");
+    }
+    for hit in hits {
+        let file = escape_control(&hit.file);
+        let snippet = escape_control(&hit.snippet);
+        let location = hit.line.map_or_else(
+            || format!("{file} (filename)"),
+            |line| format!("{file}:{line}"),
+        );
+        let line_label = hit.line.map_or_else(
+            || "Match: filename".to_owned(),
+            |line| format!("Lines: {line}-{line}"),
+        );
+        let source_line = hit
+            .line
+            .map_or_else(String::new, |line| format!("{line}: {snippet}\n"));
+        let xml_location = hit.line.map_or_else(
+            || " match=\"filename\"".to_owned(),
+            |line| format!(" line=\"{line}\""),
+        );
+        if options.files_only {
+            match format {
+                "xml" | "outline-xml" => {
+                    output.push_str(&format!("<file path=\"{}\"/>\n", escape_xml(&file)));
+                }
+                "markdown" => output.push_str(&format!("- `{file}`\n")),
+                "color" => output.push_str(&format!("\x1b[36m{file}\x1b[0m\n")),
+                _ => output.push_str(&format!("{file}\n")),
+            }
+            continue;
+        }
+        match format {
+            "xml" => output.push_str(&format!(
+                "<hit file=\"{}\"{} score=\"{:.4}\"{}><snippet>{}</snippet></hit>\n",
+                escape_xml(&file),
+                xml_location,
+                hit.score,
+                if options.frequency {
+                    format!(" occurrences=\"{}\"", hit.occurrences)
+                } else {
+                    String::new()
+                },
+                escape_xml(&snippet)
+            )),
+            "outline-xml" => output.push_str(&format!(
+                "<hit file=\"{}\"{} score=\"{:.4}\"{} />\n",
+                escape_xml(&file),
+                xml_location,
+                hit.score,
+                if options.frequency {
+                    format!(" occurrences=\"{}\"", hit.occurrences)
+                } else {
+                    String::new()
+                }
+            )),
+            "outline" => output.push_str(&format!(
+                "{location} score={:.4}{}\n",
+                hit.score,
+                if options.frequency {
+                    format!(" occurrences={}", hit.occurrences)
+                } else {
+                    String::new()
+                }
+            )),
+            "markdown" => output.push_str(&format!(
+                "- `{location}` (BM25 {:.4}{})\n    {source_line}",
+                hit.score,
+                if options.frequency {
+                    format!(", occurrences {}", hit.occurrences)
+                } else {
+                    String::new()
+                },
+            )),
+            "color" => output.push_str(&format!(
+                "\x1b[36mFile: {file}, {line_label}\x1b[0m\nScore: {:.4}{}\n{source_line}",
+                hit.score,
+                if options.frequency {
+                    format!(" Occurrences: {}", hit.occurrences)
+                } else {
+                    String::new()
+                },
+            )),
+            "terminal" => output.push_str(&format!(
+                "== {location} ==\nBM25 {:.4}{}\n{source_line}",
+                hit.score,
+                if options.frequency {
+                    format!(" | {} occurrences", hit.occurrences)
+                } else {
+                    String::new()
+                }
+            )),
+            _ => output.push_str(&format!(
+                "File: {file}, {line_label}\nScore: {:.4}{}\n{source_line}",
+                hit.score,
+                if options.frequency {
+                    format!(" Occurrences: {}", hit.occurrences)
+                } else {
+                    String::new()
+                },
+            )),
+        }
+    }
+    if matches!(format, "xml" | "outline-xml") {
+        output.push_str("</results>\n");
+    }
+    output.into_bytes()
+}
+
+fn escape_control(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn print_evidence(report: &pbi_rs::EvidenceReport, root: &Path) -> Result<(), CliError> {
     let mut output = Vec::new();
     for (index, item) in report.evidence().iter().enumerate() {
@@ -954,6 +1189,8 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool, Option<u64>), C
 fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), CliError> {
     let mut raw = false;
     let mut question_seen = false;
+    let mut reranker_seen = false;
+    let mut requested_reranker = None;
     let mut options = SearchOptions::default();
     let mut query_parts = Vec::new();
     let mut after_separator = false;
@@ -979,22 +1216,26 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 index += 1;
             }
             "--reranker" | "-r" => {
-                // Legacy discards any next operand, even an invalid/empty option.
-                // Probe remains forced to BM25; this is not reranker activation.
+                reranker_seen = true;
+                requested_reranker = arguments.get(index + 1).cloned();
                 index = (index + 2).min(arguments.len());
             }
-            value if value.starts_with("--reranker=") => index += 1,
+            value if value.starts_with("--reranker=") => {
+                reranker_seen = true;
+                requested_reranker = value.split_once('=').map(|(_, name)| name.to_owned());
+                index += 1;
+            }
             value if value == "--session" || value.starts_with("--session=") => {
                 return Err(CliError::usage(
-                    "--session requires durable Probe cache writes; search session storage is not supported",
+                    "--session is unavailable: native raw search is stateless",
                 ));
             }
             value if value == "--question" || value.starts_with("--question=") => {
                 if question_seen {
                     return Err(CliError::usage("--question cannot be used multiple times"));
                 }
-                // Probe result_ranking.rs:138-145 uses question only with BERT.
-                // BM25 compatibility consumes it without inference or forwarding.
+                // Preserve the operand boundary before rejecting this BERT-only
+                // option for native BM25 below.
                 if value == "--question" {
                     next_value(arguments, &mut index, "--question")?;
                 } else {
@@ -1095,6 +1336,16 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
         }
     }
     let mut query = query_parts.join(" ");
+    if raw && question_seen {
+        return Err(CliError::usage(
+            "--question requires a model reranker; native BM25 does not use it",
+        ));
+    }
+    if raw && reranker_seen && requested_reranker.as_deref() != Some("bm25") {
+        return Err(CliError::usage(
+            "native raw search supports only --reranker bm25",
+        ));
+    }
     if !raw && !options.help {
         for (enabled, name) in [
             (options.files_only, "--files-only"),
