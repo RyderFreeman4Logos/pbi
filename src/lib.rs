@@ -1519,6 +1519,39 @@ fn raw_identifiers(text: &str) -> Vec<String> {
     values
 }
 
+fn registered_c_macro_literal(group: &QueryGroup, relative: &Path, text: &str, code: &str) -> bool {
+    if group.terms.len() != 1
+        || !relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "c" | "h" | "cc" | "cpp" | "cxx"))
+    {
+        return false;
+    }
+    text.lines()
+        .zip(code.lines())
+        .any(|(source_line, code_line)| {
+            let Some((name, _)) = code_line.trim_start().split_once('(') else {
+                return false;
+            };
+            let name = name.trim();
+            if name.len() < 3
+                || !name.chars().all(|character| {
+                    character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+                })
+            {
+                return false;
+            }
+            let Some((prefix, rest)) = source_line.trim_start().split_once('"') else {
+                return false;
+            };
+            let Some((literal, _)) = rest.split_once('"') else {
+                return false;
+            };
+            prefix.starts_with(name) && literal.eq_ignore_ascii_case(&group.terms[0])
+        })
+}
+
 fn best_windows(
     group: &QueryGroup,
     all_groups: &[QueryGroup],
@@ -1646,9 +1679,31 @@ fn best_windows(
             let direct = group_matches.len();
             // A requested compound symbol is covered only when every term is exact.
             let exact_group = !group.exact_symbols.is_empty() && direct == group.terms.len();
+            let documentation = relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(extension, "md" | "markdown" | "txt" | "rst" | "adoc")
+                });
+            let exact_single_declaration = !documentation
+                && group.terms.len() == 1
+                && lines[start..end].iter().enumerate().any(|(offset, line)| {
+                    declaration_names(
+                        line,
+                        code_lines[start + offset],
+                        relative,
+                        start + offset + 1,
+                        &declarations,
+                    )
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&group.terms[0]))
+                });
+            let registered_literal = registered_c_macro_literal(group, relative, &text, &code);
             let simple_lexical = !behavioral
                 && (direct >= 2
                     || exact_group
+                    || exact_single_declaration
+                    || registered_literal
                     || (group.any_of && direct >= 1 && any_matches >= 2));
             let exact = exact_symbol.is_some() && group.exact_symbols.len() <= 1;
             let defined = !group.definition
@@ -1793,7 +1848,12 @@ fn best_windows(
                 .or_else(|| {
                     lines[start..end].iter().enumerate().find(|(offset, _)| {
                         let code = code_lines[start + offset].trim_start();
-                        !code.starts_with("//")
+                        registered_c_macro_literal(
+                            group,
+                            relative,
+                            lines[start + offset],
+                            code_lines[start + offset],
+                        ) || !code.starts_with("//")
                             && !code.starts_with('#')
                             && group.terms.iter().any(|term| {
                                 code_lines[start + offset]

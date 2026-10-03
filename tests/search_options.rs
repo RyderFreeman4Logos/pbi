@@ -42,6 +42,62 @@ impl Drop for Fixture {
 
 const SCOPE_QUERY: &str = "compression publication cache assembly";
 
+#[test]
+fn search_single_registered_c_method_name_uses_executable_registration() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("registration.c"),
+        "/* RestartUnit is mentioned only in this comment. */\n\
+         static const BusVTable methods[] = {\n\
+             SD_BUS_METHOD_WITH_ARGS(\"RestartUnit\",\n\
+                 SD_BUS_ARGS(\"s\", name), handler, 0),\n\
+         };\n",
+    )
+    .expect("C registration");
+    fs::write(
+        fixture.root.join("notes.md"),
+        "RestartUnit reference only\n",
+    )
+    .expect("unrelated documentation");
+
+    let output = fixture.run(&["search", "RestartUnit"], "verified");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "registration.c:3\n"
+    );
+}
+
+#[test]
+fn search_single_rust_type_name_uses_code_identifier() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("declaration.rs"),
+        "// SourceLocation occurs in this comment.\npub struct SourceLocation;\n",
+    )
+    .expect("Rust declaration");
+    fs::write(
+        fixture.root.join("notes.md"),
+        "SourceLocation reference only\n",
+    )
+    .expect("unrelated documentation");
+
+    let output = fixture.run(&["search", "SourceLocation"], "verified");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "declaration.rs:2\n"
+    );
+}
+
 fn safe_test_root(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
