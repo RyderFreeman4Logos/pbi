@@ -8,6 +8,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use syn::visit::{self, Visit};
 use workflow_adk::model_profiles::{
     CredentialBroker, CredentialHandle, ModelProfileRegistry, ModelRuntimeConfig,
     OpenAiCompatibleProfile,
@@ -669,10 +670,19 @@ pub async fn investigate(
         return Err(SemanticError::InputTooLarge);
     }
 
-    let output_schema: Value =
+    let mut output_schema: Value =
         serde_json::from_str(OUTPUT_SCHEMA).map_err(|_| SemanticError::Protocol)?;
+    let stop_question = question_is_about_stopping(question);
+    if stop_question {
+        let citation_schema = output_schema["properties"]["citations"]["items"].clone();
+        output_schema["properties"]["stop_citation"] = citation_schema;
+        output_schema["required"]
+            .as_array_mut()
+            .ok_or(SemanticError::Protocol)?
+            .push(json!("stop_citation"));
+    }
     let protocol = PromptProtocol::new(
-        "Answer only from VERIFIED_EVIDENCE. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
+        "Answer only from VERIFIED_EVIDENCE. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. For why-stop questions, stop_citation must identify the full verified span with the executable return false that directly ends the active operation. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
         Vec::new(),
         output_schema.clone(),
         common_data,
@@ -729,6 +739,7 @@ pub async fn investigate(
         &allowed,
         &evidence,
         report,
+        stop_question,
         invocation_identity,
     )
 }
@@ -738,6 +749,7 @@ fn decode_answer(
     allowed: &[AllowedCitation],
     evidence: &[&SourceEvidence],
     report: &EvidenceReport,
+    stop_question: bool,
     invocation_identity: String,
 ) -> Result<SemanticAnswer, SemanticError> {
     let object = value.as_object().ok_or(SemanticError::InvalidOutput)?;
@@ -806,6 +818,41 @@ fn decode_answer(
         });
     }
     answer_body_citations_match(&answer, &selected.iter().collect::<Vec<_>>())?;
+    if stop_question {
+        let stop = object
+            .get("stop_citation")
+            .and_then(Value::as_object)
+            .ok_or(SemanticError::CitationMismatch)?;
+        let stop_path = stop
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or(SemanticError::CitationMismatch)?;
+        let stop_start = stop
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok())
+            .ok_or(SemanticError::CitationMismatch)?;
+        let stop_end = stop
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok())
+            .ok_or(SemanticError::CitationMismatch)?;
+        let stop_index = allowed
+            .iter()
+            .find(|item| {
+                item.path == stop_path && item.start_line == stop_start && item.end_line == stop_end
+            })
+            .map(|item| item.evidence_index)
+            .ok_or(SemanticError::CitationMismatch)?;
+        if !selected
+            .iter()
+            .any(|item| item.evidence_index == stop_index)
+            || report.followed_from(stop_index).is_none()
+            || !has_executable_false_return(evidence[stop_index].snippet())
+        {
+            return Err(SemanticError::CitationMismatch);
+        }
+    }
     // A followed definition is admitted only through a parsed call in its
     // parent window. Keep that call site and its ancestors with the model's
     // selected citation so causal claims retain their executable path.
@@ -832,6 +879,44 @@ fn decode_answer(
         citations,
         invocation_identity,
     })
+}
+
+fn question_is_about_stopping(question: &str) -> bool {
+    let mut words = question
+        .split(|character: char| !character.is_alphabetic())
+        .filter(|word| !word.is_empty());
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("why"))
+        && words.any(|word| {
+            word.eq_ignore_ascii_case("stop")
+                || word.eq_ignore_ascii_case("stops")
+                || word.eq_ignore_ascii_case("stopped")
+        })
+}
+
+fn has_executable_false_return(snippet: &str) -> bool {
+    struct FalseReturn(bool);
+
+    impl<'ast> Visit<'ast> for FalseReturn {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if matches!(node.expr.as_deref(), Some(syn::Expr::Lit(literal))
+                if matches!(&literal.lit, syn::Lit::Bool(value) if !value.value))
+            {
+                self.0 = true;
+            }
+            visit::visit_expr_return(self, node);
+        }
+
+        fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
+    }
+
+    let parsed = syn::parse_file(snippet)
+        .or_else(|_| syn::parse_file(&format!("impl EvidenceOwner {{ {snippet} }}")));
+    let Ok(parsed) = parsed else { return false };
+    let mut visitor = FalseReturn(false);
+    visitor.visit_file(&parsed);
+    visitor.0
 }
 
 /// One contextual boundary: retain filename punctuation until the whole token
@@ -1631,6 +1716,7 @@ mod tests {
             &allowed,
             &[item],
             &report,
+            false,
             "test-route".to_owned(),
         )
         .expect("the precise subspan remains verified");
@@ -1641,7 +1727,14 @@ mod tests {
             "citations":[{"path":"src/lib.rs","start_line":3,"end_line":3}]
         });
         assert_eq!(
-            decode_answer(outside, &allowed, &[item], &report, "test-route".to_owned()),
+            decode_answer(
+                outside,
+                &allowed,
+                &[item],
+                &report,
+                false,
+                "test-route".to_owned()
+            ),
             Err(SemanticError::CitationMismatch)
         );
     }
@@ -1698,6 +1791,118 @@ mod tests {
         assert!(answer.citations()[2]
             .snippet()
             .contains("let retry = wait()"));
+    }
+
+    #[test]
+    fn stop_answer_without_a_direct_stop_branch_fails_closed() {
+        let fixture = Fixture::new();
+        let response = json!({
+            "answer": "The hold stops because the predicate becomes false.",
+            "uncertainty": "Only one span was inspected.",
+            "citations": [{"path": "src/lib.rs", "start_line": 1, "end_line": 1}]
+        });
+        let publisher = publisher(response);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(investigate(
+            "Why does the hold stop?",
+            &fixture.root,
+            &fixture.report,
+            &publisher.policy(deadline),
+            deadline,
+            &ModelRouteCancellation::new(),
+        ));
+        assert!(
+            result.is_err(),
+            "an unsupported stop cause must fail closed"
+        );
+    }
+
+    #[test]
+    fn stop_answer_names_a_verified_false_return_and_its_caller() {
+        assert!(has_executable_false_return(
+            "async fn wait(&self) -> bool { if remaining.is_zero() { return false; } true }"
+        ));
+        assert!(!has_executable_false_return(
+            "fn wait() -> bool { /* return false; */ true }"
+        ));
+        let fixture = Fixture::new();
+        let source = fixture.root.join("src/lib.rs");
+        fs::write(
+            &source,
+            "fn caller() -> bool { let retry = wait(); retry }\n\n\n\n\n\n\n\n\
+             fn wait() -> bool { if remaining() == 0 { return false; } true }\n\n\n\n\n\n\n\n\
+             fn remaining() -> u64 { 0 }\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-1\n", source.display()),
+            &fixture.root,
+            "caller retry",
+            3,
+        )
+        .expect("caller evidence")
+        .with_following_lines(&fixture.root, 3)
+        .expect("verified call chain");
+        assert_eq!(report.evidence().len(), 3);
+        let stop = &report.evidence()[1];
+        let budget = &report.evidence()[2];
+        assert!(has_executable_false_return(stop.snippet()));
+        assert!(!has_executable_false_return(budget.snippet()));
+        let stop_citation = json!({"path":"src/lib.rs",
+            "start_line":stop.location().start_line(), "end_line":stop.location().end_line()});
+        let response = json!({
+            "answer": "The caller receives false when wait sees zero remaining budget.",
+            "uncertainty": "Only the verified source was inspected.",
+            "citations": [stop_citation.clone(), {"path":"src/lib.rs",
+                "start_line":budget.location().start_line(), "end_line":budget.location().end_line()}],
+            "stop_citation": stop_citation
+        });
+        let accepted_publisher = publisher(response);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let answer = runtime
+            .block_on(investigate(
+                "Why does the operation stop?",
+                &fixture.root,
+                &report,
+                &accepted_publisher.policy(deadline),
+                deadline,
+                &ModelRouteCancellation::new(),
+            ))
+            .expect("verified stop answer");
+        assert_eq!(answer.citations().len(), 3);
+        assert!(answer
+            .citations()
+            .last()
+            .expect("caller")
+            .snippet()
+            .contains("let retry = wait()"));
+        let wrong_stop = json!({"path":"src/lib.rs",
+            "start_line":budget.location().start_line(), "end_line":budget.location().end_line()});
+        let response = json!({
+            "answer": "The caller receives false when wait sees zero remaining budget.",
+            "uncertainty": "Only the verified source was inspected.",
+            "citations": [wrong_stop.clone()],
+            "stop_citation": wrong_stop
+        });
+        let publisher = publisher(response);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let rejected = runtime.block_on(investigate(
+            "Why does the operation stop?",
+            &fixture.root,
+            &report,
+            &publisher.policy(deadline),
+            deadline,
+            &ModelRouteCancellation::new(),
+        ));
+        assert_eq!(rejected, Err(SemanticError::CitationMismatch));
     }
 
     #[test]

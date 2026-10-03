@@ -2957,9 +2957,34 @@ mod tests {
         fs::create_dir_all(&root).expect("fixture directory");
         fs::write(
             root.join("outage_hold.rs"),
-            "fn is_outage() -> bool { true }\n",
+            "fn is_outage() -> bool { wait() }\n\n\n\n\n\n\n\n\
+             fn wait() -> bool { if remaining() == 0 { return false; } true }\n\n\n\n\n\n\n\n\
+             fn remaining() -> u64 { 0 }\n",
         )
         .expect("source");
+        let found = search_repository(
+            &root,
+            "is_outage",
+            &SearchLimits {
+                deadline: Instant::now() + Duration::from_secs(2),
+                max_results: DEFAULT_MAX_RESULTS,
+                language: None,
+                ignores: Vec::new(),
+            },
+        )
+        .expect("native search");
+        let report = verify_probe_evidence(&found, &root, "is_outage", DEFAULT_MAX_RESULTS)
+            .expect("verified search")
+            .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
+            .expect("verified call chain");
+        let stop = report
+            .evidence()
+            .iter()
+            .find(|item| item.snippet().contains("return false"))
+            .expect("direct stop branch");
+        let stop_citation = json!({"path":"outage_hold.rs",
+            "start_line": stop.location().start_line(),
+            "end_line": stop.location().end_line()});
         let _env = RouteConfigEnvGuard::new(&root, &[]);
         let profile = FakeModelProfile::new("pbi-test", "1", "fake-model", ["unused"]);
         let registry = ModelProfileRegistry::new()
@@ -2980,9 +3005,10 @@ mod tests {
                 behavior: TestModelBehavior::Responses(Mutex::new(VecDeque::from([
                     json!({"query":"is_outage"}).to_string(),
                     json!({
-                        "answer":"The outage hold controls the stop condition.",
+                        "answer":"The caller stops when wait returns false after the budget reaches zero.",
                         "uncertainty":"Only the verified function was inspected.",
-                        "citations":[{"path":"outage_hold.rs","start_line":1,"end_line":1}]
+                        "citations":[stop_citation.clone()],
+                        "stop_citation": stop_citation
                     })
                     .to_string(),
                 ]))),
@@ -3002,8 +3028,9 @@ mod tests {
         }
         assert!(matches!(result, Ok(0)));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(String::from_utf8_lossy(&output)
-            .contains("The outage hold controls the stop condition."));
+        assert!(
+            String::from_utf8_lossy(&output).contains("The caller stops when wait returns false")
+        );
         drop(_env);
         fs::remove_dir_all(root).expect("remove fixture");
     }
