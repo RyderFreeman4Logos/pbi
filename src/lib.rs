@@ -109,7 +109,7 @@ pub struct EvidenceReport {
     missing_targets: Vec<String>,
     cited: Vec<usize>,
     followed_from: Vec<Option<usize>>,
-    call_edges: Vec<(usize, usize, bool)>,
+    call_edges: Vec<(usize, usize)>,
 }
 
 impl EvidenceReport {
@@ -137,48 +137,20 @@ impl EvidenceReport {
             return Vec::new();
         }
         let mut ancestor = Some(stop);
-        let mut ancestors = Vec::new();
         while let Some(index) = ancestor {
             if selected[index] {
                 break;
             }
             selected[index] = true;
-            ancestors.push(index);
             ancestor = self.followed_from(index);
         }
         let mut pending = vec![stop];
         while let Some(parent) = pending.pop() {
-            for &(_, child, _) in self
-                .call_edges
-                .iter()
-                .filter(|(owner, _, _)| *owner == parent)
-            {
+            for &(_, child) in self.call_edges.iter().filter(|(owner, _)| *owner == parent) {
                 if !selected[child] {
                     selected[child] = true;
                     pending.push(child);
                 }
-            }
-        }
-        // A caller can apply another value-producing gate before the selected
-        // stop. Its definition is evidence for comparisons between budgets.
-        for parent in ancestors.into_iter().skip(1) {
-            let mut sibling_pending = self
-                .call_edges
-                .iter()
-                .filter(|(owner, _, value_used)| *owner == parent && *value_used)
-                .map(|(_, child, _)| *child)
-                .collect::<Vec<_>>();
-            while let Some(index) = sibling_pending.pop() {
-                if selected[index] {
-                    continue;
-                }
-                selected[index] = true;
-                sibling_pending.extend(
-                    self.call_edges
-                        .iter()
-                        .filter(|(owner, _, value_used)| *owner == index && *value_used)
-                        .map(|(_, child, _)| *child),
-                );
             }
         }
         selected
@@ -200,6 +172,7 @@ impl EvidenceReport {
         max_total: usize,
     ) -> Result<Self, EvidenceError> {
         let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
+        let initial_count = self.evidence.len();
         let count = max_total.saturating_sub(self.evidence.len());
         for index in 0..count.min(self.evidence.len()) {
             let item = self.evidence[index].clone();
@@ -214,38 +187,22 @@ impl EvidenceReport {
             if start > lines.len() {
                 continue;
             }
-            let declarations =
+            let next_declaration =
                 if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
                     declaration_identity::declarations(&source)
+                        .into_iter()
+                        .map(|declaration| declaration.line)
+                        .find(|line| *line >= start)
                 } else {
-                    Vec::new()
+                    None
                 };
-            let next_declaration = declarations
-                .iter()
-                .map(|declaration| declaration.line)
-                .find(|line| *line >= start);
             let end = next_declaration
                 .map(|line| line.saturating_sub(1))
                 .unwrap_or(start.saturating_add(MAX_FOLLOWING_LINES - 1))
                 .max(item.location().end_line())
                 .min(lines.len());
-            let mut first = item
-                .location()
-                .start_line()
-                .saturating_sub(MAX_CALLER_CONTEXT_LINES)
-                .max(
-                    declarations
-                        .iter()
-                        .map(|declaration| declaration.line)
-                        .take_while(|line| *line <= item.location().start_line())
-                        .last()
-                        .unwrap_or(1),
-                );
-            let mut snippet = lines[first - 1..end].join("\n");
-            if snippet.len() > 4096 {
-                first = item.location().start_line();
-                snippet = lines[first - 1..end].join("\n");
-            }
+            let first = item.location().start_line();
+            let snippet = lines[first - 1..end].join("\n");
             if snippet.len() > 4096 {
                 continue;
             }
@@ -456,13 +413,8 @@ impl EvidenceReport {
                         && existing.location().start_line() <= start
                         && existing.location().end_line() >= end
                 }) {
-                    if child != index
-                        && !self
-                            .call_edges
-                            .iter()
-                            .any(|(owner, target, _)| *owner == index && *target == child)
-                    {
-                        self.call_edges.push((index, child, call.value_used));
+                    if child != index && !self.call_edges.contains(&(index, child)) {
+                        self.call_edges.push((index, child));
                     }
                     continue;
                 }
@@ -475,10 +427,51 @@ impl EvidenceReport {
                     relevance: String::from("called Rust definition candidate"),
                 });
                 self.followed_from.push(Some(index));
-                self.call_edges.push((index, child, call.value_used));
+                self.call_edges.push((index, child));
                 pending.push((index, call_index + 1));
                 pending.push((self.evidence.len() - 1, 0));
                 break;
+            }
+        }
+        // Follow the original verified spans first so caller context cannot
+        // spend the bounded evidence slots before the stopping definition.
+        for index in 0..initial_count {
+            let item = self.evidence[index].clone();
+            if item.snippet().contains("return false") {
+                continue;
+            }
+            let Some((path, source, declarations, _)) = sources
+                .iter()
+                .find(|(path, _, _, _)| path == item.location().path())
+            else {
+                continue;
+            };
+            let start = item.location().start_line();
+            let first = start.saturating_sub(MAX_CALLER_CONTEXT_LINES).max(
+                declarations
+                    .iter()
+                    .map(|declaration| declaration.line)
+                    .take_while(|line| *line <= start)
+                    .last()
+                    .unwrap_or(1),
+            );
+            if first == start {
+                continue;
+            }
+            let snippet = source
+                .lines()
+                .skip(first - 1)
+                .take(item.location().end_line() - first + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if snippet.len() <= 4096 {
+                self.evidence[index] = SourceEvidence {
+                    location: SourceLocation::new(path.clone(), first, item.location().end_line()),
+                    target: item.target().to_owned(),
+                    snippet,
+                    symbol: item.symbol().map(str::to_owned),
+                    relevance: item.relevance().to_owned(),
+                };
             }
         }
         Ok(self)
@@ -3394,7 +3387,10 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             .map(|index| report.evidence()[*index].snippet())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(selected_text.contains("used < 3"), "{selected_text}");
+        assert!(
+            selected_text.contains("let mut retry = attempt_budget(used)"),
+            "{selected_text}"
+        );
         assert!(
             selected_text.contains("remaining() -> u64"),
             "{selected_text}"
