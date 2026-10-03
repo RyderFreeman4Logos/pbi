@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use syn::visit::{self, Visit};
 
 const EXCLUDED: [&str; 5] = [".git", "target", "drafts", "node_modules", "__pycache__"];
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -177,12 +178,20 @@ pub fn candidate_symbols(
         for item in parsed.items {
             match item {
                 syn::Item::Fn(function) => {
-                    symbols.push((relative.clone(), function.sig.ident.to_string()));
+                    symbols.push((
+                        relative.clone(),
+                        function.sig.ident.to_string(),
+                        has_false_return(&function.block),
+                    ));
                 }
                 syn::Item::Impl(block) => {
                     for item in block.items {
                         if let syn::ImplItem::Fn(function) = item {
-                            symbols.push((relative.clone(), function.sig.ident.to_string()));
+                            symbols.push((
+                                relative.clone(),
+                                function.sig.ident.to_string(),
+                                has_false_return(&function.block),
+                            ));
                         }
                     }
                 }
@@ -197,20 +206,46 @@ pub fn candidate_symbols(
         }
     }
     let question_lower = question.to_lowercase();
-    let score = |name: &str| {
-        usize::from(name.starts_with("is_") || name.starts_with("should_"))
+    let stop_question = question_lower
+        .split(|character: char| !character.is_alphabetic())
+        .any(|word| matches!(word, "stop" | "stops" | "stopped"));
+    let score = |name: &str, returns_false: bool| {
+        usize::from(stop_question && returns_false) * 2
+            + usize::from(name.starts_with("is_") || name.starts_with("should_"))
             + name
                 .split('_')
                 .filter(|part| part.len() >= 3 && question_lower.contains(part))
                 .count()
     };
     symbols.sort_by(|left, right| {
-        score(&right.1)
-            .cmp(&score(&left.1))
+        score(&right.1, right.2)
+            .cmp(&score(&left.1, left.2))
             .then_with(|| left.1.cmp(&right.1))
     });
     symbols.truncate(MAX_PLAN_SYMBOLS);
-    Ok(symbols)
+    Ok(symbols
+        .into_iter()
+        .map(|(path, name, _)| (path, name))
+        .collect())
+}
+
+fn has_false_return(block: &syn::Block) -> bool {
+    struct FalseReturn(bool);
+
+    impl<'ast> Visit<'ast> for FalseReturn {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if matches!(node.expr.as_deref(), Some(syn::Expr::Lit(literal))
+                if matches!(&literal.lit, syn::Lit::Bool(value) if !value.value))
+            {
+                self.0 = true;
+            }
+            visit::visit_expr_return(self, node);
+        }
+    }
+
+    let mut visitor = FalseReturn(false);
+    visitor.visit_block(block);
+    visitor.0
 }
 
 fn walk(root: &Path, device: u64, limits: &SearchLimits) -> Result<Vec<PathBuf>, SearchFailure> {

@@ -523,6 +523,8 @@ mod explicit_config_route_tests;
 
 /// Ask the authorized kit route for one short source search when literal retrieval has no hits.
 /// The resulting text is only a query; repository reads and citation admission stay in Rust.
+const SEARCH_PLAN_PROMPT: &str = "A literal search did not find trustworthy implementation evidence. If candidate_functions are supplied, choose exactly one listed function name and return it verbatim as query. For why/stop questions, choose the function whose return value directly stops the caller, not a predicate that merely classifies the state. Prefer implementation functions over metrics and tests. If there are no candidates, choose a different likely identifier without repeating a snake_case name from the question. Do not answer or invent citations.";
+
 pub async fn plan_search_query(
     question: &str,
     candidates: &[(String, String)],
@@ -539,7 +541,7 @@ pub async fn plan_search_query(
     let schema: Value =
         serde_json::from_str(SEARCH_PLAN_SCHEMA).map_err(|_| SemanticError::Protocol)?;
     let protocol = PromptProtocol::new(
-        "A literal search did not find trustworthy implementation evidence. If candidate_functions are supplied, choose exactly one listed function name and return it verbatim as query. For why/stop questions, prefer a state-classifying predicate over the function that drains or records attempts. Prefer implementation functions over metrics and tests. If there are no candidates, choose a different likely identifier without repeating a snake_case name from the question. Do not answer or invent citations.",
+        SEARCH_PLAN_PROMPT,
         Vec::new(),
         schema.clone(),
         json!({

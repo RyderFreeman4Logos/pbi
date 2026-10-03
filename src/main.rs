@@ -423,7 +423,13 @@ fn run(
                     &cancellation,
                 ))
                 .map_err(semantic_cli_error)?;
-            collect_evidence(&revised)?
+            let search_query = candidates
+                .iter()
+                .find(|(_, name)| *name == revised)
+                .and_then(|(path, _)| Path::new(path).file_stem().and_then(|stem| stem.to_str()))
+                .map(|module| format!("{module}::{revised}"))
+                .unwrap_or(revised);
+            collect_evidence(&search_query)?
                 .ok_or_else(|| evidence_cli_error(EvidenceError::NoSourceLocations))?
         }
         None => return Err(evidence_cli_error(EvidenceError::NoSourceLocations)),
@@ -2955,16 +2961,22 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).expect("fixture directory");
+        fs::create_dir_all(root.join("src/proxy")).expect("module directory");
         fs::write(
-            root.join("outage_hold.rs"),
+            root.join("src/proxy/outage_hold.rs"),
             "fn is_outage() -> bool { wait() }\n\n\n\n\n\n\n\n\
              fn wait() -> bool { if remaining() == 0 { return false; } true }\n\n\n\n\n\n\n\n\
              fn remaining() -> u64 { 0 }\n",
         )
         .expect("source");
+        fs::write(
+            root.join("src/proxy.rs"),
+            "mod outage_hold;\nfn attempt() { let _ = outage_hold::wait(); }\n",
+        )
+        .expect("caller");
         let found = search_repository(
             &root,
-            "is_outage",
+            "outage_hold::wait",
             &SearchLimits {
                 deadline: Instant::now() + Duration::from_secs(2),
                 max_results: DEFAULT_MAX_RESULTS,
@@ -2973,7 +2985,7 @@ mod tests {
             },
         )
         .expect("native search");
-        let report = verify_probe_evidence(&found, &root, "is_outage", DEFAULT_MAX_RESULTS)
+        let report = verify_probe_evidence(&found, &root, "outage_hold::wait", DEFAULT_MAX_RESULTS)
             .expect("verified search")
             .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
             .expect("verified call chain");
@@ -2983,7 +2995,7 @@ mod tests {
             .enumerate()
             .find(|(_, item)| item.snippet().contains("return false"))
             .expect("direct stop branch");
-        let stop_citation = json!({"path":"outage_hold.rs",
+        let stop_citation = json!({"path":"src/proxy/outage_hold.rs",
             "start_line": stop.location().start_line(),
             "end_line": stop.location().end_line()});
         let _env = RouteConfigEnvGuard::new(&root, &[]);
@@ -3004,7 +3016,7 @@ mod tests {
             Arc::new(TestRouteLlm {
                 calls: Arc::clone(&calls),
                 behavior: TestModelBehavior::Responses(Mutex::new(VecDeque::from([
-                    json!({"query":"is_outage"}).to_string(),
+                    json!({"query":"wait"}).to_string(),
                     json!({
                         "answer":"The caller stops when wait returns false after the budget reaches zero.",
                         "uncertainty":"Only the verified function was inspected.",
@@ -3128,7 +3140,7 @@ mod tests {
         fs::create_dir_all(root.join("src")).expect("fixture directory");
         fs::write(
             root.join("src/outage_hold.rs"),
-            "fn start() {}\nfn classify() {}\nfn remember() {}\nfn finish() {}\nfn probe() {}\nfn reload() {}\nfn count() {}\nfn wait() {}\nfn remaining() {}\nfn is_outage() -> bool { true }\n",
+            "fn start() {}\nfn classify() {}\nfn remember() {}\nfn finish() {}\nfn probe() {}\nfn reload() {}\nfn count() {}\nfn wait() -> bool { if remaining() == 0 { return false; } true }\nfn remaining() -> u64 { 0 }\nfn is_outage() -> bool { true }\n",
         )
         .expect("implementation");
         fs::write(root.join("src/metrics.rs"), "fn unrelated() {}\n").expect("noise");
@@ -3144,6 +3156,7 @@ mod tests {
         )
         .expect("bounded source names");
         assert!(candidates.contains(&("src/outage_hold.rs".to_owned(), "is_outage".to_owned())));
+        assert!(candidates.contains(&("src/outage_hold.rs".to_owned(), "wait".to_owned())));
         assert!(candidates.len() <= 8);
         assert!(candidates.iter().all(|(path, _)| path != "src/metrics.rs"));
         fs::remove_dir_all(root).expect("remove fixture");
