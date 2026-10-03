@@ -194,6 +194,10 @@ impl EvidenceReport {
             let calls = declaration_identity::calls(&source);
             sources.push((path, source, declarations, calls));
         }
+        let fields = sources
+            .iter()
+            .flat_map(|(_, source, _, _)| declaration_identity::field_types(source))
+            .collect::<Vec<_>>();
         let mut pending = (0..self.evidence.len())
             .rev()
             .map(|index| (index, 0))
@@ -203,7 +207,7 @@ impl EvidenceReport {
                 break;
             }
             let item = self.evidence[index].clone();
-            let calls = sources
+            let mut calls = sources
                 .iter()
                 .find(|(path, _, _, _)| path == item.location().path())
                 .map(|(_, _, _, calls)| {
@@ -213,20 +217,39 @@ impl EvidenceReport {
                             call.line >= item.location().start_line()
                                 && call.line <= item.location().end_line()
                         })
-                        .map(|call| call.marker.clone())
+                        .cloned()
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            for (call_index, call) in calls.into_iter().enumerate().skip(next_call) {
-                let mut added = false;
-                let (kind, qualifier, name) = if let Some((owner, name)) = call.rsplit_once("::") {
-                    ("qualified", owner, name)
-                } else if let Some((_, name)) = call.rsplit_once('.') {
-                    ("method", "", name)
+            calls.sort_by_key(|call| {
+                let specificity = if call.marker.starts_with('.') {
+                    usize::from(declaration_identity::receiver_owner(call, &fields).is_none())
+                } else if call.marker.contains("::") {
+                    1
                 } else {
-                    ("bare", "", call.as_str())
+                    2
                 };
-                for (path, source, declarations, _) in &sources {
+                (!call.value_used, specificity)
+            });
+            for (call_index, call) in calls.into_iter().enumerate().skip(next_call) {
+                let (kind, qualifier, name) =
+                    if let Some((owner, name)) = call.marker.rsplit_once("::") {
+                        ("qualified", owner, name)
+                    } else if let Some((_, name)) = call.marker.rsplit_once('.') {
+                        ("method", "", name)
+                    } else {
+                        ("bare", "", call.marker.as_str())
+                    };
+                let receiver = if kind == "method" {
+                    let Some(owner) = declaration_identity::receiver_owner(&call, &fields) else {
+                        continue;
+                    };
+                    Some(owner)
+                } else {
+                    None
+                };
+                let mut matches = Vec::new();
+                for (source_index, (path, _, declarations, _)) in sources.iter().enumerate() {
                     let same_file = path == item.location().path();
                     let file_stem = path.file_stem().and_then(|stem| stem.to_str());
                     if (kind != "qualified" && !same_file)
@@ -234,56 +257,59 @@ impl EvidenceReport {
                     {
                         continue;
                     }
-                    let matches = declarations
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, declaration)| {
-                            declaration.name == name
-                                && declaration.owner.as_ref().is_some_and(|owner| match kind {
-                                    "method" => !owner.is_root(),
-                                    "qualified" if file_stem == Some(qualifier) => owner.is_root(),
-                                    "qualified" => owner.matches(qualifier),
-                                    _ => owner.is_root(),
-                                })
-                        })
-                        .collect::<Vec<_>>();
-                    let [(_, declaration)] = matches.as_slice() else {
-                        continue;
-                    };
-                    let lines = source.lines().collect::<Vec<_>>();
-                    let start = declaration.line;
-                    let end = declarations
-                        .iter()
-                        .find(|next| next.line > start)
-                        .map_or(lines.len(), |next| next.line.saturating_sub(1));
-                    if start == 0 || end < start || end > lines.len() {
-                        continue;
+                    for (declaration_index, declaration) in declarations.iter().enumerate() {
+                        if declaration.name == name
+                            && declaration.owner.as_ref().is_some_and(|owner| match kind {
+                                "method" => {
+                                    !owner.is_root()
+                                        && receiver.as_ref().is_some_and(|receiver| {
+                                            owner.matches_receiver(receiver, file_stem)
+                                        })
+                                }
+                                "qualified" => {
+                                    (file_stem == Some(qualifier) && owner.is_root())
+                                        || owner.equals(qualifier)
+                                }
+                                _ => owner.is_root(),
+                            })
+                        {
+                            matches.push((source_index, declaration_index));
+                        }
                     }
-                    let snippet = lines[start - 1..end].join("\n");
-                    if snippet.len() > 4096
-                        || self.evidence.iter().any(|existing| {
-                            existing.location().path() == path
-                                && existing.location().start_line() <= start
-                                && existing.location().end_line() >= end
-                        })
-                    {
-                        continue;
-                    }
-                    self.evidence.push(SourceEvidence {
-                        location: SourceLocation::new(path.clone(), start, end),
-                        target: item.target().to_owned(),
-                        snippet,
-                        symbol: Some(name.to_owned()),
-                        relevance: String::from("called Rust definition candidate"),
-                    });
-                    pending.push((index, call_index + 1));
-                    pending.push((self.evidence.len() - 1, 0));
-                    added = true;
-                    break;
                 }
-                if added {
-                    break;
+                let [(source_index, declaration_index)] = matches.as_slice() else {
+                    continue;
+                };
+                let (path, source, declarations, _) = &sources[*source_index];
+                let lines = source.lines().collect::<Vec<_>>();
+                let start = declarations[*declaration_index].line;
+                let end = declarations
+                    .iter()
+                    .find(|next| next.line > start)
+                    .map_or(lines.len(), |next| next.line.saturating_sub(1));
+                if start == 0 || end < start || end > lines.len() {
+                    continue;
                 }
+                let snippet = lines[start - 1..end].join("\n");
+                if snippet.len() > 4096
+                    || self.evidence.iter().any(|existing| {
+                        existing.location().path() == path
+                            && existing.location().start_line() <= start
+                            && existing.location().end_line() >= end
+                    })
+                {
+                    continue;
+                }
+                self.evidence.push(SourceEvidence {
+                    location: SourceLocation::new(path.clone(), start, end),
+                    target: item.target().to_owned(),
+                    snippet,
+                    symbol: Some(name.to_owned()),
+                    relevance: String::from("called Rust definition candidate"),
+                });
+                pending.push((index, call_index + 1));
+                pending.push((self.evidence.len() - 1, 0));
+                break;
             }
         }
         Ok(self)
@@ -2826,7 +2852,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         .expect("hold source");
         fs::write(
             &caller,
-            "async fn attempt(runtime: &Runtime) -> bool {\n    let mut can_retry = true;\n    if hold::is_outage(runtime) {\n        log_failure();\n        can_retry = hold::wait(runtime).await;\n        next_step();\n        record();\n    }\n    can_retry\n}\nfn log_failure() {}\nfn next_step() {}\nfn record() {}\nasync fn later(runtime: &Runtime) -> bool {\n    if hold::is_outage(runtime) {\n        return hold::wait(runtime).await;\n    }\n    false\n}\n",
+            "struct Config;\nstruct Runtime { hold: hold::Hold, config: Config }\nasync fn attempt(runtime: &Runtime) -> bool {\n    let mut can_retry = true;\n    if hold::is_outage(runtime) {\n        log_failure();\n        can_retry = hold::wait(runtime).await;\n        next_step();\n        record();\n    }\n    can_retry\n}\nfn log_failure() {}\nfn next_step() {}\nfn record() {}\nasync fn later(runtime: &Runtime) -> bool {\n    if hold::is_outage(runtime) {\n        return hold::wait(runtime).await;\n    }\n    false\n}\n",
         )
         .expect("caller source");
         let located = format!("{}{}", probe_file(&hold), probe_file(&caller));
@@ -2850,5 +2876,88 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             assert!(text.contains(required), "missing {required}: {text}");
         }
         assert!(report.evidence().len() <= 8);
+    }
+
+    #[test]
+    fn typed_field_call_precedes_unrelated_and_bare_calls() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/flow.rs");
+        fs::write(
+            &path,
+            "struct Runtime { deadline: Deadline, hold: Holder }\n\
+             struct Holder;\nstruct Decoy;\nstruct Deadline;\n\
+             fn caller(runtime: &Runtime) -> bool {\n\
+                 runtime.deadline.pause();\n\
+                 log();\n\
+                 let retry = runtime.hold.wait();\n\
+                 wait();\n\
+                 retry\n}\n\
+             impl Deadline { fn pause(&self) {} }\n\
+             impl Holder {\n\
+                 fn wait(&self) -> bool {\n\
+                     let left = budget();\n\
+                     left > 0\n    }\n}\n\
+             impl Decoy { fn wait(&self) -> bool { false } }\n\
+             fn wait() -> bool { false }\n\
+             fn log() {}\n\
+             fn budget() -> u64 { 1 }\n",
+        )
+        .expect("source");
+        let report = EvidenceReport {
+            complete: true,
+            evidence: vec![SourceEvidence {
+                location: SourceLocation::new(path, 5, 11),
+                target: "caller".to_owned(),
+                snippet: String::new(),
+                symbol: Some("caller".to_owned()),
+                relevance: String::new(),
+            }],
+            missing_targets: Vec::new(),
+            cited: vec![5],
+        }
+        .with_following_lines(&fixture.root, 3)
+        .expect("bounded calls");
+        let text = report
+            .evidence()
+            .iter()
+            .map(SourceEvidence::snippet)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("let left = budget()"), "{text}");
+        assert!(text.contains("fn budget()"), "{text}");
+        assert!(!text.contains("fn pause(&self)"), "{text}");
+        assert!(!text.contains("fn log()"), "{text}");
+        assert!(!text.contains("fn wait() -> bool"), "{text}");
+        assert!(!text.contains("impl Decoy"), "{text}");
+        assert_eq!(report.evidence().len(), 3);
+    }
+
+    #[test]
+    fn unproven_receiver_does_not_admit_a_same_named_impl() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/flow.rs");
+        fs::write(
+            &path,
+            "use external::External;\n\
+             fn caller(value: &dyn External) { value.wait(); }\n\
+             struct Decoy;\n\
+             impl Decoy { fn wait(&self) {} }\n",
+        )
+        .expect("source");
+        let report = EvidenceReport {
+            complete: true,
+            evidence: vec![SourceEvidence {
+                location: SourceLocation::new(path, 2, 2),
+                target: "caller".to_owned(),
+                snippet: String::new(),
+                symbol: Some("caller".to_owned()),
+                relevance: String::new(),
+            }],
+            missing_targets: Vec::new(),
+            cited: vec![2],
+        }
+        .with_following_lines(&fixture.root, 2)
+        .expect("bounded calls");
+        assert_eq!(report.evidence().len(), 1, "{:?}", report.evidence());
     }
 }

@@ -1,8 +1,8 @@
-//! Direct associated declarations from one syn parse.
-//! Local functions and declarations inside an ended impl are not owners.
+//! Parsed declaration, field, and call identities from bounded Rust sources.
+//! Unproven receivers and declarations inside an ended impl are not owners.
 use syn::{
     visit::{self, Visit},
-    Expr, File, ImplItem, Item, TraitItem, Type, UseTree,
+    Expr, File, FnArg, ImplItem, Item, Member, Pat, Stmt, TraitItem, Type, UseTree,
 };
 
 /// Segment identity, shared by lexical owners and directly resolvable impl types.
@@ -32,6 +32,27 @@ impl OwnerPath {
                 .zip(requested.iter().rev())
                 .all(|(a, b)| a == b)
     }
+
+    pub(super) fn matches_receiver(&self, query: &str, file_stem: Option<&str>) -> bool {
+        self.equals(query)
+            || query.rsplit_once("::").is_some_and(|(module, ty)| {
+                file_stem == Some(module) && self.0.len() == 1 && self.0[0] == bare(ty)
+            })
+    }
+
+    pub(super) fn equals(&self, query: &str) -> bool {
+        let requested = query.split("::").map(bare).collect::<Vec<_>>();
+        requested.len() == self.0.len()
+            && self
+                .0
+                .iter()
+                .zip(requested)
+                .all(|(owner, name)| owner == name)
+    }
+
+    fn query(&self) -> String {
+        self.0.join("::")
+    }
 }
 
 fn bare(value: &str) -> &str {
@@ -45,27 +66,245 @@ pub(super) struct Declaration {
     pub(super) owner: Option<OwnerPath>,
 }
 
+#[derive(Clone)]
 pub(super) struct CallSite {
     pub(super) line: usize,
     pub(super) marker: String,
+    pub(super) receiver: Option<ReceiverPath>,
+    pub(super) value_used: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ReceiverPath {
+    base_type: String,
+    fields: Vec<String>,
+}
+
+pub(super) struct FieldType {
+    owner: String,
+    field: String,
+    ty: String,
+}
+
+pub(super) fn receiver_owner(call: &CallSite, fields: &[FieldType]) -> Option<String> {
+    let receiver = call.receiver.as_ref()?;
+    let mut ty = receiver.base_type.clone();
+    for field in &receiver.fields {
+        let mut matches = fields
+            .iter()
+            .filter(|candidate| candidate.owner == ty && candidate.field == *field);
+        let next = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        ty.clone_from(&next.ty);
+    }
+    Some(ty)
+}
+
+pub(super) fn field_types(source: &str) -> Vec<FieldType> {
+    let Ok(file) = syn::parse_file(source) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_fields(&file.items, "", &mut found);
+    found
+}
+
+fn collect_fields(items: &[Item], module: &str, found: &mut Vec<FieldType>) {
+    for item in items {
+        match item {
+            Item::Struct(item) => {
+                let owner = format!("{module}{}", item.ident);
+                for field in &item.fields {
+                    if let (Some(name), Some(ty)) = (&field.ident, type_path(&field.ty)) {
+                        found.push(FieldType {
+                            owner: owner.clone(),
+                            field: bare(&name.to_string()).to_owned(),
+                            ty,
+                        });
+                    }
+                }
+            }
+            Item::Mod(item) => {
+                if let Some((_, nested)) = &item.content {
+                    collect_fields(nested, &format!("{module}{}::", item.ident), found);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(super) fn calls(source: &str) -> Vec<CallSite> {
     let Ok(file) = syn::parse_file(source) else {
         return Vec::new();
     };
-    let mut collector = CallCollector(Vec::new());
+    let mut collector = CallCollector {
+        file: &file,
+        module: OwnerPath::default(),
+        calls: Vec::new(),
+        bindings: Vec::new(),
+        self_type: None,
+        value_used: true,
+    };
     collector.visit_file(&file);
-    collector.0
+    collector.calls
 }
 
-struct CallCollector(Vec<CallSite>);
+struct CallCollector<'a> {
+    file: &'a File,
+    module: OwnerPath,
+    calls: Vec<CallSite>,
+    bindings: Vec<(String, String)>,
+    self_type: Option<String>,
+    value_used: bool,
+}
 
-impl<'ast> Visit<'ast> for CallCollector {
+impl CallCollector<'_> {
+    fn receiver(&self, expr: &Expr) -> Option<ReceiverPath> {
+        match expr {
+            Expr::Path(path) if path.path.segments.len() == 1 => {
+                let name = path.path.segments.first()?.ident.to_string();
+                let base_type = if name == "self" {
+                    self.self_type.clone()?
+                } else {
+                    self.bindings
+                        .iter()
+                        .find(|(binding, _)| *binding == name)?
+                        .1
+                        .clone()
+                };
+                Some(ReceiverPath {
+                    base_type,
+                    fields: Vec::new(),
+                })
+            }
+            Expr::Field(field) => {
+                let Member::Named(name) = &field.member else {
+                    return None;
+                };
+                let mut receiver = self.receiver(&field.base)?;
+                receiver.fields.push(bare(&name.to_string()).to_owned());
+                Some(receiver)
+            }
+            Expr::Reference(reference) => self.receiver(&reference.expr),
+            Expr::Paren(paren) => self.receiver(&paren.expr),
+            Expr::Group(group) => self.receiver(&group.expr),
+            _ => None,
+        }
+    }
+
+    fn enter_inputs(&mut self, inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>) {
+        self.bindings = inputs
+            .iter()
+            .filter_map(|arg| {
+                let FnArg::Typed(arg) = arg else { return None };
+                let Pat::Ident(name) = &*arg.pat else {
+                    return None;
+                };
+                Some((name.ident.to_string(), type_path(&arg.ty)?))
+            })
+            .collect();
+    }
+}
+
+fn type_path(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Reference(reference) => type_path(&reference.elem),
+        Type::Paren(paren) => type_path(&paren.elem),
+        Type::Group(group) => type_path(&group.elem),
+        Type::Path(path)
+            if path.qself.is_none()
+                && path
+                    .path
+                    .segments
+                    .iter()
+                    .all(|segment| matches!(segment.arguments, syn::PathArguments::None)) =>
+        {
+            Some(
+                path.path
+                    .segments
+                    .iter()
+                    .map(|segment| bare(&segment.ident.to_string()).to_owned())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            )
+        }
+        _ => None,
+    }
+}
+
+impl<'ast> Visit<'ast> for CallCollector<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        let previous = self.module.clone();
+        self.module = self.module.child(&item.ident);
+        visit::visit_item_mod(self, item);
+        self.module = previous;
+    }
+
+    fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+        let previous = std::mem::take(&mut self.bindings);
+        let self_type = self.self_type.take();
+        self.enter_inputs(&function.sig.inputs);
+        visit::visit_item_fn(self, function);
+        self.bindings = previous;
+        self.self_type = self_type;
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let owner = impl_owner(
+            self.file,
+            &item.self_ty,
+            &self.module,
+            &impl_binders(&item.generics),
+        )
+        .map(|owner| owner.query());
+        let previous = std::mem::replace(&mut self.self_type, owner);
+        visit::visit_item_impl(self, item);
+        self.self_type = previous;
+    }
+
+    fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+        let previous = std::mem::take(&mut self.bindings);
+        self.enter_inputs(&function.sig.inputs);
+        visit::visit_impl_item_fn(self, function);
+        self.bindings = previous;
+    }
+
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        let previous = self.value_used;
+        self.value_used = !matches!(
+            statement,
+            Stmt::Expr(
+                Expr::Call(_) | Expr::MethodCall(_) | Expr::Await(_),
+                Some(_)
+            )
+        );
+        visit::visit_stmt(self, statement);
+        self.value_used = previous;
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        visit::visit_local(self, local);
+        if let Pat::Ident(name) = &local.pat {
+            self.bindings
+                .retain(|(binding, _)| binding != &name.ident.to_string());
+        }
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let previous = std::mem::take(&mut self.bindings);
+        let self_type = self.self_type.take();
+        visit::visit_expr_closure(self, closure);
+        self.bindings = previous;
+        self.self_type = self_type;
+    }
+
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let Expr::Path(path) = &*call.func {
             if let Some(first) = path.path.segments.first() {
-                self.0.push(CallSite {
+                self.calls.push(CallSite {
                     line: first.ident.span().start().line,
                     marker: path
                         .path
@@ -74,6 +313,8 @@ impl<'ast> Visit<'ast> for CallCollector {
                         .map(|segment| segment.ident.to_string())
                         .collect::<Vec<_>>()
                         .join("::"),
+                    receiver: None,
+                    value_used: self.value_used,
                 });
             }
         }
@@ -81,9 +322,11 @@ impl<'ast> Visit<'ast> for CallCollector {
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        self.0.push(CallSite {
+        self.calls.push(CallSite {
             line: call.method.span().start().line,
             marker: format!(".{}", call.method),
+            receiver: self.receiver(&call.receiver),
+            value_used: self.value_used,
         });
         visit::visit_expr_method_call(self, call);
     }
