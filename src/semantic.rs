@@ -980,7 +980,9 @@ fn admitted_windows(items: &[AllowedCitation]) -> String {
         }
         label.push_str(&format!(
             "{}:{}-{}",
-            item.path, item.start_line, item.end_line
+            item.path.escape_debug(),
+            item.start_line,
+            item.end_line
         ));
     }
     if items.len() > 8 {
@@ -1924,6 +1926,82 @@ mod tests {
         assert!(
             !body_text.contains("See src"),
             "refusal must not echo answer text: {body_text}"
+        );
+    }
+
+    #[test]
+    fn citation_refusal_escapes_control_characters_in_admitted_path() {
+        let hostile = "src/a\nb\rc\u{1b}d.rs";
+        let fixture = Fixture::new();
+        let source = fixture.root.join("src/lib.rs");
+        fs::write(
+            &source,
+            "fn empty_guard() {\n    if empty { return Err(SourceOutsideRoot); }\n}\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-3\n", source.display()),
+            &fixture.root,
+            "empty_guard",
+            8,
+        )
+        .expect("verified span");
+        let item = &report.evidence()[0];
+        let allowed = [AllowedCitation {
+            path: hostile.to_owned(),
+            start_line: 1,
+            end_line: 2,
+            evidence_index: 0,
+        }];
+        let outside = json!({
+            "answer":"The guard returns SourceOutsideRoot.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[{"path":"src/lib.rs","start_line":3,"end_line":3}]
+        });
+        let refused = decode_answer(
+            outside,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        )
+        .expect_err("an empty admission refuses the citation");
+        let text = refused.to_string();
+        let diagnostic = format!("pbi-rs: {text}");
+        assert_eq!(
+            diagnostic.lines().count(),
+            1,
+            "default stderr must stay one line: {diagnostic:?}"
+        );
+        assert!(
+            !diagnostic.chars().any(char::is_control),
+            "control characters must be escaped: {diagnostic:?}"
+        );
+        assert!(
+            diagnostic.contains("reason=citation_span"),
+            "predicate missing: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("admitted="),
+            "admitted identity missing: {diagnostic}"
+        );
+        let admitted = diagnostic
+            .split_once("admitted=")
+            .expect("admitted label")
+            .1;
+        assert!(
+            admitted.contains("src/a"),
+            "ordinary path text must stay readable: {admitted}"
+        );
+        assert!(
+            !admitted.contains(hostile),
+            "raw newline path must not be echoed: {admitted:?}"
+        );
+        assert!(
+            !diagnostic.contains("SourceOutsideRoot"),
+            "refusal must not echo answer text: {diagnostic}"
         );
     }
 
