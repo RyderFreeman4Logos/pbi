@@ -14,6 +14,7 @@ pub mod semantic;
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVIDENCE_LINES: usize = 4;
 const MAX_FOLLOWING_LINES: usize = 8;
+const MAX_CALLER_CONTEXT_LINES: usize = 40;
 
 #[cfg(test)]
 std::thread_local! {
@@ -108,7 +109,7 @@ pub struct EvidenceReport {
     missing_targets: Vec<String>,
     cited: Vec<usize>,
     followed_from: Vec<Option<usize>>,
-    call_edges: Vec<(usize, usize)>,
+    call_edges: Vec<(usize, usize, bool)>,
 }
 
 impl EvidenceReport {
@@ -136,20 +137,48 @@ impl EvidenceReport {
             return Vec::new();
         }
         let mut ancestor = Some(stop);
+        let mut ancestors = Vec::new();
         while let Some(index) = ancestor {
             if selected[index] {
                 break;
             }
             selected[index] = true;
+            ancestors.push(index);
             ancestor = self.followed_from(index);
         }
         let mut pending = vec![stop];
         while let Some(parent) = pending.pop() {
-            for &(_, child) in self.call_edges.iter().filter(|(owner, _)| *owner == parent) {
+            for &(_, child, _) in self
+                .call_edges
+                .iter()
+                .filter(|(owner, _, _)| *owner == parent)
+            {
                 if !selected[child] {
                     selected[child] = true;
                     pending.push(child);
                 }
+            }
+        }
+        // A caller can apply another value-producing gate before the selected
+        // stop. Its definition is evidence for comparisons between budgets.
+        for parent in ancestors.into_iter().skip(1) {
+            let mut sibling_pending = self
+                .call_edges
+                .iter()
+                .filter(|(owner, _, value_used)| *owner == parent && *value_used)
+                .map(|(_, child, _)| *child)
+                .collect::<Vec<_>>();
+            while let Some(index) = sibling_pending.pop() {
+                if selected[index] {
+                    continue;
+                }
+                selected[index] = true;
+                sibling_pending.extend(
+                    self.call_edges
+                        .iter()
+                        .filter(|(owner, _, value_used)| *owner == index && *value_used)
+                        .map(|(_, child, _)| *child),
+                );
             }
         }
         selected
@@ -185,22 +214,38 @@ impl EvidenceReport {
             if start > lines.len() {
                 continue;
             }
-            let next_declaration =
+            let declarations =
                 if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
                     declaration_identity::declarations(&source)
-                        .into_iter()
-                        .map(|declaration| declaration.line)
-                        .find(|line| *line >= start)
                 } else {
-                    None
+                    Vec::new()
                 };
+            let next_declaration = declarations
+                .iter()
+                .map(|declaration| declaration.line)
+                .find(|line| *line >= start);
             let end = next_declaration
                 .map(|line| line.saturating_sub(1))
                 .unwrap_or(start.saturating_add(MAX_FOLLOWING_LINES - 1))
                 .max(item.location().end_line())
                 .min(lines.len());
-            let first = item.location().start_line();
-            let snippet = lines[first - 1..end].join("\n");
+            let mut first = item
+                .location()
+                .start_line()
+                .saturating_sub(MAX_CALLER_CONTEXT_LINES)
+                .max(
+                    declarations
+                        .iter()
+                        .map(|declaration| declaration.line)
+                        .take_while(|line| *line <= item.location().start_line())
+                        .last()
+                        .unwrap_or(1),
+                );
+            let mut snippet = lines[first - 1..end].join("\n");
+            if snippet.len() > 4096 {
+                first = item.location().start_line();
+                snippet = lines[first - 1..end].join("\n");
+            }
             if snippet.len() > 4096 {
                 continue;
             }
@@ -411,8 +456,13 @@ impl EvidenceReport {
                         && existing.location().start_line() <= start
                         && existing.location().end_line() >= end
                 }) {
-                    if child != index && !self.call_edges.contains(&(index, child)) {
-                        self.call_edges.push((index, child));
+                    if child != index
+                        && !self
+                            .call_edges
+                            .iter()
+                            .any(|(owner, target, _)| *owner == index && *target == child)
+                    {
+                        self.call_edges.push((index, child, call.value_used));
                     }
                     continue;
                 }
@@ -425,7 +475,7 @@ impl EvidenceReport {
                     relevance: String::from("called Rust definition candidate"),
                 });
                 self.followed_from.push(Some(index));
-                self.call_edges.push((index, child));
+                self.call_edges.push((index, child, call.value_used));
                 pending.push((index, call_index + 1));
                 pending.push((self.evidence.len() - 1, 0));
                 break;
@@ -3309,5 +3359,47 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         assert!(selected
             .iter()
             .any(|index| report.evidence()[*index].snippet().contains("fn remaining")));
+    }
+
+    #[test]
+    fn why_stop_admits_the_callers_other_budget_without_unrelated_calls() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/budgets.rs");
+        let source = "fn attempt(used: u32) -> bool {\n    let mut retry = attempt_budget(used);\n    if is_outage() {\n        retry = wait();\n    }\n    if retry { return true; }\n    audit();\n    false\n}\nfn attempt_budget(used: u32) -> bool { used < 3 }\nfn is_outage() -> bool { true }\nfn wait() -> bool { if remaining() == 0 { return false; } true }\nfn remaining() -> u64 { 0 }\nfn audit() {}\nfn noise_budget() -> u64 { 99 }\n";
+        fs::write(&path, source).expect("source");
+        let report = EvidenceReport {
+            complete: true,
+            evidence: vec![SourceEvidence {
+                location: SourceLocation::new(path, 3, 4),
+                target: "wait".to_owned(),
+                snippet: String::new(),
+                symbol: Some("attempt".to_owned()),
+                relevance: String::new(),
+            }],
+            missing_targets: Vec::new(),
+            cited: vec![3],
+            followed_from: vec![None],
+            call_edges: Vec::new(),
+        }
+        .with_following_lines(&fixture.root, 6)
+        .expect("bounded evidence");
+        let stop = report
+            .evidence()
+            .iter()
+            .position(|item| item.snippet().contains("return false"))
+            .expect("stop branch");
+        let selected = report.causal_indices(stop);
+        let selected_text = selected
+            .iter()
+            .map(|index| report.evidence()[*index].snippet())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(selected_text.contains("used < 3"), "{selected_text}");
+        assert!(
+            selected_text.contains("remaining() -> u64"),
+            "{selected_text}"
+        );
+        assert!(!selected_text.contains("noise_budget"), "{selected_text}");
+        assert!(report.evidence().len() <= 6);
     }
 }
