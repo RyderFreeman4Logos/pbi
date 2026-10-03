@@ -3,6 +3,7 @@ mod declaration_identity;
 #[path = "definition_intent_tests.rs"]
 mod definition_intent_tests;
 mod relevance_scope;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -13,6 +14,11 @@ pub mod semantic;
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVIDENCE_LINES: usize = 4;
 const MAX_FOLLOWING_LINES: usize = 8;
+
+#[cfg(test)]
+std::thread_local! {
+    static WINDOW_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// A verified source path and the exact cited line returned to a caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -511,6 +517,7 @@ pub fn verify_probe_evidence(
     let any_of = groups[0].any_of;
 
     let mut choices: Vec<Vec<ScoredEvidence>> = vec![Vec::new(); groups.len()];
+    let mut scanned_paths = HashSet::new();
     for raw in raw_locations {
         let Some(path) = resolve_candidate_path(&raw.path, &root) else {
             continue;
@@ -525,6 +532,10 @@ pub fn verify_probe_evidence(
         let Ok(source) = fs::read_to_string(&path) else {
             continue;
         };
+        // Source windows cover the entire file; repeated range hints yield the same candidates.
+        if !scanned_paths.insert(path.clone()) {
+            continue;
+        }
         let lines: Vec<&str> = source.lines().collect();
         if lines.is_empty() {
             continue;
@@ -1514,6 +1525,8 @@ fn best_windows(
     order: usize,
     max_results: usize,
 ) -> Vec<ScoredEvidence> {
+    #[cfg(test)]
+    WINDOW_SCANS.with(|scans| scans.set(scans.get() + 1));
     let test_candidate = test_path(relative);
     let all_terms = all_groups
         .iter()
@@ -2294,6 +2307,25 @@ mod tests {
         .expect("verified source");
         assert_eq!(locations.len(), 1);
         assert!(locations[0].path().ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn repeated_locations_scan_each_verified_file_once() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/lib.rs");
+        let locations = (1..=8)
+            .map(|line| format!("File: {}, Lines: {line}-{line}\n", path.display()))
+            .collect::<String>();
+        WINDOW_SCANS.with(|scans| scans.set(0));
+        let report = verify_probe_evidence(
+            &locations,
+            &fixture.root,
+            "compression publication cache assembly",
+            8,
+        )
+        .expect("verified evidence");
+        assert!(!report.evidence().is_empty());
+        WINDOW_SCANS.with(|scans| assert_eq!(scans.get(), 1));
     }
 
     #[test]
