@@ -8,6 +8,7 @@
 
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use std::fs::{self, File, OpenOptions};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -144,13 +145,15 @@ pub fn search_raw_repository(
     query: &str,
     limits: &SearchLimits,
     options: &RawSearchOptions,
-) -> Result<Vec<RawHit>, SearchFailure> {
+) -> Result<(Vec<RawHit>, u64), SearchFailure> {
     let terms = raw_terms(query);
     if terms.is_empty() || terms.len() > 32 {
         return Err(SearchFailure::Limit);
     }
     let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
-    let files = walk(root, root_meta.dev(), limits)?;
+    let mut files = walk(root, root_meta.dev(), limits)?;
+    files.sort();
+    let mut freshness = DefaultHasher::new();
     let mut documents = 0usize;
     let mut total_length = 0usize;
     let mut document_frequency = vec![0usize; terms.len()];
@@ -166,6 +169,8 @@ pub fn search_raw_repository(
         let Some(bytes) = read_source(&path, root_meta.dev())? else {
             continue;
         };
+        path.hash(&mut freshness);
+        bytes.hash(&mut freshness);
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };
@@ -263,7 +268,7 @@ pub fn search_raw_repository(
         }
     }
     if documents == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), freshness.finish()));
     }
     let average_length = (total_length as f64 / documents as f64).max(1.0);
     let mut hits = candidates
@@ -301,7 +306,7 @@ pub fn search_raw_repository(
             .then_with(|| left.file.cmp(&right.file))
             .then_with(|| left.line.cmp(&right.line))
     });
-    Ok(hits)
+    Ok((hits, freshness.finish()))
 }
 
 fn raw_terms(query: &str) -> Vec<String> {

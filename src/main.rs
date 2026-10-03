@@ -12,6 +12,7 @@ use pbi_rs::semantic::{
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
 mod native_search;
+mod raw_session;
 use native_search::{
     candidate_symbols, search_raw_repository, search_repository, RawHit, RawSearchOptions,
     SearchFailure, SearchLimits,
@@ -20,7 +21,9 @@ use serde_json::json;
 use std::cell::Cell;
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 #[cfg(test)]
@@ -183,6 +186,7 @@ struct SearchOptions {
     frequency: bool,
     exclude_filenames: bool,
     strict_elastic_syntax: bool,
+    session: Option<String>,
 }
 
 impl Default for SearchOptions {
@@ -202,6 +206,7 @@ impl Default for SearchOptions {
             frequency: false,
             exclude_filenames: false,
             strict_elastic_syntax: false,
+            session: None,
         }
     }
 }
@@ -433,7 +438,7 @@ fn run(
             println!(
                     "pbi-rs search is bounded and in-process.\n\
                  Supported: --timeout --max-results --language/-l --ignore/-i.\n\
-                 --bm25 prints bounded native ranked hits. Raw --merge-threshold merges blocks separated by at most N lines (default 5). Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
+                 --bm25 prints bounded native ranked hits. Raw --merge-threshold merges blocks separated by at most N lines (default 5). Raw --session ID paginates with private source-fresh state. Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
                 );
             return Ok(0);
         }
@@ -494,7 +499,15 @@ fn run(
                 "--strict-elastic-syntax has no verified historical query contract",
             ));
         }
-        let mut hits = search_raw_repository(
+        let session = options
+            .session
+            .as_deref()
+            .map(|id| {
+                let scope = raw_session_scope(&root, &query, &options)?;
+                raw_session::RawSession::open(id, scope, deadline).map_err(CliError::failed)
+            })
+            .transpose()?;
+        let (mut hits, freshness) = search_raw_repository(
             &root,
             &query,
             &SearchLimits {
@@ -518,15 +531,34 @@ fn run(
             let mut seen = std::collections::HashSet::new();
             hits.retain(|hit| seen.insert(hit.file.clone()));
         }
-        hits.truncate(options.max_results);
         if hits.is_empty() {
             return Err(evidence_cli_error(EvidenceError::NoSourceLocations));
         }
-        let output = render_raw_hits(&hits, &options, deadline)?;
+        let cursor = session
+            .as_ref()
+            .map(|state| state.cursor(freshness).map_err(CliError::failed))
+            .transpose()?
+            .unwrap_or(0);
+        if cursor >= hits.len() {
+            return Err(CliError::failed("raw search session exhausted"));
+        }
+        let end = cursor.saturating_add(options.max_results).min(hits.len());
+        let (output, emitted) = render_raw_hits(&hits[cursor..end], &options, deadline)?;
+        if let Some(state) = session.as_ref() {
+            state
+                .advance(freshness, cursor + emitted)
+                .map_err(CliError::failed)?;
+        }
         io::stdout()
             .write_all(&output)
             .map_err(|_| CliError::failed("cannot write raw search results"))?;
-        trace.point(TraceStage::Terminal, TraceStatus::Ok, hits.len());
+        if emitted < end - cursor {
+            eprintln!(
+                "pbi-rs: raw results truncated: emitted {emitted} of {} page hits",
+                end - cursor
+            );
+        }
+        trace.point(TraceStage::Terminal, TraceStatus::Ok, emitted);
         return Ok(0);
     }
     if options.format.is_some()
@@ -538,6 +570,7 @@ fn run(
         || options.frequency
         || options.exclude_filenames
         || options.strict_elastic_syntax
+        || options.session.is_some()
     {
         return Err(CliError::usage(
             "raw search options require --bm25; verified search prints compact citations",
@@ -859,11 +892,33 @@ fn search_cli_error(failure: SearchFailure) -> CliError {
     }
 }
 
+fn raw_session_scope(root: &Path, query: &str, options: &SearchOptions) -> Result<u64, CliError> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|_| CliError::failed("raw search root is unavailable"))?;
+    let mut scope = DefaultHasher::new();
+    root.hash(&mut scope);
+    metadata.dev().hash(&mut scope);
+    metadata.ino().hash(&mut scope);
+    query.hash(&mut scope);
+    options.language.hash(&mut scope);
+    options.ignores.hash(&mut scope);
+    options.exact.hash(&mut scope);
+    options.exclude_filenames.hash(&mut scope);
+    options.files_only.hash(&mut scope);
+    options.merge_threshold.hash(&mut scope);
+    options.max_results.hash(&mut scope);
+    options.format.hash(&mut scope);
+    options.max_bytes.hash(&mut scope);
+    options.max_tokens.hash(&mut scope);
+    options.frequency.hash(&mut scope);
+    Ok(scope.finish())
+}
+
 fn render_raw_hits(
     hits: &[RawHit],
     options: &SearchOptions,
     deadline: Instant,
-) -> Result<Vec<u8>, CliError> {
+) -> Result<(Vec<u8>, usize), CliError> {
     if options.files_only && options.frequency {
         return Err(CliError::usage(
             "--files-only and --frequency cannot be combined",
@@ -882,6 +937,7 @@ fn render_raw_hits(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
     let mut output = Vec::new();
+    let mut emitted = 0;
     for count in 1..=hits.len() {
         if Instant::now() >= deadline {
             return Err(CliError::failed(
@@ -900,8 +956,9 @@ fn render_raw_hits(
             break;
         }
         output = next;
+        emitted = count;
     }
-    Ok(output)
+    Ok((output, emitted))
 }
 
 fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> Vec<u8> {
@@ -939,7 +996,10 @@ fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> 
         let snippet = escape_control(&hit.snippet);
         let location = hit.line.map_or_else(
             || format!("{file} (filename)"),
-            |line| format!("{file}:{line}"),
+            |line| match hit.end_line {
+                Some(end) if end > line => format!("{file}:{line}-{end}"),
+                _ => format!("{file}:{line}"),
+            },
         );
         let line_label = hit.line.map_or_else(
             || "Match: filename".to_owned(),
@@ -1277,9 +1337,26 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 index += 1;
             }
             value if value == "--session" || value.starts_with("--session=") => {
-                return Err(CliError::usage(
-                    "--session is unavailable: native raw search is stateless",
-                ));
+                if options.session.is_some() {
+                    return Err(CliError::usage("--session cannot be used multiple times"));
+                }
+                let id = if value == "--session" {
+                    next_value(arguments, &mut index, "--session")?
+                } else {
+                    index += 1;
+                    value[10..].to_owned()
+                };
+                if id.len() > 64
+                    || id.is_empty()
+                    || !id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                {
+                    return Err(CliError::usage(
+                        "--session ID must use 1-64 ASCII letters, digits, hyphens, or underscores",
+                    ));
+                }
+                options.session = Some(id);
             }
             value if value == "--question" || value.starts_with("--question=") => {
                 if question_seen {

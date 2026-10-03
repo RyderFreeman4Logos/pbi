@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -400,6 +401,16 @@ impl ScopeFixture {
             .output()
             .expect("run pbi-rs in nested invocation root")
     }
+
+    fn run_session(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+            .env_clear()
+            .env("XDG_STATE_HOME", self.base.join("state"))
+            .current_dir(&self.root)
+            .args(args)
+            .output()
+            .expect("run pbi-rs with isolated state")
+    }
 }
 
 impl Drop for ScopeFixture {
@@ -468,26 +479,271 @@ fn question_parity_message_rejects_unsupported_chat_tail_before_probe() {
 }
 
 #[test]
-fn search_session_refuses_durable_cache_before_probe() {
-    for tail in [
-        vec!["--session", "owned-id"],
-        vec!["--session=../outside"],
-        vec!["--session="],
-        vec!["--session"],
-        vec!["--session", "--help"],
-    ] {
-        let fixture = Fixture::new();
-        let mut args = vec!["search", "search option parity"];
-        args.extend(tail);
-        let output = fixture.run(&args, "evidence");
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
+fn raw_session_pages_deduplicate_and_invalidate_changed_source() {
+    let fixture = ScopeFixture::new();
+    let source = fixture.root.join("blocks.rs");
+    fs::write(&source, "fn marker() {}\n// gap\nfn marker() {}\n").expect("source");
+    let args = [
+        "search",
+        "--bm25",
+        "--format=json",
+        "--merge-threshold=0",
+        "--max-results=1",
+        "--session=page",
+        "marker",
+    ];
+    let first = fixture.run_session(&args);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let one: serde_json::Value = serde_json::from_slice(&first.stdout).expect("first JSON");
+    assert_eq!(one[0]["line"], 1);
+    let second = fixture.run_session(&args);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let two: serde_json::Value = serde_json::from_slice(&second.stdout).expect("second JSON");
+    assert_eq!(two[0]["line"], 3);
+    let exhausted = fixture.run_session(&args);
+    assert_eq!(exhausted.status.code(), Some(1));
+    assert!(exhausted.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&exhausted.stderr).contains("exhausted"));
+    fs::write(
+        &source,
+        "fn marker() { changed(); }\n// gap\nfn marker() {}\n",
+    )
+    .expect("modify source");
+    let refreshed = fixture.run_session(&args);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let fresh: serde_json::Value = serde_json::from_slice(&refreshed.stdout).expect("fresh JSON");
+    assert_eq!(fresh[0]["line"], 1);
+    assert!(fresh[0]["snippet"]
+        .as_str()
+        .expect("snippet")
+        .contains("changed"));
+    let other_query = fixture.run_session(&[
+        "search",
+        "--bm25",
+        "--format=json",
+        "--max-results=1",
+        "--session=page",
+        "changed",
+    ]);
+    assert!(
+        other_query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&other_query.stderr)
+    );
+    let other: serde_json::Value = serde_json::from_slice(&other_query.stdout).expect("other JSON");
+    assert_eq!(other[0]["line"], 1);
+    let other_options = fixture.run_session(&[
+        "search",
+        "--bm25",
+        "--format=json",
+        "--max-results=1",
+        "--session=page",
+        "marker",
+    ]);
+    assert!(
+        other_options.status.success(),
+        "{}",
+        String::from_utf8_lossy(&other_options.stderr)
+    );
+    let other: serde_json::Value =
+        serde_json::from_slice(&other_options.stdout).expect("options JSON");
+    assert_eq!(other[0]["line"], 1);
+    assert_eq!(other[0]["end_line"], 3);
+    let other_root = fixture.base.join("other-root");
+    fs::create_dir(&other_root).expect("other root");
+    fs::write(other_root.join("only.rs"), "fn marker() {}\n").expect("other source");
+    let isolated = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .env("XDG_STATE_HOME", fixture.base.join("state"))
+        .current_dir(&other_root)
+        .args(args)
+        .output()
+        .expect("other root session");
+    assert!(
+        isolated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&isolated.stderr)
+    );
+    let other: serde_json::Value = serde_json::from_slice(&isolated.stdout).expect("isolated JSON");
+    assert_eq!(other[0]["file"], "only.rs");
+    let state_dir = fixture.base.join("state/pbi-rs/search-sessions");
+    assert_eq!(
+        fs::metadata(&state_dir)
+            .expect("state dir")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for entry in fs::read_dir(&state_dir).expect("state entries") {
+        let path = entry.expect("entry").path();
         assert_eq!(
-            output.stderr,
-            b"pbi-rs: --session is unavailable: native raw search is stateless\n"
+            fs::metadata(&path)
+                .expect("state file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
-        assert!(!fixture.root.join("probe-argv").exists());
+        let bytes = fs::read(&path).expect("state bytes");
+        assert!(!bytes.windows(6).any(|window| window == b"marker"));
     }
+}
+
+#[test]
+fn raw_session_rejects_unsafe_ids_and_state_symlinks() {
+    let fixture = ScopeFixture::new();
+    fs::write(fixture.root.join("match.rs"), "fn marker() {}\n").expect("source");
+    for id in ["../outside", "", "a/b", ".", ".."] {
+        let option = format!("--session={id}");
+        let output = fixture.run_session(&["search", "--bm25", &option, "marker"]);
+        assert_eq!(output.status.code(), Some(2), "{id:?}");
+        assert!(output.stdout.is_empty());
+    }
+    let state = fixture.base.join("state");
+    symlink(&fixture.root, &state).expect("state symlink");
+    let output = fixture.run_session(&["search", "--bm25", "--session=safe", "marker"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let fixture = ScopeFixture::new();
+    fs::write(fixture.root.join("match.rs"), "fn marker() {}\n").expect("source");
+    let args = ["search", "--bm25", "--session=safe", "marker"];
+    let first = fixture.run_session(&args);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let dir = fixture.base.join("state/pbi-rs/search-sessions");
+    let state_file = fs::read_dir(&dir)
+        .expect("state dir")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .expect("state JSON");
+    let outside = fixture.base.join("outside.txt");
+    fs::write(&outside, "untouched").expect("outside");
+    fs::remove_file(&state_file).expect("remove owned state");
+    symlink(&outside, &state_file).expect("replace state with symlink");
+    let second = fixture.run_session(&args);
+    assert!(!second.status.success());
+    assert!(second.stdout.is_empty());
+    assert_eq!(
+        fs::read_to_string(&outside).expect("outside content"),
+        "untouched"
+    );
+}
+
+#[test]
+fn raw_session_concurrent_pages_remain_disjoint() {
+    let fixture = ScopeFixture::new();
+    fs::write(
+        fixture.root.join("blocks.rs"),
+        "fn marker() {}\n// gap\nfn marker() {}\n",
+    )
+    .expect("source");
+    let handles = (0..2)
+        .map(|_| {
+            let root = fixture.root.clone();
+            let state = fixture.base.join("state");
+            std::thread::spawn(move || {
+                Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+                    .env_clear()
+                    .env("XDG_STATE_HOME", state)
+                    .current_dir(root)
+                    .args([
+                        "search",
+                        "--bm25",
+                        "--format=json",
+                        "--merge-threshold=0",
+                        "--max-results=1",
+                        "--session=parallel",
+                        "marker",
+                    ])
+                    .output()
+                    .expect("parallel session")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut lines = handles
+        .into_iter()
+        .map(|handle| {
+            let output = handle.join().expect("child thread");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rows: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+            rows[0]["line"].as_u64().expect("line")
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    assert_eq!(lines, [1, 3]);
+}
+
+#[test]
+fn raw_session_budget_advances_only_emitted_results() {
+    let fixture = ScopeFixture::new();
+    fs::write(
+        fixture.root.join("blocks.rs"),
+        "fn marker() {}\n// gap\nfn marker() {}\n",
+    )
+    .expect("source");
+    let unpaged = fixture.run_session(&[
+        "search",
+        "--bm25",
+        "--format=json",
+        "--merge-threshold=0",
+        "--max-results=1",
+        "marker",
+    ]);
+    assert!(unpaged.status.success());
+    assert!(
+        !fixture.base.join("state").exists(),
+        "stateless search wrote session data"
+    );
+    let budget = format!("--max-bytes={}", unpaged.stdout.len());
+    let args = [
+        "search",
+        "--bm25",
+        "--format=json",
+        "--merge-threshold=0",
+        "--max-results=2",
+        &budget,
+        "--session=budget",
+        "marker",
+    ];
+    let first = fixture.run_session(&args);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let one: serde_json::Value = serde_json::from_slice(&first.stdout).expect("first JSON");
+    assert_eq!(one.as_array().expect("first rows").len(), 1);
+    assert_eq!(one[0]["line"], 1);
+    assert!(String::from_utf8_lossy(&first.stderr).contains("truncated"));
+    let second = fixture.run_session(&args);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let two: serde_json::Value = serde_json::from_slice(&second.stdout).expect("second JSON");
+    assert_eq!(two[0]["line"], 3);
 }
 
 #[test]
