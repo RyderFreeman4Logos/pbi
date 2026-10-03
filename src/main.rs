@@ -165,7 +165,7 @@ fn semantic_trace_status(error: &SemanticError) -> TraceStatus {
             TraceStatus::Deadline
         }
         SemanticError::Route { .. } => TraceStatus::RouteError,
-        SemanticError::InvalidOutput | SemanticError::CitationMismatch => {
+        SemanticError::InvalidOutput | SemanticError::CitationMismatch { .. } => {
             TraceStatus::InvalidOutput
         }
         SemanticError::NoEvidence => TraceStatus::NoSource,
@@ -2232,7 +2232,7 @@ mod tests {
                 let passed = if accepted {
                     matches!(result, Ok(0)) && !output.is_empty()
                 } else {
-                    matches!(&result, Err(error) if error.code == 1 && error.message == SemanticError::CitationMismatch.to_string())
+                    matches!(&result, Err(error) if error.code == 1 && error.message.starts_with("semantic model returned an unverified citation"))
                         && output.is_empty()
                 };
                 if accepted && matches!(result, Ok(0)) {

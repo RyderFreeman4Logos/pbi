@@ -97,7 +97,7 @@ impl SemanticAnswer {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticError {
     EmptyQuestion,
     NoEvidence,
@@ -112,7 +112,10 @@ pub enum SemanticError {
         attempts: usize,
     },
     InvalidOutput,
-    CitationMismatch,
+    CitationMismatch {
+        reason: &'static str,
+        admitted: String,
+    },
 }
 
 impl fmt::Display for SemanticError {
@@ -134,7 +137,12 @@ impl fmt::Display for SemanticError {
             Self::DeadlineExceeded => "semantic investigation exceeded its bounded deadline",
             Self::Route { .. } => unreachable!("route errors are formatted above"),
             Self::InvalidOutput => "semantic model output failed validation",
-            Self::CitationMismatch => "semantic model returned an unverified citation",
+            Self::CitationMismatch { reason, admitted } => {
+                return write!(
+                    formatter,
+                    "semantic model returned an unverified citation; reason={reason}; admitted={admitted}"
+                );
+            }
         })
     }
 }
@@ -840,26 +848,27 @@ fn decode_answer(
     if citation_values.is_empty() || citation_values.len() > MAX_SEMANTIC_EVIDENCE {
         return Err(SemanticError::InvalidOutput);
     }
+    let admitted = admitted_windows(allowed);
     let mut citations = Vec::with_capacity(citation_values.len());
     let mut selected = Vec::with_capacity(citation_values.len());
     for citation in citation_values {
         let citation = citation
             .as_object()
-            .ok_or_else(|| citation_mismatch("citation_object"))?;
+            .ok_or_else(|| citation_mismatch("citation_object", &admitted))?;
         let path = citation
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| citation_mismatch("citation_path"))?;
+            .ok_or_else(|| citation_mismatch("citation_path", &admitted))?;
         let start_line = citation
             .get("start_line")
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| citation_mismatch("citation_start"))?;
+            .ok_or_else(|| citation_mismatch("citation_start", &admitted))?;
         let end_line = citation
             .get("end_line")
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| citation_mismatch("citation_end"))?;
+            .ok_or_else(|| citation_mismatch("citation_end", &admitted))?;
         let matched = allowed
             .iter()
             .find(|allowed| {
@@ -868,12 +877,12 @@ fn decode_answer(
                     && allowed.start_line <= start_line
                     && end_line <= allowed.end_line
             })
-            .ok_or_else(|| citation_mismatch("citation_span"))?;
+            .ok_or_else(|| citation_mismatch("citation_span", &admitted))?;
         if citations
             .iter()
             .any(|item: &SourceEvidence| item == evidence[matched.evidence_index])
         {
-            return Err(citation_mismatch("duplicate_evidence"));
+            return Err(citation_mismatch("duplicate_evidence", &admitted));
         }
         citations.push(evidence[matched.evidence_index].clone());
         selected.push(AllowedCitation {
@@ -883,8 +892,9 @@ fn decode_answer(
             evidence_index: matched.evidence_index,
         });
     }
-    answer_body_citations_match(&answer, &selected.iter().collect::<Vec<_>>())
-        .map_err(|_| citation_mismatch("answer_body"))?;
+    let selected_refs = selected.iter().collect::<Vec<_>>();
+    answer_body_citations_match(&answer, &selected_refs)
+        .map_err(|reason| citation_mismatch(reason, &admitted_windows(&selected)))?;
     let stop_index = if stop_candidates.is_empty() {
         None
     } else {
@@ -892,9 +902,9 @@ fn decode_answer(
             .get("stop_evidence_id")
             .and_then(Value::as_u64)
             .and_then(|index| usize::try_from(index).ok())
-            .ok_or_else(|| citation_mismatch("stop_id"))?;
+            .ok_or_else(|| citation_mismatch("stop_id", &admitted))?;
         if !stop_candidates.contains(&index) {
-            return Err(citation_mismatch("stop_id_unadmitted"));
+            return Err(citation_mismatch("stop_id_unadmitted", &admitted));
         }
         Some(index)
     };
@@ -908,7 +918,7 @@ fn decode_answer(
     if let Some(index) = stop_index {
         if !cited_indices.contains(&index) {
             if citations.len() >= MAX_SEMANTIC_EVIDENCE {
-                return Err(citation_mismatch("stop_evidence_capacity"));
+                return Err(citation_mismatch("stop_evidence_capacity", &admitted));
             }
             citations.push(evidence[index].clone());
             cited_indices.push(index);
@@ -918,7 +928,7 @@ fn decode_answer(
     for mut child in roots {
         while let Some(parent) = report.followed_from(child) {
             if parent >= child || parent >= evidence.len() {
-                return Err(citation_mismatch("parent_index"));
+                return Err(citation_mismatch("parent_index", &admitted));
             }
             if !visible.get(parent).copied().unwrap_or(false) {
                 break;
@@ -937,7 +947,7 @@ fn decode_answer(
         for (index, included) in visible.iter().copied().enumerate() {
             if included && !cited_indices.contains(&index) {
                 if citations.len() >= MAX_SEMANTIC_EVIDENCE {
-                    return Err(citation_mismatch("causal_evidence_capacity"));
+                    return Err(citation_mismatch("causal_evidence_capacity", &admitted));
                 }
                 citations.push(evidence[index].clone());
                 cited_indices.push(index);
@@ -952,11 +962,34 @@ fn decode_answer(
     })
 }
 
-fn citation_mismatch(reason: &'static str) -> SemanticError {
+fn citation_mismatch(reason: &'static str, admitted: &str) -> SemanticError {
     if env::var("PBI_RS_STAGE_TIMING").as_deref() == Ok("1") {
         eprintln!("pbi-rs.citation_failure={reason}");
     }
-    SemanticError::CitationMismatch
+    SemanticError::CitationMismatch {
+        reason,
+        admitted: admitted.to_owned(),
+    }
+}
+
+fn admitted_windows(items: &[AllowedCitation]) -> String {
+    let mut label = String::new();
+    for (index, item) in items.iter().take(8).enumerate() {
+        if index > 0 {
+            label.push(',');
+        }
+        label.push_str(&format!(
+            "{}:{}-{}",
+            item.path, item.start_line, item.end_line
+        ));
+    }
+    if items.len() > 8 {
+        label.push_str(",...");
+    }
+    if label.is_empty() {
+        label.push('-');
+    }
+    label
 }
 
 fn question_is_about_stopping(question: &str) -> bool {
@@ -1018,7 +1051,7 @@ fn has_executable_false_return(snippet: &str) -> bool {
 fn answer_body_citations_match(
     answer: &str,
     selected: &[&AllowedCitation],
-) -> Result<(), SemanticError> {
+) -> Result<(), &'static str> {
     let wrappers = BodyWrappers::new(answer);
     let mut owners = BodyOwners::default();
     let mut start = 0;
@@ -1496,7 +1529,7 @@ impl BodyWrappers {
 fn body_citation<'a>(
     token: &'a str,
     selected: &[&AllowedCitation],
-) -> Result<Option<(&'a str, usize, usize)>, SemanticError> {
+) -> Result<Option<(&'a str, usize, usize)>, &'static str> {
     let Some((path, spec)) = token.rsplit_once(':') else {
         return Ok(None);
     };
@@ -1533,12 +1566,12 @@ fn body_citation<'a>(
             .split('/')
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
-        return Err(SemanticError::CitationMismatch);
+        return Err("body_path");
     }
     if !contained {
-        return Err(SemanticError::CitationMismatch);
+        return Err("body_span");
     }
-    let (start, end) = span.ok_or(SemanticError::CitationMismatch)?;
+    let (start, end) = span.ok_or("body_span")?;
     Ok(Some((path, start, end)))
 }
 
@@ -1811,22 +1844,86 @@ mod tests {
         )
         .expect("the precise subspan remains verified");
         assert_eq!(answer.citations().len(), 1);
+    }
+
+    #[test]
+    fn citation_refusal_names_predicate_and_admitted_span() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("src/lib.rs");
+        fs::write(
+            &source,
+            "fn empty_guard() {\n    if empty { return Err(SourceOutsideRoot); }\n}\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-3\n", source.display()),
+            &fixture.root,
+            "empty_guard",
+            8,
+        )
+        .expect("verified span");
+        let item = &report.evidence()[0];
+        let allowed = [AllowedCitation {
+            path: "src/lib.rs".to_owned(),
+            start_line: 1,
+            end_line: 2,
+            evidence_index: 0,
+        }];
         let outside = json!({
             "answer":"The guard returns SourceOutsideRoot.",
             "uncertainty":"Only the verified source span was inspected.",
             "citations":[{"path":"src/lib.rs","start_line":3,"end_line":3}]
         });
-        assert_eq!(
-            decode_answer(
-                outside,
-                &allowed,
-                &[item],
-                &report,
-                &[],
-                &[true],
-                "test-route".to_owned()
-            ),
-            Err(SemanticError::CitationMismatch)
+        let refused = decode_answer(
+            outside,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        )
+        .expect_err("line 3 is outside the admitted window");
+        let text = refused.to_string();
+        assert!(
+            text.contains("reason=citation_span"),
+            "predicate missing: {text}"
+        );
+        assert!(
+            text.contains("admitted=src/lib.rs:1-2"),
+            "admitted identity missing: {text}"
+        );
+        assert!(
+            !text.contains("SourceOutsideRoot"),
+            "refusal must not echo answer text: {text}"
+        );
+        let bad_body = json!({
+            "answer":"See src/lib.rs:9 for the decision.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[{"path":"src/lib.rs","start_line":2,"end_line":2}]
+        });
+        let body = decode_answer(
+            bad_body,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        )
+        .expect_err("body line 9 is not the admitted span");
+        let body_text = body.to_string();
+        assert!(
+            body_text.contains("reason=body_span"),
+            "body predicate missing: {body_text}"
+        );
+        assert!(
+            body_text.contains("admitted=src/lib.rs:2-2"),
+            "selected admitted identity missing: {body_text}"
+        );
+        assert!(
+            !body_text.contains("See src"),
+            "refusal must not echo answer text: {body_text}"
         );
     }
 
@@ -2084,7 +2181,10 @@ mod tests {
             deadline,
             &cancellation,
         ));
-        assert_eq!(result, Err(SemanticError::CitationMismatch));
+        assert!(matches!(
+            result,
+            Err(SemanticError::CitationMismatch { .. })
+        ));
     }
 
     #[test]
