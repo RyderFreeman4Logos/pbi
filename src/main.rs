@@ -32,7 +32,7 @@ use workflow_adk::{
 const VERSION: &str = "0.1.0";
 const DEFAULT_MAX_RESULTS: usize = 8;
 const PROBE_OUTER_DEADLINE_SECONDS: u64 = 8;
-const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 30;
+const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 90;
 const MAX_STAGE_ROWS: usize = 24;
 
 #[derive(Clone, Copy)]
@@ -209,7 +209,7 @@ fn usage() {
                 pbi-rs search [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
-         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: 30 for answers, 8 for search). Search is read-only and bounded. Source citations are verified before a model sees them."
+         Model routes require explicit local opt-in. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {PROBE_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Source citations are verified before a model sees them."
     );
 }
 
