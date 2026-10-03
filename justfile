@@ -38,6 +38,13 @@ build-release:
     ionice -c 3 cargo build --locked --release
     cp target/release/pbi-rs target/release/pbi
 
+# Build a Cargo-installed candidate in a caller-owned staging root. Promotion
+# to a shared command is a separate, verified operation.
+install-stage:
+    test -n "${PBI_INSTALL_STAGE:-}"
+    test -d "$PBI_INSTALL_STAGE"
+    ionice -c 3 cargo install --offline --locked --path . --bin pbi-rs --root "$PBI_INSTALL_STAGE" --target-dir ./target --force
+
 clippy:
     ionice -c 3 cargo clippy --locked --all-targets -- -D warnings
 
