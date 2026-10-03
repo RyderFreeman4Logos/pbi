@@ -357,6 +357,36 @@ fn question_code_anchor_missing(question: &str, report: &pbi_rs::EvidenceReport)
         })
 }
 
+// A field question needs the named type's declaration. Prose terms such as
+// "fields" and "store" otherwise outrank that short declaration in a small
+// bounded search window. Keep the question itself for the model invocation.
+fn type_field_subject(question: &str) -> Option<&str> {
+    let tokens = question
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if !tokens.iter().any(|token| {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "field" | "fields" | "member" | "members"
+        )
+    }) {
+        return None;
+    }
+    let mut subjects = tokens.into_iter().filter(|token| {
+        token
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_uppercase())
+            && !matches!(
+                token.to_ascii_lowercase().as_str(),
+                "what" | "which" | "how" | "does" | "do" | "the" | "a" | "an"
+            )
+    });
+    let subject = subjects.next()?;
+    subjects.next().is_none().then_some(subject)
+}
+
 fn run(
     arguments: Vec<String>,
     #[cfg(test)] _test_route_injection: Option<TestRouteInjection<'_>>,
@@ -555,6 +585,11 @@ fn run(
     };
     let collect_evidence =
         |search_query: &str, initial: bool| -> Result<Option<pbi_rs::EvidenceReport>, CliError> {
+            let evidence_query = if semantic && initial {
+                type_field_subject(search_query).unwrap_or(search_query)
+            } else {
+                search_query
+            };
             let (search_stage, verify_stage) = if initial {
                 (TraceStage::InitialSearch, TraceStage::InitialVerify)
             } else {
@@ -563,7 +598,7 @@ fn run(
             trace.point(search_stage, TraceStatus::Start, 0);
             let found = search_repository(
                 &root,
-                search_query,
+                evidence_query,
                 &SearchLimits {
                     deadline,
                     max_results: options.max_results,
@@ -595,7 +630,7 @@ fn run(
                     "source verification exceeded its bounded deadline",
                 ));
             }
-            let verified = verify_probe_evidence(&found, &root, search_query, verify_limit);
+            let verified = verify_probe_evidence(&found, &root, evidence_query, verify_limit);
             if Instant::now() >= deadline {
                 trace.point(verify_stage, TraceStatus::Deadline, 0);
                 return Err(CliError::failed(

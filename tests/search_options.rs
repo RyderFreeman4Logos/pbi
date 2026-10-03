@@ -99,6 +99,24 @@ fn search_single_rust_type_name_uses_code_identifier() {
 }
 
 #[test]
+fn field_question_admits_the_type_declaration_before_repeated_mentions() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("model.rs"),
+        "pub struct LedgerState {\n    pub entries: usize,\n    pub revision: u64,\n}\n",
+    )
+    .expect("type declaration");
+    fs::write(
+        fixture.root.join("usage.rs"),
+        "// LedgerState fields store cached data.\n".repeat(40),
+    )
+    .expect("distracting mentions");
+    let output = fixture.run(&["What fields does LedgerState store?"], "evidence");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("model.rs:1"), "{stdout}");
+}
+
+#[test]
 fn raw_native_bm25_ranks_source_and_returns_real_locations() {
     let fixture = Fixture::new();
     fs::write(
