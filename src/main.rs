@@ -3009,6 +3009,56 @@ mod tests {
     }
 
     #[test]
+    fn planning_deadline_is_named_and_never_starts_answer() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-plan-deadline-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("outage_hold.rs"),
+            "fn is_outage() -> bool { true }\n",
+        )
+        .expect("source");
+        let _env = RouteConfigEnvGuard::new(&root, &[]);
+        let planning_calls = Arc::new(AtomicUsize::new(0));
+        let answer_calls = Arc::new(AtomicUsize::new(0));
+        let factory = |routes: &[AdmittedLocalModelRoute]| {
+            cli_route_publisher(
+                routes,
+                "unused",
+                true,
+                TestModelBehavior::Pending,
+                Arc::clone(&planning_calls),
+                Arc::clone(&answer_calls),
+            )
+        };
+        let started = Instant::now();
+        let mut output = Vec::new();
+        let result = run(
+            cli_route_arguments("Why does persistent_outage_hold stop with attempts left?"),
+            Some(TestRouteInjection::Factory {
+                build: &factory,
+                deadline: Duration::from_millis(80),
+            }),
+            &mut output,
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            result.err().map(|error| error.message),
+            Some("semantic planning exceeded its bounded deadline".to_owned())
+        );
+        assert_eq!(planning_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(answer_calls.load(Ordering::SeqCst), 0);
+        assert!(output.is_empty());
+        drop(_env);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn semantic_question_replans_when_its_code_anchor_is_missing_from_evidence() {
         let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
             "pbi-rs-anchor-{}",

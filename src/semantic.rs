@@ -104,6 +104,7 @@ pub enum SemanticError {
     InputTooLarge,
     Protocol,
     Cancelled,
+    PlanningDeadlineExceeded,
     DeadlineExceeded,
     Route {
         kind: ModelRouteTerminalErrorKind,
@@ -128,6 +129,7 @@ impl fmt::Display for SemanticError {
             Self::InputTooLarge => "semantic evidence exceeded the bounded context",
             Self::Protocol => "semantic invocation protocol could not be built",
             Self::Cancelled => "semantic investigation was cancelled",
+            Self::PlanningDeadlineExceeded => "semantic planning exceeded its bounded deadline",
             Self::DeadlineExceeded => "semantic investigation exceeded its bounded deadline",
             Self::Route { .. } => unreachable!("route errors are formatted above"),
             Self::InvalidOutput => "semantic model output failed validation",
@@ -531,7 +533,7 @@ pub async fn plan_search_query(
         return Err(SemanticError::EmptyQuestion);
     }
     if Instant::now() >= deadline {
-        return Err(SemanticError::DeadlineExceeded);
+        return Err(SemanticError::PlanningDeadlineExceeded);
     }
     let schema: Value =
         serde_json::from_str(SEARCH_PLAN_SCHEMA).map_err(|_| SemanticError::Protocol)?;
@@ -576,14 +578,16 @@ pub async fn plan_search_query(
         Ok(Err(error)) => {
             return Err(match error.kind() {
                 ModelRouteTerminalErrorKind::Cancelled => SemanticError::Cancelled,
-                ModelRouteTerminalErrorKind::DeadlineExceeded => SemanticError::DeadlineExceeded,
+                ModelRouteTerminalErrorKind::DeadlineExceeded => {
+                    SemanticError::PlanningDeadlineExceeded
+                }
                 kind => SemanticError::Route {
                     kind,
                     attempts: error.attempts().len(),
                 },
             });
         }
-        Err(_) => return Err(SemanticError::DeadlineExceeded),
+        Err(_) => return Err(SemanticError::PlanningDeadlineExceeded),
     };
     let value = result.into_output();
     let query = value
