@@ -3,10 +3,14 @@
 use syn::{File, ImplItem, Item, TraitItem, Type, UseTree};
 
 /// Segment identity, shared by lexical owners and directly resolvable impl types.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct OwnerPath(Vec<String>);
 
 impl OwnerPath {
+    pub(super) fn is_root(&self) -> bool {
+        self.0.is_empty()
+    }
+
     fn child(&self, name: &syn::Ident) -> Self {
         let mut path = self.clone();
         path.0.push(bare(&name.to_string()).to_owned());

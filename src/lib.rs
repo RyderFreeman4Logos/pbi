@@ -5,6 +5,7 @@ mod definition_intent_tests;
 mod relevance_scope;
 use std::fmt;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 pub mod semantic;
@@ -118,8 +119,8 @@ impl EvidenceReport {
         &self.missing_targets
     }
 
-    /// Extend selected source spans with bounded following lines. The combined
-    /// range is reread and confined to the same repository before a model sees it.
+    /// Extend selected spans and their called Rust definitions within the same
+    /// verified files. Every added range is reread and bounded before synthesis.
     pub fn with_following_lines(
         mut self,
         root: &Path,
@@ -166,6 +167,102 @@ impl EvidenceReport {
                 symbol: item.symbol().map(str::to_owned),
                 relevance: item.relevance().to_owned(),
             };
+        }
+        let root_device = fs::metadata(&root)
+            .map_err(|_| EvidenceError::SourceUnavailable)?
+            .dev();
+        let mut sources = Vec::new();
+        for item in &self.evidence {
+            let path = item.location().path();
+            if path.extension().and_then(|value| value.to_str()) != Some("rs")
+                || sources.iter().any(|(seen, _, _)| seen == path)
+            {
+                continue;
+            }
+            let path =
+                resolve_candidate_path(path, &root).ok_or(EvidenceError::SourceOutsideRoot)?;
+            if source_is_too_large(&path)
+                || fs::metadata(&path)
+                    .map_err(|_| EvidenceError::SourceUnavailable)?
+                    .dev()
+                    != root_device
+            {
+                return Err(EvidenceError::SourceUnavailable);
+            }
+            let source = fs::read_to_string(&path).map_err(|_| EvidenceError::SourceUnavailable)?;
+            let declarations = declaration_identity::declarations(&source);
+            sources.push((path, source, declarations));
+        }
+        let mut index = 0;
+        while index < self.evidence.len() && self.evidence.len() < max_total {
+            let item = self.evidence[index].clone();
+            let code = CodeView::new(item.snippet());
+            let calls = code.code.lines().flat_map(call_markers).collect::<Vec<_>>();
+            for call in calls {
+                let (kind, qualifier, name) = if let Some((owner, name)) = call.rsplit_once("::") {
+                    ("qualified", owner, name)
+                } else if let Some((_, name)) = call.rsplit_once('.') {
+                    ("method", "", name)
+                } else {
+                    ("bare", "", call.as_str())
+                };
+                for (path, source, declarations) in &sources {
+                    let same_file = path == item.location().path();
+                    let file_stem = path.file_stem().and_then(|stem| stem.to_str());
+                    if (kind != "qualified" && !same_file)
+                        || (kind == "qualified" && file_stem != Some(qualifier) && !same_file)
+                    {
+                        continue;
+                    }
+                    let matches = declarations
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, declaration)| {
+                            declaration.name == name
+                                && declaration.owner.as_ref().is_some_and(|owner| match kind {
+                                    "method" => !owner.is_root(),
+                                    "qualified" if file_stem == Some(qualifier) => owner.is_root(),
+                                    "qualified" => owner.matches(qualifier),
+                                    _ => owner.is_root(),
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    let [(_, declaration)] = matches.as_slice() else {
+                        continue;
+                    };
+                    let lines = source.lines().collect::<Vec<_>>();
+                    let start = declaration.line;
+                    let end = declarations
+                        .iter()
+                        .find(|next| next.line > start)
+                        .map_or(lines.len(), |next| next.line.saturating_sub(1));
+                    if start == 0 || end < start || end > lines.len() {
+                        continue;
+                    }
+                    let snippet = lines[start - 1..end].join("\n");
+                    if snippet.len() > 4096
+                        || self.evidence.iter().any(|existing| {
+                            existing.location().path() == path
+                                && existing.location().start_line() <= start
+                                && existing.location().end_line() >= end
+                        })
+                    {
+                        continue;
+                    }
+                    self.evidence.push(SourceEvidence {
+                        location: SourceLocation::new(path.clone(), start, end),
+                        target: item.target().to_owned(),
+                        snippet,
+                        symbol: Some(name.to_owned()),
+                        relevance: String::from("called Rust definition candidate"),
+                    });
+                    break;
+                }
+                if self.evidence.len() >= max_total {
+                    break;
+                }
+            }
+            index += 1;
         }
         Ok(self)
     }
@@ -221,6 +318,8 @@ struct ScoredEvidence {
     score: i32,
     order: usize,
     cited: usize,
+    covers_terms: bool,
+    declaration_owner: Option<declaration_identity::OwnerPath>,
 }
 
 /// Parse Probe output, inspect the cited files, and return compact evidence.
@@ -263,7 +362,6 @@ pub fn verify_probe_evidence(
         {
             continue;
         }
-        let test_candidate = test_path(relative);
         let Ok(source) = fs::read_to_string(&path) else {
             continue;
         };
@@ -283,7 +381,7 @@ pub fn verify_probe_evidence(
                 &path,
                 &lines,
                 raw_order,
-                test_candidate,
+                max_results,
             ));
         }
     }
@@ -376,20 +474,16 @@ pub fn verify_probe_evidence(
                                     || choice.evidence.location.end_line
                                         < candidate.location.start_line
                             });
-                        let same_call = choice
-                            .evidence
-                            .symbol
-                            .as_ref()
-                            .filter(|symbol| symbol.contains("::"))
-                            .is_some_and(|symbol| {
-                                evidence.iter().any(|candidate| {
-                                    candidate.location.path == choice.evidence.location.path
-                                        && candidate.symbol.as_deref() == Some(symbol.as_str())
-                                })
-                            });
-                        if (!distinct_group && !disjoint_window)
+                        let same_call = choice.evidence.symbol.as_ref().is_some_and(|symbol| {
+                            evidence.iter().any(|candidate| {
+                                candidate.location.path == choice.evidence.location.path
+                                    && candidate.symbol.as_deref() == Some(symbol.as_str())
+                            })
+                        });
+                        if !disjoint_window
+                            || (!distinct_group && !same_call && !choice.covers_terms)
                             || (representative_only
-                                && !(disjoint_window && same_call)
+                                && !same_call
                                 && !owners[group_index].is_empty())
                         {
                             continue;
@@ -1255,8 +1349,9 @@ fn best_windows(
     path: &Path,
     lines: &[&str],
     order: usize,
-    test_candidate: bool,
+    max_results: usize,
 ) -> Vec<ScoredEvidence> {
+    let test_candidate = test_path(relative);
     let all_terms = all_groups
         .iter()
         .flat_map(|group| group.terms.iter().cloned())
@@ -1429,12 +1524,7 @@ fn best_windows(
             let call_of_kept = code_lines[start..end].iter().any(|line| {
                 call_markers(line).iter().any(|marker| {
                     group.exact_symbols.iter().any(|expected| {
-                        !expected.is_empty()
-                            && (compact_alphanumeric(marker) == *expected
-                                || marker.split("::").any(|part| {
-                                    part.len() >= 3
-                                        && expected.contains(&compact_alphanumeric(part))
-                                }))
+                        !expected.is_empty() && compact_alphanumeric(marker) == *expected
                     })
                 })
             });
@@ -1572,6 +1662,12 @@ fn best_windows(
                 relevance_parts.push("exact symbol".to_owned());
             }
             let candidate = ScoredEvidence {
+                declaration_owner: declarations
+                    .iter()
+                    .find(|item| {
+                        item.line == cited && symbol.as_deref() == Some(item.name.as_str())
+                    })
+                    .and_then(|item| item.owner.clone()),
                 evidence: SourceEvidence {
                     location,
                     target: group.label.clone(),
@@ -1582,6 +1678,7 @@ fn best_windows(
                 score,
                 order,
                 cited,
+                covers_terms: group.terms.len() > 1 && direct == group.terms.len(),
             };
             let disjoint = |current: &ScoredEvidence| {
                 candidate.evidence.location.start_line > current.evidence.location.end_line
@@ -1589,43 +1686,33 @@ fn best_windows(
             };
             if kept
                 .iter()
-                .any(|current| !disjoint(current) && candidate.score > current.score)
+                .any(|current| !disjoint(current) && current.score >= candidate.score)
             {
-                kept.retain(|current| disjoint(current) || candidate.score <= current.score);
+                continue;
             }
-            let same_symbol = candidate.evidence.symbol.as_deref().is_some_and(|symbol| {
-                symbol.contains("::")
-                    && kept.iter().any(|current| {
-                        current.evidence.symbol.as_deref() == Some(symbol) && disjoint(current)
-                    })
+            let same_declaration = |current: &ScoredEvidence| {
+                candidate.declaration_owner.is_some()
+                    && candidate.declaration_owner == current.declaration_owner
+                    && candidate.evidence.symbol == current.evidence.symbol
+            };
+            if kept
+                .iter()
+                .any(|current| same_declaration(current) && current.score >= candidate.score)
+            {
+                continue;
+            }
+            kept.retain(disjoint);
+            kept.retain(|current| !same_declaration(current));
+            kept.push(candidate);
+            kept.sort_by(|left, right| {
+                right
+                    .score
+                    .cmp(&left.score)
+                    .then_with(|| left.order.cmp(&right.order))
             });
-            let later_write = candidate.evidence.snippet.contains(".push(")
-                && kept.iter().any(|current| {
-                    !current.evidence.snippet.contains(".push(")
-                        && current.evidence.location.path == candidate.evidence.location.path
-                        && candidate.evidence.location.start_line
-                            > current.evidence.location.end_line
-                });
-            if kept.is_empty() || same_symbol || later_write {
-                if later_write {
-                    kept.retain(|current| {
-                        current.evidence.location.path != candidate.evidence.location.path
-                    });
-                }
-                kept.push(candidate);
-            } else if candidate.score > kept.iter().map(|current| current.score).max().unwrap_or(0)
-            {
-                kept.clear();
-                kept.push(candidate);
-            }
+            kept.truncate(max_results);
         }
     }
-    kept.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.order.cmp(&right.order))
-    });
     kept
 }
 
@@ -2081,7 +2168,7 @@ mod tests {
         )
         .expect("verified evidence");
         assert!(report.is_complete());
-        assert_eq!(report.evidence().len(), 2);
+        assert_eq!(report.evidence().len(), 2, "{:?}", report.evidence());
         assert!(report.evidence().iter().any(|evidence| evidence
             .location()
             .path()
@@ -2531,7 +2618,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
     }
 
     #[test]
-    fn why_question_keeps_a_second_same_file_stop() {
+    fn planned_predicate_keeps_two_disjoint_call_sites() {
         let fixture = Fixture::new();
         let hold = fixture.root.join("src/hold.rs");
         let caller = fixture.root.join("src/caller.rs");
@@ -2558,7 +2645,8 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
              // A started hold stays on after its budget ends.\n    \
              started || persistent_outage_hold_left(started) > 0\n}\n\n\
              pub async fn persistent_outage_hold_continue(started: bool) -> bool {\n    \
-             persistent_outage_hold_wait(started).await\n}\n",
+             persistent_outage_hold_wait(started).await\n}\n\n\
+             fn is_outage(started: bool) -> bool {\n    started\n}\n",
         )
         .expect("hold");
         fs::write(
@@ -2586,7 +2674,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         for path in [&hold, &caller, &noise] {
             located.push_str(&probe_file(path));
         }
-        let query = "Why does persistent_outage_hold stop with attempts left?";
+        let query = "is_outage";
         let report = verify_probe_evidence(&located, &fixture.root, query, 8)
             .expect("ranked windows")
             .with_following_lines(&fixture.root, 8)
@@ -2612,5 +2700,133 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn disjoint_read_survives_a_later_unrelated_push() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/flow.rs");
+        fs::write(
+            &path,
+            "fn decision() -> bool {\n    let remaining = budget.remaining();\n    remaining > 0\n}\n\nfn record() {\n    let remaining = 7;\n    notes.push(decision(remaining));\n}\n",
+        )
+        .expect("source");
+        let report =
+            verify_probe_evidence(&probe_file(&path), &fixture.root, "decision remaining", 8)
+                .expect("verified evidence");
+        assert!(
+            report.evidence().iter().any(|item| item
+                .snippet()
+                .contains("let remaining = budget.remaining()")),
+            "read lost: {:?}",
+            report.evidence()
+        );
+    }
+
+    #[test]
+    fn disjoint_bare_calls_remain_bounded() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/flow.rs");
+        fs::write(
+            &path,
+            "fn first() {\n    let retry = wait();\n}\n\nfn second() {\n    let retry = wait();\n}\n\nfn third() {\n    let retry = wait();\n}\n",
+        )
+        .expect("source");
+        let output = probe_file(&path);
+        let report = verify_probe_evidence(&output, &fixture.root, "wait retry", 8)
+            .expect("verified evidence");
+        assert!(
+            report
+                .evidence()
+                .iter()
+                .any(|item| item.location().start_line() <= 2)
+                && report
+                    .evidence()
+                    .iter()
+                    .any(|item| item.location().start_line() >= 5),
+            "bare calls collapsed: {:?}",
+            report.evidence()
+        );
+        assert_eq!(
+            verify_probe_evidence(&output, &fixture.root, "wait retry", 2)
+                .expect("capped evidence")
+                .evidence()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn path_fragment_is_not_a_compound_call() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/other.rs");
+        fs::write(&path, "fn unrelated() {\n    other::hold();\n}\n").expect("source");
+        assert_eq!(
+            verify_probe_evidence(&probe_file(&path), &fixture.root, "retry_hold", 8),
+            Err(EvidenceError::NoSourceLocations)
+        );
+    }
+
+    #[test]
+    fn same_named_methods_of_distinct_owners_remain_distinct() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/owners.rs");
+        fs::write(
+            &path,
+            "struct First;\nstruct Second;\nimpl First {\n    fn wait_step() {}\n}\nimpl Second {\n    fn wait_step() {}\n}\n",
+        )
+        .expect("source");
+        let report = verify_probe_evidence(&probe_file(&path), &fixture.root, "wait_step", 8)
+            .expect("verified methods");
+        assert!(
+            report
+                .evidence()
+                .iter()
+                .any(|item| item.location().start_line() <= 4)
+                && report
+                    .evidence()
+                    .iter()
+                    .any(|item| item.location().start_line() >= 7),
+            "method owners collapsed: {:?}",
+            report.evidence()
+        );
+    }
+
+    #[test]
+    fn why_evidence_follows_wait_to_the_hold_budget_decision() {
+        let fixture = Fixture::new();
+        let hold = fixture.root.join("src/hold.rs");
+        let caller = fixture.root.join("src/proxy.rs");
+        fs::write(
+            &hold,
+            "struct Hold;\nimpl Hold {\n    fn remaining(&self, config: &Config) -> Duration {\n        Duration::from_millis(config.outage_hold_ms).saturating_sub(self.started.elapsed())\n    }\n\n    async fn wait(&self, config: &Config) -> bool {\n        let remaining = self.remaining(config);\n        if remaining.is_zero() {\n            return false;\n        }\n        sleep(remaining).await;\n        !self.remaining(config).is_zero()\n    }\n}\n\nfn is_outage(runtime: &Runtime) -> bool {\n    runtime.hold.remaining(&runtime.config) > Duration::ZERO\n}\n\nasync fn wait(runtime: &Runtime) -> bool {\n    runtime.hold.wait(&runtime.config).await\n}\n",
+        )
+        .expect("hold source");
+        fs::write(
+            &caller,
+            "async fn attempt(runtime: &Runtime) -> bool {\n    let mut can_retry = true;\n    if hold::is_outage(runtime) {\n        can_retry = hold::wait(runtime).await;\n    }\n    can_retry\n}\n",
+        )
+        .expect("caller source");
+        let located = format!("{}{}", probe_file(&hold), probe_file(&caller));
+        let report = verify_probe_evidence(&located, &fixture.root, "is_outage", 8)
+            .expect("verified seed")
+            .with_following_lines(&fixture.root, 8)
+            .expect("bounded causal evidence");
+        let text = report
+            .evidence()
+            .iter()
+            .map(SourceEvidence::snippet)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for required in [
+            "can_retry = hold::wait(runtime).await",
+            "runtime.hold.wait(&runtime.config).await",
+            "if remaining.is_zero()",
+            "return false",
+            "config.outage_hold_ms).saturating_sub",
+        ] {
+            assert!(text.contains(required), "missing {required}: {text}");
+        }
+        assert!(report.evidence().len() <= 8);
     }
 }
