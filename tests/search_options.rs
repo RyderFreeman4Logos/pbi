@@ -171,6 +171,58 @@ fn raw_symbol_definitions_outrank_fixture_strings_without_excluding_tests() {
 }
 
 #[test]
+fn raw_unicode_declarations_keep_priority_under_result_cap() {
+    for name in ["Éclair", "éclair", "Δέλτα", "类型"] {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("a_noise.rs"), "pub fn helper() {}\n")
+            .expect("competing ASCII declaration");
+        fs::write(
+            fixture.root.join("z_decl.rs"),
+            format!(
+                "pub struct {name};\n// {}\n",
+                format!("{name} helper ").repeat(40)
+            ),
+        )
+        .expect("higher-scoring Unicode declaration");
+        let query = format!("{name} helper");
+        let strict_query = format!("\"{name}\" OR helper");
+        for strict in [false, true] {
+            let mut args = vec!["search", "--bm25", "--max-results", "1"];
+            if strict {
+                args.push("--strict-elastic-syntax");
+            }
+            args.push(if strict { &strict_query } else { &query });
+            let output = fixture.run(&args, "raw");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "Unicode CLI status: {:?}",
+                output.status.code()
+            );
+            assert!(
+                stdout.starts_with("File: z_decl.rs, Lines: 1-2\n"),
+                "Unicode declaration must be first under cap"
+            );
+            assert!(
+                stdout.contains(&format!("pub struct {name};")),
+                "Unicode declaration identity"
+            );
+        }
+    }
+    for name in ["Éclair", "Δέλτα", "类型", "İclair"] {
+        let source = format!("pub struct {name};\n");
+        assert_eq!(
+            pbi_rs::matching_rust_declaration_lines(&source, &[name.to_lowercase()]),
+            vec![1],
+            "{name}"
+        );
+        for term in ["i", "écl", "clair", "δέλ", "类", "éclair_extra"] {
+            assert!(pbi_rs::matching_rust_declaration_lines(&source, &[term.into()]).is_empty());
+        }
+    }
+}
+
+#[test]
 fn raw_native_bm25_ranks_source_and_returns_real_locations() {
     let fixture = Fixture::new();
     fs::write(

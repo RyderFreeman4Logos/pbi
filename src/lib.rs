@@ -26,7 +26,7 @@ pub fn matching_rust_declaration_lines(source: &str, terms: &[String]) -> Vec<us
         .filter(|declaration| {
             terms
                 .iter()
-                .any(|term| declaration.name.eq_ignore_ascii_case(term))
+                .any(|term| declaration.name.to_lowercase() == *term)
         })
         .map(|declaration| declaration.line)
         .collect()
