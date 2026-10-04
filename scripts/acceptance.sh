@@ -60,7 +60,7 @@ test ! -s "$fixture/nohit.out"
 grep -q '^File: chosen.rs, Lines: 1-1$' "$fixture/raw.out"
 grep -q '^File: chosen.py, Lines: 1-1$' "$fixture/raw.out"
 test ! -s "$fixture/raw.err"
-grep -qx 'pbi: no source locations found' "$fixture/nohit.err"
+awk 'NR==1 && $0=="pbi: no source locations found" {ok=1} NR==2 && $0 ~ /^pbi-failure / {receipt=1} END {exit !(ok && receipt && NR==2)}' "$fixture/nohit.err"
 
 printf '%s\n' 'fn outside_marker() {}' > "$fixture/outside.rs"
 ln -s "$fixture/outside.rs" "$fixture/repo/linked.rs"

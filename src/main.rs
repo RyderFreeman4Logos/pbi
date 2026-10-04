@@ -108,6 +108,7 @@ struct StageTrace {
     previous: Cell<Instant>,
     deadline: Instant,
     rows: Cell<usize>,
+    last: Cell<Option<(&'static str, &'static str)>>,
 }
 
 impl StageTrace {
@@ -119,10 +120,18 @@ impl StageTrace {
             previous: Cell::new(now),
             deadline,
             rows: Cell::new(0),
+            last: Cell::new(None),
         }
     }
 
+    fn observed(&self) -> Option<(&'static str, &'static str)> {
+        self.last.get()
+    }
+
     fn point(&self, stage: TraceStage, status: TraceStatus, count: usize) {
+        if !matches!(stage, TraceStage::Terminal) || self.last.get().is_none() {
+            self.last.set(Some((stage.label(), status.label())));
+        }
         if !self.enabled || self.rows.get() >= MAX_STAGE_ROWS {
             return;
         }
@@ -225,20 +234,73 @@ fn usage() {
 }
 
 fn main() {
-    let code = match run(
-        env::args().skip(1).collect(),
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    let started = Instant::now();
+    let deadline = cli_deadline_seconds(&arguments);
+    let trace = StageTrace::new(started + std::time::Duration::from_secs(deadline.unwrap_or(0)));
+    let code = match run_traced(
+        arguments.clone(),
         #[cfg(test)]
         None,
         #[cfg(test)]
         &mut Vec::new(),
+        &trace,
     ) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{}: {}", error.prefix, error.message);
+            emit_failure_receipt(&arguments, error.code, trace.observed(), started, deadline);
             error.code
         }
     };
     std::process::exit(code);
+}
+
+fn cli_deadline_seconds(arguments: &[String]) -> Option<u64> {
+    let search = arguments
+        .first()
+        .is_some_and(|argument| argument == "search");
+    arguments
+        .iter()
+        .position(|argument| argument == "--timeout")
+        .and_then(|index| arguments.get(index + 1))
+        .and_then(|value| value.parse().ok())
+        .or(Some(if search {
+            SEARCH_OUTER_DEADLINE_SECONDS
+        } else {
+            MESSAGE_OUTER_DEADLINE_SECONDS
+        }))
+}
+
+fn emit_failure_receipt(
+    arguments: &[String],
+    code: i32,
+    stage: Option<(&'static str, &'static str)>,
+    started: Instant,
+    deadline: Option<u64>,
+) {
+    let (stage, status) = stage.unwrap_or(("unknown", "unknown"));
+    let cwd = env::current_dir()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let exe = env::current_exe()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let argv0 = env::args().next().unwrap_or_else(|| "unknown".to_owned());
+    let argv = arguments
+        .iter()
+        .map(|argument| argument.replace([' ', '\n', '\r', '='], "_"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let deadline_s = deadline
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    eprintln!(
+        "pbi-failure rc={code} stage={stage} stage_status={status} candidates=unknown ranges=unknown admission=unknown deadline_s={deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv={argv}",
+        started.elapsed().as_millis()
+    );
 }
 
 struct CliError {
@@ -394,10 +456,28 @@ fn type_field_subject(question: &str) -> Option<&str> {
     subjects.next().is_none().then_some(subject)
 }
 
+#[cfg(test)]
 fn run(
     arguments: Vec<String>,
     #[cfg(test)] _test_route_injection: Option<TestRouteInjection<'_>>,
     #[cfg(test)] _semantic_output: &mut Vec<u8>,
+) -> Result<i32, CliError> {
+    let trace = StageTrace::new(Instant::now());
+    run_traced(
+        arguments,
+        #[cfg(test)]
+        _test_route_injection,
+        #[cfg(test)]
+        _semantic_output,
+        &trace,
+    )
+}
+
+fn run_traced(
+    arguments: Vec<String>,
+    #[cfg(test)] _test_route_injection: Option<TestRouteInjection<'_>>,
+    #[cfg(test)] _semantic_output: &mut Vec<u8>,
+    trace: &StageTrace,
 ) -> Result<i32, CliError> {
     let (arguments, route_specs) = parse_local_route_prefix(arguments)?;
     if arguments.is_empty() {
@@ -488,7 +568,6 @@ fn run(
     let deadline = Instant::now()
         .checked_add(deadline_duration)
         .ok_or_else(|| CliError::usage("--timeout is too large"))?;
-    let trace = StageTrace::new(deadline);
     if let Some(routes) = admitted_routes.as_deref() {
         trace.point(TraceStage::Route, TraceStatus::Ok, routes.len());
         for (index, route) in routes.iter().enumerate() {
@@ -535,6 +614,7 @@ fn run(
             hits.retain(|hit| seen.insert(hit.file.clone()));
         }
         if hits.is_empty() {
+            trace.point(TraceStage::InitialVerify, TraceStatus::NoSource, 0);
             return Err(evidence_cli_error(EvidenceError::NoSourceLocations));
         }
         let cursor = session
@@ -708,15 +788,17 @@ fn run(
     let anchor_missing = report
         .as_ref()
         .is_some_and(|report| semantic && question_code_anchor_missing(&query, report));
-    trace.point(
-        TraceStage::Anchor,
-        if anchor_missing {
-            TraceStatus::NoSource
-        } else {
-            TraceStatus::Ok
-        },
-        usize::from(anchor_missing),
-    );
+    if report.is_some() {
+        trace.point(
+            TraceStage::Anchor,
+            if anchor_missing {
+                TraceStatus::NoSource
+            } else {
+                TraceStatus::Ok
+            },
+            usize::from(anchor_missing),
+        );
+    }
     let report = report.filter(|_| !anchor_missing);
     let report = match report {
         Some(report) => report,

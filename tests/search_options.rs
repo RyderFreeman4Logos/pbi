@@ -512,10 +512,16 @@ fn dispatch_no_argument_diagnostic() {
     let empty = fixture.run(&[], "raw");
     assert_eq!(empty.status.code(), Some(2));
     assert!(empty.stdout.is_empty());
+    let stderr = String::from_utf8(empty.stderr).expect("utf-8");
+    let mut lines = stderr.lines();
     assert_eq!(
-        empty.stderr,
-        b"pbi: question is required; interactive mode is disabled\n"
+        lines.next(),
+        Some("pbi: question is required; interactive mode is disabled")
     );
+    assert!(lines
+        .next()
+        .is_some_and(|line| line.starts_with("pbi-failure ")));
+    assert!(lines.next().is_none());
     assert!(!fixture.root.join("probe-argv").exists());
 }
 
@@ -741,6 +747,7 @@ fn raw_session_concurrent_pages_remain_disjoint() {
                     .current_dir(root)
                     .args([
                         "search",
+                        "--timeout=30",
                         "--bm25",
                         "--format=json",
                         "--merge-threshold=0",
@@ -1095,7 +1102,58 @@ fn root_scope_user_ignore_skips_fallback() {
         "stdout={stdout} stderr={stderr}",
     );
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(stderr.trim(), "pbi: no source locations found");
+    let mut lines = stderr.lines();
+    assert_eq!(lines.next(), Some("pbi: no source locations found"));
+    assert!(lines
+        .next()
+        .is_some_and(|line| line.starts_with("pbi-failure ")));
+    assert!(lines.next().is_none());
+}
+
+#[test]
+fn caller_failure_receipt_is_automatic_and_bounded() {
+    let fixture = Fixture::new();
+    let secret = "sk-live-failure-canary";
+    let query = format!("missing_symbol_{secret}");
+    let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .env("LOCAL_ROUTER_API_KEY", secret)
+        .current_dir(&fixture.root)
+        .args(["search", "--timeout", "8", &query])
+        .output()
+        .expect("controlled miss");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        stderr.starts_with("pbi: no source locations found\n"),
+        "{stderr}"
+    );
+    let receipt = stderr
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("pbi-failure "))
+        .expect("receipt line");
+    let fields: std::collections::HashMap<&str, &str> = receipt
+        .split(' ')
+        .filter_map(|part| part.split_once('='))
+        .collect();
+    assert_eq!(fields["rc"], "1");
+    assert_eq!(fields["stage"], "initial_verify");
+    assert_eq!(fields["stage_status"], "no_source");
+    assert_eq!(fields["candidates"], "unknown");
+    assert_eq!(fields["ranges"], "unknown");
+    assert_eq!(fields["admission"], "unknown");
+    assert_eq!(fields["deadline_s"], "8");
+    assert!(fields["elapsed_ms"].chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(fields["cwd"], fixture.root.to_str().unwrap());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_pbi-rs"));
+    let exe = exe.canonicalize().unwrap_or(exe);
+    assert_eq!(fields["exe"], exe.to_str().unwrap());
+    assert_eq!(fields["argv0"], env!("CARGO_BIN_EXE_pbi-rs"));
+    assert!(fields["argv"].contains("search"));
+    assert!(fields["argv"].contains(&query));
+    assert!(!stderr.contains("LOCAL_ROUTER_API_KEY"));
 }
 
 #[test]
