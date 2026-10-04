@@ -143,12 +143,7 @@ pub(super) fn extract(
         .metadata()
         .map_err(|_| SearchFailure::Unavailable)?
         .dev();
-    let candidate = root.join(relative);
-    if !walk(root, device, limits)?.contains(&candidate) {
-        return Err(SearchFailure::Unavailable);
-    }
-    let file = open_source(root_file, relative, device, limits)?;
-    let bytes = read_source_file(file, device)?.ok_or(SearchFailure::Unavailable)?;
+    let bytes = admitted_source(root_file, root, relative, device, limits, walk)?;
     let source = std::str::from_utf8(&bytes).map_err(|_| SearchFailure::Unavailable)?;
     if source.contains('\0') {
         return Err(SearchFailure::Unavailable);
@@ -215,9 +210,11 @@ pub(super) fn extract(
         .trim_end_matches(['\r', '\n']);
     // Preserve source layout while using the established terminal-control policy.
     let body = body
-        .split_inclusive(['\n', '\r', '\t'])
+        .split_inclusive(['\n', '\t'])
         .map(|part| {
-            let (text, whitespace) = if part.ends_with(['\n', '\r', '\t']) {
+            let (text, whitespace) = if let Some(text) = part.strip_suffix("\r\n") {
+                (text, "\r\n")
+            } else if part.ends_with(['\n', '\t']) {
                 part.split_at(part.len() - 1)
             } else {
                 (part, "")
@@ -252,6 +249,81 @@ pub(super) fn extract(
     Ok(output)
 }
 
+fn admitted_source(
+    root_file: File,
+    root: &Path,
+    relative: &Path,
+    device: u64,
+    limits: &SearchLimits,
+    walk_source: impl FnOnce(
+        &Path,
+        u64,
+        &SearchLimits,
+    ) -> Result<Vec<std::path::PathBuf>, SearchFailure>,
+) -> Result<Vec<u8>, SearchFailure> {
+    let (file, directories) = open_source(root_file, relative, device, limits)?;
+    let mut policies = Vec::new();
+    let mut directory_path = root.to_path_buf();
+    let names = relative
+        .components()
+        .filter_map(|part| {
+            if let Component::Normal(name) = part {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    // The pathname walk supplies only bounds and an additional denial. Authority
+    // comes from policy bytes opened through the same retained owners as source.
+    // A swap-and-restore cannot replace these matchers with another tree's rules.
+    for (depth, directory) in directories.iter().enumerate() {
+        let mut local = Vec::new();
+        for policy in [".gitignore", ".ignore"] {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(&directory_path);
+            match open_at(directory, std::ffi::OsStr::new(policy), false) {
+                Ok(policy_file) => {
+                    let bytes =
+                        read_source_file(policy_file, device)?.ok_or(SearchFailure::Unavailable)?;
+                    let text =
+                        std::str::from_utf8(&bytes).map_err(|_| SearchFailure::Unavailable)?;
+                    for line in text.lines() {
+                        check_deadline(limits)?;
+                        builder
+                            .add_line(Some(directory_path.join(policy)), line)
+                            .map_err(|_| SearchFailure::Unavailable)?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(SearchFailure::Unavailable),
+            }
+            local.push(builder.build().map_err(|_| SearchFailure::Unavailable)?);
+        }
+        policies.push(local);
+        directory_path.push(names[depth]);
+    }
+    let mut admitted = true;
+    let mut candidate = root.to_path_buf();
+    for (depth, name) in names.iter().enumerate() {
+        candidate.push(name);
+        let is_dir = depth + 1 < names.len();
+        // .ignore outranks .gitignore; nearest ancestor wins within each class.
+        let matched = [1, 0].into_iter().find_map(|kind| {
+            policies[..=depth].iter().rev().find_map(|local| {
+                let matched = local[kind].matched(&candidate, is_dir);
+                (!matched.is_none()).then_some(matched)
+            })
+        });
+        if matched.is_some_and(|matched| matched.is_ignore()) {
+            admitted = false;
+        }
+    }
+    if !walk_source(root, device, limits)?.contains(&root.join(relative)) || !admitted {
+        return Err(SearchFailure::Unavailable);
+    }
+    read_source_file(file, device)?.ok_or(SearchFailure::Unavailable)
+}
+
 fn check_deadline(limits: &SearchLimits) -> Result<(), SearchFailure> {
     if Instant::now() >= limits.deadline {
         Err(SearchFailure::Deadline)
@@ -260,33 +332,38 @@ fn check_deadline(limits: &SearchLimits) -> Result<(), SearchFailure> {
     }
 }
 
+fn open_at(parent: &File, name: &std::ffi::OsStr, directory: bool) -> std::io::Result<File> {
+    let name = CString::new(name.as_encoded_bytes()).map_err(std::io::Error::other)?;
+    let flags = libc::O_RDONLY
+        | libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | libc::O_NONBLOCK
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    // SAFETY: parent is live and name is a NUL-terminated single component.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful openat returned a fresh descriptor owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 fn open_source(
     mut parent: File,
     relative: &Path,
     device: u64,
     limits: &SearchLimits,
-) -> Result<File, SearchFailure> {
+) -> Result<(File, Vec<File>), SearchFailure> {
+    let mut directories = Vec::new();
     let mut parts = relative
         .components()
         .filter(|part| !matches!(part, Component::CurDir))
         .peekable();
     while let Some(Component::Normal(name)) = parts.next() {
         check_deadline(limits)?;
-        let name = CString::new(name.as_encoded_bytes()).map_err(|_| SearchFailure::Unavailable)?;
+        directories.push(parent.try_clone().map_err(|_| SearchFailure::Unavailable)?);
         let directory = parts.peek().is_some();
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_CLOEXEC
-            | libc::O_NONBLOCK
-            | if directory { libc::O_DIRECTORY } else { 0 };
-        // SAFETY: parent is a retained live descriptor; name is a NUL-terminated
-        // single component. openat returns a new owned descriptor or -1.
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(SearchFailure::Unavailable);
-        }
-        // SAFETY: a successful openat returned a fresh descriptor owned here.
-        let opened = unsafe { File::from_raw_fd(fd) };
+        let opened = open_at(&parent, name, directory).map_err(|_| SearchFailure::Unavailable)?;
         let metadata = opened.metadata().map_err(|_| SearchFailure::Unavailable)?;
         if metadata.dev() != device
             || (directory && !metadata.is_dir())
@@ -296,7 +373,7 @@ fn open_source(
         }
         parent = opened;
     }
-    Ok(parent)
+    Ok((parent, directories))
 }
 
 struct RustBlock {
@@ -337,6 +414,117 @@ impl<'ast> Visit<'ast> for RustBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_namespace_replacement_and_policy_aba_fail_closed() {
+        let fixture = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join(format!("extract-namespace-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).expect("fixture");
+        let root = fixture.join("root");
+        let replacement = fixture.join("replacement");
+        let held = fixture.join("held");
+        let mut refused = Vec::new();
+        for swap_ancestor in [false, true] {
+            for restore in [false, true] {
+                std::fs::create_dir_all(root.join("dir")).expect("root");
+                std::fs::create_dir_all(replacement.join("dir")).expect("replacement");
+                let relative = Path::new("dir/file.rs");
+                std::fs::write(root.join(relative), "fn synthetic_private() {}\n").expect("source");
+                let policy = if swap_ancestor {
+                    root.join("dir/.gitignore")
+                } else {
+                    root.join(".gitignore")
+                };
+                std::fs::write(policy, "file.rs\n").expect("policy");
+                std::fs::write(replacement.join(relative), "fn allowed() {}\n")
+                    .expect("replacement source");
+                let root_file = File::open(&root).expect("root fd");
+                let device = root_file.metadata().expect("metadata").dev();
+                let limits = SearchLimits {
+                    deadline: Instant::now() + std::time::Duration::from_secs(8),
+                    max_results: 1,
+                    language: None,
+                    ignores: Vec::new(),
+                };
+                let (original, other) = if swap_ancestor {
+                    (root.join("dir"), replacement.join("dir"))
+                } else {
+                    (root.clone(), replacement.clone())
+                };
+                let result = admitted_source(
+                    root_file,
+                    &root,
+                    relative,
+                    device,
+                    &limits,
+                    |path, device, limits| {
+                        std::fs::rename(&original, &held).expect("move original");
+                        std::fs::rename(&other, &original).expect("install replacement");
+                        let admitted = walk(path, device, limits);
+                        assert!(
+                            admitted
+                                .as_ref()
+                                .expect("walk")
+                                .contains(&root.join(relative)),
+                            "controlled replacement must be admitted"
+                        );
+                        if restore {
+                            std::fs::rename(&original, &other).expect("remove replacement");
+                            std::fs::rename(&held, &original).expect("restore original");
+                        }
+                        admitted
+                    },
+                );
+                refused.push(matches!(result, Err(SearchFailure::Unavailable)));
+                for path in [&root, &replacement, &held] {
+                    if path.exists() {
+                        std::fs::remove_dir_all(path).expect("cleanup");
+                    }
+                }
+            }
+        }
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("file.rs"), "fn synthetic_private() {}\n").expect("source");
+        for policy_name in [".gitignore", ".ignore"] {
+            let policy = root.join(policy_name);
+            std::fs::write(&policy, "file.rs\n").expect("policy");
+            let root_file = File::open(&root).expect("root fd");
+            let device = root_file.metadata().expect("metadata").dev();
+            let limits = SearchLimits {
+                deadline: Instant::now() + std::time::Duration::from_secs(8),
+                max_results: 1,
+                language: None,
+                ignores: Vec::new(),
+            };
+            let result = admitted_source(
+                root_file,
+                &root,
+                Path::new("file.rs"),
+                device,
+                &limits,
+                |path, device, limits| {
+                    std::fs::write(&policy, "").expect("temporary allow");
+                    let admitted = walk(path, device, limits);
+                    assert!(admitted
+                        .as_ref()
+                        .expect("walk")
+                        .contains(&root.join("file.rs")));
+                    std::fs::write(&policy, "file.rs\n").expect("restore policy");
+                    admitted
+                },
+            );
+            refused.push(matches!(result, Err(SearchFailure::Unavailable)));
+            std::fs::remove_file(policy).expect("policy cleanup");
+        }
+        std::fs::remove_dir_all(fixture).expect("cleanup");
+        assert_eq!(
+            refused,
+            vec![true; 6],
+            "root/ancestor replacement, restored namespaces, and policy ABA must fail closed"
+        );
+    }
 
     #[test]
     fn extract_descriptor_refuses_an_actual_other_device() {

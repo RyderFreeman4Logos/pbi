@@ -152,7 +152,7 @@ fn extract_foreign_items_are_smallest_enclosing_declarations() {
 
 #[test]
 fn extract_escapes_unsafe_controls_before_enforcing_output_cap() {
-    let controls = "\u{1b}\u{7}\u{8}\u{c}\u{7f}\u{85}\u{9b}";
+    let controls = "\u{1b}\u{7}\u{8}\u{c}\u{d}\u{7f}\u{85}\u{9b}";
     let fixture = Fixture::new(&format!("fn chosen() {{\n\t// {controls}\n}}\n"));
     let output = fixture.extract("fixture.rs:2");
     assert!(
@@ -344,6 +344,22 @@ fn extract_paths_ignores_symlinks_and_nonfiles_fail_closed() {
     let status = Command::new("mkfifo").arg(&fifo).status().expect("fifo");
     assert!(status.success());
     fixture.refused("fifo.rs:1");
+}
+
+#[test]
+fn extract_retained_policy_preserves_precedence_and_static_controls() {
+    let fixture = Fixture::new(SOURCE);
+    fs::create_dir(fixture.0.join("dir")).expect("dir");
+    fs::write(fixture.0.join("dir/file.rs"), SOURCE).expect("source");
+    fs::write(fixture.0.join(".gitignore"), "*.rs\n!fixture.rs\n").expect("root policy");
+    fs::write(fixture.0.join("dir/.gitignore"), "!file.rs\n").expect("nested policy");
+    assert!(fixture.extract("dir/file.rs:7").contains("Block: complete"));
+    fs::write(fixture.0.join(".ignore"), "dir/file.rs\n").expect("ignore precedence");
+    fixture.refused("dir/file.rs:7");
+    fs::write(fixture.0.join("dir/.ignore"), "!file.rs\n").expect("nested override");
+    assert!(fixture.extract("dir/file.rs:7").contains("Block: complete"));
+    fs::write(fixture.0.join(".ignore"), "dir/\n").expect("ancestor denial");
+    fixture.refused("dir/file.rs:7");
 }
 
 #[test]
