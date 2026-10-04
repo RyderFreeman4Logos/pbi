@@ -262,6 +262,62 @@ fn admitted_source(
     ) -> Result<Vec<std::path::PathBuf>, SearchFailure>,
 ) -> Result<Vec<u8>, SearchFailure> {
     let (file, directories) = open_source(root_file, relative, device, limits)?;
+    check_source_namespace(root, relative, &directories, &file)?;
+    let admitted = policy_admitted(root, relative, &directories, device, limits)?;
+    if !walk_source(root, device, limits)?.contains(&root.join(relative)) || !admitted {
+        return Err(SearchFailure::Unavailable);
+    }
+    let bytes = read_source_file(
+        file.try_clone().map_err(|_| SearchFailure::Unavailable)?,
+        device,
+    )?
+    .ok_or(SearchFailure::Unavailable)?;
+    // Current named-owner equality rejects detached roots/ancestors/leafs;
+    // it is NOT the ABA proof. Descriptor-owned policy admission on both sides
+    // of the read independently denies ignored bytes, even after restoration.
+    check_source_namespace(root, relative, &directories, &file)?;
+    if !policy_admitted(root, relative, &directories, device, limits)? {
+        return Err(SearchFailure::Unavailable);
+    }
+    Ok(bytes)
+}
+
+fn check_source_namespace(
+    root: &Path,
+    relative: &Path,
+    directories: &[File],
+    file: &File,
+) -> Result<(), SearchFailure> {
+    let mut path = root.to_path_buf();
+    let mut names = relative.components().filter_map(|part| {
+        if let Component::Normal(name) = part {
+            Some(name)
+        } else {
+            None
+        }
+    });
+    for owned in directories.iter().chain(std::iter::once(file)) {
+        let held = owned.metadata().map_err(|_| SearchFailure::Unavailable)?;
+        let named = std::fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
+        if (held.dev(), held.ino(), held.file_type())
+            != (named.dev(), named.ino(), named.file_type())
+        {
+            return Err(SearchFailure::Unavailable);
+        }
+        if let Some(name) = names.next() {
+            path.push(name);
+        }
+    }
+    Ok(())
+}
+
+fn policy_admitted(
+    root: &Path,
+    relative: &Path,
+    directories: &[File],
+    device: u64,
+    limits: &SearchLimits,
+) -> Result<bool, SearchFailure> {
     let mut policies = Vec::new();
     let mut directory_path = root.to_path_buf();
     let names = relative
@@ -318,10 +374,7 @@ fn admitted_source(
             admitted = false;
         }
     }
-    if !walk_source(root, device, limits)?.contains(&root.join(relative)) || !admitted {
-        return Err(SearchFailure::Unavailable);
-    }
-    read_source_file(file, device)?.ok_or(SearchFailure::Unavailable)
+    Ok(admitted)
 }
 
 fn check_deadline(limits: &SearchLimits) -> Result<(), SearchFailure> {
@@ -523,6 +576,100 @@ mod tests {
             refused,
             vec![true; 6],
             "root/ancestor replacement, restored namespaces, and policy ABA must fail closed"
+        );
+    }
+
+    #[test]
+    fn extract_retained_namespace_rejects_detached_allowed_owners() {
+        let fixture = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join(format!("extract-detached-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).expect("fixture");
+        let root = fixture.join("root");
+        let replacement = fixture.join("replacement");
+        let held = fixture.join("held");
+        let mut refused = Vec::new();
+        for ancestor in [false, true] {
+            std::fs::create_dir_all(root.join("dir")).expect("root");
+            std::fs::create_dir_all(replacement.join("dir")).expect("replacement");
+            let relative = Path::new("dir/file.rs");
+            std::fs::write(root.join(relative), "fn original_allowed() {}\n").expect("source");
+            std::fs::write(replacement.join(relative), "fn replacement_allowed() {}\n")
+                .expect("replacement source");
+            let root_file = File::open(&root).expect("root fd");
+            let device = root_file.metadata().expect("metadata").dev();
+            let limits = SearchLimits {
+                deadline: Instant::now() + std::time::Duration::from_secs(8),
+                max_results: 1,
+                language: None,
+                ignores: Vec::new(),
+            };
+            let (original, other) = if ancestor {
+                (root.join("dir"), replacement.join("dir"))
+            } else {
+                (root.clone(), replacement.clone())
+            };
+            let result = admitted_source(
+                root_file,
+                &root,
+                relative,
+                device,
+                &limits,
+                |path, device, limits| {
+                    std::fs::rename(&original, &held).expect("move original");
+                    std::fs::rename(&other, &original).expect("replace");
+                    let admitted = walk(path, device, limits);
+                    assert!(admitted
+                        .as_ref()
+                        .expect("walk")
+                        .contains(&root.join(relative)));
+                    admitted
+                },
+            );
+            refused.push(matches!(result, Err(SearchFailure::Unavailable)));
+            for path in [&root, &replacement, &held] {
+                if path.exists() {
+                    std::fs::remove_dir_all(path).expect("cleanup");
+                }
+            }
+        }
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("file.rs"), "fn original_allowed() {}\n").expect("source");
+        for policy_name in [".gitignore", ".ignore"] {
+            let root_file = File::open(&root).expect("root fd");
+            let device = root_file.metadata().expect("metadata").dev();
+            let limits = SearchLimits {
+                deadline: Instant::now() + std::time::Duration::from_secs(8),
+                max_results: 1,
+                language: None,
+                ignores: Vec::new(),
+            };
+            let policy = root.join(policy_name);
+            let result = admitted_source(
+                root_file,
+                &root,
+                Path::new("file.rs"),
+                device,
+                &limits,
+                |path, device, limits| {
+                    let admitted = walk(path, device, limits);
+                    assert!(admitted
+                        .as_ref()
+                        .expect("walk")
+                        .contains(&root.join("file.rs")));
+                    std::fs::write(&policy, "file.rs\n").expect("new denial policy");
+                    admitted
+                },
+            );
+            refused.push(matches!(result, Err(SearchFailure::Unavailable)));
+            std::fs::remove_file(policy).expect("policy cleanup");
+        }
+        std::fs::remove_dir_all(fixture).expect("cleanup");
+        assert_eq!(
+            refused,
+            vec![true; 4],
+            "allowed policy does not authorize detached owners or newly denied source"
         );
     }
 
