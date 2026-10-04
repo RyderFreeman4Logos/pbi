@@ -253,6 +253,7 @@ fn usage() {
     println!(
         "pbi-rs {VERSION} — bounded native source search and cited answers\n\
          Usage: pbi-rs extract <path>:<line> [--timeout <SECONDS>] [--max-bytes <N>]\n\
+                pbi-rs symbols <path>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
@@ -324,6 +325,12 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
                 .map(|options| options.timeout)
                 .unwrap_or(SEARCH_OUTER_DEADLINE_SECONDS),
         );
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "symbols")
+    {
+        return Some(SEARCH_OUTER_DEADLINE_SECONDS);
     }
     let search = arguments
         .first()
@@ -681,6 +688,20 @@ fn run_traced(
         writer
             .write_all(output.as_bytes())
             .map_err(|_| CliError::failed("cannot write extraction"))?;
+        return Ok(0);
+    }
+    if arguments[0] == "symbols" {
+        if !route_specs.is_empty() {
+            return Err(CliError::usage("symbols does not accept model routes"));
+        }
+        let output = extract::run_symbols(&arguments[1..])?;
+        #[cfg(test)]
+        let writer = _semantic_output;
+        #[cfg(not(test))]
+        let mut writer = io::stdout();
+        writer
+            .write_all(output.as_bytes())
+            .map_err(|_| CliError::failed("cannot write symbols"))?;
         return Ok(0);
     }
     if arguments[0] == "search" && !route_specs.is_empty() {

@@ -100,6 +100,223 @@ pub(super) fn run(arguments: &[String]) -> Result<String, crate::CliError> {
     })
 }
 
+pub(super) fn run_symbols(arguments: &[String]) -> Result<String, crate::CliError> {
+    if arguments == ["--help"] || arguments == ["-h"] {
+        return Ok("Usage: pbi-rs symbols <path>\nLists Rust functions/structs/impl methods, Python defs/classes, or Go funcs/types.\n".to_owned());
+    }
+    let [path] = arguments else {
+        return Err(crate::CliError::usage("symbols requires one source path"));
+    };
+    let path = Path::new(path);
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or_else(|| crate::CliError::usage("symbols supports .rs, .py, and .go files"))?;
+    if !matches!(extension, "rs" | "py" | "go") {
+        return Err(crate::CliError::usage(
+            "symbols supports .rs, .py, and .go files",
+        ));
+    }
+    let root = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| crate::CliError::failed("symbols source unavailable"))?;
+    let deadline = Instant::now()
+        .checked_add(std::time::Duration::from_secs(
+            crate::SEARCH_OUTER_DEADLINE_SECONDS,
+        ))
+        .ok_or_else(|| crate::CliError::usage("symbols deadline is too large"))?;
+    let limits = SearchLimits {
+        deadline,
+        max_results: 1,
+        language: None,
+        ignores: Vec::new(),
+    };
+    let (source, _) = read_admitted_source(&root, path, &limits).map_err(|failure| {
+        crate::CliError::failed(match failure {
+            SearchFailure::Deadline => "symbols deadline exceeded",
+            SearchFailure::Limit | SearchFailure::TargetLimit => "symbols safety limit exceeded",
+            SearchFailure::Unavailable => "symbols source unavailable or invalid",
+        })
+    })?;
+    let (symbols, truncated) = match extension {
+        "rs" => rust_symbols(&source, &limits),
+        "py" | "go" => line_symbols(&source, extension, &limits),
+        _ => unreachable!("extension was validated above"),
+    }
+    .map_err(|failure| {
+        crate::CliError::failed(match failure {
+            SearchFailure::Deadline => "symbols deadline exceeded",
+            SearchFailure::Limit | SearchFailure::TargetLimit => "symbols safety limit exceeded",
+            SearchFailure::Unavailable => "symbols source unavailable or invalid",
+        })
+    })?;
+    Ok(render_symbols(&symbols, truncated))
+}
+
+const MAX_SYMBOLS: usize = 256;
+
+struct Symbol {
+    line: usize,
+    kind: &'static str,
+    name: String,
+}
+
+fn rust_symbols(source: &str, limits: &SearchLimits) -> Result<(Vec<Symbol>, bool), SearchFailure> {
+    check_deadline(limits)?;
+    let parsed = syn::parse_file(source).map_err(|_| SearchFailure::Unavailable)?;
+    let mut symbols = Vec::new();
+    let mut truncated = false;
+    'items: for item in parsed.items {
+        match item {
+            syn::Item::Fn(function) => {
+                if symbols.len() == MAX_SYMBOLS {
+                    truncated = true;
+                    break;
+                }
+                symbols.push(Symbol {
+                    line: function.sig.fn_token.span.start().line,
+                    kind: "fn",
+                    name: function.sig.ident.to_string(),
+                });
+            }
+            syn::Item::Struct(item) => {
+                if symbols.len() == MAX_SYMBOLS {
+                    truncated = true;
+                    break;
+                }
+                symbols.push(Symbol {
+                    line: item.struct_token.span.start().line,
+                    kind: "struct",
+                    name: item.ident.to_string(),
+                });
+            }
+            syn::Item::Impl(block) => {
+                for item in block.items {
+                    if let syn::ImplItem::Fn(function) = item {
+                        if symbols.len() == MAX_SYMBOLS {
+                            truncated = true;
+                            break 'items;
+                        }
+                        symbols.push(Symbol {
+                            line: function.sig.fn_token.span.start().line,
+                            kind: "fn",
+                            name: function.sig.ident.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    check_deadline(limits)?;
+    Ok((symbols, truncated))
+}
+
+fn line_symbols(
+    source: &str,
+    language: &str,
+    limits: &SearchLimits,
+) -> Result<(Vec<Symbol>, bool), SearchFailure> {
+    let mut symbols = Vec::new();
+    let mut truncated = false;
+    for (index, line) in source.lines().enumerate() {
+        check_deadline(limits)?;
+        let declaration = if language == "py" {
+            python_symbol(line)
+        } else {
+            go_symbol(line)
+        };
+        if let Some((kind, name)) = declaration {
+            if symbols.len() == MAX_SYMBOLS {
+                truncated = true;
+                break;
+            }
+            symbols.push(Symbol {
+                line: index + 1,
+                kind,
+                name: name.to_owned(),
+            });
+        }
+    }
+    check_deadline(limits)?;
+    Ok((symbols, truncated))
+}
+
+fn python_symbol(line: &str) -> Option<(&'static str, &str)> {
+    let mut line = line.trim_start();
+    if line.starts_with('#') {
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix("async") {
+        if rest.chars().next().is_some_and(char::is_whitespace) {
+            line = rest.trim_start();
+        }
+    }
+    let split = line.find(char::is_whitespace)?;
+    let (keyword, rest) = line.split_at(split);
+    let kind = match keyword {
+        "def" => "def",
+        "class" => "class",
+        _ => return None,
+    };
+    identifier(rest.trim_start()).map(|name| (kind, name))
+}
+
+fn go_symbol(line: &str) -> Option<(&'static str, &str)> {
+    let line = line.trim_start();
+    if line.starts_with("//") {
+        return None;
+    }
+    if let Some(rest) = keyword_rest(line, "func") {
+        let rest = if rest.starts_with('(') {
+            &rest[rest.find(')')? + 1..]
+        } else {
+            rest
+        };
+        return identifier(rest.trim_start()).map(|name| ("func", name));
+    }
+    keyword_rest(line, "type")
+        .and_then(identifier)
+        .map(|name| ("type", name))
+}
+
+fn keyword_rest<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(keyword)?;
+    rest.chars()
+        .next()
+        .filter(|character| character.is_whitespace())?;
+    Some(rest.trim_start())
+}
+
+fn identifier(text: &str) -> Option<&str> {
+    let mut chars = text.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '_' && !first.is_alphabetic() {
+        return None;
+    }
+    let end = chars
+        .find(|(_, character)| *character != '_' && !character.is_alphanumeric())
+        .map_or(text.len(), |(index, _)| index);
+    Some(&text[..end])
+}
+
+fn render_symbols(symbols: &[Symbol], mut truncated: bool) -> String {
+    const MARKER: &str = "[truncated]\n";
+    let mut output = String::new();
+    for symbol in symbols {
+        let line = format!("{}: {} {}\n", symbol.line, symbol.kind, symbol.name);
+        if output.len() + line.len() + MARKER.len() > crate::MAX_RAW_OUTPUT_BYTES {
+            truncated = true;
+            break;
+        }
+        output.push_str(&line);
+    }
+    if truncated {
+        output.push_str(MARKER);
+    }
+    output
+}
+
 /// Return the smallest enclosing Rust item, or a four-line approximate window.
 /// Admission uses the same ignore/device/file bounds as search. Each path
 /// component is opened relative to a retained descriptor, without following links.
@@ -110,45 +327,10 @@ pub(super) fn extract(
     limits: &SearchLimits,
     max_bytes: usize,
 ) -> Result<String, SearchFailure> {
-    check_deadline(limits)?;
-    if line == 0
-        || path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-    {
+    if line == 0 {
         return Err(SearchFailure::Unavailable);
     }
-    let relative = if path.is_absolute() {
-        path.strip_prefix(root)
-            .map_err(|_| SearchFailure::Unavailable)?
-    } else {
-        path
-    };
-    if relative.components().any(|part| matches!(part, Component::Normal(name) if name.to_str().is_none_or(|name| name.starts_with('.')))) {
-        return Err(SearchFailure::Unavailable);
-    }
-    if relative.as_os_str().is_empty()
-        || relative
-            .to_str()
-            .is_none_or(|name| name.chars().any(char::is_control))
-    {
-        return Err(SearchFailure::Unavailable);
-    }
-    let root_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root)
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let device = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?
-        .dev();
-    let bytes = admitted_source(root_file, root, relative, device, limits, walk)?;
-    let source = std::str::from_utf8(&bytes).map_err(|_| SearchFailure::Unavailable)?;
-    if source.contains('\0') {
-        return Err(SearchFailure::Unavailable);
-    }
-    check_deadline(limits)?;
+    let (source, relative) = read_admitted_source(root, path, limits)?;
     let offsets = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(at, _)| at + 1))
         .collect::<Vec<_>>();
@@ -159,7 +341,7 @@ pub(super) fn extract(
     let mut block = RustBlock { line, best: None };
     let mut parser_offset = 0;
     if path.extension().is_some_and(|extension| extension == "rs") {
-        if let Ok(parsed) = syn::parse_file(source) {
+        if let Ok(parsed) = syn::parse_file(&source) {
             // syn strips the BOM and shebang, but retains the shebang's LF.
             parser_offset = usize::from(source.starts_with('\u{feff}')) * '\u{feff}'.len_utf8()
                 + parsed.shebang.as_ref().map_or(0, String::len);
@@ -247,6 +429,52 @@ pub(super) fn extract(
     }
     check_deadline(limits)?;
     Ok(output)
+}
+
+fn read_admitted_source<'a>(
+    root: &Path,
+    path: &'a Path,
+    limits: &SearchLimits,
+) -> Result<(String, &'a Path), SearchFailure> {
+    check_deadline(limits)?;
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(SearchFailure::Unavailable);
+    }
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root)
+            .map_err(|_| SearchFailure::Unavailable)?
+    } else {
+        path
+    };
+    if relative.components().any(|part| matches!(part, Component::Normal(name) if name.to_str().is_none_or(|name| name.starts_with('.')))) {
+        return Err(SearchFailure::Unavailable);
+    }
+    if relative.as_os_str().is_empty()
+        || relative
+            .to_str()
+            .is_none_or(|name| name.chars().any(char::is_control))
+    {
+        return Err(SearchFailure::Unavailable);
+    }
+    let root_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(root)
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let device = root_file
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?
+        .dev();
+    let bytes = admitted_source(root_file, root, relative, device, limits, walk)?;
+    let source = std::str::from_utf8(&bytes).map_err(|_| SearchFailure::Unavailable)?;
+    if source.contains('\0') {
+        return Err(SearchFailure::Unavailable);
+    }
+    check_deadline(limits)?;
+    Ok((source.to_owned(), relative))
 }
 
 fn admitted_source(

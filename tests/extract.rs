@@ -386,3 +386,125 @@ fn extract_cross_device_path_is_refused() {
     symlink("/proc", fixture.0.join("proc")).expect("proc link");
     fixture.refused("proc/self/status:1");
 }
+
+#[test]
+fn symbols_rust_top_level_items_and_impl_methods_have_lines() {
+    let fixture = Fixture::new("placeholder");
+    fs::write(
+        fixture.0.join("fixture.rs"),
+        "fn first() {}\nstruct Owner;\nimpl Owner {\n    fn method(&self) {}\n}\n",
+    )
+    .expect("source");
+    let result = fixture.run(&["symbols", "fixture.rs"]);
+    assert!(result.status.success(), "Rust symbols command must succeed");
+    assert!(result.stderr.is_empty(), "no stderr");
+    assert_eq!(
+        String::from_utf8(result.stdout).expect("UTF-8"),
+        "1: fn first\n2: struct Owner\n4: fn method\n"
+    );
+}
+
+#[test]
+fn symbols_python_defs_and_classes_have_lines() {
+    let fixture = Fixture::new("placeholder");
+    fs::write(
+        fixture.0.join("fixture.py"),
+        "def first():\n    pass\nclass Owner:\n    pass\n",
+    )
+    .expect("source");
+    let result = fixture.run(&["symbols", "fixture.py"]);
+    assert!(
+        result.status.success(),
+        "Python symbols command must succeed"
+    );
+    assert!(result.stderr.is_empty(), "no stderr");
+    assert_eq!(
+        String::from_utf8(result.stdout).expect("UTF-8"),
+        "1: def first\n3: class Owner\n"
+    );
+}
+
+#[test]
+fn symbols_go_functions_and_types_have_lines() {
+    let fixture = Fixture::new("placeholder");
+    fs::write(
+        fixture.0.join("fixture.go"),
+        "package sample\nfunc first() {}\ntype Owner struct{}\n",
+    )
+    .expect("source");
+    let result = fixture.run(&["symbols", "fixture.go"]);
+    assert!(result.status.success(), "Go symbols command must succeed");
+    assert!(result.stderr.is_empty(), "no stderr");
+    assert_eq!(
+        String::from_utf8(result.stdout).expect("UTF-8"),
+        "2: func first\n3: type Owner\n"
+    );
+}
+
+#[test]
+fn symbols_missing_non_utf8_ignored_hidden_links_and_fifo_fail_closed() {
+    let fixture = Fixture::new("fn allowed() {}\n");
+    for path in ["missing.rs", "binary.rs"] {
+        if path == "binary.rs" {
+            fs::write(fixture.0.join(path), [0xff, 0xfe]).expect("binary source");
+        }
+        let result = fixture.run(&["symbols", path]);
+        assert!(!result.status.success(), "invalid source must fail");
+        assert!(result.stdout.is_empty(), "no partial output on failure");
+        assert!(!String::from_utf8_lossy(&result.stderr).contains(path));
+    }
+    fs::write(fixture.0.join(".private.rs"), "fn private_canary() {}\n").expect("hidden");
+    fs::write(fixture.0.join(".ignore"), "!.private.rs\n").expect("negation");
+    let hidden = fixture.run(&["symbols", ".private.rs"]);
+    assert!(
+        !hidden.status.success(),
+        "hidden hard-deny must beat negation"
+    );
+    assert!(hidden.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&hidden.stderr).contains("private_canary"));
+    fs::write(fixture.0.join("ignored.rs"), "fn ignored() {}\n").expect("ignored");
+    fs::write(fixture.0.join(".gitignore"), "ignored.rs\n").expect("policy");
+    let ignored = fixture.run(&["symbols", "ignored.rs"]);
+    assert!(!ignored.status.success(), "ignored sources must fail");
+    assert!(ignored.stdout.is_empty());
+    symlink("fixture.rs", fixture.0.join("alias.rs")).expect("source link");
+    let linked = fixture.run(&["symbols", "alias.rs"]);
+    assert!(!linked.status.success(), "source symlinks must fail");
+    assert!(linked.stdout.is_empty());
+    let outside = fixture.run(&["symbols", "../outside.rs"]);
+    assert!(!outside.status.success(), "paths outside root must fail");
+    assert!(outside.stdout.is_empty());
+    let fifo = fixture.0.join("fifo.rs");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("fifo")
+        .success());
+    let special = fixture.run(&["symbols", "fifo.rs"]);
+    assert!(!special.status.success(), "nonregular sources must fail");
+    assert!(special.stdout.is_empty());
+}
+
+#[test]
+fn symbols_count_and_output_bytes_are_bounded() {
+    let fixture = Fixture::new("placeholder");
+    let many = (0..300)
+        .map(|index| format!("def f{index}():\n    pass\n"))
+        .collect::<String>();
+    fs::write(fixture.0.join("many.py"), many).expect("many symbols");
+    let count = fixture.run(&["symbols", "many.py"]);
+    assert!(count.status.success(), "bounded listing must succeed");
+    let count = String::from_utf8(count.stdout).expect("UTF-8");
+    assert!(count.ends_with("[truncated]\n"));
+    assert_eq!(count.lines().count(), 257);
+    let long = (0..300)
+        .map(|index| format!("def {}_{index}():\n    pass\n", "x".repeat(200)))
+        .collect::<String>();
+    fs::write(fixture.0.join("long.py"), long).expect("long names");
+    let bytes = fixture.run(&["symbols", "long.py"]);
+    assert!(bytes.status.success(), "output must truncate successfully");
+    assert!(bytes.stdout.len() <= 32 * 1024);
+    assert!(String::from_utf8(bytes.stdout)
+        .unwrap_or_else(|_| panic!("symbols output must remain UTF-8"))
+        .ends_with("[truncated]\n"));
+}
