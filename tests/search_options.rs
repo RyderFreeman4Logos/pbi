@@ -120,6 +120,57 @@ fn field_question_admits_the_type_declaration_before_repeated_mentions() {
 }
 
 #[test]
+fn raw_symbol_definitions_outrank_fixture_strings_without_excluding_tests() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.root.join("src")).expect("source directory");
+    fs::create_dir_all(fixture.root.join("tests")).expect("test directory");
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct SourceLocation {\n    path: PathBuf,\n}\n\nimpl SourceLocation {\n    pub fn display_relative(&self, root: &Path) -> String {\n        root.display().to_string()\n    }\n}\n",
+    )
+    .expect("production declarations");
+    let mut tests = String::from(
+        "#[test]\nfn positional_question_dispatches_through_adk_and_checks_citations() {\n",
+    );
+    for _ in 0..12 {
+        tests.push_str("    fs::write(path, \"pub struct SourceLocation; fn display_relative() {}\").unwrap();\n".repeat(4).as_str());
+        tests.push_str(&"    unrelated_setup();\n".repeat(6));
+    }
+    tests.push_str("}\nfn bounded_output_with_stdout() {}\n");
+    fs::write(fixture.root.join("tests/contracts.rs"), tests).expect("fixture definitions");
+
+    let output = fixture.run(
+        &["search", "--bm25", "SourceLocation display_relative"],
+        "raw",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("File: src/lib.rs, Lines: 1-6\n"),
+        "{stdout}"
+    );
+    for query in [
+        "positional_question_dispatches_through_adk_and_checks_citations",
+        "bounded_output_with_stdout",
+    ] {
+        let output = fixture.run(&["search", "--bm25", query], "raw");
+        assert!(output.status.success(), "{query}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("File: tests/contracts.rs"));
+        let output = fixture.run(&["search", query], "verified");
+        assert!(
+            output.status.success(),
+            "{query}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("tests/contracts.rs:"));
+    }
+}
+
+#[test]
 fn raw_native_bm25_ranks_source_and_returns_real_locations() {
     let fixture = Fixture::new();
     fs::write(
