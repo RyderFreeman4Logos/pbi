@@ -1,6 +1,8 @@
-# pbi-rs
+# pbi
 
-`pbi-rs` searches source in the current repository with a bounded native walker. `--bm25` returns raw ranked hits and does not invoke a model.
+`pbi-rs` is the native binary. `just install-release <dir>` copies that same binary as `pbi-rs` and `pbi` into a caller-owned directory. It does not replace `/usr/local/bin/pbi`.
+
+`pbi-rs` searches source in the current repository with a bounded native walker. `--bm25` returns raw ranked hits and does not invoke a model. The historical Probe shell wrapper is archived under `archive/shell/` and is not the default command.
 
 Bare positional questions and `--message` synthesize answers from verified source evidence when a discovered config selects an approved local route and an approved credential environment handle is available. `PBI_RS_ADK_ENABLE=0` explicitly disables model use; without a configured route, the CLI emits deterministic evidence. The CLI validates model citations against bounded in-root source spans and shares one deadline across retrieval and synthesis. Explicit `--model-route` candidates require `PBI_RS_ADK_ENABLE=1` when no config is discovered.
 

@@ -45,6 +45,15 @@ install-stage:
     test -d "$PBI_INSTALL_STAGE"
     ionice -c 3 cargo install --offline --locked --path . --bin pbi-rs --root "$PBI_INSTALL_STAGE" --target-dir ./target --force
 
+# Copy the release binary to a caller-owned directory as both pbi-rs and pbi.
+# Does not replace /usr/local/bin/pbi.
+install-release dest:
+    test -n "{{dest}}"
+    test -d "{{dest}}"
+    test -x target/release/pbi-rs
+    install -m 0755 target/release/pbi-rs "{{dest}}/pbi-rs"
+    install -m 0755 target/release/pbi-rs "{{dest}}/pbi"
+
 clippy:
     ionice -c 3 cargo clippy --locked --all-targets -- -D warnings
 
