@@ -1146,14 +1146,147 @@ fn caller_failure_receipt_is_automatic_and_bounded() {
     assert_eq!(fields["admission"], "unknown");
     assert_eq!(fields["deadline_s"], "8");
     assert!(fields["elapsed_ms"].chars().all(|c| c.is_ascii_digit()));
-    assert_eq!(fields["cwd"], fixture.root.to_str().unwrap());
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_pbi-rs"));
-    let exe = exe.canonicalize().unwrap_or(exe);
-    assert_eq!(fields["exe"], exe.to_str().unwrap());
-    assert_eq!(fields["argv0"], env!("CARGO_BIN_EXE_pbi-rs"));
+    assert_eq!(fields["cwd"], "[REDACTED]");
+    assert_eq!(fields["exe"], "[REDACTED]");
+    assert_eq!(fields["argv0"], "[REDACTED]");
     assert!(fields["argv"].contains("search"));
-    assert!(fields["argv"].contains(&query));
+    assert!(fields["argv"].contains("--timeout"));
+    assert_eq!(fields["argv_count"], "4");
+    assert!(
+        !stderr.contains(secret),
+        "failure output kept the query secret"
+    );
     assert!(!stderr.contains("LOCAL_ROUTER_API_KEY"));
+    assert!(!stderr.contains(fixture.root.to_str().unwrap()));
+}
+
+#[test]
+fn automatic_failure_redacts_opaque_caller_values() {
+    let fixture = Fixture::new();
+    let nested = fixture.root.join("weird path");
+    fs::create_dir(&nested).expect("nested cwd");
+    let canaries = [
+        "opaque-canary-query-7f3a",
+        "opaque-canary-flag-eq-91c2",
+        "opaque-canary-flag-value-44de",
+        "opaque-canary-url-a81b",
+        "opaque-canary-password-c03e",
+        "opaque-canary-endpoint-55aa",
+        "opaque-canary-path-d17f",
+        "opaque-canary-cwd-e90b",
+    ];
+    let query = format!(
+        "{} https://user:{}@endpoint.example/v1?token={} path/{}\nline\r\t\u{1b}uni-Δ",
+        canaries[0], canaries[4], canaries[5], canaries[6]
+    );
+    let oversized = "Z".repeat(300);
+    let bad_flag = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .current_dir(&nested)
+        .args(["search", &format!("--bogus={}", canaries[1])])
+        .output()
+        .expect("bad flag");
+    let miss = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .env("LOCAL_ROUTER_API_KEY", canaries[5])
+        .current_dir(&nested)
+        .args([
+            "search",
+            &format!("--ignore={}", canaries[1]),
+            "--language",
+            "rs",
+            "--timeout",
+            "8",
+            &query,
+            &oversized,
+        ])
+        .output()
+        .expect("controlled miss");
+    for output in [&bad_flag, &miss] {
+        assert!(output.stdout.is_empty(), "stdout changed on failure");
+        let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+        let controls: Vec<u32> = stderr
+            .chars()
+            .filter(|ch| ch.is_control() && *ch != '\n')
+            .map(|ch| ch as u32)
+            .collect();
+        assert!(
+            controls.is_empty(),
+            "failure output kept control code points {controls:?}"
+        );
+        assert_eq!(
+            stderr.trim_end_matches('\n').lines().count(),
+            2,
+            "failure output was not two lines"
+        );
+        for canary in &canaries {
+            assert!(
+                !stderr.contains(canary),
+                "failure output kept an opaque caller value"
+            );
+        }
+        assert!(
+            !stderr.contains(&oversized),
+            "failure output kept an oversized argument"
+        );
+        assert!(
+            !stderr.contains("weird path"),
+            "failure output kept the cwd"
+        );
+        assert!(!stderr.contains("LOCAL_ROUTER_API_KEY"));
+        assert!(
+            stderr.contains("[REDACTED]"),
+            "failure output had no redaction marker"
+        );
+    }
+    assert_eq!(bad_flag.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad_flag.stderr).starts_with("pbi-rs: "),
+        "usage class missing"
+    );
+    assert_eq!(miss.status.code(), Some(1));
+    let stderr = String::from_utf8(miss.stderr).expect("utf-8 stderr");
+    assert!(
+        stderr.starts_with("pbi: no source locations found\n"),
+        "failure class missing"
+    );
+    let receipt = stderr
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("pbi-failure "))
+        .expect("receipt line");
+    let fields: std::collections::HashMap<&str, &str> = receipt
+        .split(' ')
+        .filter_map(|part| part.split_once('='))
+        .collect();
+    assert_eq!(fields["rc"], "1");
+    assert_eq!(fields["stage"], "initial_verify");
+    assert_eq!(fields["stage_status"], "no_source");
+    assert_eq!(fields["candidates"], "unknown");
+    assert_eq!(fields["ranges"], "unknown");
+    assert_eq!(fields["admission"], "unknown");
+    assert_eq!(fields["deadline_s"], "8");
+    assert!(fields["elapsed_ms"].chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(fields["cwd"], "[REDACTED]");
+    assert_eq!(fields["exe"], "[REDACTED]");
+    assert_eq!(fields["argv0"], "[REDACTED]");
+    assert_eq!(fields["argv_count"], "8");
+    assert_eq!(
+        fields["argv"],
+        "search,--ignore,[REDACTED],--language,[REDACTED],--timeout,8,[REDACTED],[REDACTED]"
+    );
+}
+
+#[test]
+fn successful_search_stdout_omits_failure_receipt() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["search", "search_option"], "verified");
+    assert!(output.status.success(), "success path failed");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fixture.rs:1\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("pbi-failure"),
+        "success printed a failure receipt"
+    );
 }
 
 #[test]

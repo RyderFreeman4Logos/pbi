@@ -47,7 +47,8 @@ printf '%s\n' "$ignored" | grep -qx 'chosen.py:1'
 set +e
 (cd "$fixture/repo" && pbi search ignored_marker) > "$fixture/ignored.out" 2> "$fixture/ignored.err"
 ignored_rc=$?
-(cd "$fixture/repo" && pbi search ghost_evidence) > "$fixture/nohit.out" 2> "$fixture/nohit.err"
+canary=opaque-canary-acceptance-71c4
+(cd "$fixture/repo" && pbi search "ghost_evidence $canary") > "$fixture/nohit.out" 2> "$fixture/nohit.err"
 nohit_rc=$?
 (cd "$fixture/repo" && pbi search --bm25 filter_operand_marker) > "$fixture/raw.out" 2> "$fixture/raw.err"
 raw_rc=$?
@@ -60,7 +61,8 @@ test ! -s "$fixture/nohit.out"
 grep -q '^File: chosen.rs, Lines: 1-1$' "$fixture/raw.out"
 grep -q '^File: chosen.py, Lines: 1-1$' "$fixture/raw.out"
 test ! -s "$fixture/raw.err"
-awk 'NR==1 && $0=="pbi: no source locations found" {ok=1} NR==2 && $0 ~ /^pbi-failure / {receipt=1} END {exit !(ok && receipt && NR==2)}' "$fixture/nohit.err"
+awk 'NR==1 && $0=="pbi: no source locations found" {ok=1} NR==2 && $0 ~ /^pbi-failure / && $0 ~ /\[REDACTED\]/ {receipt=1} END {exit !(ok && receipt && NR==2)}' "$fixture/nohit.err"
+! grep -F "$canary" "$fixture/nohit.err"
 
 printf '%s\n' 'fn outside_marker() {}' > "$fixture/outside.rs"
 ln -s "$fixture/outside.rs" "$fixture/repo/linked.rs"

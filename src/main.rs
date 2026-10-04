@@ -248,7 +248,7 @@ fn main() {
     ) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("{}: {}", error.prefix, error.message);
+            eprintln!("{}: {}", error.prefix, safe_failure_text(&error.message));
             emit_failure_receipt(&arguments, error.code, trace.observed(), started, deadline);
             error.code
         }
@@ -280,27 +280,105 @@ fn emit_failure_receipt(
     deadline: Option<u64>,
 ) {
     let (stage, status) = stage.unwrap_or(("unknown", "unknown"));
-    let cwd = env::current_dir()
-        .ok()
-        .and_then(|path| path.into_os_string().into_string().ok())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let exe = env::current_exe()
-        .ok()
-        .and_then(|path| path.into_os_string().into_string().ok())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let argv0 = env::args().next().unwrap_or_else(|| "unknown".to_owned());
+    let cwd = redact_identity(env::current_dir().is_ok());
+    let exe = redact_identity(env::current_exe().is_ok());
+    let argv0 = redact_identity(env::args().next().is_some());
+    let argv_count = arguments.len();
     let argv = arguments
         .iter()
-        .map(|argument| argument.replace([' ', '\n', '\r', '='], "_"))
+        .map(|argument| safe_argument(argument))
         .collect::<Vec<_>>()
         .join(",");
     let deadline_s = deadline
         .map(|seconds| seconds.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     eprintln!(
-        "pbi-failure rc={code} stage={stage} stage_status={status} candidates=unknown ranges=unknown admission=unknown deadline_s={deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv={argv}",
+        "pbi-failure rc={code} stage={stage} stage_status={status} candidates=unknown ranges=unknown admission=unknown deadline_s={deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
         started.elapsed().as_millis()
     );
+}
+
+fn redact_identity(present: bool) -> &'static str {
+    if present {
+        "[REDACTED]"
+    } else {
+        "unknown"
+    }
+}
+
+fn safe_failure_text(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(safe_failure_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn safe_failure_token(token: &str) -> String {
+    let (body, suffix) = token
+        .strip_suffix(':')
+        .map(|body| (body, ":"))
+        .or_else(|| token.strip_suffix(';').map(|body| (body, ";")))
+        .or_else(|| token.strip_suffix(',').map(|body| (body, ",")))
+        .unwrap_or((token, ""));
+    if body.starts_with('-') && !known_option(body) {
+        return format!("[REDACTED]{suffix}");
+    }
+    escape_control(body) + suffix
+}
+
+fn safe_argument(argument: &str) -> String {
+    if let Some((name, _)) = argument.split_once('=') {
+        if known_option(name) {
+            return format!("{name},[REDACTED]");
+        }
+    }
+    if known_option(argument) || argument.bytes().all(|byte| byte.is_ascii_digit()) {
+        return escape_control(argument);
+    }
+    "[REDACTED]".to_owned()
+}
+
+fn known_option(value: &str) -> bool {
+    matches!(
+        value,
+        "--help"
+            | "-h"
+            | "--version"
+            | "-V"
+            | "--debug-config"
+            | "--json"
+            | "--message"
+            | "--model-route"
+            | "--model-name"
+            | "--force-provider"
+            | "--timeout"
+            | "--bm25"
+            | "--reranker"
+            | "-r"
+            | "--session"
+            | "--question"
+            | "--max-results"
+            | "--max-bytes"
+            | "--max-tokens"
+            | "--merge-threshold"
+            | "--format"
+            | "-o"
+            | "--language"
+            | "-l"
+            | "--ignore"
+            | "-i"
+            | "--files-only"
+            | "-f"
+            | "--exact"
+            | "-e"
+            | "--frequency"
+            | "-s"
+            | "--exclude-filenames"
+            | "-n"
+            | "--strict-elastic-syntax"
+            | "search"
+    )
 }
 
 struct CliError {
@@ -1365,10 +1443,9 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool, Option<u64>), C
                 if value.starts_with("--model-name=") || value.starts_with("--force-provider=") => {
             }
             value if message || value.starts_with('-') => {
-                return Err(CliError::usage(format!(
-                    "unsupported {} option or operand: {value}; only --timeout, --json, and discarded legacy routing options are supported; --model-route must precede the question",
-                    if message { "Chat" } else { "question" }
-                )));
+                return Err(CliError::usage(
+                    "unsupported question option or operand; only --timeout, --json, and discarded legacy routing options are supported; --model-route must precede the question",
+                ));
             }
             value => parts.push(value),
         }
@@ -1539,9 +1616,7 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 index += 1;
             }
             value if value.starts_with('-') => {
-                return Err(CliError::usage(format!(
-                    "unsupported search option: {value}"
-                )));
+                return Err(CliError::usage("unsupported search option"));
             }
             value => {
                 query_parts.push(value.to_owned());
@@ -1624,11 +1699,7 @@ fn set_raw_safe_flag(options: &mut SearchOptions, option: &str) -> Result<(), Cl
             &mut options.strict_elastic_syntax,
             "--strict-elastic-syntax",
         ),
-        _ => {
-            return Err(CliError::usage(format!(
-                "unsupported search option: {option}"
-            )))
-        }
+        _ => return Err(CliError::usage("unsupported search option")),
     };
     if *slot {
         return Err(CliError::usage(format!(
