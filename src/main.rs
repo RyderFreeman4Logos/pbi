@@ -255,7 +255,7 @@ fn usage() {
                 pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
-         A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Normal source citations are verified; --bm25 prints raw native ranked hits without citation verification or a model."
+         A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Questions return verified source citations; search prints compact native BM25 locations and scores. --bm25 shows source blocks from the same ranker; neither search path calls a model."
     );
 }
 
@@ -543,7 +543,7 @@ fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, Sema
         (route.base_url().to_owned(), route.model().to_owned())
     };
     Ok(format!(
-        "search_default=native_bounded_term_frequency_no_probe\nsearch_bm25_opt_in=native_bounded_raw_no_model\nsearch_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_route_enable=approved_config_or_PBI_RS_ADK_ENABLE_1\nmodel_route_disable=PBI_RS_ADK_ENABLE_0\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
+        "search_default=native_bounded_bm25_compact_no_probe\nsearch_bm25_opt_in=native_bounded_raw_no_model\nsearch_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_route_enable=approved_config_or_PBI_RS_ADK_ENABLE_1\nmodel_route_disable=PBI_RS_ADK_ENABLE_0\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
     ))
 }
 
@@ -653,7 +653,7 @@ fn run_traced(
             "--model-route is only supported for semantic questions",
         ));
     }
-    let (raw, semantic, query, options, json_output, requested_timeout) = if arguments[0]
+    let (raw, semantic, query, mut options, json_output, requested_timeout) = if arguments[0]
         == "search"
     {
         let (raw, query, options) = parse_search(&arguments[1..])?;
@@ -661,7 +661,7 @@ fn run_traced(
             println!(
                     "pbi-rs search is bounded and in-process.\n\
                  Supported: --timeout --max-results --language/-l --ignore/-i.\n\
-                 --bm25 prints bounded native ranked hits. Raw --merge-threshold merges blocks separated by at most N lines (default 5). Raw --session ID paginates with private source-fresh state. Raw --strict-elastic-syntax validates and evaluates explicit Boolean or quoted queries. Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
+                 Default search prints compact BM25 locations and scores; --bm25 adds source blocks. Both evaluate Boolean AND/OR/NOT, groups, and quoted phrases without a syntax flag. Raw --merge-threshold merges blocks separated by at most N lines (default 5). Raw --session ID paginates with private source-fresh state. Raw --strict-elastic-syntax additionally enforces the legacy strict admission rules. Raw formats: plain, terminal, markdown, json, xml, color, outline, outline-xml. Raw --max-bytes caps emitted bytes; --max-tokens caps lexical output tokens."
                 );
             return Ok(0);
         }
@@ -715,12 +715,25 @@ fn run_traced(
             trace.route(index, route);
         }
     }
-    if raw {
-        let strict_query = options
-            .strict_elastic_syntax
-            .then(|| StrictQuery::parse(&query))
-            .transpose()
-            .map_err(CliError::usage)?;
+    if !raw
+        && (options.max_bytes.is_some()
+            || options.max_tokens.is_some()
+            || options.merge_threshold.is_some()
+            || options.session.is_some())
+    {
+        return Err(CliError::usage(
+            "raw search options require --bm25; default search prints compact ranked locations",
+        ));
+    }
+    if !semantic {
+        let strict_query = if options.strict_elastic_syntax {
+            StrictQuery::parse(&query).map(Some)
+        } else if options.exact {
+            Ok(None)
+        } else {
+            StrictQuery::for_search(&query)
+        }
+        .map_err(CliError::usage)?;
         let session = options
             .session
             .as_deref()
@@ -729,6 +742,7 @@ fn run_traced(
                 raw_session::RawSession::open(id, scope, deadline).map_err(CliError::failed)
             })
             .transpose()?;
+        trace.point(TraceStage::InitialSearch, TraceStatus::Start, 0);
         let (mut hits, freshness) = search_raw_repository(
             &root,
             &query,
@@ -749,8 +763,23 @@ fn run_traced(
                 strict: strict_query.as_ref(),
             },
         )
-        .map_err(search_cli_error)?;
-        if options.files_only {
+        .map_err(|error| {
+            let status = if matches!(error, SearchFailure::Deadline) {
+                TraceStatus::Deadline
+            } else {
+                TraceStatus::OtherError
+            };
+            trace.point(TraceStage::InitialSearch, status, 0);
+            search_cli_error(error)
+        })?;
+        trace.point(TraceStage::InitialSearch, TraceStatus::Ok, hits.len());
+        if !raw {
+            // Compact search emits checked source locations, not snippets or
+            // semantic citations. Filename-only hits cannot supply a location.
+            hits.retain(|hit| hit.line.is_some());
+            options.format = Some("compact".to_owned());
+        }
+        if options.files_only || !raw {
             let mut seen = std::collections::HashSet::new();
             hits.retain(|hit| seen.insert(hit.file.clone()));
         }
@@ -785,21 +814,7 @@ fn run_traced(
         trace.point(TraceStage::Terminal, TraceStatus::Ok, emitted);
         return Ok(0);
     }
-    if options.format.is_some()
-        || options.max_bytes.is_some()
-        || options.max_tokens.is_some()
-        || options.merge_threshold.is_some()
-        || options.files_only
-        || options.exact
-        || options.frequency
-        || options.exclude_filenames
-        || options.strict_elastic_syntax
-        || options.session.is_some()
-    {
-        return Err(CliError::usage(
-            "raw search options require --bm25; verified search prints compact citations",
-        ));
-    }
+
     #[cfg(test)]
     let injected_publisher = match _test_route_injection {
         Some(TestRouteInjection::Publisher(publisher)) => Some(publisher),
@@ -1256,6 +1271,7 @@ fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> 
             continue;
         }
         match format {
+            "compact" => output.push_str(&format!("{location}\nScore: {:.4}\n", hit.score)),
             "xml" => output.push_str(&format!(
                 "<hit file=\"{}\"{} score=\"{:.4}\"{}><snippet>{}</snippet></hit>\n",
                 escape_xml(&file),
@@ -1693,7 +1709,7 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
             }
         }
     }
-    let mut query = query_parts.join(" ");
+    let query = query_parts.join(" ");
     if raw && question_seen {
         return Err(CliError::usage(
             "--question requires a model reranker; native BM25 does not use it",
@@ -1728,20 +1744,6 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
     }
     if query.trim().is_empty() && !options.help {
         return Err(CliError::usage("search query is required"));
-    }
-    // Legacy verified search expands owner:member, while raw BM25 stays literal.
-    if !raw {
-        if let Some((owner, member)) = query.split_once(':') {
-            let is_name = |name: &str| {
-                !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
-            };
-            if is_name(owner) && is_name(member) {
-                query = format!("{owner} {member}");
-            }
-        }
     }
     Ok((raw, query, options))
 }
