@@ -7,11 +7,13 @@
 //! the same bounded walk, with exact Rust declarations before lexical mentions.
 //! Neither path creates an index or a model request.
 
+use crate::extract::{check_source_namespace, open_source, policy_admitted};
 use crate::strict_query::StrictQuery;
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -94,8 +96,11 @@ pub fn search_repository(
     if terms.is_empty() || limits.max_results == 0 {
         return Ok(String::new());
     }
-    let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
-    let files = walk(root, root_meta.dev(), limits)?;
+    let root_file = open_root(root)?;
+    let root_meta = root_file
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
     let mut hits = Vec::new();
     for path in files {
         if Instant::now() >= limits.deadline {
@@ -104,7 +109,7 @@ pub fn search_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(&path, root_meta.dev())? else {
+        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
             continue;
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -159,8 +164,11 @@ pub fn search_raw_repository(
     if terms.is_empty() || terms.len() > 32 {
         return Err(SearchFailure::Limit);
     }
-    let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
-    let mut files = walk(root, root_meta.dev(), limits)?;
+    let root_file = open_root(root)?;
+    let root_meta = root_file
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let mut files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
     files.sort();
     let mut freshness = DefaultHasher::new();
     let mut documents = 0usize;
@@ -175,7 +183,7 @@ pub fn search_raw_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(&path, root_meta.dev())? else {
+        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
             continue;
         };
         path.hash(&mut freshness);
@@ -348,7 +356,21 @@ fn raw_terms(query: &str) -> Vec<String> {
     terms
 }
 
-fn read_source(path: &Path, device: u64) -> Result<Option<Vec<u8>>, SearchFailure> {
+fn open_root(root: &Path) -> Result<File, SearchFailure> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(root)
+        .map_err(|_| SearchFailure::Unavailable)
+}
+
+fn read_source(
+    root: &Path,
+    root_file: &File,
+    path: &Path,
+    device: u64,
+    limits: &SearchLimits,
+) -> Result<Option<Vec<u8>>, SearchFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -357,12 +379,36 @@ fn read_source(path: &Path, device: u64) -> Result<Option<Vec<u8>>, SearchFailur
     {
         return Ok(None);
     }
-    let file: File = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    #[cfg(test)]
+    issue_327_tests::after_metadata();
+    let relative = path
+        .strip_prefix(root)
         .map_err(|_| SearchFailure::Unavailable)?;
-    read_source_file(file, device)
+    let (file, directories) = open_source(
+        root_file
+            .try_clone()
+            .map_err(|_| SearchFailure::Unavailable)?,
+        relative,
+        device,
+        limits,
+        false,
+    )?;
+    check_source_namespace(root, relative, &directories, &file)?;
+    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+        return Err(SearchFailure::Unavailable);
+    }
+    let bytes = read_source_file(
+        file.try_clone().map_err(|_| SearchFailure::Unavailable)?,
+        device,
+    )?;
+    check_source_namespace(root, relative, &directories, &file)?;
+    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+        return Err(SearchFailure::Unavailable);
+    }
+    if Instant::now() >= limits.deadline {
+        return Err(SearchFailure::Deadline);
+    }
+    Ok(bytes)
 }
 
 /// Recheck and bound a descriptor opened by a no-follow source reader.
@@ -399,8 +445,11 @@ pub fn candidate_symbols(
     if parts.is_empty() {
         return Ok(Vec::new());
     }
-    let root_meta = fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
-    let files = walk(root, root_meta.dev(), limits)?;
+    let root_file = open_root(root)?;
+    let root_meta = root_file
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
     let mut ranked = files
         .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
@@ -419,15 +468,9 @@ pub fn candidate_symbols(
         if Instant::now() >= limits.deadline {
             return Err(SearchFailure::Deadline);
         }
-        let metadata = fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.dev() != root_meta.dev()
-            || metadata.len() > MAX_FILE_BYTES
-        {
+        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
             continue;
-        }
-        let bytes = fs::read(&path).map_err(|_| SearchFailure::Unavailable)?;
+        };
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };
@@ -517,28 +560,63 @@ fn has_false_return(block: &syn::Block) -> bool {
     visitor.0
 }
 
+/// Pathname traversal supplies candidates and bounds, never source/policy authority.
 pub(super) fn walk(
     root: &Path,
     device: u64,
     limits: &SearchLimits,
 ) -> Result<Vec<PathBuf>, SearchFailure> {
-    validate_gitignore(&root.join(".gitignore"), device)?;
+    let root_file = open_root(root)?;
+    walk_owned(root, &root_file, device, limits)
+}
+
+fn walk_owned(
+    root: &Path,
+    root_file: &File,
+    device: u64,
+    limits: &SearchLimits,
+) -> Result<Vec<PathBuf>, SearchFailure> {
+    check_source_namespace(root, Path::new(""), &[], root_file)?;
+    if root_file
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?
+        .dev()
+        != device
+    {
+        return Err(SearchFailure::Unavailable);
+    }
+    // Check both root policy classes, even when no visible entry exists.
+    policy_admitted(
+        root,
+        Path::new(""),
+        &[root_file
+            .try_clone()
+            .map_err(|_| SearchFailure::Unavailable)?],
+        device,
+        limits,
+        true,
+    )?;
     let mut root_targets = 0usize;
-    for entry in fs::read_dir(root).map_err(|_| SearchFailure::Unavailable)? {
+    // Linux-only: enumerate the retained root, not a substituted named root.
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", root_file.as_raw_fd()))
+        .map_err(|_| SearchFailure::Unavailable)?
+    {
+        if Instant::now() >= limits.deadline {
+            return Err(SearchFailure::Deadline);
+        }
         let entry = entry.map_err(|_| SearchFailure::Unavailable)?;
         let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with('.') || EXCLUDED.contains(&name) {
+        if name.as_bytes().starts_with(b".")
+            || name.to_str().is_some_and(|name| EXCLUDED.contains(&name))
+        {
             continue;
         }
         let metadata =
             fs::symlink_metadata(entry.path()).map_err(|_| SearchFailure::Unavailable)?;
-        if metadata.file_type().is_symlink() || metadata.dev() != device {
-            continue;
-        }
-        if !metadata.is_dir() && !metadata.is_file() {
+        if metadata.file_type().is_symlink()
+            || metadata.dev() != device
+            || (!metadata.is_dir() && !metadata.is_file())
+        {
             continue;
         }
         if root_targets == MAX_ROOT_TARGETS {
@@ -557,6 +635,16 @@ pub(super) fn walk(
         .map_err(|_| SearchFailure::Unavailable)?;
     let unsafe_ignore = Arc::new(AtomicBool::new(false));
     let unsafe_ignore_filter = Arc::clone(&unsafe_ignore);
+    let policy_root = root.to_path_buf();
+    let policy_owner = root_file
+        .try_clone()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let policy_limits = SearchLimits {
+        deadline: limits.deadline,
+        max_results: limits.max_results,
+        language: None,
+        ignores: Vec::new(),
+    };
     let mut walker = WalkBuilder::new(root);
     walker
         .follow_links(false)
@@ -566,6 +654,9 @@ pub(super) fn walk(
         .git_global(false)
         .git_exclude(false)
         .require_git(false)
+        // Never let the library independently reopen policy pathnames.
+        .ignore(false)
+        .git_ignore(false)
         .filter_entry(move |entry| {
             if entry.depth() == 0 {
                 return true;
@@ -573,7 +664,11 @@ pub(super) fn walk(
             if entry.file_name().as_bytes().starts_with(b".") {
                 return false;
             }
-            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            let kind = entry.file_type();
+            let is_dir = kind.is_some_and(|kind| kind.is_dir());
+            if !is_dir && !kind.is_some_and(|kind| kind.is_file()) {
+                return false;
+            }
             if entry
                 .file_name()
                 .to_str()
@@ -584,11 +679,50 @@ pub(super) fn walk(
             {
                 return false;
             }
-            if is_dir && validate_gitignore(&entry.path().join(".gitignore"), device).is_err() {
-                unsafe_ignore_filter.store(true, Ordering::Relaxed);
-                return false;
+            let admitted = (|| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(&policy_root)
+                    .map_err(|_| SearchFailure::Unavailable)?;
+                let (file, directories) = open_source(
+                    policy_owner
+                        .try_clone()
+                        .map_err(|_| SearchFailure::Unavailable)?,
+                    relative,
+                    device,
+                    &policy_limits,
+                    is_dir,
+                )?;
+                check_source_namespace(&policy_root, relative, &directories, &file)?;
+                let admitted = policy_admitted(
+                    &policy_root,
+                    relative,
+                    &directories,
+                    device,
+                    &policy_limits,
+                    is_dir,
+                )?;
+                // A directory's policies must also be safe before descending.
+                if is_dir && admitted {
+                    policy_admitted(
+                        entry.path(),
+                        Path::new(""),
+                        &[file.try_clone().map_err(|_| SearchFailure::Unavailable)?],
+                        device,
+                        &policy_limits,
+                        true,
+                    )?;
+                }
+                check_source_namespace(&policy_root, relative, &directories, &file)?;
+                Ok::<_, SearchFailure>(admitted)
+            })();
+            match admitted {
+                Ok(admitted) => admitted,
+                Err(_) => {
+                    unsafe_ignore_filter.store(true, Ordering::Relaxed);
+                    false
+                }
             }
-            true
         });
     let mut files = Vec::new();
     let mut file_count = 0usize;
@@ -619,23 +753,8 @@ pub(super) fn walk(
     if unsafe_ignore.load(Ordering::Relaxed) {
         return Err(SearchFailure::Unavailable);
     }
+    check_source_namespace(root, Path::new(""), &[], root_file)?;
     Ok(files)
-}
-
-fn validate_gitignore(path: &Path, device: u64) -> Result<(), SearchFailure> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(SearchFailure::Unavailable),
-    };
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.dev() != device
-        || metadata.len() > MAX_FILE_BYTES
-    {
-        return Err(SearchFailure::Unavailable);
-    }
-    Ok(())
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -702,6 +821,10 @@ fn language_matches(path: &Path, language: Option<&str>) -> bool {
         other => extension.eq_ignore_ascii_case(other),
     }
 }
+
+#[cfg(test)]
+#[path = "native_search_custody_tests.rs"]
+mod issue_327_tests;
 
 #[cfg(test)]
 mod issue_326_tests {

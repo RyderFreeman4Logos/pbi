@@ -261,9 +261,9 @@ fn admitted_source(
         &SearchLimits,
     ) -> Result<Vec<std::path::PathBuf>, SearchFailure>,
 ) -> Result<Vec<u8>, SearchFailure> {
-    let (file, directories) = open_source(root_file, relative, device, limits)?;
+    let (file, directories) = open_source(root_file, relative, device, limits, false)?;
     check_source_namespace(root, relative, &directories, &file)?;
-    let admitted = policy_admitted(root, relative, &directories, device, limits)?;
+    let admitted = policy_admitted(root, relative, &directories, device, limits, false)?;
     if !walk_source(root, device, limits)?.contains(&root.join(relative)) || !admitted {
         return Err(SearchFailure::Unavailable);
     }
@@ -276,13 +276,13 @@ fn admitted_source(
     // it is NOT the ABA proof. Descriptor-owned policy admission on both sides
     // of the read independently denies ignored bytes, even after restoration.
     check_source_namespace(root, relative, &directories, &file)?;
-    if !policy_admitted(root, relative, &directories, device, limits)? {
+    if !policy_admitted(root, relative, &directories, device, limits, false)? {
         return Err(SearchFailure::Unavailable);
     }
     Ok(bytes)
 }
 
-fn check_source_namespace(
+pub(super) fn check_source_namespace(
     root: &Path,
     relative: &Path,
     directories: &[File],
@@ -311,12 +311,13 @@ fn check_source_namespace(
     Ok(())
 }
 
-fn policy_admitted(
+pub(super) fn policy_admitted(
     root: &Path,
     relative: &Path,
     directories: &[File],
     device: u64,
     limits: &SearchLimits,
+    final_directory: bool,
 ) -> Result<bool, SearchFailure> {
     let mut policies = Vec::new();
     let mut directory_path = root.to_path_buf();
@@ -356,13 +357,15 @@ fn policy_admitted(
             local.push(builder.build().map_err(|_| SearchFailure::Unavailable)?);
         }
         policies.push(local);
-        directory_path.push(names[depth]);
+        if let Some(name) = names.get(depth) {
+            directory_path.push(name);
+        }
     }
     let mut admitted = true;
     let mut candidate = root.to_path_buf();
     for (depth, name) in names.iter().enumerate() {
         candidate.push(name);
-        let is_dir = depth + 1 < names.len();
+        let is_dir = depth + 1 < names.len() || final_directory;
         // .ignore outranks .gitignore; nearest ancestor wins within each class.
         let matched = [1, 0].into_iter().find_map(|kind| {
             policies[..=depth].iter().rev().find_map(|local| {
@@ -401,11 +404,12 @@ fn open_at(parent: &File, name: &std::ffi::OsStr, directory: bool) -> std::io::R
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn open_source(
+pub(super) fn open_source(
     mut parent: File,
     relative: &Path,
     device: u64,
     limits: &SearchLimits,
+    final_directory: bool,
 ) -> Result<(File, Vec<File>), SearchFailure> {
     let mut directories = Vec::new();
     let mut parts = relative
@@ -415,7 +419,7 @@ fn open_source(
     while let Some(Component::Normal(name)) = parts.next() {
         check_deadline(limits)?;
         directories.push(parent.try_clone().map_err(|_| SearchFailure::Unavailable)?);
-        let directory = parts.peek().is_some();
+        let directory = parts.peek().is_some() || final_directory;
         let opened = open_at(&parent, name, directory).map_err(|_| SearchFailure::Unavailable)?;
         let metadata = opened.metadata().map_err(|_| SearchFailure::Unavailable)?;
         if metadata.dev() != device
@@ -686,7 +690,7 @@ mod tests {
             ignores: Vec::new(),
         };
         assert!(matches!(
-            open_source(proc_root, Path::new("version"), device, &limits),
+            open_source(proc_root, Path::new("version"), device, &limits, false),
             Err(SearchFailure::Unavailable)
         ));
     }

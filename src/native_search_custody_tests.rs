@@ -1,0 +1,189 @@
+//! Synthetic SSD-only hostile substitutions at the production read boundary.
+use super::*;
+use std::cell::RefCell;
+use std::os::unix::fs::symlink;
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+thread_local! {
+    static AFTER_METADATA: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+pub(super) fn after_metadata() {
+    let hook = AFTER_METADATA.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+fn substitute(hook: impl FnOnce() + 'static) {
+    AFTER_METADATA.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+struct Fixture(PathBuf);
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+fn fixture() -> Fixture {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let path = PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp")
+        .join(format!("pbi-327-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(path.join("root/dir")).expect("fixture");
+    Fixture(path)
+}
+fn limits() -> SearchLimits {
+    SearchLimits {
+        deadline: Instant::now() + Duration::from_secs(8),
+        max_results: 8,
+        language: None,
+        ignores: Vec::new(),
+    }
+}
+#[test]
+fn ancestor_symlink_substitution_is_denied_in_all_readers() {
+    let mut denied = Vec::new();
+    for mode in 0..3 {
+        let fixture = fixture();
+        let root = fixture.0.join("root");
+        let outside = fixture.0.join("outside");
+        fs::create_dir(&outside).expect("outside");
+        fs::write(
+            root.join("dir/synthetic_candidate.rs"),
+            "fn ordinary() {}\n",
+        )
+        .expect("source");
+        fs::write(
+            outside.join("synthetic_candidate.rs"),
+            "fn synthetic_external_marker() {}\n",
+        )
+        .expect("external");
+        let original = root.join("dir");
+        let held = fixture.0.join("held");
+        substitute(move || {
+            fs::rename(&original, &held).expect("retain original");
+            symlink(&outside, &original).expect("substitute ancestor");
+        });
+        let refused = match mode {
+            0 => search_repository(&root, "synthetic_external_marker", &limits()).is_err(),
+            1 => search_raw_repository(
+                &root,
+                "synthetic_external_marker",
+                &limits(),
+                &RawSearchOptions {
+                    exact: false,
+                    exclude_filenames: false,
+                    merge_threshold: 2,
+                    strict: None,
+                },
+            )
+            .is_err(),
+            _ => candidate_symbols(&root, "synthetic_candidate", &limits()).is_err(),
+        };
+        denied.push(refused);
+    }
+    assert_eq!(
+        denied,
+        vec![true; 3],
+        "all shared readers must reject redirected ancestors"
+    );
+}
+#[test]
+fn policy_symlink_is_not_authority() {
+    for policy in [".gitignore", ".ignore"] {
+        let fixture = fixture();
+        let root = fixture.0.join("root");
+        fs::write(root.join("ordinary.rs"), "fn ordinary() {}\n").expect("source");
+        let outside = fixture.0.join("external-policy");
+        fs::write(&outside, "ordinary.rs\n").expect("synthetic policy");
+        symlink(outside, root.join(policy)).expect("policy link");
+        assert!(
+            matches!(
+                walk(
+                    &root,
+                    fs::metadata(&root).expect("metadata").dev(),
+                    &limits()
+                ),
+                Err(SearchFailure::Unavailable)
+            ),
+            "linked policy must fail closed"
+        );
+    }
+}
+// The outer process owns a strict deadline and reaps the child even on RED.
+// Mutation is synchronous at the metadata/open seam; no race sleeps are used.
+#[test]
+fn fifo_substitution_and_policy_opens_are_bounded() {
+    if let Ok(kind) = std::env::var("PBI_327_FIFO_CHILD") {
+        let root = PathBuf::from(std::env::var_os("PBI_327_FIFO_ROOT").expect("root"));
+        if kind == "policy" {
+            assert!(walk(
+                &root,
+                fs::metadata(&root).expect("metadata").dev(),
+                &limits()
+            )
+            .is_err());
+        } else {
+            let path = root.join("dir/synthetic_candidate.rs");
+            substitute(move || {
+                fs::remove_file(&path).expect("remove regular leaf");
+                let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+                // SAFETY: NUL-terminated synthetic path, no borrowed memory escapes.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            });
+            let result = if kind == "candidate" {
+                candidate_symbols(&root, "synthetic_candidate", &limits()).map(|_| ())
+            } else {
+                search_repository(&root, "ordinary", &limits()).map(|_| ())
+            };
+            assert!(result.is_err(), "FIFO must be rejected");
+        }
+        return;
+    }
+    let mut completed = Vec::new();
+    for kind in ["source", "candidate", "policy"] {
+        let fixture = fixture();
+        let root = fixture.0.join("root");
+        fs::write(
+            root.join("dir/synthetic_candidate.rs"),
+            "fn ordinary() {}\n",
+        )
+        .expect("source");
+        if kind == "policy" {
+            let name =
+                std::ffi::CString::new(root.join(".ignore").as_os_str().as_bytes()).expect("path");
+            // SAFETY: NUL-terminated path in the owned harmless fixture.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        }
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "native_search::issue_327_tests::fifo_substitution_and_policy_opens_are_bounded",
+            ])
+            .env("PBI_327_FIFO_CHILD", kind)
+            .env("PBI_327_FIFO_ROOT", &root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("child");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let success = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status.success();
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("bounded kill");
+                child.wait().expect("reap");
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        completed.push(success);
+    }
+    assert_eq!(
+        completed,
+        vec![true; 3],
+        "source/candidate/policy FIFO opens must finish and reject"
+    );
+}
