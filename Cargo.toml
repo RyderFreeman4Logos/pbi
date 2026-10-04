@@ -1,0 +1,32 @@
+[package]
+name = "pbi-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Bounded native Rust source search and cited model answers"
+license = "MIT"
+default-run = "pbi-rs"
+
+[lib]
+name = "pbi_rs"
+path = "src/lib.rs"
+
+[dependencies]
+# Reuse the already locked syntax crates; no new package versions.
+syn = { version = "=2.0.119", features = ["full", "visit"] }
+proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
+serde_json = "=1.0.149"
+ignore = "=0.4.25"
+libc = "=0.2.189"
+toml = "=0.9.12"
+tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
+workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb" }
+workflow-runtime = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb" }
+
+[dev-dependencies]
+adk-rust = { version = "=2.1.0", default-features = false, features = ["agents", "models", "graph", "guardrail", "telemetry", "openai"] }
+workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb", features = ["test-support"] }
+
+[[bin]]
+name = "pbi-rs"
+path = "src/main.rs"

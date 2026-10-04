@@ -1,2 +1,10 @@
+# Cargo output is kept on the canonical SSD target symlink.
+/target
+
+# Local editor and OS noise.
+.DS_Store
+*.swp
+
+# Historical shell tests, not executed by default.
 __pycache__/
 *.py[cod]
