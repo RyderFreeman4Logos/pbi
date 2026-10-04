@@ -64,6 +64,7 @@ pub struct RawHit {
 /// Raw search shares the walk and file limits with verified search.
 pub struct RawSearchOptions<'a> {
     pub exact: bool,
+    pub stem: bool,
     pub exclude_filenames: bool,
     pub merge_threshold: usize,
     pub strict: Option<&'a StrictQuery>,
@@ -157,6 +158,12 @@ pub fn search_raw_repository(
     limits: &SearchLimits,
     options: &RawSearchOptions<'_>,
 ) -> Result<(Vec<RawHit>, u64), SearchFailure> {
+    let normalized_query = options
+        .stem
+        .then(|| crate::strict_query::stem_text(query, Some(limits.deadline)))
+        .transpose()
+        .map_err(|_| SearchFailure::Deadline)?;
+    let query = normalized_query.as_deref().unwrap_or(query);
     let terms = options
         .strict
         .map(|strict| strict.positive_terms().to_vec())
@@ -191,11 +198,25 @@ pub fn search_raw_repository(
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };
+        let normalized_source = options
+            .stem
+            .then(|| crate::strict_query::stem_text(source, Some(limits.deadline)))
+            .transpose()
+            .map_err(|_| SearchFailure::Deadline)?;
+        let matching_source = normalized_source.as_deref().unwrap_or(source);
         let filename = path.file_name().and_then(|name| name.to_str());
+        let normalized_filename = filename
+            .filter(|_| options.stem)
+            .map(|name| crate::strict_query::stem_text(name, Some(limits.deadline)))
+            .transpose()
+            .map_err(|_| SearchFailure::Deadline)?;
+        let matching_filename = normalized_filename.as_deref().or(filename);
         let strict_match = options.strict.is_none_or(|strict| {
             strict.matches(
-                source,
-                (!options.exclude_filenames).then_some(filename).flatten(),
+                matching_source,
+                (!options.exclude_filenames)
+                    .then_some(matching_filename)
+                    .flatten(),
             )
         });
         let Some(relative) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
@@ -210,7 +231,12 @@ pub fn search_raw_repository(
             if Instant::now() >= limits.deadline {
                 return Err(SearchFailure::Deadline);
             }
-            let normalized = line.to_lowercase();
+            let normalized = if options.stem {
+                crate::strict_query::stem_text(line, Some(limits.deadline))
+                    .map_err(|_| SearchFailure::Deadline)?
+            } else {
+                line.to_lowercase()
+            };
             let mut line_matches = 0usize;
             for word in normalized
                 .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
@@ -241,7 +267,7 @@ pub fn search_raw_repository(
             }
         }
         if !options.exclude_filenames {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if let Some(name) = matching_filename {
                 for word in name
                     .to_lowercase()
                     .split(|ch: char| !ch.is_alphanumeric() && ch != '_')

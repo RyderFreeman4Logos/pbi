@@ -12,7 +12,10 @@ name = "pbi_rs"
 path = "src/lib.rs"
 
 [dependencies]
-# Reuse the already locked syntax crates; no new package versions.
+# English-only Porter stemmer for the fixtures; none existed before #316.
+porter-stemmer = "=0.1.2"
+# Reuse the locked syntax crates; stemming adds only its English implementation
+# and unicode-segmentation transitive dependency.
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 serde_json = "=1.0.149"

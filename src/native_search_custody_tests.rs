@@ -80,6 +80,7 @@ fn ancestor_symlink_substitution_is_denied_in_all_readers() {
                 &limits(),
                 &RawSearchOptions {
                     exact: false,
+                    stem: false,
                     exclude_filenames: false,
                     merge_threshold: 2,
                     strict: None,
@@ -187,6 +188,7 @@ fn unreadable_policy_entry(policy: &str, directory: bool) {
     fs::set_permissions(&denied, fs::Permissions::from_mode(0o0)).expect("unreadable");
     let raw = RawSearchOptions {
         exact: false,
+        stem: false,
         exclude_filenames: false,
         merge_threshold: 2,
         strict: None,

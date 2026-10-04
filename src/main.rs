@@ -221,6 +221,7 @@ struct SearchOptions {
     format: Option<String>,
     files_only: bool,
     exact: bool,
+    stem: bool,
     frequency: bool,
     exclude_filenames: bool,
     strict_elastic_syntax: bool,
@@ -241,6 +242,7 @@ impl Default for SearchOptions {
             format: None,
             files_only: false,
             exact: false,
+            stem: false,
             frequency: false,
             exclude_filenames: false,
             strict_elastic_syntax: false,
@@ -255,7 +257,7 @@ fn usage() {
          Usage: pbi-rs extract <path>:<line> [--timeout <SECONDS>] [--max-bytes <N>]\n\
                 pbi-rs symbols <path>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--timeout <SECONDS>] [--json]\n\
-                pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs search [--bm25] [--stem] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
          A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Questions return verified source citations; search prints compact native BM25 locations and scores. --bm25 shows source blocks from the same ranker; neither search path calls a model."
@@ -444,6 +446,7 @@ fn known_option(value: &str) -> bool {
             | "--force-provider"
             | "--timeout"
             | "--bm25"
+            | "--stem"
             | "--reranker"
             | "-r"
             | "--session"
@@ -789,7 +792,16 @@ fn run_traced(
         } else {
             StrictQuery::for_search(&query)
         }
-        .map_err(CliError::usage)?;
+        .map_err(CliError::usage)?
+        .map(|strict| {
+            if options.stem {
+                strict.stemmed(deadline)
+            } else {
+                Ok(strict)
+            }
+        })
+        .transpose()
+        .map_err(|_| search_cli_error(SearchFailure::Deadline))?;
         let session = options
             .session
             .as_deref()
@@ -810,6 +822,7 @@ fn run_traced(
             },
             &RawSearchOptions {
                 exact: options.exact,
+                stem: options.stem,
                 exclude_filenames: options.exclude_filenames,
                 merge_threshold: options
                     .merge_threshold
@@ -1200,6 +1213,7 @@ fn raw_session_scope(root: &Path, query: &str, options: &SearchOptions) -> Resul
     options.language.hash(&mut scope);
     options.ignores.hash(&mut scope);
     options.exact.hash(&mut scope);
+    options.stem.hash(&mut scope);
     options.strict_elastic_syntax.hash(&mut scope);
     options.exclude_filenames.hash(&mut scope);
     options.files_only.hash(&mut scope);
@@ -1744,7 +1758,8 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 }
                 index += 1;
             }
-            "--files-only"
+            "--stem"
+            | "--files-only"
             | "-f"
             | "--exact"
             | "-e"
@@ -1766,6 +1781,12 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
         }
     }
     let query = query_parts.join(" ");
+    if options.stem && options.exact {
+        return Err(CliError::usage("--stem cannot be combined with --exact"));
+    }
+    if options.stem && query.len() > 8192 {
+        return Err(CliError::usage("stem query exceeds its byte cap"));
+    }
     if raw && question_seen {
         return Err(CliError::usage(
             "--question requires a model reranker; native BM25 does not use it",
@@ -1819,6 +1840,7 @@ fn next_value(arguments: &[String], index: &mut usize, option: &str) -> Result<S
 fn set_raw_safe_flag(options: &mut SearchOptions, option: &str) -> Result<(), CliError> {
     let (slot, canonical) = match option {
         "--files-only" | "-f" => (&mut options.files_only, "--files-only"),
+        "--stem" => (&mut options.stem, "--stem"),
         "--exact" | "-e" => (&mut options.exact, "--exact"),
         "--frequency" | "-s" => (&mut options.frequency, "--frequency"),
         "--exclude-filenames" | "-n" => (&mut options.exclude_filenames, "--exclude-filenames"),

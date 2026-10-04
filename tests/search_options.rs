@@ -147,6 +147,123 @@ fn unified_search_boolean_phrase_and_unicode_sets() {
 }
 
 #[test]
+fn english_stemming_is_opt_in_and_preserves_queries() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("fixture.rs")).expect("remove seed");
+    for (name, text) in [
+        ("a.rs", "run alpha\n"),
+        ("b.rs", "walk\n"),
+        ("c.rs", "retries retrying\n"),
+        ("d.rs", "if or in type\n"),
+    ] {
+        fs::write(fixture.root.join(name), text).expect("stem fixture");
+    }
+    let search = |query: &str, stem: bool, raw: bool| {
+        let mut args = vec!["search"];
+        if stem {
+            args.push("--stem");
+        }
+        if raw {
+            args.push("--bm25");
+        }
+        args.push(query);
+        fixture.run(&args, "stemming")
+    };
+
+    for raw in [false, true] {
+        let stemmed = search("running", true, raw);
+        assert!(stemmed.status.success(), "stem search must succeed");
+        let output = String::from_utf8_lossy(&stemmed.stdout);
+        assert!(output.contains("a.rs"), "stem hit missing");
+        assert!(!output.contains("b.rs"), "unrelated hit");
+
+        let default = search("running", false, raw);
+        assert_eq!(default.status.code(), Some(1));
+        assert!(default.stdout.is_empty());
+
+        let retry = search("retry", true, raw);
+        assert!(retry.status.success());
+        assert!(String::from_utf8_lossy(&retry.stdout).contains("c.rs"));
+
+        for stopword in ["if", "or", "in", "type"] {
+            let result = search(stopword, true, raw);
+            assert!(result.status.success(), "stopword search failed");
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains("d.rs"),
+                "{stopword}"
+            );
+        }
+
+        for query in ["running AND alpha", "\"running alpha\""] {
+            let result = search(query, true, raw);
+            assert!(
+                result.status.success(),
+                "Boolean or phrase stem search failed"
+            );
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains("a.rs"),
+                "{query}"
+            );
+        }
+        let reversed = search("\"alpha running\"", true, raw);
+        assert_eq!(reversed.status.code(), Some(1));
+        assert!(reversed.stdout.is_empty());
+    }
+}
+
+#[test]
+fn english_stemming_bounds_exact_refusal_and_session_separation() {
+    let fixture = ScopeFixture::new();
+    fs::write(
+        fixture.root.join("a.txt"),
+        "run retries café 类型 retry_id\n",
+    )
+    .expect("synthetic source");
+    for args in [
+        vec!["search", "--stem", "--bm25", "--exact", "[REDACTED]"],
+        vec!["search", "--exact", "--stem", "[REDACTED]"],
+    ] {
+        let result = fixture.run_args("stem", &args);
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("--stem cannot be combined with --exact"));
+    }
+    let long = "a".repeat(8193);
+    let result = fixture.run_args("stem", &["search", "--stem", &long]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&result.stderr).contains(&long));
+    for query in [
+        "café",
+        "类型",
+        "retry_id",
+        "running NOT walk",
+        "running OR walk",
+    ] {
+        assert!(fixture
+            .run_args("stem", &["search", "--stem", "--bm25", query])
+            .status
+            .success());
+    }
+    for query in ["running NOT retries", "\"retry id\""] {
+        assert_eq!(
+            fixture
+                .run_args("stem", &["search", "--stem", "--bm25", query])
+                .status
+                .code(),
+            Some(1)
+        );
+    }
+    let plain = ["search", "--bm25", "--session=stem-scope", "run"];
+    assert!(fixture.run_session(&plain).status.success());
+    assert_eq!(fixture.run_session(&plain).status.code(), Some(1));
+    assert!(fixture
+        .run_session(&["search", "--bm25", "--stem", "--session=stem-scope", "run"])
+        .status
+        .success());
+}
+
+#[test]
 fn unified_search_punctuated_operands_preserve_default_raw_parity() {
     let fixture = Fixture::new();
     fs::remove_file(fixture.root.join("fixture.rs")).expect("remove seed");
