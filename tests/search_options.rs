@@ -147,6 +147,63 @@ fn unified_search_boolean_phrase_and_unicode_sets() {
 }
 
 #[test]
+fn unified_search_punctuated_operands_preserve_default_raw_parity() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("fixture.rs")).expect("remove seed");
+    for (name, text) in [
+        ("a.txt", "Owner:OR Owner:AND Owner:NOT Owner::OR\n"),
+        ("b.txt", "OR AND NOT\n"),
+        ("c.txt", "Owner\n"),
+        ("path.txt", "src/Owner:OR\n"),
+    ] {
+        fs::write(fixture.root.join(name), text).expect("punctuation fixture");
+    }
+    let mut statuses = Vec::new();
+    for (query, expected) in [
+        ("Owner:OR", vec!["a.txt", "b.txt", "c.txt", "path.txt"]),
+        ("Owner:AND", vec!["a.txt", "b.txt", "c.txt", "path.txt"]),
+        ("Owner:NOT", vec!["a.txt", "b.txt", "c.txt", "path.txt"]),
+        ("Owner::OR", vec!["a.txt", "b.txt", "c.txt", "path.txt"]),
+        ("Owner.OR", vec!["a.txt", "b.txt", "c.txt", "path.txt"]),
+        ("Owner-OR", vec!["a.txt", "b.txt", "c.txt", "path.txt"]),
+        ("\"Owner:OR\"", vec!["a.txt", "path.txt"]),
+        ("\"Owner:AND\"", vec!["a.txt"]),
+        ("\"Owner:NOT\"", vec!["a.txt"]),
+        ("\"Owner::OR\"", vec!["a.txt"]),
+        ("\"src/Owner:OR\"", vec!["path.txt"]),
+        ("\"Owner:OR\" OR \"Owner:AND\"", vec!["a.txt", "path.txt"]),
+        ("(\"Owner:OR\" OR \"Owner:AND\") NOT src", vec!["a.txt"]),
+    ] {
+        let default = fixture.run(&["search", query], "default");
+        let raw = fixture.run(&["search", "--bm25", "--format=json", query], "raw");
+        statuses.extend([default.status.code(), raw.status.code()]);
+        if !default.status.success() || !raw.status.success() {
+            continue;
+        }
+        assert!(default.stderr.is_empty() && raw.stderr.is_empty());
+        let rows: serde_json::Value = serde_json::from_slice(&raw.stdout).expect("raw JSON");
+        let mut raw_files = rows
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row["file"].as_str().expect("file").to_owned())
+            .collect::<Vec<_>>();
+        let mut default_files = compact_locations(&default)
+            .into_iter()
+            .map(|location| location.split_once(':').expect("location").0.to_owned())
+            .collect::<Vec<_>>();
+        raw_files.sort();
+        default_files.sort();
+        assert_eq!(raw_files, expected, "raw punctuation file set");
+        assert_eq!(default_files, expected, "default punctuation file set");
+    }
+    assert!(
+        statuses.iter().all(|status| *status == Some(0)),
+        "punctuated operands must not manufacture operators: {statuses:?}"
+    );
+}
+
+#[test]
 fn unified_search_phrase_rejects_reversed_tokens() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("ordered.txt"), "foo bar\n").expect("ordered");

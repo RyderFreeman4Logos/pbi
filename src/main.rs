@@ -1709,7 +1709,7 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
             }
         }
     }
-    let mut query = query_parts.join(" ");
+    let query = query_parts.join(" ");
     if raw && question_seen {
         return Err(CliError::usage(
             "--question requires a model reranker; native BM25 does not use it",
@@ -1744,20 +1744,6 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
     }
     if query.trim().is_empty() && !options.help {
         return Err(CliError::usage("search query is required"));
-    }
-    // Legacy verified search expands owner:member, while raw BM25 stays literal.
-    if !raw {
-        if let Some((owner, member)) = query.split_once(':') {
-            let is_name = |name: &str| {
-                !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
-            };
-            if is_name(owner) && is_name(member) {
-                query = format!("{owner} {member}");
-            }
-        }
     }
     Ok((raw, query, options))
 }
