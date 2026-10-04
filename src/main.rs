@@ -234,9 +234,13 @@ fn usage() {
 }
 
 fn main() {
-    let arguments: Vec<String> = env::args().skip(1).collect();
+    let Some(arguments) = utf8_arguments() else {
+        eprintln!("pbi-rs: arguments must be UTF-8");
+        emit_failure_receipt(&[], 2, None, Instant::now(), None);
+        std::process::exit(2);
+    };
     let started = Instant::now();
-    let deadline = cli_deadline_seconds(&arguments);
+    let deadline = parsed_execution_timeout(&arguments);
     let trace = StageTrace::new(started + std::time::Duration::from_secs(deadline.unwrap_or(0)));
     let code = match run_traced(
         arguments.clone(),
@@ -256,20 +260,38 @@ fn main() {
     std::process::exit(code);
 }
 
-fn cli_deadline_seconds(arguments: &[String]) -> Option<u64> {
+fn utf8_arguments() -> Option<Vec<String>> {
+    let mut arguments = Vec::new();
+    for argument in env::args_os().skip(1) {
+        arguments.push(argument.to_str()?.to_owned());
+    }
+    Some(arguments)
+}
+
+fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
+    let Ok((arguments, _)) = parse_local_route_prefix(arguments.to_vec()) else {
+        return None;
+    };
     let search = arguments
         .first()
         .is_some_and(|argument| argument == "search");
-    arguments
-        .iter()
-        .position(|argument| argument == "--timeout")
-        .and_then(|index| arguments.get(index + 1))
-        .and_then(|value| value.parse().ok())
-        .or(Some(if search {
-            SEARCH_OUTER_DEADLINE_SECONDS
-        } else {
-            MESSAGE_OUTER_DEADLINE_SECONDS
-        }))
+    let fallback = if search {
+        SEARCH_OUTER_DEADLINE_SECONDS
+    } else {
+        MESSAGE_OUTER_DEADLINE_SECONDS
+    };
+    let requested = if search {
+        match parse_search(&arguments[1..]) {
+            Ok((_, _, options)) => options.timeout,
+            Err(_) => return Some(fallback),
+        }
+    } else {
+        match parse_question(&arguments) {
+            Ok((_, _, timeout)) => timeout,
+            Err(_) => return Some(fallback),
+        }
+    };
+    Some(requested.unwrap_or(fallback))
 }
 
 fn emit_failure_receipt(
@@ -282,7 +304,7 @@ fn emit_failure_receipt(
     let (stage, status) = stage.unwrap_or(("unknown", "unknown"));
     let cwd = redact_identity(env::current_dir().is_ok());
     let exe = redact_identity(env::current_exe().is_ok());
-    let argv0 = redact_identity(env::args().next().is_some());
+    let argv0 = redact_identity(env::args_os().next().is_some());
     let argv_count = arguments.len();
     let argv = arguments
         .iter()
@@ -1535,6 +1557,9 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 question_seen = true;
             }
             "--timeout" => {
+                if options.timeout.is_some() {
+                    return Err(CliError::usage("--timeout cannot be used multiple times"));
+                }
                 options.timeout = Some(parse_timeout_seconds(&next_value(
                     arguments,
                     &mut index,
@@ -1542,6 +1567,9 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 )?)?);
             }
             value if value.starts_with("--timeout=") => {
+                if options.timeout.is_some() {
+                    return Err(CliError::usage("--timeout cannot be used multiple times"));
+                }
                 options.timeout = Some(parse_timeout_seconds(&value[10..])?);
                 index += 1;
             }

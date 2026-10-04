@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -1275,6 +1277,85 @@ fn automatic_failure_redacts_opaque_caller_values() {
         fields["argv"],
         "search,--ignore,[REDACTED],--language,[REDACTED],--timeout,8,[REDACTED],[REDACTED]"
     );
+}
+
+#[test]
+fn non_utf8_argument_fails_closed() {
+    let fixture = Fixture::new();
+    let argument = OsString::from_vec(b"--timeout=\xff".to_vec());
+    let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .current_dir(&fixture.root)
+        .arg("search")
+        .arg(argument)
+        .arg("missing_symbol")
+        .output()
+        .expect("non-utf8 argv");
+    let stderr = String::from_utf8(output.stderr.clone()).expect("static utf-8 stderr");
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(stderr.starts_with("pbi-rs: arguments must be UTF-8\n"));
+    assert!(stderr.contains("deadline_s=unknown"));
+    assert!(!stderr.contains('\u{fffd}'));
+    assert_eq!(stderr.lines().count(), 2, "{stderr}");
+}
+
+#[test]
+fn equals_timeout_receipt_uses_enforced_deadline() {
+    let fixture = Fixture::new();
+    let cases = [
+        (vec!["search", "--timeout=0", "missing_symbol"], "1", "0"),
+        (vec!["search", "--timeout", "0", "missing_symbol"], "1", "0"),
+        (
+            vec!["search", "--bm25", "--timeout=0", "missing_symbol"],
+            "1",
+            "0",
+        ),
+        (vec!["--timeout=0", "missing_symbol"], "1", "0"),
+        (vec!["--timeout", "0", "missing_symbol"], "1", "0"),
+        (
+            vec!["search", "--timeout=4", "--timeout", "0", "missing_symbol"],
+            "2",
+            "8",
+        ),
+        (
+            vec!["search", "--timeout", "0", "--timeout=4", "missing_symbol"],
+            "2",
+            "8",
+        ),
+        (
+            vec!["--timeout=0", "--timeout", "4", "missing_symbol"],
+            "2",
+            "90",
+        ),
+        (vec!["search", "--timeout=fast", "missing_symbol"], "2", "8"),
+        (vec!["--timeout=fast", "missing_symbol"], "2", "90"),
+    ];
+    for (args, code, deadline) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+            .env_clear()
+            .current_dir(&fixture.root)
+            .args(&args)
+            .output()
+            .expect("run timeout form");
+        let stderr = String::from_utf8(output.stderr).expect("utf-8");
+        assert_eq!(
+            output.status.code(),
+            Some(code.parse().unwrap()),
+            "{args:?} {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let receipt = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("pbi-failure "))
+            .unwrap_or_else(|| panic!("missing receipt for {args:?}: {stderr}"));
+        let fields: std::collections::HashMap<&str, &str> = receipt
+            .split(' ')
+            .filter_map(|part| part.split_once('='))
+            .collect();
+        assert_eq!(fields["deadline_s"], deadline, "{args:?} {stderr}");
+        assert!(!stderr.contains("fast"), "{args:?} {stderr}");
+    }
 }
 
 #[test]
