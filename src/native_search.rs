@@ -686,6 +686,32 @@ fn walk_owned(
                     .path()
                     .strip_prefix(&policy_root)
                     .map_err(|_| SearchFailure::Unavailable)?;
+                // Denial belongs to retained parents; an excluded leaf need not open.
+                let parent = relative.parent().ok_or(SearchFailure::Unavailable)?;
+                let (owner, mut parents) = open_source(
+                    policy_owner
+                        .try_clone()
+                        .map_err(|_| SearchFailure::Unavailable)?,
+                    parent,
+                    device,
+                    &policy_limits,
+                    true,
+                )?;
+                check_source_namespace(&policy_root, parent, &parents, &owner)?;
+                parents.push(owner.try_clone().map_err(|_| SearchFailure::Unavailable)?);
+                let inherited = policy_admitted(
+                    &policy_root,
+                    relative,
+                    &parents,
+                    device,
+                    &policy_limits,
+                    is_dir,
+                )?;
+                parents.pop();
+                check_source_namespace(&policy_root, parent, &parents, &owner)?;
+                if !inherited {
+                    return Ok(false);
+                }
                 let (file, directories) = open_source(
                     policy_owner
                         .try_clone()

@@ -164,6 +164,91 @@ fn policy_symlink_is_not_authority() {
         );
     }
 }
+fn unreadable_policy_entry(policy: &str, directory: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    fs::write(root.join("visible.rs"), "fn review_marker() {}\n").expect("visible");
+    let denied = root.join(if directory { "ignored" } else { "ignored.rs" });
+    if directory {
+        fs::create_dir(&denied).expect("directory");
+    } else {
+        fs::write(&denied, "fn private_marker() {}\n").expect("ignored source");
+    }
+    fs::write(
+        root.join(policy),
+        if directory {
+            "ignored/\n"
+        } else {
+            "ignored.rs\n"
+        },
+    )
+    .expect("policy");
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o0)).expect("unreadable");
+    let raw = RawSearchOptions {
+        exact: false,
+        exclude_filenames: false,
+        merge_threshold: 2,
+        strict: None,
+    };
+    let admitted = vec![
+        search_repository(&root, "review_marker", &limits()).is_ok_and(|hits| !hits.is_empty()),
+        search_raw_repository(&root, "review_marker", &limits(), &raw)
+            .is_ok_and(|hits| !hits.0.is_empty()),
+        candidate_symbols(&root, "visible_marker", &limits()).is_ok_and(|hits| !hits.is_empty()),
+        crate::extract::extract(&root, Path::new("visible.rs"), 1, &limits(), 4096)
+            .is_ok_and(|text| text.contains("review_marker")),
+    ];
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).expect("restore");
+    assert_eq!(
+        admitted,
+        vec![true; 4],
+        "excluded entry must not abort shared readers"
+    );
+}
+#[test]
+fn inherited_policy_precedence_and_unreadable_admission_stay_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    let source = root.join("dir/visible.rs");
+    fs::write(&source, "fn review_marker() {}\n").expect("source");
+    fs::write(root.join(".gitignore"), "*.rs\n").expect("root policy");
+    fs::write(root.join("dir/.gitignore"), "!visible.rs\n").expect("nearest policy");
+    assert!(!search_repository(&root, "review_marker", &limits())
+        .expect("nested negation")
+        .is_empty());
+    fs::write(root.join(".ignore"), "*.rs\n").expect("higher class");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o0)).expect("unreadable");
+    let denied = search_repository(&root, "review_marker", &limits());
+    fs::write(root.join("dir/.ignore"), "!visible.rs\n").expect("nearest higher class");
+    let admitted_unreadable = search_repository(&root, "review_marker", &limits());
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("restore");
+    assert!(denied.expect("excluded unreadable").is_empty());
+    assert!(matches!(
+        admitted_unreadable,
+        Err(SearchFailure::Unavailable)
+    ));
+    assert!(!search_repository(&root, "review_marker", &limits())
+        .expect("nearest negation")
+        .is_empty());
+}
+#[test]
+fn ignored_unreadable_gitignore_file_preserves_shared_readers() {
+    unreadable_policy_entry(".gitignore", false);
+}
+#[test]
+fn ignored_unreadable_gitignore_directory_preserves_shared_readers() {
+    unreadable_policy_entry(".gitignore", true);
+}
+#[test]
+fn ignored_unreadable_ignore_file_preserves_shared_readers() {
+    unreadable_policy_entry(".ignore", false);
+}
+#[test]
+fn ignored_unreadable_ignore_directory_preserves_shared_readers() {
+    unreadable_policy_entry(".ignore", true);
+}
 // The outer process owns a strict deadline and reaps the child even on RED.
 // Mutation is synchronous at the metadata/open seam; no race sleeps are used.
 #[test]
