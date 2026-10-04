@@ -17,16 +17,16 @@ test:
     ionice -c 3 cargo test --locked
 
 test-lib filter='':
-    ionice -c 3 cargo test --locked --lib {{filter}}
+    ionice -c 3 cargo test --locked --lib {{quote(filter)}}
 
 test-bin filter='':
-    ionice -c 3 cargo test --locked --bin pbi-rs {{filter}}
+    ionice -c 3 cargo test --locked --bin pbi-rs {{quote(filter)}}
 
 test-definition filter='':
-    ionice -c 3 cargo test --locked --lib definition_intent {{filter}}
+    ionice -c 3 cargo test --locked --lib -- {{quote('definition_intent_tests::' + filter)}}
 
 test-search-options filter='':
-    ionice -c 3 cargo test --locked --test search_options {{filter}}
+    ionice -c 3 cargo test --locked --test search_options {{quote(filter)}}
 
 test-relevance:
     ionice -c 3 cargo test --locked --test relevance

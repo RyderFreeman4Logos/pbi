@@ -1144,7 +1144,7 @@ fn caller_failure_receipt_is_automatic_and_bounded() {
     assert_eq!(fields["stage"], "initial_verify");
     assert_eq!(fields["stage_status"], "no_source");
     assert_eq!(fields["candidates"], "unknown");
-    assert_eq!(fields["ranges"], "unknown");
+    assert_eq!(fields["ranges"], "0");
     assert_eq!(fields["admission"], "unknown");
     assert_eq!(fields["deadline_s"], "8");
     assert!(fields["elapsed_ms"].chars().all(|c| c.is_ascii_digit()));
@@ -1265,7 +1265,7 @@ fn automatic_failure_redacts_opaque_caller_values() {
     assert_eq!(fields["stage"], "initial_verify");
     assert_eq!(fields["stage_status"], "no_source");
     assert_eq!(fields["candidates"], "unknown");
-    assert_eq!(fields["ranges"], "unknown");
+    assert_eq!(fields["ranges"], "0");
     assert_eq!(fields["admission"], "unknown");
     assert_eq!(fields["deadline_s"], "8");
     assert!(fields["elapsed_ms"].chars().all(|c| c.is_ascii_digit()));
@@ -1356,6 +1356,64 @@ fn equals_timeout_receipt_uses_enforced_deadline() {
         assert_eq!(fields["deadline_s"], deadline, "{args:?} {stderr}");
         assert!(!stderr.contains("fast"), "{args:?} {stderr}");
     }
+}
+
+#[test]
+fn zero_timeout_answer_stays_at_initial_search() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("decision.rs"),
+        "fn native_json_fallback_eligible() -> bool { false }\n",
+    )
+    .expect("source");
+    let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .env("PBI_RS_ADK_ENABLE", "0")
+        .current_dir(&fixture.root)
+        .args([
+            "--timeout=0",
+            "How does native_json_fallback_eligible decide whether to retry?",
+        ])
+        .output()
+        .expect("zero timeout question");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    let receipt_lines = stderr
+        .lines()
+        .filter(|line| line.starts_with("pbi-failure "))
+        .count();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "status={:?}",
+        output.status.code()
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stdout_bytes={}",
+        output.stdout.len()
+    );
+    let fields = failure_fields(&stderr);
+    assert_eq!(fields["stage"], "initial_search");
+    assert_eq!(fields["stage_status"], "deadline");
+    assert_eq!(fields["candidates"], "unknown");
+    assert_eq!(fields["ranges"], "unknown");
+    assert_eq!(fields["admission"], "unknown");
+    assert_eq!(fields["deadline_s"], "0");
+    assert_eq!(receipt_lines, 1, "receipt_lines={receipt_lines}");
+    assert!(
+        !stderr.contains("native_json_fallback_eligible"),
+        "stderr leaked the queried symbol"
+    );
+}
+
+fn failure_fields(stderr: &str) -> std::collections::HashMap<&str, &str> {
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("pbi-failure "))
+        .expect("receipt")
+        .split(' ')
+        .filter_map(|part| part.split_once('='))
+        .collect()
 }
 
 #[test]
