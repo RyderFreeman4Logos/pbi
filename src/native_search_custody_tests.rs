@@ -7,9 +7,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 thread_local! {
     static AFTER_METADATA: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static AFTER_POLICY: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 pub(super) fn after_metadata() {
     let hook = AFTER_METADATA.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+pub(super) fn after_policy_validation() {
+    let hook = AFTER_POLICY.with(|hook| hook.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -90,6 +97,52 @@ fn ancestor_symlink_substitution_is_denied_in_all_readers() {
     );
 }
 #[test]
+fn retained_root_and_current_policy_are_required() {
+    for replace_root in [false, true] {
+        let fixture = fixture();
+        let root = fixture.0.join("root");
+        fs::write(
+            root.join("dir/synthetic_candidate.rs"),
+            "fn ordinary() {}\n",
+        )
+        .expect("source");
+        let named = root.clone();
+        let held = fixture.0.join("held");
+        substitute(move || {
+            if replace_root {
+                fs::rename(&named, &held).expect("retain root");
+                fs::create_dir_all(named.join("dir")).expect("replacement root");
+                fs::write(
+                    named.join("dir/synthetic_candidate.rs"),
+                    "fn replacement() {}\n",
+                )
+                .expect("replacement");
+            } else {
+                fs::write(named.join("dir/.ignore"), "synthetic_candidate.rs\n")
+                    .expect("new denial");
+            }
+        });
+        assert!(candidate_symbols(&root, "synthetic_candidate", &limits()).is_err());
+    }
+}
+
+#[test]
+fn candidate_reread_keeps_the_two_mib_cap() {
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    let path = root.join("dir/synthetic_candidate.rs");
+    fs::write(&path, "fn ordinary() {}\n").expect("source");
+    substitute(move || {
+        let mut bytes = b"fn oversized() {}\n".to_vec();
+        bytes.resize(MAX_FILE_BYTES as usize + 1, b' ');
+        fs::write(&path, bytes).expect("growth");
+    });
+    assert!(candidate_symbols(&root, "synthetic_candidate", &limits())
+        .expect("bounded skip")
+        .is_empty());
+}
+
+#[test]
 fn policy_symlink_is_not_authority() {
     for policy in [".gitignore", ".ignore"] {
         let fixture = fixture();
@@ -118,6 +171,15 @@ fn fifo_substitution_and_policy_opens_are_bounded() {
     if let Ok(kind) = std::env::var("PBI_327_FIFO_CHILD") {
         let root = PathBuf::from(std::env::var_os("PBI_327_FIFO_ROOT").expect("root"));
         if kind == "policy" {
+            let policy = root.join(".gitignore");
+            AFTER_POLICY.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    fs::remove_file(&policy).expect("remove validated policy");
+                    let name = std::ffi::CString::new(policy.as_os_str().as_bytes()).expect("path");
+                    // SAFETY: owned synthetic NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }))
+            });
             assert!(walk(
                 &root,
                 fs::metadata(&root).expect("metadata").dev(),
@@ -151,10 +213,7 @@ fn fifo_substitution_and_policy_opens_are_bounded() {
         )
         .expect("source");
         if kind == "policy" {
-            let name =
-                std::ffi::CString::new(root.join(".ignore").as_os_str().as_bytes()).expect("path");
-            // SAFETY: NUL-terminated path in the owned harmless fixture.
-            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            fs::write(root.join(".gitignore"), "").expect("initial regular policy");
         }
         let mut child = Command::new(std::env::current_exe().expect("test executable"))
             .args([
@@ -179,6 +238,19 @@ fn fifo_substitution_and_policy_opens_are_bounded() {
             }
             std::thread::yield_now();
         };
+        use std::os::unix::fs::FileTypeExt;
+        let substituted = if kind == "policy" {
+            root.join(".gitignore")
+        } else {
+            root.join("dir/synthetic_candidate.rs")
+        };
+        assert!(
+            fs::symlink_metadata(substituted)
+                .expect("mutation witness")
+                .file_type()
+                .is_fifo(),
+            "the deterministic substitution must actually have executed"
+        );
         completed.push(success);
     }
     assert_eq!(

@@ -282,6 +282,8 @@ fn admitted_source(
     Ok(bytes)
 }
 
+/// Reject held source owners no longer named by the checked project path.
+/// Equality at these observations is not an atomic snapshot or ABA guarantee.
 pub(super) fn check_source_namespace(
     root: &Path,
     relative: &Path,
@@ -311,6 +313,8 @@ pub(super) fn check_source_namespace(
     Ok(())
 }
 
+/// Evaluate bounded .ignore/.gitignore bytes through the retained source owners.
+/// An empty relative path validates a directory's policies without matching a leaf.
 pub(super) fn policy_admitted(
     root: &Path,
     relative: &Path,
@@ -404,6 +408,8 @@ fn open_at(parent: &File, name: &std::ffi::OsStr, directory: bool) -> std::io::R
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// Open a validated project-relative path component by component, without links
+/// or blocking nonregular opens, retaining every directory that owns the leaf.
 pub(super) fn open_source(
     mut parent: File,
     relative: &Path,

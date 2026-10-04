@@ -596,6 +596,8 @@ fn walk_owned(
         limits,
         true,
     )?;
+    #[cfg(test)]
+    issue_327_tests::after_policy_validation();
     let mut root_targets = 0usize;
     // Linux-only: enumerate the retained root, not a substituted named root.
     for entry in fs::read_dir(format!("/proc/self/fd/{}", root_file.as_raw_fd()))

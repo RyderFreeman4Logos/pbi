@@ -12,6 +12,12 @@ Bare positional questions and `--message` synthesize answers from verified sourc
 
 Paths are relative to the current project root, or absolute inside that root. Parent traversal, ignored/hidden files, symlink components, non-regular files, other devices, files over 2 MiB, invalid positions and expired deadlines are refused without echoing private input. Extraction shares search's bounded ignore-aware walk and 16-root-target ceiling. No model, Probe, shell search, new dependency, or repository write is involved.
 
+## Source custody (Linux)
+
+Verified search, raw BM25, semantic candidate parsing and extraction use the existing descriptor-relative no-follow/nonblocking opens and 2 MiB bounded regular-file reader. Each operation retains its initially opened project-root directory. Source ancestors, source and `.gitignore`/`.ignore` bytes are opened through retained directory owners on that device; policy admission is checked before and after source consumption. The walk supplies candidates and budgets, not authority, and does not independently reopen ignore-policy pathnames. Hidden components remain unconditionally excluded, even when whitelisted.
+
+Named root/ancestor/leaf equality rejects detached owners at the checks. It is not an ABA proof or an atomic filesystem snapshot: authorized files and policies may change in place, and a regular replacement inside the retained root is evaluated under its own retained owners' policies. No historical walk admission alone authorizes a read. Symlink/FIFO substitution or unsafe policy custody fails closed without source output; ordinary visible whitelist and ignore precedence remain supported.
+
 ## Local commands
 
 `--debug-config` reports `search_default=native_bounded_bm25_compact_no_probe`. Probe overrides are ignored and never printed; credential values are redacted.
