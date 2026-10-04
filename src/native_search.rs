@@ -150,6 +150,67 @@ pub fn search_repository(
     Ok(output)
 }
 
+/// Case-sensitive, single-line regex locations from the same retained source
+/// descriptors as token search. No filenames, snippets, stemming, or model.
+pub fn search_regex_repository(
+    root: &Path,
+    regex: &regex::Regex,
+    limits: &SearchLimits,
+) -> Result<Vec<RawHit>, SearchFailure> {
+    let root_file = open_root(root)?;
+    let root_meta = root_file
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let mut files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    files.sort();
+    let mut hits = Vec::new();
+    for path in files {
+        if Instant::now() >= limits.deadline {
+            return Err(SearchFailure::Deadline);
+        }
+        if !language_matches(&path, limits.language.as_deref()) {
+            continue;
+        }
+        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+            continue;
+        };
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Some(relative) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        // Compact output cannot safely represent control-bearing pathnames.
+        if relative.chars().any(char::is_control) {
+            continue;
+        }
+        for (index, line) in source.lines().enumerate() {
+            if Instant::now() >= limits.deadline {
+                return Err(SearchFailure::Deadline);
+            }
+            let matched = regex.is_match(line);
+            if Instant::now() >= limits.deadline {
+                return Err(SearchFailure::Deadline);
+            }
+            if matched {
+                if hits.len() >= MAX_RAW_BLOCKS {
+                    return Err(SearchFailure::Limit);
+                }
+                hits.push(RawHit {
+                    file: relative.to_owned(),
+                    line: Some(index + 1),
+                    end_line: Some(index + 1),
+                    snippet: String::new(),
+                    score: 1.0,
+                    occurrences: 1,
+                    declaration: false,
+                });
+            }
+        }
+    }
+    Ok(hits)
+}
+
 /// Rank bounded repository files with BM25, retaining separate source blocks.
 /// The caller applies its page limit after block merging and optional dedup.
 pub fn search_raw_repository(

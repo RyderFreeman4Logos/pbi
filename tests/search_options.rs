@@ -44,6 +44,190 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn bounded_regex_returns_original_source_lines_without_snippets() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("类型.rs"),
+        "// synthetic\nfn café() {}\nfn café() {}\n",
+    )
+    .expect("synthetic Unicode source");
+    let output = fixture.run(
+        &["search", "--regex", r"^fn café\(", "--timeout=2"],
+        "regex",
+    );
+    assert!(output.status.success(), "regex search must succeed");
+    assert_eq!(compact_locations(&output), ["类型.rs:2", "类型.rs:3"]);
+    assert!(output.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fn café"));
+}
+
+#[test]
+fn bounded_regex_private_usage_errors_and_flag_contract() {
+    let fixture = Fixture::new();
+    let oversized = "é".repeat(4097);
+    let deep = format!("{}a{}", "(".repeat(65), ")".repeat(65));
+    for pattern in [
+        "[synthetic_private\n\r\t\u{1b}",
+        r"(?=synthetic_private)",
+        r"[a-z]{1000000}",
+        &oversized,
+        &deep,
+    ] {
+        let output = fixture.run(&["search", "--regex", pattern], "regex");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "invalid regex must be usage error"
+        );
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(pattern),
+            "rejected pattern must remain private"
+        );
+        assert!(!stderr.contains("synthetic_private"));
+        assert!(!stderr.chars().any(|ch| ch.is_control() && ch != '\n'));
+    }
+    for flag in [
+        "--exact",
+        "--stem",
+        "--strict-elastic-syntax",
+        "--session=synthetic",
+        "--bm25",
+        "--files-only",
+        "--frequency",
+        "--exclude-filenames",
+        "--regex",
+    ] {
+        let output = fixture.run(&["search", "--regex", flag, "synthetic"], "regex");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "incompatible flag must be refused"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn bounded_regex_no_hit_and_nested_quantifiers_finish_under_deadline() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("adversarial.txt"),
+        format!("{}!\n", "a".repeat(128 * 1024)),
+    )
+    .expect("synthetic adversarial source");
+    let started = Instant::now();
+    let output = fixture.run(&["search", "--regex", "^(a+)+$", "--timeout=2"], "regex");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "bounded engine must finish under deadline"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("pbi: no source locations found\n"));
+    let zero = fixture.run(&["search", "--regex", "a", "--timeout=0"], "regex");
+    assert_eq!(zero.status.code(), Some(1));
+    assert!(zero.stdout.is_empty());
+    assert_eq!(
+        failure_fields(std::str::from_utf8(&zero.stderr).expect("static failure"))["stage_status"],
+        "deadline"
+    );
+}
+
+#[test]
+fn bounded_regex_preserves_admission_and_actual_utf8_lines() {
+    let fixture = ScopeFixture::new();
+    fs::create_dir(fixture.root.join("src")).expect("synthetic source directory");
+    for name in [
+        "src/kept.rs",
+        "src/ignored.rs",
+        "src/policy.rs",
+        ".env",
+        ".hidden.rs",
+        "src/control\n.rs",
+    ] {
+        fs::write(fixture.root.join(name), "// synthetic\nfn café() {}\n")
+            .expect("synthetic source");
+    }
+    fs::write(fixture.root.join(".gitignore"), "src/policy.rs\n!.*\n")
+        .expect("synthetic ignore policy");
+    fs::write(fixture.base.join("outside.rs"), "fn café() {}\n").expect("synthetic outside");
+    symlink(
+        fixture.base.join("outside.rs"),
+        fixture.root.join("linked.rs"),
+    )
+    .expect("source symlink");
+    symlink("/proc", fixture.root.join("foreign")).expect("cross-device link");
+    fs::write(
+        fixture.root.join("src/large.rs"),
+        "a".repeat(2 * 1024 * 1024 + 1),
+    )
+    .expect("oversized source");
+    let output = fixture.run_args(
+        "regex",
+        &[
+            "search",
+            "--regex",
+            r"^fn café\(",
+            "--language=rust",
+            "--ignore=src/ignored.rs",
+        ],
+    );
+    assert!(output.status.success(), "admitted regex match must succeed");
+    assert_eq!(compact_locations(&output), ["src/kept.rs:2"]);
+    let missed = fixture.run_args("regex", &["search", "--regex", "linked|kept|large"]);
+    assert_eq!(
+        missed.status.code(),
+        Some(1),
+        "filename-only regex must not invent locations"
+    );
+}
+
+#[test]
+fn bounded_regex_candidate_root_result_and_output_caps() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("many.txt"), "synthetic\n".repeat(4097))
+        .expect("candidate overflow");
+    let overflow = fixture.run(&["search", "--regex", "synthetic"], "regex");
+    assert_eq!(overflow.status.code(), Some(1));
+    assert!(overflow.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&overflow.stderr).contains("bounded limit"));
+    fs::write(fixture.root.join("many.txt"), "synthetic\n".repeat(4)).expect("small candidate set");
+    let capped = fixture.run(
+        &["search", "--regex", "synthetic", "--max-results=2"],
+        "regex",
+    );
+    assert!(capped.status.success());
+    assert_eq!(compact_locations(&capped), ["many.txt:1", "many.txt:2"]);
+    for index in 0..16 {
+        fs::write(
+            fixture.root.join(format!("root-{index}.txt")),
+            "synthetic\n",
+        )
+        .expect("root target overflow");
+    }
+    let overflow = fixture.run(&["search", "--regex", "synthetic"], "regex");
+    assert_eq!(overflow.status.code(), Some(1));
+    assert!(overflow.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&overflow.stderr).contains("bounded target limit"));
+
+    let fixture = Fixture::new();
+    let name = format!("{}.txt", "n".repeat(240));
+    fs::write(fixture.root.join(name), "synthetic\n".repeat(4096)).expect("output overflow");
+    let bounded = fixture.run(
+        &["search", "--regex", "synthetic", "--max-results=4096"],
+        "regex",
+    );
+    assert!(
+        bounded.status.success(),
+        "output truncation must retain nonempty bounded result"
+    );
+    assert!(!bounded.stdout.is_empty() && bounded.stdout.len() <= 64 * 1024);
+    assert!(String::from_utf8_lossy(&bounded.stderr).contains("truncated"));
+}
+
 const SCOPE_QUERY: &str = "compression publication cache assembly";
 
 fn compact_locations(output: &Output) -> Vec<String> {
