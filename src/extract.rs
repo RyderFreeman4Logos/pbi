@@ -217,6 +217,18 @@ fn line_symbols(
     language: &str,
     limits: &SearchLimits,
 ) -> Result<(Vec<Symbol>, bool), SearchFailure> {
+    let normalized;
+    let source = if language == "py" {
+        // Python accepts one source BOM and universal physical newlines.
+        normalized = source
+            .strip_prefix('\u{feff}')
+            .unwrap_or(source)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        normalized.as_str()
+    } else {
+        source
+    };
     let mut symbols = Vec::new();
     let mut truncated = false;
     for (index, line) in source.lines().enumerate() {

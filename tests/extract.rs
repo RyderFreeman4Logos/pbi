@@ -442,6 +442,67 @@ fn symbols_go_functions_and_types_have_lines() {
 }
 
 #[test]
+fn symbols_python_source_prefix_preserves_first_and_second_lines() {
+    let fixture = Fixture::new("placeholder");
+    for (source, expected) in [
+        ("\u{feff}def first(): pass\n", "1: def first\n"),
+        ("\u{feff}class Owner: pass\n", "1: class Owner\n"),
+        (
+            "\u{feff}def first(): pass\ndef second(): pass\n",
+            "1: def first\n2: def second\n",
+        ),
+        (
+            "\u{feff}\u{feff}def rejected(): pass\n\u{feff}class Rejected: pass\ndef last(): pass\n",
+            "3: def last\n",
+        ),
+        (" \u{feff}def rejected(): pass\n", ""),
+    ] {
+        fs::write(fixture.0.join("fixture.py"), source).expect("source");
+        let result = fixture.run(&["symbols", "fixture.py"]);
+        assert!(result.status.success(), "Python symbols must succeed");
+        assert!(result.stderr.is_empty(), "no stderr");
+        assert!(
+            result.stdout == expected.as_bytes(),
+            "only one source-leading BOM may be stripped; retain exact declaration lines"
+        );
+    }
+}
+
+#[test]
+fn symbols_python_source_bare_cr_preserves_physical_lines() {
+    let fixture = Fixture::new("placeholder");
+    fs::write(
+        fixture.0.join("fixture.py"),
+        "def first(): pass\rclass Owner:\r    pass\rdef last(): pass\r",
+    )
+    .expect("source");
+    let result = fixture.run(&["symbols", "fixture.py"]);
+    assert!(result.status.success(), "Python symbols must succeed");
+    assert!(result.stderr.is_empty(), "no stderr");
+    assert!(
+        result.stdout == b"1: def first\n2: class Owner\n4: def last\n",
+        "bare CR must separate physical Python lines"
+    );
+}
+
+#[test]
+fn symbols_python_source_mixed_newlines_do_not_double_crlf() {
+    let fixture = Fixture::new("placeholder");
+    fs::write(
+        fixture.0.join("fixture.py"),
+        "\u{feff}\ndef first(): pass\r\n\rclass Owner: pass\n\r\nasync def last(): pass\r",
+    )
+    .expect("source");
+    let result = fixture.run(&["symbols", "fixture.py"]);
+    assert!(result.status.success(), "Python symbols must succeed");
+    assert!(result.stderr.is_empty(), "no stderr");
+    assert!(
+        result.stdout == b"2: def first\n4: class Owner\n6: def last\n",
+        "LF, bare CR, blank lines and CRLF must each preserve physical numbering"
+    );
+}
+
+#[test]
 fn symbols_python_identifier_preserves_combining_mark() {
     let fixture = Fixture::new("placeholder");
     fs::write(fixture.0.join("fixture.py"), "def cafe\u{301}(): pass\n").expect("source");
