@@ -108,7 +108,7 @@ struct StageTrace {
     previous: Cell<Instant>,
     deadline: Instant,
     rows: Cell<usize>,
-    last: Cell<Option<(&'static str, &'static str)>>,
+    last: Cell<Option<(&'static str, &'static str, &'static str)>>,
 }
 
 impl StageTrace {
@@ -124,13 +124,39 @@ impl StageTrace {
         }
     }
 
-    fn observed(&self) -> Option<(&'static str, &'static str)> {
+    fn observed(&self) -> Option<(&'static str, &'static str, &'static str)> {
         self.last.get()
     }
 
     fn point(&self, stage: TraceStage, status: TraceStatus, count: usize) {
         if !matches!(stage, TraceStage::Terminal) || self.last.get().is_none() {
-            self.last.set(Some((stage.label(), status.label())));
+            let field = match stage {
+                TraceStage::Candidates => "candidates",
+                TraceStage::InitialVerify
+                | TraceStage::RevisedVerify
+                | TraceStage::Anchor
+                | TraceStage::Follow => "ranges",
+                TraceStage::Answer => "admission",
+                _ => "",
+            };
+            let recorded = if matches!(status, TraceStatus::Start) || field.is_empty() {
+                "unknown"
+            } else {
+                match count {
+                    0 => "0",
+                    1 => "1",
+                    2 => "2",
+                    3 => "3",
+                    4 => "4",
+                    5 => "5",
+                    6 => "6",
+                    7 => "7",
+                    8 => "8",
+                    _ => "9+",
+                }
+            };
+            self.last
+                .set(Some((stage.label(), status.label(), recorded)));
         }
         if !self.enabled || self.rows.get() >= MAX_STAGE_ROWS {
             return;
@@ -236,7 +262,7 @@ fn usage() {
 fn main() {
     let Some(arguments) = utf8_arguments() else {
         eprintln!("pbi-rs: arguments must be UTF-8");
-        emit_failure_receipt(&[], 2, None, Instant::now(), None);
+        emit_failure_receipt(&[], 2, None, None, Instant::now(), None);
         std::process::exit(2);
     };
     let started = Instant::now();
@@ -253,7 +279,14 @@ fn main() {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{}: {}", error.prefix, safe_failure_text(&error.message));
-            emit_failure_receipt(&arguments, error.code, trace.observed(), started, deadline);
+            emit_failure_receipt(
+                &arguments,
+                error.code,
+                trace.observed().map(|(stage, status, _)| (stage, status)),
+                trace.observed().map(|(_, _, count)| count),
+                started,
+                deadline,
+            );
             error.code
         }
     };
@@ -298,10 +331,18 @@ fn emit_failure_receipt(
     arguments: &[String],
     code: i32,
     stage: Option<(&'static str, &'static str)>,
+    observed_count: Option<&'static str>,
     started: Instant,
     deadline: Option<u64>,
 ) {
     let (stage, status) = stage.unwrap_or(("unknown", "unknown"));
+    let count = observed_count.unwrap_or("unknown");
+    let (candidates, ranges, admission) = match stage {
+        "candidates" => (count, "unknown", "unknown"),
+        "initial_verify" | "revised_verify" | "anchor" | "follow" => ("unknown", count, "unknown"),
+        "answer" => ("unknown", "unknown", count),
+        _ => ("unknown", "unknown", "unknown"),
+    };
     let cwd = redact_identity(env::current_dir().is_ok());
     let exe = redact_identity(env::current_exe().is_ok());
     let argv0 = redact_identity(env::args_os().next().is_some());
@@ -315,7 +356,7 @@ fn emit_failure_receipt(
         .map(|seconds| seconds.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     eprintln!(
-        "pbi-failure rc={code} stage={stage} stage_status={status} candidates=unknown ranges=unknown admission=unknown deadline_s={deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
+        "pbi-failure rc={code} stage={stage} stage_status={status} candidates={candidates} ranges={ranges} admission={admission} deadline_s={deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
         started.elapsed().as_millis()
     );
 }
