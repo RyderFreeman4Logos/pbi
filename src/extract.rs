@@ -259,7 +259,7 @@ fn python_symbol(line: &str) -> Option<(&'static str, &str)> {
         "class" => "class",
         _ => return None,
     };
-    identifier(rest.trim_start()).map(|name| (kind, name))
+    python_identifier(rest.trim_start()).map(|name| (kind, name))
 }
 
 fn go_symbol(line: &str) -> Option<(&'static str, &str)> {
@@ -282,10 +282,23 @@ fn go_symbol(line: &str) -> Option<(&'static str, &str)> {
 
 fn keyword_rest<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = line.strip_prefix(keyword)?;
-    rest.chars()
-        .next()
-        .filter(|character| character.is_whitespace())?;
+    rest.chars().next().filter(|character| {
+        character.is_whitespace() || (keyword == "func" && *character == '(')
+    })?;
     Some(rest.trim_start())
+}
+
+fn python_identifier(text: &str) -> Option<&str> {
+    let end = text
+        .char_indices()
+        .find(|(_, character)| {
+            character.is_ascii() && *character != '_' && !character.is_ascii_alphanumeric()
+        })
+        .map_or(text.len(), |(index, _)| index);
+    let identifier = text.get(..end)?.trim_end();
+    syn::parse::Parser::parse_str(<syn::Ident as syn::ext::IdentExt>::parse_any, identifier)
+        .ok()?;
+    Some(identifier)
 }
 
 fn identifier(text: &str) -> Option<&str> {

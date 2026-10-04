@@ -442,6 +442,41 @@ fn symbols_go_functions_and_types_have_lines() {
 }
 
 #[test]
+fn symbols_python_identifier_preserves_combining_mark() {
+    let fixture = Fixture::new("placeholder");
+    fs::write(fixture.0.join("fixture.py"), "def cafe\u{301}(): pass\n").expect("source");
+    let result = fixture.run(&["symbols", "fixture.py"]);
+    assert!(
+        result.status.success(),
+        "Python symbols command must succeed"
+    );
+    assert!(result.stderr.is_empty(), "no stderr");
+    let actual = String::from_utf8(result.stdout).expect("UTF-8");
+    assert!(
+        actual == "1: def cafe\u{301}\n",
+        "Python scanner must preserve the full Unicode identifier"
+    );
+}
+
+#[test]
+fn symbols_go_compact_receiver_and_prefix_boundary() {
+    let fixture = Fixture::new("placeholder");
+    fs::write(
+        fixture.0.join("fixture.go"),
+        "package fixture\ntype Owner struct{}\nfunc(o *Owner) Method() {}\nfunc (o *Owner) Spaced() {}\nfuncion() {}\n",
+    )
+    .expect("source");
+    let result = fixture.run(&["symbols", "fixture.go"]);
+    assert!(result.status.success(), "Go symbols command must succeed");
+    assert!(result.stderr.is_empty(), "no stderr");
+    let actual = String::from_utf8(result.stdout).expect("UTF-8");
+    assert!(
+        actual == "2: type Owner\n3: func Method\n4: func Spaced\n",
+        "Go scanner must accept compact receiver syntax and reject keyword prefixes"
+    );
+}
+
+#[test]
 fn symbols_missing_non_utf8_ignored_hidden_links_and_fifo_fail_closed() {
     let fixture = Fixture::new("fn allowed() {}\n");
     for path in ["missing.rs", "binary.rs"] {
