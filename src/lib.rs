@@ -15,6 +15,23 @@ const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVIDENCE_LINES: usize = 4;
 const MAX_FOLLOWING_LINES: usize = 8;
 
+/// Ranking hints for exact Rust declaration names, never citation admission.
+/// Strings, comments, and calls are not declarations; test declarations remain.
+pub fn matching_rust_declaration_lines(source: &str, terms: &[String]) -> Vec<usize> {
+    if source.len() as u64 > MAX_SOURCE_BYTES {
+        return Vec::new();
+    }
+    declaration_identity::declarations(source)
+        .into_iter()
+        .filter(|declaration| {
+            terms
+                .iter()
+                .any(|term| declaration.name.to_lowercase() == *term)
+        })
+        .map(|declaration| declaration.line)
+        .collect()
+}
+
 #[cfg(test)]
 std::thread_local! {
     static WINDOW_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

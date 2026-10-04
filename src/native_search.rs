@@ -4,7 +4,8 @@
 //! `File:` ranges so the existing verifier remains the citation boundary.
 //!
 //! Verified locations use one lexical pass; raw results rank with BM25 over
-//! the same bounded walk. Neither path creates an index or a model request.
+//! the same bounded walk, with exact Rust declarations before lexical mentions.
+//! Neither path creates an index or a model request.
 
 use crate::strict_query::StrictQuery;
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
@@ -54,6 +55,7 @@ pub struct RawHit {
     pub snippet: String,
     pub score: f64,
     pub occurrences: usize,
+    declaration: bool,
 }
 
 /// Raw search shares the walk and file limits with verified search.
@@ -72,6 +74,7 @@ struct RawCandidate {
     term_counts: Vec<usize>,
     length: usize,
     occurrences: usize,
+    declaration: bool,
 }
 
 struct Hit {
@@ -256,6 +259,11 @@ pub fn search_raw_repository(
         if blocks.is_empty() {
             blocks.push((0, 0));
         }
+        let declarations = if path.extension().is_some_and(|extension| extension == "rs") {
+            pbi_rs::matching_rust_declaration_lines(source, &terms)
+        } else {
+            Vec::new()
+        };
         for (start, end) in blocks {
             if candidates.len() >= MAX_RAW_BLOCKS {
                 return Err(SearchFailure::Limit);
@@ -277,6 +285,7 @@ pub fn search_raw_repository(
                 occurrences: counts.iter().sum(),
                 term_counts: counts.clone(),
                 length,
+                declaration: declarations.iter().any(|line| (start..=end).contains(line)),
             });
         }
     }
@@ -309,13 +318,15 @@ pub fn search_raw_repository(
                 snippet: candidate.snippet,
                 score,
                 occurrences: candidate.occurrences,
+                declaration: candidate.declaration,
             }
         })
         .collect::<Vec<_>>();
     hits.sort_by(|left, right| {
         right
-            .score
-            .total_cmp(&left.score)
+            .declaration
+            .cmp(&left.declaration)
+            .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.file.cmp(&right.file))
             .then_with(|| left.line.cmp(&right.line))
     });
