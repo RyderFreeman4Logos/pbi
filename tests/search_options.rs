@@ -146,25 +146,26 @@ fn raw_symbol_definitions_outrank_fixture_strings_without_excluding_tests() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "production declaration search failed"
     );
     assert!(
         stdout.contains("File: src/lib.rs, Lines: 1-6\n"),
-        "{stdout}"
+        "production declaration missing from results"
     );
     for query in [
         "positional_question_dispatches_through_adk_and_checks_citations",
         "bounded_output_with_stdout",
     ] {
         let output = fixture.run(&["search", "--bm25", query], "raw");
-        assert!(output.status.success(), "{query}");
+        assert!(
+            output.status.success(),
+            "explicit test-symbol raw search failed"
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains("File: tests/contracts.rs"));
         let output = fixture.run(&["search", query], "verified");
         assert!(
             output.status.success(),
-            "{query}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "explicit test-symbol verified search failed"
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("tests/contracts.rs:"));
     }
@@ -194,11 +195,7 @@ fn raw_unicode_declarations_keep_priority_under_result_cap() {
             args.push(if strict { &strict_query } else { &query });
             let output = fixture.run(&args, "raw");
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "Unicode CLI status: {:?}",
-                output.status.code()
-            );
+            assert!(output.status.success(), "Unicode CLI search failed");
             assert!(
                 stdout.starts_with("File: z_decl.rs, Lines: 1-2\n"),
                 "Unicode declaration must be first under cap"
@@ -214,7 +211,7 @@ fn raw_unicode_declarations_keep_priority_under_result_cap() {
         assert_eq!(
             pbi_rs::matching_rust_declaration_lines(&source, &[name.to_lowercase()]),
             vec![1],
-            "{name}"
+            "normalized Unicode declaration identity"
         );
         for term in ["i", "écl", "clair", "δέλ", "类", "éclair_extra"] {
             assert!(pbi_rs::matching_rust_declaration_lines(&source, &[term.into()]).is_empty());
