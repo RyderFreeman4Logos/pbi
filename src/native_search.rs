@@ -12,6 +12,7 @@ use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -569,6 +570,9 @@ pub(super) fn walk(
             if entry.depth() == 0 {
                 return true;
             }
+            if entry.file_name().as_bytes().starts_with(b".") {
+                return false;
+            }
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
             if entry
                 .file_name()
@@ -696,5 +700,88 @@ fn language_matches(path: &Path, language: Option<&str>) -> bool {
         "rust" | "rs" => extension == "rs",
         "python" | "py" => extension == "py",
         other => extension.eq_ignore_ascii_case(other),
+    }
+}
+
+#[cfg(test)]
+mod issue_326_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const HIDDEN_MARKER: &str = "synthetic_issue326_hidden_marker";
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (Fixture, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let base = PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp")
+            .join(format!("pbi-rs-issue326-{}-{nonce}", std::process::id()));
+        let root = base.join(".repo");
+        fs::create_dir_all(root.join(".private")).expect("synthetic hidden fixture");
+        fs::write(
+            root.join(".gitignore"),
+            "*.rs\n!.*\n!.private/**\n!visible_candidate.rs\n",
+        )
+        .expect("synthetic whitelist");
+        fs::write(root.join(".env"), HIDDEN_MARKER).expect("synthetic env fixture");
+        for name in [
+            std::ffi::OsStr::new(".类型.rs"),
+            std::ffi::OsStr::from_bytes(b".\xff.rs"),
+        ] {
+            fs::write(root.join(name), HIDDEN_MARKER).expect("synthetic hidden byte names");
+        }
+        fs::write(
+            root.join(".private/issue326_hidden_candidate.rs"),
+            "fn issue326_hidden_candidate() {}\n",
+        )
+        .expect("synthetic hidden candidate");
+        fs::write(
+            root.join("visible_candidate.rs"),
+            "fn issue326_hidden_candidate() {}\n",
+        )
+        .expect("ordinary candidate");
+        (Fixture(base), root)
+    }
+
+    fn limits() -> SearchLimits {
+        SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(10),
+            max_results: 16,
+            language: None,
+            ignores: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verified_search_denies_whitelisted_hidden_components() {
+        let (_fixture, root) = fixture();
+        let files = walk(
+            &root,
+            fs::metadata(&root).expect("root metadata").dev(),
+            &limits(),
+        )
+        .expect("shared admission");
+        assert!(files.len() == 1 && files[0] == root.join("visible_candidate.rs"));
+        let results = search_repository(&root, HIDDEN_MARKER, &limits()).expect("verified search");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn semantic_candidates_deny_whitelisted_hidden_components() {
+        let (_fixture, root) = fixture();
+        let candidates = candidate_symbols(&root, "where is issue326_hidden_candidate?", &limits())
+            .expect("semantic candidate ingestion");
+        assert!(candidates.len() == 1 && candidates[0].0 == "visible_candidate.rs");
     }
 }
