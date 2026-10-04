@@ -190,7 +190,7 @@ fn english_stemming_is_opt_in_and_preserves_queries() {
             assert!(result.status.success(), "stopword search failed");
             assert!(
                 String::from_utf8_lossy(&result.stdout).contains("d.rs"),
-                "{stopword}"
+                "stopword hit missing"
             );
         }
 
@@ -202,7 +202,7 @@ fn english_stemming_is_opt_in_and_preserves_queries() {
             );
             assert!(
                 String::from_utf8_lossy(&result.stdout).contains("a.rs"),
-                "{query}"
+                "expression hit missing"
             );
         }
         let reversed = search("\"alpha running\"", true, raw);
