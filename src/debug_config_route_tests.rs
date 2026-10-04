@@ -102,7 +102,7 @@ fn debug_probe_overrides_are_redacted_without_field_injection() {
     let _env = route_env(&dir, &[("PBI_RS_PROBE", None)]);
     let baseline = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
     assert!(!baseline.contains("probe_binary="));
-    assert!(baseline.contains("search_default=native_bounded_term_frequency_no_probe\n"));
+    assert!(baseline.contains("search_default=native_bounded_bm25_compact_no_probe\n"));
     assert_selected(&baseline, LOCAL, NONE);
     for value in [
         "/public/probe\nprimary_model=public-injected-model\napi_key=public-canary-key",
@@ -249,7 +249,7 @@ fn inherited_controls_and_default_path_stay_unchanged() {
     let _env = route_env(&dir, &[]);
     let stdout = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
     assert_selected(&stdout, LOCAL, NONE);
-    assert!(stdout.contains("search_default=native_bounded_term_frequency_no_probe\n"));
+    assert!(stdout.contains("search_default=native_bounded_bm25_compact_no_probe\n"));
     assert!(stdout.contains("search_bm25_opt_in=native_bounded_raw_no_model\n"));
     assert!(stdout.contains(&format!(
         "search_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\n"

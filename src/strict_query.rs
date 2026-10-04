@@ -1,5 +1,5 @@
 //! The historical strict flag validates explicit Elastic style expressions.
-//! The native raw path evaluates the admitted Boolean form over bounded files.
+//! Both native search modes evaluate the admitted Boolean form over bounded files.
 
 #[derive(Clone)]
 enum Expr {
@@ -45,11 +45,22 @@ impl StrictQuery {
                 "strict query requires explicit AND/OR operators or a quoted phrase".into(),
             );
         }
-        let tokens = tokenize(query)?;
-        let mut parser = Parser {
-            tokens: &tokens,
-            at: 0,
-        };
+        let tokens = tokenize(query, true)?;
+        Self::from_tokens(&tokens)
+    }
+
+    /// Ordinary keyword bags keep their existing admission. Reserved Boolean
+    /// tokens, groups, and quotes opt into the same expression evaluator.
+    pub fn for_search(query: &str) -> Result<Option<Self>, String> {
+        let tokens = tokenize(query, false)?;
+        if tokens.iter().all(|token| matches!(token, Token::Word(_))) {
+            return Ok(None);
+        }
+        Self::from_tokens(&tokens).map(Some)
+    }
+
+    fn from_tokens(tokens: &[Token]) -> Result<Self, String> {
+        let mut parser = Parser { tokens, at: 0 };
         let expr = parser.or_expr()?;
         if parser.at != tokens.len() {
             return Err("strict query has trailing syntax".into());
@@ -74,7 +85,7 @@ impl StrictQuery {
     }
 }
 
-fn tokenize(query: &str) -> Result<Vec<Token>, String> {
+fn tokenize(query: &str, strict: bool) -> Result<Vec<Token>, String> {
     let mut chars = query.chars().peekable();
     let mut tokens = Vec::new();
     while let Some(ch) = chars.next() {
@@ -115,7 +126,7 @@ fn tokenize(query: &str) -> Result<Vec<Token>, String> {
                     _ => {
                         let mixed_case = word.chars().any(char::is_uppercase)
                             && word.chars().any(char::is_lowercase);
-                        if word.contains('_') || (word.len() > 1 && mixed_case) {
+                        if strict && (word.contains('_') || (word.len() > 1 && mixed_case)) {
                             return Err("strict query requires quotes around terms with underscores or mixed case".into());
                         }
                         Token::Word(word.to_lowercase())

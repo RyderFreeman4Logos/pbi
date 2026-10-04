@@ -30,6 +30,7 @@ impl Fixture {
     fn run(&self, args: &[&str], _mode: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
             .env_clear()
+            .env("PBI_RS_ADK_ENABLE", "0")
             .current_dir(&self.root)
             .args(args)
             .output()
@@ -45,8 +46,138 @@ impl Drop for Fixture {
 
 const SCOPE_QUERY: &str = "compression publication cache assembly";
 
+fn compact_locations(output: &Output) -> Vec<String> {
+    let stdout = String::from_utf8(output.stdout.clone()).expect("UTF-8 compact output");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len() % 2, 0, "paired locations and scores");
+    lines
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            assert!(pair[1]
+                .strip_prefix("Score: ")
+                .and_then(|score| score.parse::<f64>().ok())
+                .is_some());
+            pair[0].to_owned()
+        })
+        .collect()
+}
+
 #[test]
-fn search_single_registered_c_method_name_uses_executable_registration() {
+fn unified_search_bm25_numeric_ranking() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("fixture.rs")).expect("remove seed");
+    for (name, text) in [
+        ("high.txt", "foo foo foo foo\n"),
+        ("one.txt", "foo\n"),
+        (
+            "long.txt",
+            "foo noise noise noise noise noise noise noise noise noise\n",
+        ),
+    ] {
+        fs::write(fixture.root.join(name), text).expect("rank fixture");
+    }
+    let default = fixture.run(&["search", "foo"], "default");
+    let bm25 = fixture.run(&["search", "--bm25", "foo"], "bm25");
+    assert!(default.status.success());
+    assert!(bm25.status.success());
+    let scores = |output: &Output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("Score: ")
+                    .map(|value| value.parse::<f64>().expect("numeric score"))
+            })
+            .collect::<Vec<_>>()
+    };
+    let actual = scores(&default);
+    assert_eq!(actual.len(), 3, "default must print BM25 scores");
+    assert_eq!(actual, scores(&bm25));
+    // Filename tokens are included by the existing ranker: lengths 6, 3, 12.
+    let average = 7.0;
+    let idf = (1.0_f64 + 0.5 / 3.5).ln();
+    let mut expected = [(4.0, 6.0), (1.0, 3.0), (1.0, 12.0)]
+        .map(|(tf, length)| idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length / average)));
+    expected.sort_by(|left, right| right.total_cmp(left));
+    for (actual, expected) in actual.into_iter().zip(expected) {
+        assert!((actual - expected).abs() < 0.00005);
+    }
+}
+
+#[test]
+fn unified_search_boolean_phrase_and_unicode_sets() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("fixture.rs")).expect("remove seed");
+    for (name, text) in [
+        ("a.txt", "foo bar café 类型\n"),
+        ("b.txt", "bar foo 类型 café\n"),
+        ("c.txt", "foo\n"),
+        ("d.txt", "bar\n"),
+    ] {
+        fs::write(fixture.root.join(name), text).expect("query fixture");
+    }
+    for (query, expected) in [
+        ("foo OR bar", vec!["a.txt", "b.txt", "c.txt", "d.txt"]),
+        ("foo AND bar", vec!["a.txt", "b.txt"]),
+        ("foo NOT bar", vec!["c.txt"]),
+        ("\"foo bar\"", vec!["a.txt"]),
+        ("\"café 类型\"", vec!["a.txt"]),
+    ] {
+        for raw in [false, true] {
+            let args = if raw {
+                vec!["search", "--bm25", query]
+            } else {
+                vec!["search", query]
+            };
+            let output = fixture.run(&args, "unified");
+            assert!(
+                output.status.success(),
+                "{query}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let actual = ["a.txt", "b.txt", "c.txt", "d.txt"]
+                .into_iter()
+                .filter(|name| stdout.contains(name))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{query}, raw={raw}");
+        }
+    }
+}
+
+#[test]
+fn unified_search_phrase_rejects_reversed_tokens() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ordered.txt"), "foo bar\n").expect("ordered");
+    fs::write(fixture.root.join("reversed.txt"), "bar foo\n").expect("reversed");
+    let output = fixture.run(&["search", "\"foo bar\""], "phrase");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ordered.txt"));
+    assert!(!stdout.contains("reversed.txt"), "{stdout}");
+}
+
+#[test]
+fn unified_search_malformed_syntax_is_private() {
+    let fixture = Fixture::new();
+    for query in ["foo OR", "\"private_marker", "foo AND (bar OR)", "NOT foo"] {
+        for raw in [false, true] {
+            let args = if raw {
+                vec!["search", "--bm25", query]
+            } else {
+                vec!["search", query]
+            };
+            let output = fixture.run(&args, "malformed");
+            assert_eq!(output.status.code(), Some(2), "{query}, raw={raw}");
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("private_marker"));
+        }
+    }
+}
+
+#[test]
+fn search_c_method_name_returns_bm25_source_blocks() {
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("registration.c"),
@@ -70,13 +201,13 @@ fn search_single_registered_c_method_name_uses_executable_registration() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "registration.c:3\n"
+        compact_locations(&output),
+        ["notes.md:1", "registration.c:1-3"]
     );
 }
 
 #[test]
-fn search_single_rust_type_name_uses_code_identifier() {
+fn search_rust_type_name_prioritizes_declaration_block() {
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("declaration.rs"),
@@ -96,8 +227,8 @@ fn search_single_rust_type_name_uses_code_identifier() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "declaration.rs:2\n"
+        compact_locations(&output),
+        ["declaration.rs:1-2", "notes.md:1"]
     );
 }
 
@@ -1555,7 +1686,7 @@ fn successful_search_stdout_omits_failure_receipt() {
     let fixture = Fixture::new();
     let output = fixture.run(&["search", "search_option"], "verified");
     assert!(output.status.success(), "success path failed");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "fixture.rs:1\n");
+    assert_eq!(compact_locations(&output), ["fixture.rs:1"]);
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("pbi-failure"),
         "success printed a failure receipt"
@@ -1709,7 +1840,7 @@ fn root_boundary_numeric_zero_spellings_share_fallback() {
 }
 
 #[test]
-fn compact_output_cites_member_line_and_keeps_both_files() {
+fn compact_output_keeps_ranked_source_blocks_and_both_files() {
     let fixture = ScopeFixture::new();
     fs::create_dir(fixture.root.join("src")).expect("src");
     fs::write(
@@ -1724,7 +1855,7 @@ fn compact_output_cites_member_line_and_keeps_both_files() {
         "{}",
         String::from_utf8_lossy(&member.stderr)
     );
-    assert_eq!(member.stdout, b"src/lib.rs:2\n");
+    assert_eq!(compact_locations(&member), ["src/lib.rs:1-2"]);
 
     fs::write(fixture.root.join("b.rs"), "fn parse_search() {}\n").expect("b");
     fs::write(fixture.root.join("a.rs"), "fn parse_search() {}\n").expect("a");
@@ -1735,7 +1866,7 @@ fn compact_output_cites_member_line_and_keeps_both_files() {
         "{}",
         String::from_utf8_lossy(&both.stderr)
     );
-    assert_eq!(both.stdout, b"a.rs:1\nb.rs:1\n");
+    assert_eq!(compact_locations(&both), ["a.rs:1", "b.rs:1"]);
 
     let repeated = ScopeFixture::new();
     fs::write(
@@ -1750,7 +1881,7 @@ fn compact_output_cites_member_line_and_keeps_both_files() {
         "{}",
         String::from_utf8_lossy(&twice.stderr)
     );
-    assert_eq!(twice.stdout, b"twice.rs:1\n");
+    assert_eq!(compact_locations(&twice), ["twice.rs:1-2"]);
 }
 
 #[test]
