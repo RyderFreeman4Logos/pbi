@@ -215,8 +215,7 @@ fn raw_strict_elastic_syntax_validates_and_applies_boolean_query() {
         assert_eq!(
             output.status.code(),
             Some(2),
-            "{query}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "strict query syntax must reject invalid inputs"
         );
     }
     let filtered = fixture.run(
@@ -274,6 +273,41 @@ fn raw_strict_elastic_syntax_validates_and_applies_boolean_query() {
         paths.contains("alpha.rs") && paths.contains("both.rs") && paths.contains("beta.rs"),
         "{paths}"
     );
+}
+
+#[test]
+fn strict_syntax_failure_redacts_rejected_query_terms() {
+    let fixture = Fixture::new();
+    for query in ["synthetic_query_token", "SyntheticQueryToken"] {
+        let output = fixture.run(
+            &["search", "--bm25", "--strict-elastic-syntax", query],
+            "raw",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "invalid strict syntax remains a usage error"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with(
+                "pbi-rs: strict query requires quotes around terms with underscores or mixed case\n"
+            ),
+            "invalid unquoted terms keep the strict-query diagnostic class"
+        );
+        assert!(
+            stderr.contains("argv=search,--bm25,--strict-elastic-syntax,[REDACTED]"),
+            "failure receipt must continue redacting query arguments"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(query),
+            "strict-query failure echoed rejected input to stdout"
+        );
+        assert!(
+            !stderr.contains(query),
+            "strict-query failure echoed rejected input to stderr"
+        );
+    }
 }
 
 #[test]

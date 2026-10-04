@@ -116,7 +116,7 @@ fn tokenize(query: &str) -> Result<Vec<Token>, String> {
                         let mixed_case = word.chars().any(char::is_uppercase)
                             && word.chars().any(char::is_lowercase);
                         if word.contains('_') || (word.len() > 1 && mixed_case) {
-                            return Err(format!("strict query requires quotes around {word}"));
+                            return Err("strict query requires quotes around terms with underscores or mixed case".into());
                         }
                         Token::Word(word.to_lowercase())
                     }
