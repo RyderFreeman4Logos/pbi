@@ -11,6 +11,7 @@ use pbi_rs::semantic::{
 };
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
+mod extract;
 mod native_search;
 mod raw_session;
 mod strict_query;
@@ -251,7 +252,8 @@ impl Default for SearchOptions {
 fn usage() {
     println!(
         "pbi-rs {VERSION} — bounded native source search and cited answers\n\
-         Usage: pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--timeout <SECONDS>] [--json]\n\
+         Usage: pbi-rs extract <path>:<line> [--timeout <SECONDS>] [--max-bytes <N>]\n\
+                pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs search [--bm25] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
@@ -267,7 +269,13 @@ fn main() {
     };
     let started = Instant::now();
     let deadline = parsed_execution_timeout(&arguments);
-    let trace = StageTrace::new(started + std::time::Duration::from_secs(deadline.unwrap_or(0)));
+    let Some(trace_deadline) = started.checked_add(Duration::from_secs(deadline.unwrap_or(0)))
+    else {
+        eprintln!("pbi-rs: --timeout is too large");
+        emit_failure_receipt(&arguments, 2, None, None, started, deadline);
+        std::process::exit(2);
+    };
+    let trace = StageTrace::new(trace_deadline);
     let code = match run_traced(
         arguments.clone(),
         #[cfg(test)]
@@ -305,6 +313,18 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
     let Ok((arguments, _)) = parse_local_route_prefix(arguments.to_vec()) else {
         return None;
     };
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "extract")
+    {
+        return Some(
+            extract::parse(&arguments[1..])
+                .ok()
+                .flatten()
+                .map(|options| options.timeout)
+                .unwrap_or(SEARCH_OUTER_DEADLINE_SECONDS),
+        );
+    }
     let search = arguments
         .first()
         .is_some_and(|argument| argument == "search");
@@ -441,6 +461,7 @@ fn known_option(value: &str) -> bool {
             | "-n"
             | "--strict-elastic-syntax"
             | "search"
+            | "extract"
     )
 }
 
@@ -648,6 +669,20 @@ fn run_traced(
         return Ok(0);
     }
 
+    if arguments[0] == "extract" {
+        if !route_specs.is_empty() {
+            return Err(CliError::usage("extract does not accept model routes"));
+        }
+        let output = extract::run(&arguments[1..])?;
+        #[cfg(test)]
+        let writer = _semantic_output;
+        #[cfg(not(test))]
+        let mut writer = io::stdout();
+        writer
+            .write_all(output.as_bytes())
+            .map_err(|_| CliError::failed("cannot write extraction"))?;
+        return Ok(0);
+    }
     if arguments[0] == "search" && !route_specs.is_empty() {
         return Err(CliError::usage(
             "--model-route is only supported for semantic questions",

@@ -361,6 +361,11 @@ fn read_source(path: &Path, device: u64) -> Result<Option<Vec<u8>>, SearchFailur
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|_| SearchFailure::Unavailable)?;
+    read_source_file(file, device)
+}
+
+/// Recheck and bound a descriptor opened by a no-follow source reader.
+pub(super) fn read_source_file(file: File, device: u64) -> Result<Option<Vec<u8>>, SearchFailure> {
     let opened = file.metadata().map_err(|_| SearchFailure::Unavailable)?;
     if !opened.is_file() || opened.dev() != device || opened.len() > MAX_FILE_BYTES {
         return Ok(None);
@@ -511,7 +516,11 @@ fn has_false_return(block: &syn::Block) -> bool {
     visitor.0
 }
 
-fn walk(root: &Path, device: u64, limits: &SearchLimits) -> Result<Vec<PathBuf>, SearchFailure> {
+pub(super) fn walk(
+    root: &Path,
+    device: u64,
+    limits: &SearchLimits,
+) -> Result<Vec<PathBuf>, SearchFailure> {
     validate_gitignore(&root.join(".gitignore"), device)?;
     let mut root_targets = 0usize;
     for entry in fs::read_dir(root).map_err(|_| SearchFailure::Unavailable)? {
