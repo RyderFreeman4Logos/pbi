@@ -76,6 +76,25 @@ impl StrictQuery {
         })
     }
 
+    /// Normalize operands only; Boolean syntax was already parsed.
+    pub fn stemmed(mut self, deadline: std::time::Instant) -> Result<Self, ()> {
+        fn normalize(expr: &mut Expr, deadline: std::time::Instant) -> Result<(), ()> {
+            match expr {
+                Expr::Term(text) | Expr::Phrase(text) => *text = stem_text(text, Some(deadline))?,
+                Expr::And(left, right) | Expr::Or(left, right) => {
+                    normalize(left, deadline)?;
+                    normalize(right, deadline)?;
+                }
+                Expr::Not(inner) => normalize(inner, deadline)?,
+            }
+            Ok(())
+        }
+        normalize(&mut self.expr, deadline)?;
+        self.positive_terms.clear();
+        collect_positive(&self.expr, false, &mut self.positive_terms);
+        Ok(self)
+    }
+
     pub fn positive_terms(&self) -> &[String] {
         &self.positive_terms
     }
@@ -83,6 +102,28 @@ impl StrictQuery {
     pub fn matches(&self, source: &str, filename: Option<&str>) -> bool {
         eval(&self.expr, source, filename)
     }
+}
+
+/// Keep the existing token delimiters, including phrase punctuation and order.
+/// English-only tokens over 256 bytes bypass the stemmer's bounded workspace.
+pub fn stem_text(text: &str, deadline: Option<std::time::Instant>) -> Result<String, ()> {
+    let mut output = String::with_capacity(text.len());
+    for part in text.split_inclusive(|ch: char| !ch.is_alphanumeric() && ch != '_') {
+        if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+            return Err(());
+        }
+        let word = part.trim_end_matches(|ch: char| !ch.is_alphanumeric() && ch != '_');
+        if word.len() <= 256
+            && word.bytes().all(|byte| byte.is_ascii_alphabetic())
+            && !word.is_empty()
+        {
+            output.push_str(&porter_stemmer::stem(&word.to_ascii_lowercase()));
+        } else {
+            output.extend(word.chars().flat_map(char::to_lowercase));
+        }
+        output.push_str(&part[word.len()..]);
+    }
+    Ok(output)
 }
 
 fn tokenize(query: &str, strict: bool) -> Result<Vec<Token>, String> {
