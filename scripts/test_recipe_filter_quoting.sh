@@ -9,12 +9,15 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-marker="${TMPDIR:?}/pbi-rs-filter-quoting-marker"
-out="$marker.out"
-rm -f "$marker" "$out"
+tmpdir=$(mktemp -d "${TMPDIR:?}/pbi-rs-filter-quoting.XXXXXX")
+trap 'rm -rf "$tmpdir"' 0
+marker="$tmpdir/marker"
+out="$tmpdir/dry-run.out"
 # Single quotes would let a shell run the touch. The quoted recipe must not.
 payload="does_not_exist|;touch ${marker};echo \$HOME \`date\` \"q\" space"
 
+# This helper checks rendered argv only; it never executes Cargo. Retained real-recipe
+# probes provide the separate runtime evidence.
 # just --dry-run writes the shell line to stderr. Capture it; do not execute it.
 dry() {
     just --dry-run "$@" >"$out" 2>&1
