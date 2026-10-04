@@ -2038,6 +2038,70 @@ fn native_search_respects_nested_gitignore_and_negation() {
 }
 
 #[test]
+fn native_search_hard_denies_whitelisted_hidden_components() {
+    const HIDDEN_MARKER: &str = "synthetic_issue326_hidden_marker";
+    const ORDINARY_MARKER: &str = "ordinary_issue326_whitelist_marker";
+    const NESTED_MARKER: &str = "nested_issue326_whitelist_marker";
+
+    let fixture = ScopeFixture::new();
+    let root = &fixture.root;
+    fs::create_dir_all(root.join(".private")).expect("hidden directory");
+    fs::create_dir_all(root.join("dir")).expect("nested directory");
+    fs::write(
+        root.join(".gitignore"),
+        "*.rs\n!.env\n!dir/\n!dir/.env.local\n!.private/\n!.private/**\n!visible.rs\n!visible_candidate.rs\n",
+    )
+    .expect("root gitignore");
+    fs::write(root.join(".env"), HIDDEN_MARKER).expect("synthetic env fixture");
+    fs::write(root.join("dir/.env.local"), HIDDEN_MARKER).expect("synthetic nested env fixture");
+    fs::write(
+        root.join(".private/issue326_hidden_candidate.rs"),
+        "fn issue326_hidden_candidate() {}\n",
+    )
+    .expect("synthetic hidden candidate");
+    fs::write(root.join("visible.rs"), ORDINARY_MARKER).expect("ordinary whitelist fixture");
+    fs::write(
+        root.join("visible_candidate.rs"),
+        "fn issue326_hidden_candidate() {}\n",
+    )
+    .expect("ordinary candidate fixture");
+    fs::write(root.join("dir/.gitignore"), "*.rs\n!kept.rs\nblocked.rs\n")
+        .expect("nested gitignore");
+    fs::write(root.join("dir/kept.rs"), NESTED_MARKER).expect("nested whitelist fixture");
+    fs::write(root.join("dir/blocked.rs"), NESTED_MARKER).expect("nested ignored fixture");
+
+    for args in [
+        vec!["search", HIDDEN_MARKER],
+        vec!["search", "--bm25", HIDDEN_MARKER],
+        vec!["search", "--bm25", "--format=json", HIDDEN_MARKER],
+    ] {
+        let output = fixture.run_args("unused", &args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stdout.contains(HIDDEN_MARKER) && !stderr.contains(HIDDEN_MARKER));
+        assert!(!stdout.contains(".env") && !stderr.contains(".env"));
+        assert!(!stdout.contains(".private") && !stderr.contains(".private"));
+    }
+
+    let ordinary = fixture.run_args("unused", &["search", ORDINARY_MARKER]);
+    assert!(ordinary.status.success());
+    assert!(String::from_utf8_lossy(&ordinary.stdout).contains("visible.rs"));
+
+    let nested = fixture.run_args("unused", &["search", NESTED_MARKER]);
+    let nested_stdout = String::from_utf8_lossy(&nested.stdout);
+    assert!(nested.status.success());
+    assert!(nested_stdout.contains("dir/kept.rs"));
+    assert!(!nested_stdout.contains("blocked.rs"));
+
+    let candidate = fixture.run_args("unused", &["search", "issue326_hidden_candidate"]);
+    let candidate_output = String::from_utf8_lossy(&candidate.stdout);
+    assert!(!candidate_output.contains(".private"));
+    assert!(candidate_output.contains("visible_candidate.rs"));
+}
+
+#[test]
 fn native_search_finds_checkout_source() {
     let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
         .env_clear()
