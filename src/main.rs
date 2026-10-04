@@ -269,7 +269,13 @@ fn main() {
     };
     let started = Instant::now();
     let deadline = parsed_execution_timeout(&arguments);
-    let trace = StageTrace::new(started + std::time::Duration::from_secs(deadline.unwrap_or(0)));
+    let Some(trace_deadline) = started.checked_add(Duration::from_secs(deadline.unwrap_or(0)))
+    else {
+        eprintln!("pbi-rs: --timeout is too large");
+        emit_failure_receipt(&arguments, 2, None, None, started, deadline);
+        std::process::exit(2);
+    };
+    let trace = StageTrace::new(trace_deadline);
     let code = match run_traced(
         arguments.clone(),
         #[cfg(test)]
@@ -312,10 +318,10 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
         .is_some_and(|argument| argument == "extract")
     {
         return Some(
-            arguments
-                .windows(2)
-                .find(|pair| pair[0] == "--timeout")
-                .and_then(|pair| pair[1].parse().ok())
+            extract::parse(&arguments[1..])
+                .ok()
+                .flatten()
+                .map(|options| options.timeout)
                 .unwrap_or(SEARCH_OUTER_DEADLINE_SECONDS),
         );
     }

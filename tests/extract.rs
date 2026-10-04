@@ -152,6 +152,55 @@ fn extract_invalid_positions_and_usage_fail_closed() {
 }
 
 #[test]
+fn timeout_validation_rejects_overflow_and_duplicates_without_panics() {
+    let fixture = Fixture::new(SOURCE);
+    let huge = "18446744073709551615";
+    let overflow = "18446744073709551616";
+    let canary = "private-timeout-query-canary";
+    for prefix in [
+        vec!["extract", "private-timeout-path.rs:6"],
+        vec!["search", canary],
+        vec!["--message", canary],
+        vec![canary],
+    ] {
+        for options in [
+            vec!["--timeout", huge],
+            vec!["--timeout", huge, "--timeout", "1"],
+            vec!["--timeout", "1", "--timeout", huge],
+            vec!["--timeout=18446744073709551615"],
+            vec!["--timeout=18446744073709551615", "--timeout=1"],
+            vec!["--timeout=1", "--timeout=18446744073709551615"],
+            vec!["--timeout", huge, "--timeout=1"],
+            vec!["--timeout=1", "--timeout", huge],
+            vec!["--timeout=18446744073709551615", "--timeout", "1"],
+            vec!["--timeout", "1", "--timeout=18446744073709551615"],
+            vec!["--timeout", overflow],
+            vec!["--timeout=18446744073709551616"],
+            vec!["--timeout", canary],
+            vec!["--timeout=private-timeout-query-canary"],
+            vec!["--timeout", huge, "--max-bytes", "0"],
+        ] {
+            let mut arguments = prefix.clone();
+            arguments.extend(&options);
+            let result = fixture.run(&arguments);
+            assert_eq!(result.status.code(), Some(2), "usage status required");
+            assert!(result.stdout.is_empty(), "usage must not emit source");
+            let error = String::from_utf8(result.stderr).expect("UTF-8 error");
+            assert!(!error.contains("panicked"), "no panic diagnostics");
+            assert!(!error.contains(canary), "query privacy");
+            assert!(!error.contains("private-timeout-path"), "path privacy");
+            assert!(error.starts_with("pbi-rs: "), "static usage diagnostic");
+            if prefix[0] == "extract" && options.len() == 4 {
+                assert!(
+                    error.starts_with("pbi-rs: invalid extract options\n")
+                        || error.starts_with("pbi-rs: invalid extract byte cap\n")
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn extract_paths_ignores_symlinks_and_nonfiles_fail_closed() {
     let fixture = Fixture::new(SOURCE);
     fs::write(

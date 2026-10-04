@@ -9,10 +9,18 @@ use std::time::Instant;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-/// Parse the no-model extract CLI; errors deliberately never echo user input.
-pub(super) fn run(arguments: &[String]) -> Result<String, crate::CliError> {
+pub(super) struct Options<'a> {
+    path: &'a str,
+    line: usize,
+    pub(super) timeout: u64,
+    max_bytes: usize,
+}
+
+/// Validate all extract options before constructing any execution deadline.
+/// Errors deliberately never echo user input; None means help only.
+pub(super) fn parse(arguments: &[String]) -> Result<Option<Options<'_>>, crate::CliError> {
     if arguments == ["--help"] || arguments == ["-h"] {
-        return Ok("Usage: pbi-rs extract <path>:<line> [--timeout <SECONDS>] [--max-bytes <N>]\nRust items are complete; other locations use approximate four-line windows. Oversized blocks are explicitly truncated.\n".to_owned());
+        return Ok(None);
     }
     let (position, options) = arguments
         .split_first()
@@ -52,6 +60,25 @@ pub(super) fn run(arguments: &[String]) -> Result<String, crate::CliError> {
             _ => return Err(crate::CliError::usage("invalid extract options")),
         }
     }
+    Ok(Some(Options {
+        path,
+        line,
+        timeout,
+        max_bytes,
+    }))
+}
+
+/// Execute the validated no-model extract CLI with the existing safety bounds.
+pub(super) fn run(arguments: &[String]) -> Result<String, crate::CliError> {
+    let Some(Options {
+        path,
+        line,
+        timeout,
+        max_bytes,
+    }) = parse(arguments)?
+    else {
+        return Ok("Usage: pbi-rs extract <path>:<line> [--timeout <SECONDS>] [--max-bytes <N>]\nRust items are complete; other locations use approximate four-line windows. Oversized blocks are explicitly truncated.\n".to_owned());
+    };
     let deadline = Instant::now()
         .checked_add(std::time::Duration::from_secs(timeout))
         .ok_or_else(|| crate::CliError::usage("extract timeout is too large"))?;
