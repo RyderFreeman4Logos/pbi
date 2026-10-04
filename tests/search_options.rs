@@ -1377,8 +1377,21 @@ fn zero_timeout_answer_stays_at_initial_search() {
         .output()
         .expect("zero timeout question");
     let stderr = String::from_utf8(output.stderr).expect("utf-8");
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(output.stdout.is_empty(), "{stderr}");
+    let receipt_lines = stderr
+        .lines()
+        .filter(|line| line.starts_with("pbi-failure "))
+        .count();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "status={:?}",
+        output.status.code()
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stdout_bytes={}",
+        output.stdout.len()
+    );
     let fields = failure_fields(&stderr);
     assert_eq!(fields["stage"], "initial_search");
     assert_eq!(fields["stage_status"], "deadline");
@@ -1386,9 +1399,10 @@ fn zero_timeout_answer_stays_at_initial_search() {
     assert_eq!(fields["ranges"], "unknown");
     assert_eq!(fields["admission"], "unknown");
     assert_eq!(fields["deadline_s"], "0");
+    assert_eq!(receipt_lines, 1, "receipt_lines={receipt_lines}");
     assert!(
         !stderr.contains("native_json_fallback_eligible"),
-        "{stderr}"
+        "stderr leaked the queried symbol"
     );
 }
 

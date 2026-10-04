@@ -23,7 +23,7 @@ test-bin filter='':
     ionice -c 3 cargo test --locked --bin pbi-rs {{quote(filter)}}
 
 test-definition filter='':
-    ionice -c 3 cargo test --locked --lib definition_intent {{quote(filter)}}
+    ionice -c 3 cargo test --locked --lib -- {{quote('definition_intent_tests::' + filter)}}
 
 test-search-options filter='':
     ionice -c 3 cargo test --locked --test search_options {{quote(filter)}}
