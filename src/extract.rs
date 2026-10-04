@@ -97,6 +97,9 @@ pub(super) fn extract(
     } else {
         path
     };
+    if relative.components().any(|part| matches!(part, Component::Normal(name) if name.to_str().is_none_or(|name| name.starts_with('.')))) {
+        return Err(SearchFailure::Unavailable);
+    }
     if relative.as_os_str().is_empty()
         || relative
             .to_str()
@@ -268,5 +271,28 @@ impl<'ast> Visit<'ast> for RustBlock {
     fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
         self.consider(item.span());
         visit::visit_trait_item(self, item);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_descriptor_refuses_an_actual_other_device() {
+        let root = std::env::current_dir().expect("root");
+        let device = std::fs::metadata(root).expect("root metadata").dev();
+        let proc_root = File::open("/proc").expect("Linux procfs");
+        assert_ne!(proc_root.metadata().expect("proc metadata").dev(), device);
+        let limits = SearchLimits {
+            deadline: Instant::now() + std::time::Duration::from_secs(8),
+            max_results: 1,
+            language: None,
+            ignores: Vec::new(),
+        };
+        assert!(matches!(
+            open_source(proc_root, Path::new("version"), device, &limits),
+            Err(SearchFailure::Unavailable)
+        ));
     }
 }

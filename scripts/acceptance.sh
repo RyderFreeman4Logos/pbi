@@ -153,5 +153,7 @@ for raw in [False, True]:
 print("acceptance #312 privacy: malformed syntax fails closed with static diagnostics")
 PY
 
+python3 "$repo_root/scripts/acceptance_extract.py" "$binary" "$fixture" "$repo_root"
+
 test ! -e "$marker"
-printf '%s\n' 'acceptance: native bounded search, filters, root cap, no-hit, linked source, unified BM25, Boolean phrases, and Probe trap passed'
+printf '%s\n' 'acceptance: native bounded search, filters, root cap, no-hit, linked source, unified BM25, Boolean phrases, extract, and Probe trap passed'

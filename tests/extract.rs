@@ -47,6 +47,10 @@ impl Fixture {
         assert!(!result.status.success(), "unexpected success {position}");
         assert!(result.stdout.is_empty(), "no partial source on failure");
         assert!(
+            !String::from_utf8_lossy(&result.stderr).contains("fixture-secret"),
+            "private content in error"
+        );
+        assert!(
             !String::from_utf8_lossy(&result.stderr).contains(position),
             "private path in error"
         );
@@ -150,17 +154,33 @@ fn extract_invalid_positions_and_usage_fail_closed() {
 #[test]
 fn extract_paths_ignores_symlinks_and_nonfiles_fail_closed() {
     let fixture = Fixture::new(SOURCE);
-    fs::write(fixture.0.join(".gitignore"), "ignored.rs\n").expect("ignore");
+    fs::write(
+        fixture.0.join(".gitignore"),
+        "ignored.rs\n!.env\n!dir/.env.local\n!.private/\n!.private/**\n",
+    )
+    .expect("ignore");
     fs::write(fixture.0.join("ignored.rs"), SOURCE).expect("ignored");
     fs::write(fixture.0.join(".env"), "fixture-secret").expect("private fixture");
     fs::create_dir(fixture.0.join("dir")).expect("dir");
     symlink("fixture.rs", fixture.0.join("link.rs")).expect("link");
     symlink("dir", fixture.0.join("linked-dir")).expect("dir link");
     fs::write(fixture.0.join("dir/file.rs"), SOURCE).expect("nested");
+    fs::write(fixture.0.join("dir/.gitignore"), "nested_ignored.rs\n").expect("nested ignore");
+    fs::write(fixture.0.join("dir/nested_ignored.rs"), SOURCE).expect("nested ignored");
+    fs::write(fixture.0.join("dir/.env.local"), "fixture-secret").expect("nested private");
+    fs::create_dir(fixture.0.join(".private")).expect("hidden dir");
+    fs::write(fixture.0.join(".private/file.rs"), SOURCE).expect("hidden source");
+    assert!(fixture.extract("dir/file.rs:7").contains("Block: complete"));
+    assert!(fixture
+        .extract("./fixture.rs:7")
+        .contains("Block: complete"));
     for position in [
         "../fixture.rs:1",
         "dir/../fixture.rs:1",
         ".env:1",
+        "dir/.env.local:1",
+        ".private/file.rs:1",
+        "dir/nested_ignored.rs:1",
         "ignored.rs:1",
         "link.rs:1",
         "linked-dir/file.rs:1",
