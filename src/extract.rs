@@ -162,8 +162,12 @@ pub(super) fn extract(
         return Err(SearchFailure::Unavailable);
     }
     let mut block = RustBlock { line, best: None };
+    let mut parser_offset = 0;
     if path.extension().is_some_and(|extension| extension == "rs") {
         if let Ok(parsed) = syn::parse_file(source) {
+            // syn strips the BOM and shebang, but retains the shebang's LF.
+            parser_offset = usize::from(source.starts_with('\u{feff}')) * '\u{feff}'.len_utf8()
+                + parsed.shebang.as_ref().map_or(0, String::len);
             block.visit_file(&parsed);
         }
     }
@@ -173,8 +177,14 @@ pub(super) fn extract(
         (
             span.start().line,
             span.end().line,
-            range.start,
-            range.end,
+            range
+                .start
+                .checked_add(parser_offset)
+                .ok_or(SearchFailure::Unavailable)?,
+            range
+                .end
+                .checked_add(parser_offset)
+                .ok_or(SearchFailure::Unavailable)?,
             true,
         )
     } else {
@@ -188,14 +198,33 @@ pub(super) fn extract(
             false,
         )
     };
-    let line_start = offsets[start_line - 1];
-    if source[line_start..start].chars().all(char::is_whitespace) {
+    let line_start = *offsets
+        .get(start_line - 1)
+        .ok_or(SearchFailure::Unavailable)?;
+    if source
+        .get(line_start..start)
+        .ok_or(SearchFailure::Unavailable)?
+        .chars()
+        .all(char::is_whitespace)
+    {
         start = line_start;
     }
     let body = source
         .get(start..end)
         .ok_or(SearchFailure::Unavailable)?
         .trim_end_matches(['\r', '\n']);
+    // Preserve source layout while using the established terminal-control policy.
+    let body = body
+        .split_inclusive(['\n', '\r', '\t'])
+        .map(|part| {
+            let (text, whitespace) = if part.ends_with(['\n', '\r', '\t']) {
+                part.split_at(part.len() - 1)
+            } else {
+                (part, "")
+            };
+            crate::escape_control(text) + whitespace
+        })
+        .collect::<String>();
     let header = |status| {
         format!(
             "File: {}, Lines: {start_line}-{end_line}\nBlock: {status}\n\n",
@@ -204,7 +233,7 @@ pub(super) fn extract(
     };
     let mut output = header(if complete { "complete" } else { "approximate" });
     if output.len() + body.len() < max_bytes {
-        output.push_str(body);
+        output.push_str(&body);
         output.push('\n');
     } else {
         output = header("truncated");
@@ -298,6 +327,10 @@ impl<'ast> Visit<'ast> for RustBlock {
     fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
         self.consider(item.span());
         visit::visit_trait_item(self, item);
+    }
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        self.consider(item.span());
+        visit::visit_foreign_item(self, item);
     }
 }
 

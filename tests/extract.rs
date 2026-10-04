@@ -82,6 +82,106 @@ fn extract_complete_rust_function_and_nested_boundaries() {
 }
 
 #[test]
+fn extract_parser_prefix_coordinates_remain_raw_and_exact() {
+    for prefix in [
+        "",
+        "\u{feff}",
+        "#!/usr/bin/env rust-script\n",
+        "\u{feff}#!/usr/bin/env rust-script\n",
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let source = format!("{prefix}{SOURCE}fn tiny() {{}} fn neighbor() {{}}\n")
+                .replace('\n', newline);
+            let fixture = Fixture::new(&source);
+            let shift = usize::from(prefix.contains('\n'));
+            for line in [4, 7, 12] {
+                let output = fixture.extract(&format!("fixture.rs:{}", line + shift));
+                let body = source
+                    .lines()
+                    .skip(2 + shift)
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join(newline);
+                assert_eq!(
+                    output,
+                    format!(
+                        "File: fixture.rs, Lines: {}-{}\nBlock: complete\n\n{body}\n",
+                        3 + shift,
+                        12 + shift
+                    )
+                );
+            }
+            let output = fixture.extract(&format!("fixture.rs:{}", 9 + shift));
+            assert_eq!(output, format!("File: fixture.rs, Lines: {}-{}\nBlock: complete\n\n    fn nested() {{{newline}        let _ = 7;{newline}    }}\n", 8 + shift, 10 + shift));
+            let output = fixture.extract(&format!("fixture.rs:{}", 14 + shift));
+            assert_eq!(
+                output,
+                format!(
+                    "File: fixture.rs, Lines: {0}-{0}\nBlock: complete\n\nfn tiny() {{}}\n",
+                    14 + shift
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn extract_foreign_items_are_smallest_enclosing_declarations() {
+    let source = "unsafe extern \"C\" {\n    /// café docs\n    #[link_name = \"external\"]\n    fn chosen(arg: u32);\n    static VALUE: u32;\n    type Opaque;\n    foreign_macro!();\n    fn neighbor();\n}\n";
+    let fixture = Fixture::new(source);
+    for (line, first, last) in [
+        (2, 2, 4),
+        (3, 2, 4),
+        (4, 2, 4),
+        (5, 5, 5),
+        (6, 6, 6),
+        (7, 7, 7),
+    ] {
+        let body = source
+            .lines()
+            .skip(first - 1)
+            .take(last - first + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            fixture.extract(&format!("fixture.rs:{line}")),
+            format!("File: fixture.rs, Lines: {first}-{last}\nBlock: complete\n\n{body}\n")
+        );
+    }
+}
+
+#[test]
+fn extract_escapes_unsafe_controls_before_enforcing_output_cap() {
+    let controls = "\u{1b}\u{7}\u{8}\u{c}\u{7f}\u{85}\u{9b}";
+    let fixture = Fixture::new(&format!("fn chosen() {{\n\t// {controls}\n}}\n"));
+    let output = fixture.extract("fixture.rs:2");
+    assert!(
+        !output
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t')),
+        "unsafe control predicate"
+    );
+    assert!(output.contains("\n\t// "));
+    for ch in controls.chars() {
+        assert!(output.contains(&format!("\\u{{{:x}}}", ch as u32)));
+    }
+    fs::write(
+        fixture.0.join("fixture.rs"),
+        format!("fn chosen() {{\n\t// {}\n}}\n", controls.repeat(10)),
+    )
+    .expect("source");
+    let result = fixture.run(&["extract", "fixture.rs:2", "--max-bytes", "128"]);
+    assert!(result.status.success());
+    assert!(result.stdout.len() <= 128);
+    let output = String::from_utf8(result.stdout).expect("UTF-8");
+    assert!(output.contains("Block: truncated"));
+    assert!(output.ends_with("\n[truncated]\n"));
+    assert!(!output
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t')));
+}
+
+#[test]
 fn extract_methods_types_and_same_line_items() {
     let fixture = Fixture::new("struct Owner {\n    value: u32,\n}\nimpl Owner {\n    /// method\n    pub fn get(&self) -> u32 {\n        self.value\n    }\n}\nfn first() {} fn second() {}\n");
     assert_eq!(
