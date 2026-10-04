@@ -11,6 +11,7 @@ use pbi_rs::semantic::{
 };
 use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
 
+mod extract;
 mod native_search;
 mod raw_session;
 mod strict_query;
@@ -305,6 +306,18 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
     let Ok((arguments, _)) = parse_local_route_prefix(arguments.to_vec()) else {
         return None;
     };
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "extract")
+    {
+        return Some(
+            arguments
+                .windows(2)
+                .find(|pair| pair[0] == "--timeout")
+                .and_then(|pair| pair[1].parse().ok())
+                .unwrap_or(SEARCH_OUTER_DEADLINE_SECONDS),
+        );
+    }
     let search = arguments
         .first()
         .is_some_and(|argument| argument == "search");
@@ -441,6 +454,7 @@ fn known_option(value: &str) -> bool {
             | "-n"
             | "--strict-elastic-syntax"
             | "search"
+            | "extract"
     )
 }
 
@@ -648,6 +662,20 @@ fn run_traced(
         return Ok(0);
     }
 
+    if arguments[0] == "extract" {
+        if !route_specs.is_empty() {
+            return Err(CliError::usage("extract does not accept model routes"));
+        }
+        let output = extract::run(&arguments[1..])?;
+        #[cfg(test)]
+        let writer = _semantic_output;
+        #[cfg(not(test))]
+        let mut writer = io::stdout();
+        writer
+            .write_all(output.as_bytes())
+            .map_err(|_| CliError::failed("cannot write extraction"))?;
+        return Ok(0);
+    }
     if arguments[0] == "search" && !route_specs.is_empty() {
         return Err(CliError::usage(
             "--model-route is only supported for semantic questions",

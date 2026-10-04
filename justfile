@@ -2,10 +2,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Cargo must stay behind ionice and the repository's canonical just recipes.
 fmt:
-    ionice -c 3 rustfmt --edition 2021 --check src/lib.rs src/main.rs src/native_search.rs src/raw_session.rs src/strict_query.rs src/semantic.rs src/explicit_config_route_tests.rs src/debug_config_route_tests.rs src/relevance_scope.rs src/definition_intent_tests.rs src/definition_intent_self_type_tests.rs src/definition_intent_binding_completeness_tests.rs tests/search_options.rs tests/relevance.rs
+    ionice -c 3 rustfmt --edition 2021 --check src/lib.rs src/main.rs src/native_search.rs src/raw_session.rs src/strict_query.rs src/semantic.rs src/explicit_config_route_tests.rs src/debug_config_route_tests.rs src/relevance_scope.rs src/definition_intent_tests.rs src/definition_intent_self_type_tests.rs src/definition_intent_binding_completeness_tests.rs tests/search_options.rs tests/relevance.rs tests/extract.rs src/extract.rs
 
 fmt-fix:
-    ionice -c 3 rustfmt --edition 2021 src/lib.rs src/main.rs src/native_search.rs src/raw_session.rs src/strict_query.rs src/semantic.rs src/explicit_config_route_tests.rs src/debug_config_route_tests.rs src/relevance_scope.rs src/definition_intent_tests.rs src/definition_intent_self_type_tests.rs src/definition_intent_binding_completeness_tests.rs tests/search_options.rs tests/relevance.rs
+    ionice -c 3 rustfmt --edition 2021 src/lib.rs src/main.rs src/native_search.rs src/raw_session.rs src/strict_query.rs src/semantic.rs src/explicit_config_route_tests.rs src/debug_config_route_tests.rs src/relevance_scope.rs src/definition_intent_tests.rs src/definition_intent_self_type_tests.rs src/definition_intent_binding_completeness_tests.rs tests/search_options.rs tests/relevance.rs tests/extract.rs src/extract.rs
 
 lock:
     ionice -c 3 cargo generate-lockfile --offline
@@ -27,6 +27,9 @@ test-definition filter='':
 
 test-search-options filter='':
     ionice -c 3 cargo test --locked --test search_options {{quote(filter)}}
+
+test-extract filter='':
+    ionice -c 3 cargo test --locked --test extract {{quote(filter)}}
 
 test-relevance:
     ionice -c 3 cargo test --locked --test relevance
