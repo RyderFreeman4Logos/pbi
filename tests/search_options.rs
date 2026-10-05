@@ -1903,9 +1903,88 @@ fn automatic_failure_redacts_opaque_caller_values() {
 }
 
 #[test]
+fn shared_failure_receipt_redacts_operand_roles() {
+    let fixture = Fixture::new();
+    let numeric = "98765432109876543210";
+    let oversized = "9".repeat(8193);
+    let cases = [
+        vec![numeric],
+        vec!["--message", "--timeout", numeric],
+        vec!["search", numeric],
+        vec!["search", "--bm25", numeric],
+        vec!["search", "--regex", numeric],
+        vec!["search", "--regex", "[", numeric],
+        vec!["search", "--regex", &oversized],
+        vec!["search", "--regex", "--", "--session"],
+        vec!["search", "--", "--timeout", numeric],
+        vec!["search", "--session", numeric, "missing"],
+        vec!["search", "--unknown", "--timeout", numeric],
+        vec!["--model-name", numeric, "missing"],
+        vec!["--model-route", numeric, numeric, numeric, "missing"],
+        vec!["extract", numeric],
+        vec!["extract", "--timeout", numeric],
+        vec!["symbols", numeric],
+        vec!["symbols", "--timeout", numeric],
+        vec!["search", "--timeout", &oversized, "missing"],
+        vec!["search", "--max-results", &oversized, "missing"],
+    ];
+    for args in cases {
+        let output = fixture.run(&args, "privacy");
+        assert!(!output.status.success(), "controlled failure required");
+        assert!(output.stdout.is_empty(), "failure stdout must remain empty");
+        let stderr = String::from_utf8(output.stderr).expect("static UTF-8 failure");
+        assert!(failure_fields(&stderr).contains_key("argv"));
+        assert!(!stderr.contains(numeric), "numeric operand leaked");
+        assert!(!stderr.contains(&oversized), "oversized operand leaked");
+        assert!(stderr.len() < 2048, "failure receipt exceeded bound");
+        if args.contains(&"--") {
+            let argv = failure_fields(&stderr)["argv"];
+            assert!(!argv.contains("--session"), "literal option operand leaked");
+            assert!(!argv.contains("--timeout"), "literal numeric option leaked");
+        }
+    }
+}
+
+#[test]
+fn shared_failure_receipt_retains_valid_public_bounds() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["search", "--timeout", "0", "--max-results", "2", "missing"],
+        vec!["search", "--timeout=0", "--max-results=2", "missing"],
+        vec!["--timeout", "0", "missing"],
+        vec![
+            "extract",
+            "fixture.rs:1",
+            "--timeout",
+            "0",
+            "--max-bytes",
+            "2",
+        ],
+    ] {
+        let output = fixture.run(&args, "privacy");
+        assert_eq!(output.status.code(), Some(1), "deadline failure required");
+        let stderr = String::from_utf8(output.stderr).expect("static UTF-8 failure");
+        let fields = failure_fields(&stderr);
+        assert_eq!(fields.get("deadline_s"), Some(&"0"));
+        assert!(
+            fields["argv"].contains("--timeout,0"),
+            "public timeout lost"
+        );
+        if args.iter().any(|arg| arg.starts_with("--max-results")) {
+            assert!(
+                fields["argv"].contains("--max-results,2"),
+                "public result bound lost"
+            );
+        }
+        assert!(!stderr.contains("missing"), "query leaked");
+        assert!(!stderr.contains("fixture.rs:1"), "position leaked");
+    }
+}
+
+#[test]
 fn non_utf8_argument_fails_closed() {
     let fixture = Fixture::new();
-    let argument = OsString::from_vec(b"--timeout=\xff".to_vec());
+    let argument = OsString::from_vec(b"--timeout=98765432109876543210\xff".to_vec());
     let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
         .env_clear()
         .current_dir(&fixture.root)
@@ -1915,12 +1994,21 @@ fn non_utf8_argument_fails_closed() {
         .output()
         .expect("non-utf8 argv");
     let stderr = String::from_utf8(output.stderr.clone()).expect("static utf-8 stderr");
-    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert_eq!(output.status.code(), Some(2), "non-UTF-8 must fail closed");
     assert!(output.stdout.is_empty());
     assert!(stderr.starts_with("pbi-rs: arguments must be UTF-8\n"));
     assert!(stderr.contains("deadline_s=unknown"));
     assert!(!stderr.contains('\u{fffd}'));
-    assert_eq!(stderr.lines().count(), 2, "{stderr}");
+    assert!(
+        !stderr.contains("98765432109876543210"),
+        "numeric bytes leaked"
+    );
+    assert!(stderr.len() < 512, "non-UTF-8 receipt exceeded bound");
+    assert_eq!(
+        stderr.lines().count(),
+        2,
+        "static receipt must be two lines"
+    );
 }
 
 #[test]

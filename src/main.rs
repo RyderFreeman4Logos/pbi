@@ -378,11 +378,7 @@ fn emit_failure_receipt(
     let exe = redact_identity(env::current_exe().is_ok());
     let argv0 = redact_identity(env::args_os().next().is_some());
     let argv_count = arguments.len();
-    let argv = arguments
-        .iter()
-        .map(|argument| safe_argument(argument))
-        .collect::<Vec<_>>()
-        .join(",");
+    let argv = safe_arguments(arguments);
     let deadline_s = deadline
         .map(|seconds| seconds.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
@@ -421,16 +417,89 @@ fn safe_failure_token(token: &str) -> String {
     escape_control(body) + suffix
 }
 
-fn safe_argument(argument: &str) -> String {
-    if let Some((name, _)) = argument.split_once('=') {
-        if known_option(name) {
-            return format!("{name},[REDACTED]");
+fn safe_arguments(arguments: &[String]) -> String {
+    // Only a successful shared parser can authorize public numeric bounds.
+    // Spelling alone never authorizes an operand, including after a parse error.
+    let parsed = parse_local_route_prefix(arguments.to_vec());
+    let valid = parsed
+        .as_ref()
+        .is_ok_and(|(args, _)| match args.first().map(String::as_str) {
+            Some("search") => parse_search(&args[1..]).is_ok(),
+            Some("extract") => extract::parse(&args[1..]).is_ok(),
+            Some("symbols") => false,
+            _ => parse_question(args).is_ok(),
+        });
+    let command_index = parsed
+        .as_ref()
+        .ok()
+        .map(|(args, _)| arguments.len() - args.len());
+    let mut literal = false;
+    let mut operands = 0;
+    let mut numeric = false;
+    let mut safe = Vec::new();
+    for (index, argument) in arguments.iter().take(64).enumerate() {
+        if literal {
+            safe.push("[REDACTED]".to_owned());
+            continue;
+        }
+        if operands > 0 {
+            operands -= 1;
+            safe.push(if numeric && valid {
+                argument
+                    .parse::<u64>()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| "[REDACTED]".to_owned())
+            } else {
+                "[REDACTED]".to_owned()
+            });
+            continue;
+        }
+        if Some(index) == command_index
+            && matches!(argument.as_str(), "search" | "extract" | "symbols")
+        {
+            safe.push(argument.clone());
+            operands = usize::from(argument == "extract");
+            literal = argument == "symbols";
+            numeric = false;
+            continue;
+        }
+        let (name, value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(name, value)| {
+                (name, Some(value))
+            });
+        if !name.starts_with('-') || !known_option(name) || name == "--" {
+            safe.push("[REDACTED]".to_owned());
+            // Unknown options terminate trustworthy role discovery.
+            literal = name.starts_with('-');
+            continue;
+        }
+        numeric = matches!(
+            name,
+            "--timeout" | "--max-results" | "--max-bytes" | "--max-tokens" | "--merge-threshold"
+        );
+        safe.push(name.to_owned());
+        if let Some(value) = value {
+            safe.push(if numeric && valid {
+                value
+                    .parse::<u64>()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| "[REDACTED]".to_owned())
+            } else {
+                "[REDACTED]".to_owned()
+            });
+        } else {
+            operands = match name {
+                "--model-route" => 3,
+                "--message" | "--model-name" | "--force-provider" | "--timeout" | "--reranker"
+                | "-r" | "--session" | "--question" | "--max-results" | "--max-bytes"
+                | "--max-tokens" | "--merge-threshold" | "--format" | "-o" | "--language"
+                | "-l" | "--ignore" | "-i" => 1,
+                _ => 0,
+            };
         }
     }
-    if known_option(argument) || argument.bytes().all(|byte| byte.is_ascii_digit()) {
-        return escape_control(argument);
-    }
-    "[REDACTED]".to_owned()
+    safe.join(",")
 }
 
 fn known_option(value: &str) -> bool {
@@ -447,6 +516,7 @@ fn known_option(value: &str) -> bool {
             | "--model-name"
             | "--force-provider"
             | "--timeout"
+            | "--regex"
             | "--bm25"
             | "--stem"
             | "--reranker"
