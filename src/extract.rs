@@ -516,7 +516,16 @@ fn admitted_source(
 ) -> Result<Vec<u8>, SearchFailure> {
     let (file, directories) = open_source(root_file, relative, device, limits, false)?;
     check_source_namespace(root, relative, &directories, &file)?;
-    let admitted = policy_admitted(root, relative, &directories, device, limits, false)?;
+    let compiler = std::sync::Mutex::new(PolicyCompiler::default());
+    let admitted = policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        &compiler,
+    )?;
     if !walk_source(root, device, limits)?.contains(&root.join(relative)) || !admitted {
         return Err(SearchFailure::Unavailable);
     }
@@ -529,7 +538,15 @@ fn admitted_source(
     // it is NOT the ABA proof. Descriptor-owned policy admission on both sides
     // of the read independently denies ignored bytes, even after restoration.
     check_source_namespace(root, relative, &directories, &file)?;
-    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+    if !policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        &compiler,
+    )? {
         return Err(SearchFailure::Unavailable);
     }
     Ok(bytes)
@@ -566,6 +583,51 @@ pub(super) fn check_source_namespace(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static POLICY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static POLICY_MATCH_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static SOURCE_COMPONENT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One search-owned compilation slot, never policy authority or a persistent cache.
+/// Bytes remain bounded by the source reader and are freshly read before every use.
+#[derive(Default)]
+pub(super) struct PolicyCompiler {
+    last: Option<(std::path::PathBuf, Vec<u8>, ignore::gitignore::Gitignore)>,
+}
+impl PolicyCompiler {
+    fn matcher(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        limits: &SearchLimits,
+    ) -> Result<Option<ignore::gitignore::Gitignore>, SearchFailure> {
+        check_deadline(limits)?;
+        if let Some((previous_path, previous_bytes, matcher)) = &self.last {
+            if previous_path == path && previous_bytes == bytes {
+                return Ok(Some(matcher.clone()));
+            }
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| SearchFailure::Unavailable)?;
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(
+            path.parent().ok_or(SearchFailure::Unavailable)?,
+        );
+        for line in text.lines() {
+            check_deadline(limits)?;
+            builder
+                .add_line(Some(path.to_path_buf()), line)
+                .map_err(|_| SearchFailure::Unavailable)?;
+        }
+        #[cfg(test)]
+        POLICY_BUILDS.with(|count| count.set(count.get() + 1));
+        let matcher = builder.build().map_err(|_| SearchFailure::Unavailable)?;
+        check_deadline(limits)?;
+        self.last = Some((path.to_path_buf(), bytes.to_vec(), matcher.clone()));
+        Ok(Some(matcher))
+    }
+}
+
 /// Evaluate bounded .ignore/.gitignore bytes through the retained source owners.
 /// An empty relative path validates a directory's policies without matching a leaf.
 pub(super) fn policy_admitted(
@@ -575,6 +637,7 @@ pub(super) fn policy_admitted(
     device: u64,
     limits: &SearchLimits,
     final_directory: bool,
+    compiler: &std::sync::Mutex<PolicyCompiler>,
 ) -> Result<bool, SearchFailure> {
     let mut policies = Vec::new();
     let mut directory_path = root.to_path_buf();
@@ -588,32 +651,28 @@ pub(super) fn policy_admitted(
             }
         })
         .collect::<Vec<_>>();
-    // The pathname walk supplies only bounds and an additional denial. Authority
-    // comes from policy bytes opened through the same retained owners as source.
-    // A swap-and-restore cannot replace these matchers with another tree's rules.
+    // Reopen and reread every policy through the current retained owners.
+    // Only compilation of identical bytes at the identical path is reused.
     for (depth, directory) in directories.iter().enumerate() {
         let mut local = Vec::new();
         for policy in [".gitignore", ".ignore"] {
-            let mut builder = ignore::gitignore::GitignoreBuilder::new(&directory_path);
-            match open_at(directory, std::ffi::OsStr::new(policy), false) {
+            let matcher = match open_at(directory, std::ffi::OsStr::new(policy), false) {
                 Ok(policy_file) => {
                     let bytes =
                         read_source_file(policy_file, device)?.ok_or(SearchFailure::Unavailable)?;
-                    let text =
-                        std::str::from_utf8(&bytes).map_err(|_| SearchFailure::Unavailable)?;
-                    for line in text.lines() {
-                        check_deadline(limits)?;
-                        builder
-                            .add_line(Some(directory_path.join(policy)), line)
-                            .map_err(|_| SearchFailure::Unavailable)?;
-                    }
+                    compiler
+                        .lock()
+                        .map_err(|_| SearchFailure::Unavailable)?
+                        .matcher(&directory_path.join(policy), &bytes, limits)?
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(_) => return Err(SearchFailure::Unavailable),
-            }
-            local.push(builder.build().map_err(|_| SearchFailure::Unavailable)?);
+            };
+            local.push(matcher);
         }
-        policies.push(local);
+        if local.iter().any(Option::is_some) {
+            policies.push((depth, local));
+        }
         if let Some(name) = names.get(depth) {
             directory_path.push(name);
         }
@@ -625,10 +684,16 @@ pub(super) fn policy_admitted(
         let is_dir = depth + 1 < names.len() || final_directory;
         // .ignore outranks .gitignore; nearest ancestor wins within each class.
         let matched = [1, 0].into_iter().find_map(|kind| {
-            policies[..=depth].iter().rev().find_map(|local| {
-                let matched = local[kind].matched(&candidate, is_dir);
-                (!matched.is_none()).then_some(matched)
-            })
+            policies
+                .iter()
+                .rev()
+                .filter(|(owner_depth, _)| *owner_depth <= depth)
+                .find_map(|(_, local)| {
+                    #[cfg(test)]
+                    POLICY_MATCH_VISITS.with(|count| count.set(count.get() + 1));
+                    let matched = local[kind].as_ref()?.matched(&candidate, is_dir);
+                    (!matched.is_none()).then_some(matched)
+                })
         });
         if matched.is_some_and(|matched| matched.is_ignore()) {
             admitted = false;
@@ -679,6 +744,8 @@ pub(super) fn open_source(
         check_deadline(limits)?;
         directories.push(parent.try_clone().map_err(|_| SearchFailure::Unavailable)?);
         let directory = parts.peek().is_some() || final_directory;
+        #[cfg(test)]
+        SOURCE_COMPONENT_OPENS.with(|count| count.set(count.get() + 1));
         let opened = open_at(&parent, name, directory).map_err(|_| SearchFailure::Unavailable)?;
         let metadata = opened.metadata().map_err(|_| SearchFailure::Unavailable)?;
         if metadata.dev() != device

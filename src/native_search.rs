@@ -7,7 +7,7 @@
 //! the same bounded walk, with exact Rust declarations before lexical mentions.
 //! Neither path creates an index or a model request.
 
-use crate::extract::{check_source_namespace, open_source, policy_admitted};
+use crate::extract::{check_source_namespace, open_source, policy_admitted, PolicyCompiler};
 use crate::strict_query::StrictQuery;
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use std::fs::{self, File, OpenOptions};
@@ -94,6 +94,7 @@ pub(crate) struct RootScope<'a> {
     root: &'a Path,
     file: File,
     device: u64,
+    compiler: Arc<std::sync::Mutex<PolicyCompiler>>,
 }
 
 /// Open explicit root scopes only after enforcing their shared count bound.
@@ -111,7 +112,12 @@ pub(crate) fn open_root_scopes<'a>(
                 .metadata()
                 .map_err(|_| SearchFailure::Unavailable)?
                 .dev();
-            Ok(RootScope { root, file, device })
+            Ok(RootScope {
+                root,
+                file,
+                device,
+                compiler: Arc::new(std::sync::Mutex::new(PolicyCompiler::default())),
+            })
         })
         .collect()
 }
@@ -134,7 +140,7 @@ pub fn search_repository(
     let scope = open_root_scope(root)?;
     let root_file = &scope.file;
     let root_device = scope.device;
-    let files = walk_owned(root, root_file, root_device, limits)?;
+    let files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     let mut hits = Vec::new();
     for path in files {
         if Instant::now() >= limits.deadline {
@@ -143,7 +149,9 @@ pub fn search_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -193,7 +201,7 @@ pub fn search_regex_repository(
     let scope = open_root_scope(root)?;
     let root_file = &scope.file;
     let root_device = scope.device;
-    let mut files = walk_owned(root, root_file, root_device, limits)?;
+    let mut files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     files.sort();
     let mut hits = Vec::new();
     for path in files {
@@ -203,7 +211,9 @@ pub fn search_regex_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -267,7 +277,7 @@ pub fn search_raw_repository(
     let scope = open_root_scope(root)?;
     let root_file = &scope.file;
     let root_device = scope.device;
-    let mut files = walk_owned(root, root_file, root_device, limits)?;
+    let mut files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     files.sort();
     let mut freshness = DefaultHasher::new();
     let mut documents = 0usize;
@@ -282,7 +292,9 @@ pub fn search_raw_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         path.hash(&mut freshness);
@@ -488,6 +500,7 @@ fn read_source(
     path: &Path,
     device: u64,
     limits: &SearchLimits,
+    compiler: &Arc<std::sync::Mutex<PolicyCompiler>>,
 ) -> Result<Option<Vec<u8>>, SearchFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
     if metadata.file_type().is_symlink()
@@ -512,7 +525,15 @@ fn read_source(
         false,
     )?;
     check_source_namespace(root, relative, &directories, &file)?;
-    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+    if !policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        compiler,
+    )? {
         return Err(SearchFailure::Unavailable);
     }
     let bytes = read_source_file(
@@ -520,7 +541,15 @@ fn read_source(
         device,
     )?;
     check_source_namespace(root, relative, &directories, &file)?;
-    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+    if !policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        compiler,
+    )? {
         return Err(SearchFailure::Unavailable);
     }
     if Instant::now() >= limits.deadline {
@@ -566,7 +595,7 @@ pub fn candidate_symbols(
     let scope = open_root_scope(root)?;
     let root_file = &scope.file;
     let root_device = scope.device;
-    let files = walk_owned(root, root_file, root_device, limits)?;
+    let files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     let mut ranked = files
         .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
@@ -585,7 +614,9 @@ pub fn candidate_symbols(
         if Instant::now() >= limits.deadline {
             return Err(SearchFailure::Deadline);
         }
-        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -687,7 +718,7 @@ pub(super) fn walk(
     if scope.device != device {
         return Err(SearchFailure::Unavailable);
     }
-    walk_owned(scope.root, &scope.file, device, limits)
+    walk_owned(scope.root, &scope.file, device, limits, &scope.compiler)
 }
 
 fn walk_owned(
@@ -695,6 +726,7 @@ fn walk_owned(
     root_file: &File,
     device: u64,
     limits: &SearchLimits,
+    compiler: &Arc<std::sync::Mutex<PolicyCompiler>>,
 ) -> Result<Vec<PathBuf>, SearchFailure> {
     check_source_namespace(root, Path::new(""), &[], root_file)?;
     if root_file
@@ -715,6 +747,7 @@ fn walk_owned(
         device,
         limits,
         true,
+        compiler,
     )?;
     #[cfg(test)]
     issue_327_tests::after_policy_validation();
@@ -767,6 +800,7 @@ fn walk_owned(
         language: None,
         ignores: Vec::new(),
     };
+    let compiler = Arc::clone(compiler);
     let mut walker = WalkBuilder::new(root);
     walker
         .follow_links(false)
@@ -826,21 +860,24 @@ fn walk_owned(
                     device,
                     &policy_limits,
                     is_dir,
+                    &compiler,
                 )?;
                 parents.pop();
                 check_source_namespace(&policy_root, parent, &parents, &owner)?;
                 if !inherited {
                     return Ok(false);
                 }
-                let (file, directories) = open_source(
-                    policy_owner
-                        .try_clone()
-                        .map_err(|_| SearchFailure::Unavailable)?,
-                    relative,
+                // Reuse the already checked parent: reopening the full relative
+                // pathname duplicates every ancestry open and admits a new owner.
+                let (file, mut leaf_parent) = open_source(
+                    owner,
+                    Path::new(entry.file_name()),
                     device,
                     &policy_limits,
                     is_dir,
                 )?;
+                let mut directories = parents;
+                directories.append(&mut leaf_parent);
                 check_source_namespace(&policy_root, relative, &directories, &file)?;
                 let admitted = policy_admitted(
                     &policy_root,
@@ -849,6 +886,7 @@ fn walk_owned(
                     device,
                     &policy_limits,
                     is_dir,
+                    &compiler,
                 )?;
                 // A directory's policies must also be safe before descending.
                 if is_dir && admitted {
@@ -859,6 +897,7 @@ fn walk_owned(
                         device,
                         &policy_limits,
                         true,
+                        &compiler,
                     )?;
                 }
                 check_source_namespace(&policy_root, relative, &directories, &file)?;
