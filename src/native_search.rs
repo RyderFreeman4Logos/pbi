@@ -7,7 +7,7 @@
 //! the same bounded walk, with exact Rust declarations before lexical mentions.
 //! Neither path creates an index or a model request.
 
-use crate::extract::{check_source_namespace, open_source, policy_admitted};
+use crate::extract::{check_source_namespace, open_source, policy_admitted, PolicyCompiler};
 use crate::strict_query::StrictQuery;
 use ignore::{gitignore::GitignoreBuilder, WalkBuilder};
 use std::fs::{self, File, OpenOptions};
@@ -26,7 +26,9 @@ use syn::visit::{self, Visit};
 const EXCLUDED: [&str; 5] = [".git", "target", "drafts", "node_modules", "__pycache__"];
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 20_000;
+const MAX_WALK_ENTRIES: usize = MAX_WALK_FILES;
 const MAX_ROOT_TARGETS: usize = 16;
+const MAX_ROOT_CHILDREN: usize = MAX_WALK_ENTRIES;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_PLAN_FILES: usize = 1;
 const MAX_PARSED_FUNCTIONS: usize = 512;
@@ -59,10 +61,13 @@ pub struct RawHit {
     pub score: f64,
     pub occurrences: usize,
     declaration: bool,
+    block_matches: usize,
 }
 
 /// Raw search shares the walk and file limits with verified search.
 pub struct RawSearchOptions<'a> {
+    /// Compact output needs only the strongest merged block per file.
+    pub compact: bool,
     pub exact: bool,
     pub stem: bool,
     pub exclude_filenames: bool,
@@ -79,6 +84,7 @@ struct RawCandidate {
     length: usize,
     occurrences: usize,
     declaration: bool,
+    block_matches: usize,
 }
 
 struct Hit {
@@ -86,6 +92,44 @@ struct Hit {
     line: usize,
     end: usize,
     score: i32,
+}
+
+pub(crate) struct RootScope<'a> {
+    root: &'a Path,
+    file: File,
+    device: u64,
+    compiler: Arc<std::sync::Mutex<PolicyCompiler>>,
+}
+
+/// Open explicit root scopes only after enforcing their shared count bound.
+pub(crate) fn open_root_scopes<'a>(
+    roots: &[&'a Path],
+) -> Result<Vec<RootScope<'a>>, SearchFailure> {
+    if roots.len() > MAX_ROOT_TARGETS {
+        return Err(SearchFailure::TargetLimit);
+    }
+    roots
+        .iter()
+        .map(|root| {
+            let file = open_root(root)?;
+            let device = file
+                .metadata()
+                .map_err(|_| SearchFailure::Unavailable)?
+                .dev();
+            Ok(RootScope {
+                root,
+                file,
+                device,
+                compiler: Arc::new(std::sync::Mutex::new(PolicyCompiler::default())),
+            })
+        })
+        .collect()
+}
+
+fn open_root_scope(root: &Path) -> Result<RootScope<'_>, SearchFailure> {
+    open_root_scopes(&[root])?
+        .pop()
+        .ok_or(SearchFailure::Unavailable)
 }
 
 pub fn search_repository(
@@ -97,11 +141,10 @@ pub fn search_repository(
     if terms.is_empty() || limits.max_results == 0 {
         return Ok(String::new());
     }
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     let mut hits = Vec::new();
     for path in files {
         if Instant::now() >= limits.deadline {
@@ -110,7 +153,9 @@ pub fn search_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -157,11 +202,10 @@ pub fn search_regex_repository(
     regex: &regex::Regex,
     limits: &SearchLimits,
 ) -> Result<Vec<RawHit>, SearchFailure> {
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let mut files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let mut files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     files.sort();
     let mut hits = Vec::new();
     for path in files {
@@ -171,7 +215,9 @@ pub fn search_regex_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -204,6 +250,7 @@ pub fn search_regex_repository(
                     score: 1.0,
                     occurrences: 1,
                     declaration: false,
+                    block_matches: 1,
                 });
             }
         }
@@ -232,11 +279,10 @@ pub fn search_raw_repository(
     if terms.is_empty() || terms.len() > 32 {
         return Err(SearchFailure::Limit);
     }
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let mut files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let mut files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     files.sort();
     let mut freshness = DefaultHasher::new();
     let mut documents = 0usize;
@@ -251,7 +297,9 @@ pub fn search_raw_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         path.hash(&mut freshness);
@@ -287,7 +335,13 @@ pub fn search_raw_repository(
         let mut counts = vec![0usize; terms.len()];
         let mut length = 0usize;
         let source_lines = source.lines().collect::<Vec<_>>();
-        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let declarations = if path.extension().is_some_and(|extension| extension == "rs") {
+            pbi_rs::matching_rust_declaration_lines(source, &terms)
+        } else {
+            Vec::new()
+        };
+        let mut blocks = Vec::new();
+        let mut pending: Option<(usize, usize, usize)> = None;
         for (index, line) in source_lines.iter().enumerate() {
             if Instant::now() >= limits.deadline {
                 return Err(SearchFailure::Deadline);
@@ -315,17 +369,24 @@ pub fn search_raw_repository(
                 || (!options.exact && line_matches > 0)
             {
                 let line_number = index + 1;
-                if let Some(last) = blocks.last_mut() {
+                if let Some(last) = pending.as_mut() {
                     if line_number.saturating_sub(last.1 + 1) <= options.merge_threshold {
                         last.1 = line_number;
+                        last.2 += line_matches;
                         continue;
                     }
                 }
-                if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
+                if let Some(block) = pending.take() {
+                    retain_block(&mut blocks, block, options.compact, &declarations)?;
+                }
+                if !options.compact && blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
                     return Err(SearchFailure::Limit);
                 }
-                blocks.push((line_number, line_number));
+                pending = Some((line_number, line_number, line_matches));
             }
+        }
+        if let Some(block) = pending {
+            retain_block(&mut blocks, block, options.compact, &declarations)?;
         }
         if !options.exclude_filenames {
             if let Some(name) = matching_filename {
@@ -353,14 +414,9 @@ pub fn search_raw_repository(
             continue;
         }
         if blocks.is_empty() {
-            blocks.push((0, 0));
+            blocks.push((0, 0, 0));
         }
-        let declarations = if path.extension().is_some_and(|extension| extension == "rs") {
-            pbi_rs::matching_rust_declaration_lines(source, &terms)
-        } else {
-            Vec::new()
-        };
-        for (start, end) in blocks {
+        for (start, end, block_matches) in blocks {
             if candidates.len() >= MAX_RAW_BLOCKS {
                 return Err(SearchFailure::Limit);
             }
@@ -382,6 +438,7 @@ pub fn search_raw_repository(
                 term_counts: counts.clone(),
                 length,
                 declaration: declarations.iter().any(|line| (start..=end).contains(line)),
+                block_matches,
             });
         }
     }
@@ -415,6 +472,7 @@ pub fn search_raw_repository(
                 score,
                 occurrences: candidate.occurrences,
                 declaration: candidate.declaration,
+                block_matches: candidate.block_matches,
             }
         })
         .collect::<Vec<_>>();
@@ -424,9 +482,42 @@ pub fn search_raw_repository(
             .cmp(&left.declaration)
             .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.file.cmp(&right.file))
+            // Keep file BM25 ranking; prefer its strongest matching block before
+            // compact search deduplicates it, rather than its earliest header.
+            .then_with(|| right.block_matches.cmp(&left.block_matches))
             .then_with(|| left.line.cmp(&right.line))
     });
     Ok((hits, freshness.finish()))
+}
+
+// Completed blocks compete before snippet allocation. The pending block remains
+// separate until merged; compact retains one winner and scans every later line.
+fn retain_block(
+    blocks: &mut Vec<(usize, usize, usize)>,
+    block: (usize, usize, usize),
+    compact: bool,
+    declarations: &[usize],
+) -> Result<(), SearchFailure> {
+    if compact {
+        let key = |(start, end, matches)| {
+            (
+                declarations.iter().any(|line| (start..=end).contains(line)),
+                matches,
+                std::cmp::Reverse(start),
+            )
+        };
+        if let Some(best) = blocks.first_mut() {
+            if key(block) > key(*best) {
+                *best = block;
+            }
+            return Ok(());
+        }
+    }
+    if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
+        return Err(SearchFailure::Limit);
+    }
+    blocks.push(block);
+    Ok(())
 }
 
 fn raw_terms(query: &str) -> Vec<String> {
@@ -457,6 +548,7 @@ fn read_source(
     path: &Path,
     device: u64,
     limits: &SearchLimits,
+    compiler: &Arc<std::sync::Mutex<PolicyCompiler>>,
 ) -> Result<Option<Vec<u8>>, SearchFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
     if metadata.file_type().is_symlink()
@@ -481,7 +573,15 @@ fn read_source(
         false,
     )?;
     check_source_namespace(root, relative, &directories, &file)?;
-    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+    if !policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        compiler,
+    )? {
         return Err(SearchFailure::Unavailable);
     }
     let bytes = read_source_file(
@@ -489,7 +589,15 @@ fn read_source(
         device,
     )?;
     check_source_namespace(root, relative, &directories, &file)?;
-    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+    if !policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        compiler,
+    )? {
         return Err(SearchFailure::Unavailable);
     }
     if Instant::now() >= limits.deadline {
@@ -532,11 +640,10 @@ pub fn candidate_symbols(
     if parts.is_empty() {
         return Ok(Vec::new());
     }
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let files = walk_owned(root, root_file, root_device, limits, &scope.compiler)?;
     let mut ranked = files
         .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
@@ -555,7 +662,9 @@ pub fn candidate_symbols(
         if Instant::now() >= limits.deadline {
             return Err(SearchFailure::Deadline);
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) =
+            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        else {
             continue;
         };
         let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -653,8 +762,11 @@ pub(super) fn walk(
     device: u64,
     limits: &SearchLimits,
 ) -> Result<Vec<PathBuf>, SearchFailure> {
-    let root_file = open_root(root)?;
-    walk_owned(root, &root_file, device, limits)
+    let scope = open_root_scope(root)?;
+    if scope.device != device {
+        return Err(SearchFailure::Unavailable);
+    }
+    walk_owned(scope.root, &scope.file, device, limits, &scope.compiler)
 }
 
 fn walk_owned(
@@ -662,6 +774,7 @@ fn walk_owned(
     root_file: &File,
     device: u64,
     limits: &SearchLimits,
+    compiler: &Arc<std::sync::Mutex<PolicyCompiler>>,
 ) -> Result<Vec<PathBuf>, SearchFailure> {
     check_source_namespace(root, Path::new(""), &[], root_file)?;
     if root_file
@@ -682,10 +795,11 @@ fn walk_owned(
         device,
         limits,
         true,
+        compiler,
     )?;
     #[cfg(test)]
     issue_327_tests::after_policy_validation();
-    let mut root_targets = 0usize;
+    let mut root_children = 0usize;
     // Linux-only: enumerate the retained root, not a substituted named root.
     for entry in fs::read_dir(format!("/proc/self/fd/{}", root_file.as_raw_fd()))
         .map_err(|_| SearchFailure::Unavailable)?
@@ -708,10 +822,10 @@ fn walk_owned(
         {
             continue;
         }
-        if root_targets == MAX_ROOT_TARGETS {
-            return Err(SearchFailure::TargetLimit);
+        if root_children >= MAX_ROOT_CHILDREN {
+            return Err(SearchFailure::Limit);
         }
-        root_targets += 1;
+        root_children += 1;
     }
     let mut user_ignores = GitignoreBuilder::new(root);
     for pattern in &limits.ignores {
@@ -734,6 +848,7 @@ fn walk_owned(
         language: None,
         ignores: Vec::new(),
     };
+    let compiler = Arc::clone(compiler);
     let mut walker = WalkBuilder::new(root);
     walker
         .follow_links(false)
@@ -793,21 +908,24 @@ fn walk_owned(
                     device,
                     &policy_limits,
                     is_dir,
+                    &compiler,
                 )?;
                 parents.pop();
                 check_source_namespace(&policy_root, parent, &parents, &owner)?;
                 if !inherited {
                     return Ok(false);
                 }
-                let (file, directories) = open_source(
-                    policy_owner
-                        .try_clone()
-                        .map_err(|_| SearchFailure::Unavailable)?,
-                    relative,
+                // Reuse the already checked parent: reopening the full relative
+                // pathname duplicates every ancestry open and admits a new owner.
+                let (file, mut leaf_parent) = open_source(
+                    owner,
+                    Path::new(entry.file_name()),
                     device,
                     &policy_limits,
                     is_dir,
                 )?;
+                let mut directories = parents;
+                directories.append(&mut leaf_parent);
                 check_source_namespace(&policy_root, relative, &directories, &file)?;
                 let admitted = policy_admitted(
                     &policy_root,
@@ -816,6 +934,7 @@ fn walk_owned(
                     device,
                     &policy_limits,
                     is_dir,
+                    &compiler,
                 )?;
                 // A directory's policies must also be safe before descending.
                 if is_dir && admitted {
@@ -826,6 +945,7 @@ fn walk_owned(
                         device,
                         &policy_limits,
                         true,
+                        &compiler,
                     )?;
                 }
                 check_source_namespace(&policy_root, relative, &directories, &file)?;
@@ -841,6 +961,7 @@ fn walk_owned(
         });
     let mut files = Vec::new();
     let mut file_count = 0usize;
+    let mut walk_entry_count = 0usize;
     for entry in walker.build() {
         if unsafe_ignore.load(Ordering::Relaxed) {
             return Err(SearchFailure::Unavailable);
@@ -851,6 +972,10 @@ fn walk_owned(
         let entry = entry.map_err(|_| SearchFailure::Unavailable)?;
         if entry.depth() == 0 {
             continue;
+        }
+        walk_entry_count += 1;
+        if walk_entry_count > MAX_WALK_ENTRIES {
+            return Err(SearchFailure::Limit);
         }
         let path = entry.path();
         let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
@@ -1021,5 +1146,209 @@ mod issue_326_tests {
         let candidates = candidate_symbols(&root, "where is issue326_hidden_candidate?", &limits())
             .expect("semantic candidate ingestion");
         assert!(candidates.len() == 1 && candidates[0].0 == "visible_candidate.rs");
+    }
+}
+
+#[cfg(test)]
+mod root_scope_tests {
+    use super::{open_root_scopes, walk, SearchFailure, SearchLimits, MAX_WALK_ENTRIES};
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos();
+            let root = PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp")
+                .join(format!("pbi-rs-{label}-{}-{nonce}", std::process::id()));
+            fs::create_dir_all(&root).expect("create safe test root");
+            Self(root)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn raw_same_file_selects_matching_body_before_sparse_header() {
+        let fixture = Fixture::new("block-admission");
+        let source = "# orbit vector\n\n\n\n\n\n\n\nassemble:\n    orbit vector orbit vector\n    orbit vector\n";
+        fs::write(fixture.0.join("tasks"), source).expect("synthetic source");
+        let limits = SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(8),
+            max_results: 8,
+            language: None,
+            ignores: Vec::new(),
+        };
+        let options = super::RawSearchOptions {
+            compact: false,
+            exact: false,
+            stem: false,
+            exclude_filenames: false,
+            merge_threshold: 5,
+            strict: None,
+        };
+        let (hits, _) = super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+            .expect("bounded raw search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].line, Some(10));
+        assert_eq!(hits[0].end_line, Some(11));
+        assert_eq!(
+            hits[0].score, hits[1].score,
+            "file BM25 must stay unchanged"
+        );
+        for count in [128, 129] {
+            fs::write(
+                fixture.0.join("tasks"),
+                "orbit\n\n\n\n\n\n\n\n".repeat(count),
+            )
+            .expect("synthetic separated blocks");
+            let result = super::search_raw_repository(&fixture.0, "orbit", &limits, &options);
+            if count == 128 {
+                assert_eq!(
+                    result.expect("admit the unchanged block cap").0.len(),
+                    count
+                );
+            } else {
+                assert!(matches!(result, Err(SearchFailure::Limit)));
+            }
+        }
+    }
+
+    #[test]
+    fn compact_streaming_storage_and_bm25_match_raw_dedup() {
+        for count in [129, 512, 2048, 8192] {
+            let mut blocks = Vec::new();
+            for line in 1..=count {
+                super::retain_block(&mut blocks, (line, line, line), true, &[])
+                    .expect("compact retention");
+                assert_eq!(blocks.len(), 1, "one winner plus one pending block maximum");
+                assert_eq!(blocks[0], (line, line, line));
+            }
+            super::retain_block(&mut blocks, (count + 1, count + 1, 0), true, &[count + 1])
+                .expect("late declaration wins before match density");
+            assert_eq!(blocks[0].0, count + 1);
+        }
+        let fixture = Fixture::new("compact-bm25");
+        fs::write(
+            fixture.0.join("tasks"),
+            "orbit\n\n\n\n\n\n\n\n".repeat(128) + "unmatched trailing words\n",
+        )
+        .expect("full file statistics");
+        fs::write(fixture.0.join("other"), "orbit vector orbit\n").expect("other document");
+        fs::write(fixture.0.join("empty"), "nonmatching document words\n")
+            .expect("document frequency");
+        let limits = SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(8),
+            max_results: 8,
+            language: None,
+            ignores: Vec::new(),
+        };
+        let mut options = super::RawSearchOptions {
+            compact: false,
+            exact: false,
+            stem: false,
+            exclude_filenames: false,
+            merge_threshold: 5,
+            strict: None,
+        };
+        let (mut raw, freshness) =
+            super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+                .expect("raw baseline");
+        let mut seen = std::collections::HashSet::new();
+        raw.retain(|hit| seen.insert(hit.file.clone()));
+        options.compact = true;
+        let (compact, compact_freshness) =
+            super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+                .expect("compact equivalent");
+        assert_eq!(compact_freshness, freshness);
+        assert_eq!(compact.len(), raw.len());
+        for (left, right) in compact.iter().zip(&raw) {
+            assert_eq!(
+                (
+                    &left.file,
+                    left.line,
+                    left.end_line,
+                    left.score,
+                    left.occurrences
+                ),
+                (
+                    &right.file,
+                    right.line,
+                    right.end_line,
+                    right.score,
+                    right.occurrences
+                )
+            );
+        }
+        fs::write(
+            fixture.0.join("tasks"),
+            "orbit\n\n\n\n\n\n\n\n".repeat(2048) + "orbit vector orbit vector\norbit vector\n",
+        )
+        .expect("late body");
+        let (compact, _) =
+            super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+                .expect("full enumeration");
+        let hit = compact
+            .iter()
+            .find(|hit| hit.file == "tasks")
+            .expect("no noisy file discarded");
+        assert_eq!(hit.line, Some(2048 * 8 + 1));
+        assert_eq!(hit.occurrences, 2048 + 6, "every matching token counted");
+    }
+
+    #[test]
+    fn explicit_seventeenth_scope_rejects_at_descriptor_admission() {
+        let fixture = Fixture::new("root-scope-admission");
+        let roots = (0..17)
+            .map(|index| {
+                let root = fixture.0.join(format!("scope-{index}"));
+                fs::create_dir(&root).expect("create explicit root scope");
+                root
+            })
+            .collect::<Vec<_>>();
+        let roots = roots.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        assert_eq!(
+            open_root_scopes(&roots[..16])
+                .expect("admit sixteen explicit scopes")
+                .len(),
+            16
+        );
+        assert!(matches!(
+            open_root_scopes(&roots),
+            Err(SearchFailure::TargetLimit)
+        ));
+    }
+
+    #[test]
+    fn total_walk_entry_budget_fails_closed() {
+        let fixture = Fixture::new("walk-entry-budget");
+        let root = fixture.0.join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create bounded root");
+        for index in 0..=MAX_WALK_ENTRIES {
+            fs::create_dir(nested.join(format!("child-{index:05}")))
+                .expect("create nested walk entry");
+        }
+        let device = fs::metadata(&root).expect("root metadata").dev();
+        let limits = SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(120),
+            max_results: 16,
+            language: None,
+            ignores: Vec::new(),
+        };
+        assert!(matches!(
+            walk(&root, device, &limits),
+            Err(SearchFailure::Limit)
+        ));
     }
 }

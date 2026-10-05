@@ -49,6 +49,133 @@ fn limits() -> SearchLimits {
     }
 }
 #[test]
+fn walk_reuses_the_retained_parent_for_leaf_admission() {
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    fs::remove_dir(root.join("dir")).expect("remove unused fixture sibling");
+    let relative = PathBuf::from("child/".repeat(16)).join("visible.rs");
+    fs::create_dir_all(root.join(relative.parent().expect("parent"))).expect("parents");
+    fs::write(root.join(&relative), "fn visible() {}\n").expect("source");
+    crate::extract::SOURCE_COMPONENT_OPENS.with(|count| count.set(0));
+    let files = walk(&root, fs::metadata(&root).expect("root").dev(), &limits()).expect("walk");
+    assert_eq!(files, vec![root.join(relative)]);
+    assert_eq!(
+        crate::extract::SOURCE_COMPONENT_OPENS.with(|count| count.get()),
+        153,
+        "each entry must open its parent ancestry once, then its leaf through that held parent"
+    );
+}
+
+#[test]
+fn absent_ancestor_policies_do_not_create_quadratic_match_work() {
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    fs::write(root.join(".gitignore"), "ignored.rs\n").expect("policy");
+    let relative = PathBuf::from("child/".repeat(16)).join("visible.rs");
+    fs::create_dir_all(root.join(relative.parent().expect("parent"))).expect("parents");
+    fs::write(root.join(&relative), "fn visible() {}\n").expect("source");
+    let device = fs::metadata(&root).expect("root").dev();
+    let (_, directories) = open_source(
+        open_root(&root).expect("owner"),
+        &relative,
+        device,
+        &limits(),
+        false,
+    )
+    .expect("source owners");
+    let compiler = std::sync::Mutex::new(crate::extract::PolicyCompiler::default());
+    crate::extract::POLICY_MATCH_VISITS.with(|count| count.set(0));
+    assert!(policy_admitted(
+        &root,
+        &relative,
+        &directories,
+        device,
+        &limits(),
+        false,
+        &compiler
+    )
+    .expect("policy"));
+    assert!(
+        crate::extract::POLICY_MATCH_VISITS.with(|count| count.get()) <= 2 * 17,
+        "matching must visit present policies, not every absent ancestor slot"
+    );
+}
+
+#[test]
+fn fresh_policy_matching_reuses_derived_ancestor_results() {
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    fs::write(root.join(".gitignore"), "ignored.rs\n").expect("policy");
+    let relative = PathBuf::from("child/".repeat(64)).join("visible.rs");
+    fs::create_dir_all(root.join(relative.parent().expect("parent"))).expect("parents");
+    fs::write(root.join(&relative), "fn review_marker() {}\n").expect("source");
+    crate::extract::POLICY_MATCH_VISITS.with(|count| count.set(0));
+    let files = walk(&root, fs::metadata(&root).expect("root").dev(), &limits()).expect("walk");
+    assert_eq!(files, vec![root.join(&relative)]);
+    let calls = crate::extract::POLICY_MATCH_VISITS.with(|count| count.get());
+    assert!(
+        calls <= 2 * 67,
+        "fresh identical policy bytes must not rematch every ancestor per entry: {calls}"
+    );
+    eprintln!("actual matcher calls={calls}");
+    let device = fs::metadata(&root).expect("root").dev();
+    let (_, directories) = open_source(
+        open_root(&root).expect("owner"),
+        &relative,
+        device,
+        &limits(),
+        false,
+    )
+    .expect("owners");
+    let compiler = std::sync::Mutex::new(crate::extract::PolicyCompiler::default());
+    let admitted = || {
+        policy_admitted(
+            &root,
+            &relative,
+            &directories,
+            device,
+            &limits(),
+            false,
+            &compiler,
+        )
+        .expect("fresh admission")
+    };
+    assert!(admitted());
+    fs::write(root.join(".gitignore"), "visible.rs\n").expect("changed policy");
+    assert!(
+        !admitted(),
+        "changed freshly read bytes invalidate derived matches"
+    );
+    fs::write(root.join(".ignore"), "!visible.rs\n").expect("absent to present");
+    assert!(admitted(), ".ignore must outrank .gitignore");
+    fs::remove_file(root.join(".ignore")).expect("present to absent");
+    assert!(!admitted());
+    fs::write(root.join(".gitignore"), "ignored.rs\n").expect("restore policy");
+    assert!(admitted());
+    fs::write(root.join("child/.ignore"), "visible.rs\n").expect("new ancestor denial");
+    assert!(
+        !admitted(),
+        "a previously absent ancestor policy must still deny"
+    );
+}
+
+#[test]
+fn unchanged_policy_bytes_compile_once_per_search() {
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    fs::write(root.join(".gitignore"), "ignored.rs\n").expect("policy");
+    fs::write(root.join("visible.rs"), "fn review_marker() {}\n").expect("source");
+    crate::extract::POLICY_BUILDS.with(|count| count.set(0));
+    let hits = search_repository(&root, "review_marker", &limits()).expect("search");
+    assert!(!hits.is_empty());
+    assert_eq!(
+        crate::extract::POLICY_BUILDS.with(|count| count.get()),
+        1,
+        "freshly reread unchanged policy bytes must not recompile per entry/read"
+    );
+}
+
+#[test]
 fn ancestor_symlink_substitution_is_denied_in_all_readers() {
     let mut denied = Vec::new();
     for mode in 0..3 {
@@ -79,6 +206,7 @@ fn ancestor_symlink_substitution_is_denied_in_all_readers() {
                 "synthetic_external_marker",
                 &limits(),
                 &RawSearchOptions {
+                    compact: false,
                     exact: false,
                     stem: false,
                     exclude_filenames: false,
@@ -187,6 +315,7 @@ fn unreadable_policy_entry(policy: &str, directory: bool) {
     .expect("policy");
     fs::set_permissions(&denied, fs::Permissions::from_mode(0o0)).expect("unreadable");
     let raw = RawSearchOptions {
+        compact: false,
         exact: false,
         stem: false,
         exclude_filenames: false,

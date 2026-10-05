@@ -516,7 +516,16 @@ fn admitted_source(
 ) -> Result<Vec<u8>, SearchFailure> {
     let (file, directories) = open_source(root_file, relative, device, limits, false)?;
     check_source_namespace(root, relative, &directories, &file)?;
-    let admitted = policy_admitted(root, relative, &directories, device, limits, false)?;
+    let compiler = std::sync::Mutex::new(PolicyCompiler::default());
+    let admitted = policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        &compiler,
+    )?;
     if !walk_source(root, device, limits)?.contains(&root.join(relative)) || !admitted {
         return Err(SearchFailure::Unavailable);
     }
@@ -529,7 +538,15 @@ fn admitted_source(
     // it is NOT the ABA proof. Descriptor-owned policy admission on both sides
     // of the read independently denies ignored bytes, even after restoration.
     check_source_namespace(root, relative, &directories, &file)?;
-    if !policy_admitted(root, relative, &directories, device, limits, false)? {
+    if !policy_admitted(
+        root,
+        relative,
+        &directories,
+        device,
+        limits,
+        false,
+        &compiler,
+    )? {
         return Err(SearchFailure::Unavailable);
     }
     Ok(bytes)
@@ -543,27 +560,138 @@ pub(super) fn check_source_namespace(
     directories: &[File],
     file: &File,
 ) -> Result<(), SearchFailure> {
-    let mut path = root.to_path_buf();
-    let mut names = relative.components().filter_map(|part| {
+    let names = relative.components().filter_map(|part| {
         if let Component::Normal(name) = part {
             Some(name)
         } else {
             None
         }
     });
-    for owned in directories.iter().chain(std::iter::once(file)) {
+    if names.clone().count() != directories.len() {
+        return Err(SearchFailure::Unavailable);
+    }
+    let mut owners = directories.iter().chain(std::iter::once(file));
+    let root_owner = owners.next().ok_or(SearchFailure::Unavailable)?;
+    let held = root_owner
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let named = std::fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
+    if (held.dev(), held.ino(), held.file_type()) != (named.dev(), named.ino(), named.file_type()) {
+        return Err(SearchFailure::Unavailable);
+    }
+    let mut parent = root_owner;
+    for (name, owned) in names.zip(owners) {
         let held = owned.metadata().map_err(|_| SearchFailure::Unavailable)?;
-        let named = std::fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
-        if (held.dev(), held.ino(), held.file_type())
-            != (named.dev(), named.ino(), named.file_type())
+        let name = CString::new(name.as_encoded_bytes()).map_err(|_| SearchFailure::Unavailable)?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: live retained parent, single NUL-terminated component and writable stat storage.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                named.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
         {
             return Err(SearchFailure::Unavailable);
         }
-        if let Some(name) = names.next() {
-            path.push(name);
+        // SAFETY: successful fstatat initialized every stat field.
+        let named = unsafe { named.assume_init() };
+        if (held.dev(), held.ino(), held.mode() & libc::S_IFMT)
+            != (named.st_dev, named.st_ino, named.st_mode & libc::S_IFMT)
+        {
+            return Err(SearchFailure::Unavailable);
         }
+        parent = owned;
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static POLICY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static POLICY_MATCH_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static SOURCE_COMPONENT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One search-owned compilation slot, never policy authority or a persistent cache.
+/// Bytes remain bounded by the source reader and are freshly read before every use.
+#[derive(Default)]
+pub(super) struct PolicyCompiler {
+    last: Option<(
+        std::path::PathBuf,
+        Vec<u8>,
+        std::sync::Arc<std::sync::Mutex<PolicyMatcher>>,
+    )>,
+}
+/// Derived matching results for one freshly byte-validated compilation slot.
+/// Retain only the last branch, not a repository-sized policy authority cache.
+pub(super) struct PolicyMatcher {
+    matcher: ignore::gitignore::Gitignore,
+    branch: std::path::PathBuf,
+    prefixes: Vec<(usize, bool, ignore::Match<()>)>,
+}
+impl PolicyMatcher {
+    fn matched(&mut self, path: &Path, is_dir: bool, depth: usize) -> ignore::Match<()> {
+        if let Some((length, directory, matched)) = self.prefixes.get(depth) {
+            if *length == path.as_os_str().len()
+                && *directory == is_dir
+                && self
+                    .branch
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .strip_prefix(path.as_os_str().as_encoded_bytes())
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
+            {
+                return matched.clone();
+            }
+        }
+        #[cfg(test)]
+        POLICY_MATCH_VISITS.with(|count| count.set(count.get() + 1));
+        let matched = self.matcher.matched(path, is_dir).map(|_| ());
+        self.prefixes.truncate(depth);
+        self.prefixes
+            .push((path.as_os_str().len(), is_dir, matched.clone()));
+        self.branch = path.to_path_buf();
+        matched
+    }
+}
+impl PolicyCompiler {
+    fn matcher(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        limits: &SearchLimits,
+    ) -> Result<Option<std::sync::Arc<std::sync::Mutex<PolicyMatcher>>>, SearchFailure> {
+        check_deadline(limits)?;
+        if let Some((previous_path, previous_bytes, matcher)) = &self.last {
+            if previous_path == path && previous_bytes == bytes {
+                return Ok(Some(matcher.clone()));
+            }
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| SearchFailure::Unavailable)?;
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(
+            path.parent().ok_or(SearchFailure::Unavailable)?,
+        );
+        for line in text.lines() {
+            check_deadline(limits)?;
+            builder
+                .add_line(Some(path.to_path_buf()), line)
+                .map_err(|_| SearchFailure::Unavailable)?;
+        }
+        #[cfg(test)]
+        POLICY_BUILDS.with(|count| count.set(count.get() + 1));
+        let matcher = builder.build().map_err(|_| SearchFailure::Unavailable)?;
+        check_deadline(limits)?;
+        let matcher = std::sync::Arc::new(std::sync::Mutex::new(PolicyMatcher {
+            matcher,
+            branch: std::path::PathBuf::new(),
+            prefixes: Vec::new(),
+        }));
+        self.last = Some((path.to_path_buf(), bytes.to_vec(), matcher.clone()));
+        Ok(Some(matcher))
+    }
 }
 
 /// Evaluate bounded .ignore/.gitignore bytes through the retained source owners.
@@ -575,6 +703,7 @@ pub(super) fn policy_admitted(
     device: u64,
     limits: &SearchLimits,
     final_directory: bool,
+    compiler: &std::sync::Mutex<PolicyCompiler>,
 ) -> Result<bool, SearchFailure> {
     let mut policies = Vec::new();
     let mut directory_path = root.to_path_buf();
@@ -588,32 +717,28 @@ pub(super) fn policy_admitted(
             }
         })
         .collect::<Vec<_>>();
-    // The pathname walk supplies only bounds and an additional denial. Authority
-    // comes from policy bytes opened through the same retained owners as source.
-    // A swap-and-restore cannot replace these matchers with another tree's rules.
+    // Reopen and reread every policy through the current retained owners.
+    // Only compilation of identical bytes at the identical path is reused.
     for (depth, directory) in directories.iter().enumerate() {
         let mut local = Vec::new();
         for policy in [".gitignore", ".ignore"] {
-            let mut builder = ignore::gitignore::GitignoreBuilder::new(&directory_path);
-            match open_at(directory, std::ffi::OsStr::new(policy), false) {
+            let matcher = match open_at(directory, std::ffi::OsStr::new(policy), false) {
                 Ok(policy_file) => {
                     let bytes =
                         read_source_file(policy_file, device)?.ok_or(SearchFailure::Unavailable)?;
-                    let text =
-                        std::str::from_utf8(&bytes).map_err(|_| SearchFailure::Unavailable)?;
-                    for line in text.lines() {
-                        check_deadline(limits)?;
-                        builder
-                            .add_line(Some(directory_path.join(policy)), line)
-                            .map_err(|_| SearchFailure::Unavailable)?;
-                    }
+                    compiler
+                        .lock()
+                        .map_err(|_| SearchFailure::Unavailable)?
+                        .matcher(&directory_path.join(policy), &bytes, limits)?
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(_) => return Err(SearchFailure::Unavailable),
-            }
-            local.push(builder.build().map_err(|_| SearchFailure::Unavailable)?);
+            };
+            local.push(matcher);
         }
-        policies.push(local);
+        if local.iter().any(Option::is_some) {
+            policies.push((depth, local));
+        }
         if let Some(name) = names.get(depth) {
             directory_path.push(name);
         }
@@ -624,12 +749,29 @@ pub(super) fn policy_admitted(
         candidate.push(name);
         let is_dir = depth + 1 < names.len() || final_directory;
         // .ignore outranks .gitignore; nearest ancestor wins within each class.
-        let matched = [1, 0].into_iter().find_map(|kind| {
-            policies[..=depth].iter().rev().find_map(|local| {
-                let matched = local[kind].matched(&candidate, is_dir);
-                (!matched.is_none()).then_some(matched)
-            })
-        });
+        let mut matched = None;
+        for kind in [1, 0] {
+            for (owner_depth, local) in policies
+                .iter()
+                .rev()
+                .filter(|(owner_depth, _)| *owner_depth <= depth)
+            {
+                let Some(matcher) = local[kind].as_ref() else {
+                    continue;
+                };
+                let result = matcher
+                    .lock()
+                    .map_err(|_| SearchFailure::Unavailable)?
+                    .matched(&candidate, is_dir, depth - owner_depth);
+                if !result.is_none() {
+                    matched = Some(result);
+                    break;
+                }
+            }
+            if matched.is_some() {
+                break;
+            }
+        }
         if matched.is_some_and(|matched| matched.is_ignore()) {
             admitted = false;
         }
@@ -679,6 +821,8 @@ pub(super) fn open_source(
         check_deadline(limits)?;
         directories.push(parent.try_clone().map_err(|_| SearchFailure::Unavailable)?);
         let directory = parts.peek().is_some() || final_directory;
+        #[cfg(test)]
+        SOURCE_COMPONENT_OPENS.with(|count| count.set(count.get() + 1));
         let opened = open_at(&parent, name, directory).map_err(|_| SearchFailure::Unavailable)?;
         let metadata = opened.metadata().map_err(|_| SearchFailure::Unavailable)?;
         if metadata.dev() != device
@@ -730,6 +874,47 @@ impl<'ast> Visit<'ast> for RustBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_namespace_custody_uses_descriptor_relative_names() {
+        let fixture = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join(format!("extract-deep-{}", std::process::id()));
+        std::fs::create_dir(&fixture).expect("owned fixture");
+        let mut owner = File::open(&fixture).expect("root owner");
+        let mut directories = Vec::new();
+        let name = CString::new("child").expect("component");
+        let mut relative = std::path::PathBuf::new();
+        for _ in 0..1100 {
+            // SAFETY: retained parent and a single owned NUL-terminated name.
+            assert_eq!(
+                unsafe { libc::mkdirat(owner.as_raw_fd(), name.as_ptr(), 0o700) },
+                0
+            );
+            let child = open_at(&owner, std::ffi::OsStr::new("child"), true).expect("child owner");
+            directories.push(owner);
+            owner = child;
+            relative.push("child");
+        }
+        let pathname_error = std::fs::symlink_metadata(fixture.join(&relative))
+            .expect_err("synthetic accumulated pathname exceeds Linux PATH_MAX")
+            .raw_os_error();
+        let admitted = check_source_namespace(&fixture, &relative, &directories, &owner);
+        for parent in directories.iter().rev() {
+            // SAFETY: remove only the owned empty child using its retained parent.
+            assert_eq!(
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) },
+                0
+            );
+        }
+        std::fs::remove_dir(&fixture).expect("fixture cleanup");
+        assert_eq!(pathname_error, Some(libc::ENAMETOOLONG));
+        assert!(
+            admitted.is_ok(),
+            "deep custody must not repeatedly resolve accumulated pathnames: {admitted:?}"
+        );
+    }
 
     #[test]
     fn extract_namespace_replacement_and_policy_aba_fail_closed() {
