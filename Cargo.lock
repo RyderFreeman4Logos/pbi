@@ -1680,6 +1680,7 @@ dependencies = [
  "libc",
  "porter-stemmer",
  "proc-macro2",
+ "regex",
  "serde_json",
  "syn 2.0.119",
  "tokio",

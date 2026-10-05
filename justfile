@@ -10,6 +10,10 @@ fmt-fix:
 lock:
     ionice -c 3 cargo generate-lockfile --offline
 
+# Sync direct dependency edges without re-resolving locked package versions.
+lock-sync:
+    ionice -c 3 cargo check --offline
+
 lock-online:
     ionice -c 3 cargo generate-lockfile
 

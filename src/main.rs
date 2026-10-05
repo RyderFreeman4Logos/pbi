@@ -222,6 +222,7 @@ struct SearchOptions {
     files_only: bool,
     exact: bool,
     stem: bool,
+    regex: bool,
     frequency: bool,
     exclude_filenames: bool,
     strict_elastic_syntax: bool,
@@ -243,6 +244,7 @@ impl Default for SearchOptions {
             files_only: false,
             exact: false,
             stem: false,
+            regex: false,
             frequency: false,
             exclude_filenames: false,
             strict_elastic_syntax: false,
@@ -257,10 +259,10 @@ fn usage() {
          Usage: pbi-rs extract <path>:<line> [--timeout <SECONDS>] [--max-bytes <N>]\n\
                 pbi-rs symbols <path>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... <question...> [--timeout <SECONDS>] [--json]\n\
-                pbi-rs search [--bm25] [--stem] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
+                pbi-rs search [--bm25] [--stem] [--regex] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
-         A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. Questions return verified source citations; search prints compact native BM25 locations and scores. --bm25 shows source blocks from the same ranker; neither search path calls a model."
+         A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. --regex searches original UTF-8 lines case-sensitively and returns locations only (8192 pattern bytes, 1 MiB compiled/DFA limits, 64 nesting depth, 4096 candidates). It cannot combine with --bm25, --exact, --stem, --strict-elastic-syntax, --session, or raw options. Questions return verified source citations; search prints compact native BM25 locations and scores. --bm25 shows source blocks from the same ranker; neither search path calls a model."
     );
 }
 
@@ -376,11 +378,7 @@ fn emit_failure_receipt(
     let exe = redact_identity(env::current_exe().is_ok());
     let argv0 = redact_identity(env::args_os().next().is_some());
     let argv_count = arguments.len();
-    let argv = arguments
-        .iter()
-        .map(|argument| safe_argument(argument))
-        .collect::<Vec<_>>()
-        .join(",");
+    let argv = safe_arguments(arguments);
     let deadline_s = deadline
         .map(|seconds| seconds.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
@@ -419,16 +417,89 @@ fn safe_failure_token(token: &str) -> String {
     escape_control(body) + suffix
 }
 
-fn safe_argument(argument: &str) -> String {
-    if let Some((name, _)) = argument.split_once('=') {
-        if known_option(name) {
-            return format!("{name},[REDACTED]");
+fn safe_arguments(arguments: &[String]) -> String {
+    // Only a successful shared parser can authorize public numeric bounds.
+    // Spelling alone never authorizes an operand, including after a parse error.
+    let parsed = parse_local_route_prefix(arguments.to_vec());
+    let valid = parsed
+        .as_ref()
+        .is_ok_and(|(args, _)| match args.first().map(String::as_str) {
+            Some("search") => parse_search(&args[1..]).is_ok(),
+            Some("extract") => extract::parse(&args[1..]).is_ok(),
+            Some("symbols") => false,
+            _ => parse_question(args).is_ok(),
+        });
+    let command_index = parsed
+        .as_ref()
+        .ok()
+        .map(|(args, _)| arguments.len() - args.len());
+    let mut literal = false;
+    let mut operands = 0;
+    let mut numeric = false;
+    let mut safe = Vec::new();
+    for (index, argument) in arguments.iter().take(64).enumerate() {
+        if literal {
+            safe.push("[REDACTED]".to_owned());
+            continue;
+        }
+        if operands > 0 {
+            operands -= 1;
+            safe.push(if numeric && valid {
+                argument
+                    .parse::<u64>()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| "[REDACTED]".to_owned())
+            } else {
+                "[REDACTED]".to_owned()
+            });
+            continue;
+        }
+        if Some(index) == command_index
+            && matches!(argument.as_str(), "search" | "extract" | "symbols")
+        {
+            safe.push(argument.clone());
+            operands = usize::from(argument == "extract");
+            literal = argument == "symbols";
+            numeric = false;
+            continue;
+        }
+        let (name, value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(name, value)| {
+                (name, Some(value))
+            });
+        if !name.starts_with('-') || !known_option(name) || name == "--" {
+            safe.push("[REDACTED]".to_owned());
+            // Unknown options terminate trustworthy role discovery.
+            literal = name.starts_with('-');
+            continue;
+        }
+        numeric = matches!(
+            name,
+            "--timeout" | "--max-results" | "--max-bytes" | "--max-tokens" | "--merge-threshold"
+        );
+        safe.push(name.to_owned());
+        if let Some(value) = value {
+            safe.push(if numeric && valid {
+                value
+                    .parse::<u64>()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| "[REDACTED]".to_owned())
+            } else {
+                "[REDACTED]".to_owned()
+            });
+        } else {
+            operands = match name {
+                "--model-route" => 3,
+                "--message" | "--model-name" | "--force-provider" | "--timeout" | "--reranker"
+                | "-r" | "--session" | "--question" | "--max-results" | "--max-bytes"
+                | "--max-tokens" | "--merge-threshold" | "--format" | "-o" | "--language"
+                | "-l" | "--ignore" | "-i" => 1,
+                _ => 0,
+            };
         }
     }
-    if known_option(argument) || argument.bytes().all(|byte| byte.is_ascii_digit()) {
-        return escape_control(argument);
-    }
-    "[REDACTED]".to_owned()
+    safe.join(",")
 }
 
 fn known_option(value: &str) -> bool {
@@ -445,6 +516,7 @@ fn known_option(value: &str) -> bool {
             | "--model-name"
             | "--force-provider"
             | "--timeout"
+            | "--regex"
             | "--bm25"
             | "--stem"
             | "--reranker"
@@ -785,7 +857,25 @@ fn run_traced(
         ));
     }
     if !semantic {
-        let strict_query = if options.strict_elastic_syntax {
+        let regex = if options.regex {
+            if Instant::now() >= deadline {
+                trace.point(TraceStage::InitialSearch, TraceStatus::Deadline, 0);
+                return Err(search_cli_error(SearchFailure::Deadline));
+            }
+            Some(
+                regex::RegexBuilder::new(&query)
+                    .size_limit(1024 * 1024)
+                    .dfa_size_limit(1024 * 1024)
+                    .nest_limit(64)
+                    .build()
+                    .map_err(|_| CliError::usage("invalid or oversized regex pattern"))?,
+            )
+        } else {
+            None
+        };
+        let strict_query = if options.regex {
+            Ok(None)
+        } else if options.strict_elastic_syntax {
             StrictQuery::parse(&query).map(Some)
         } else if options.exact {
             Ok(None)
@@ -811,27 +901,32 @@ fn run_traced(
             })
             .transpose()?;
         trace.point(TraceStage::InitialSearch, TraceStatus::Start, 0);
-        let (mut hits, freshness) = search_raw_repository(
-            &root,
-            &query,
-            &SearchLimits {
-                deadline,
-                max_results: options.max_results,
-                language: options.language.clone(),
-                ignores: options.ignores.clone(),
-            },
-            &RawSearchOptions {
-                exact: options.exact,
-                stem: options.stem,
-                exclude_filenames: options.exclude_filenames,
-                merge_threshold: options
-                    .merge_threshold
-                    .as_deref()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(5),
-                strict: strict_query.as_ref(),
-            },
-        )
+        let limits = SearchLimits {
+            deadline,
+            max_results: options.max_results,
+            language: options.language.clone(),
+            ignores: options.ignores.clone(),
+        };
+        let (mut hits, freshness) = if let Some(regex) = regex.as_ref() {
+            native_search::search_regex_repository(&root, regex, &limits).map(|hits| (hits, 0))
+        } else {
+            search_raw_repository(
+                &root,
+                &query,
+                &limits,
+                &RawSearchOptions {
+                    exact: options.exact,
+                    stem: options.stem,
+                    exclude_filenames: options.exclude_filenames,
+                    merge_threshold: options
+                        .merge_threshold
+                        .as_deref()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(5),
+                    strict: strict_query.as_ref(),
+                },
+            )
+        }
         .map_err(|error| {
             let status = if matches!(error, SearchFailure::Deadline) {
                 TraceStatus::Deadline
@@ -848,7 +943,7 @@ fn run_traced(
             hits.retain(|hit| hit.line.is_some());
             options.format = Some("compact".to_owned());
         }
-        if options.files_only || !raw {
+        if options.files_only || (!raw && !options.regex) {
             let mut seen = std::collections::HashSet::new();
             hits.retain(|hit| seen.insert(hit.file.clone()));
         }
@@ -1758,7 +1853,8 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                 }
                 index += 1;
             }
-            "--stem"
+            "--regex"
+            | "--stem"
             | "--files-only"
             | "-f"
             | "--exact"
@@ -1781,6 +1877,25 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
         }
     }
     let query = query_parts.join(" ");
+    if options.regex
+        && (raw
+            || options.exact
+            || options.stem
+            || options.strict_elastic_syntax
+            || options.session.is_some()
+            || options.files_only
+            || options.frequency
+            || options.exclude_filenames
+            || reranker_seen
+            || question_seen)
+    {
+        return Err(CliError::usage(
+            "--regex requires compact stateless search without token or raw options",
+        ));
+    }
+    if options.regex && query.len() > 8192 {
+        return Err(CliError::usage("regex pattern exceeds its byte cap"));
+    }
     if options.stem && options.exact {
         return Err(CliError::usage("--stem cannot be combined with --exact"));
     }
@@ -1841,6 +1956,7 @@ fn set_raw_safe_flag(options: &mut SearchOptions, option: &str) -> Result<(), Cl
     let (slot, canonical) = match option {
         "--files-only" | "-f" => (&mut options.files_only, "--files-only"),
         "--stem" => (&mut options.stem, "--stem"),
+        "--regex" => (&mut options.regex, "--regex"),
         "--exact" | "-e" => (&mut options.exact, "--exact"),
         "--frequency" | "-s" => (&mut options.frequency, "--frequency"),
         "--exclude-filenames" | "-n" => (&mut options.exclude_filenames, "--exclude-filenames"),

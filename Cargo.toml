@@ -20,6 +20,8 @@ syn = { version = "=2.0.119", features = ["full", "visit"] }
 proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 serde_json = "=1.0.149"
 ignore = "=0.4.25"
+# Already locked transitively; bounded regex search uses the same engine.
+regex = { version = "=1.13.1", default-features = false, features = ["std", "unicode", "perf"] }
 libc = "=0.2.189"
 toml = "=0.9.12"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
