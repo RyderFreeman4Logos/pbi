@@ -619,7 +619,43 @@ thread_local! {
 /// Bytes remain bounded by the source reader and are freshly read before every use.
 #[derive(Default)]
 pub(super) struct PolicyCompiler {
-    last: Option<(std::path::PathBuf, Vec<u8>, ignore::gitignore::Gitignore)>,
+    last: Option<(
+        std::path::PathBuf,
+        Vec<u8>,
+        std::sync::Arc<std::sync::Mutex<PolicyMatcher>>,
+    )>,
+}
+/// Derived matching results for one freshly byte-validated compilation slot.
+/// Retain only the last branch, not a repository-sized policy authority cache.
+pub(super) struct PolicyMatcher {
+    matcher: ignore::gitignore::Gitignore,
+    branch: std::path::PathBuf,
+    prefixes: Vec<(usize, bool, ignore::Match<()>)>,
+}
+impl PolicyMatcher {
+    fn matched(&mut self, path: &Path, is_dir: bool, depth: usize) -> ignore::Match<()> {
+        if let Some((length, directory, matched)) = self.prefixes.get(depth) {
+            if *length == path.as_os_str().len()
+                && *directory == is_dir
+                && self
+                    .branch
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .strip_prefix(path.as_os_str().as_encoded_bytes())
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
+            {
+                return matched.clone();
+            }
+        }
+        #[cfg(test)]
+        POLICY_MATCH_VISITS.with(|count| count.set(count.get() + 1));
+        let matched = self.matcher.matched(path, is_dir).map(|_| ());
+        self.prefixes.truncate(depth);
+        self.prefixes
+            .push((path.as_os_str().len(), is_dir, matched.clone()));
+        self.branch = path.to_path_buf();
+        matched
+    }
 }
 impl PolicyCompiler {
     fn matcher(
@@ -627,7 +663,7 @@ impl PolicyCompiler {
         path: &Path,
         bytes: &[u8],
         limits: &SearchLimits,
-    ) -> Result<Option<ignore::gitignore::Gitignore>, SearchFailure> {
+    ) -> Result<Option<std::sync::Arc<std::sync::Mutex<PolicyMatcher>>>, SearchFailure> {
         check_deadline(limits)?;
         if let Some((previous_path, previous_bytes, matcher)) = &self.last {
             if previous_path == path && previous_bytes == bytes {
@@ -648,6 +684,11 @@ impl PolicyCompiler {
         POLICY_BUILDS.with(|count| count.set(count.get() + 1));
         let matcher = builder.build().map_err(|_| SearchFailure::Unavailable)?;
         check_deadline(limits)?;
+        let matcher = std::sync::Arc::new(std::sync::Mutex::new(PolicyMatcher {
+            matcher,
+            branch: std::path::PathBuf::new(),
+            prefixes: Vec::new(),
+        }));
         self.last = Some((path.to_path_buf(), bytes.to_vec(), matcher.clone()));
         Ok(Some(matcher))
     }
@@ -708,18 +749,29 @@ pub(super) fn policy_admitted(
         candidate.push(name);
         let is_dir = depth + 1 < names.len() || final_directory;
         // .ignore outranks .gitignore; nearest ancestor wins within each class.
-        let matched = [1, 0].into_iter().find_map(|kind| {
-            policies
+        let mut matched = None;
+        for kind in [1, 0] {
+            for (owner_depth, local) in policies
                 .iter()
                 .rev()
                 .filter(|(owner_depth, _)| *owner_depth <= depth)
-                .find_map(|(_, local)| {
-                    #[cfg(test)]
-                    POLICY_MATCH_VISITS.with(|count| count.set(count.get() + 1));
-                    let matched = local[kind].as_ref()?.matched(&candidate, is_dir);
-                    (!matched.is_none()).then_some(matched)
-                })
-        });
+            {
+                let Some(matcher) = local[kind].as_ref() else {
+                    continue;
+                };
+                let result = matcher
+                    .lock()
+                    .map_err(|_| SearchFailure::Unavailable)?
+                    .matched(&candidate, is_dir, depth - owner_depth);
+                if !result.is_none() {
+                    matched = Some(result);
+                    break;
+                }
+            }
+            if matched.is_some() {
+                break;
+            }
+        }
         if matched.is_some_and(|matched| matched.is_ignore()) {
             admitted = false;
         }

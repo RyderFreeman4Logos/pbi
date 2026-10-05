@@ -102,6 +102,64 @@ fn absent_ancestor_policies_do_not_create_quadratic_match_work() {
 }
 
 #[test]
+fn fresh_policy_matching_reuses_derived_ancestor_results() {
+    let fixture = fixture();
+    let root = fixture.0.join("root");
+    fs::write(root.join(".gitignore"), "ignored.rs\n").expect("policy");
+    let relative = PathBuf::from("child/".repeat(64)).join("visible.rs");
+    fs::create_dir_all(root.join(relative.parent().expect("parent"))).expect("parents");
+    fs::write(root.join(&relative), "fn review_marker() {}\n").expect("source");
+    crate::extract::POLICY_MATCH_VISITS.with(|count| count.set(0));
+    let files = walk(&root, fs::metadata(&root).expect("root").dev(), &limits()).expect("walk");
+    assert_eq!(files, vec![root.join(&relative)]);
+    let calls = crate::extract::POLICY_MATCH_VISITS.with(|count| count.get());
+    assert!(
+        calls <= 2 * 67,
+        "fresh identical policy bytes must not rematch every ancestor per entry: {calls}"
+    );
+    eprintln!("actual matcher calls={calls}");
+    let device = fs::metadata(&root).expect("root").dev();
+    let (_, directories) = open_source(
+        open_root(&root).expect("owner"),
+        &relative,
+        device,
+        &limits(),
+        false,
+    )
+    .expect("owners");
+    let compiler = std::sync::Mutex::new(crate::extract::PolicyCompiler::default());
+    let admitted = || {
+        policy_admitted(
+            &root,
+            &relative,
+            &directories,
+            device,
+            &limits(),
+            false,
+            &compiler,
+        )
+        .expect("fresh admission")
+    };
+    assert!(admitted());
+    fs::write(root.join(".gitignore"), "visible.rs\n").expect("changed policy");
+    assert!(
+        !admitted(),
+        "changed freshly read bytes invalidate derived matches"
+    );
+    fs::write(root.join(".ignore"), "!visible.rs\n").expect("absent to present");
+    assert!(admitted(), ".ignore must outrank .gitignore");
+    fs::remove_file(root.join(".ignore")).expect("present to absent");
+    assert!(!admitted());
+    fs::write(root.join(".gitignore"), "ignored.rs\n").expect("restore policy");
+    assert!(admitted());
+    fs::write(root.join("child/.ignore"), "visible.rs\n").expect("new ancestor denial");
+    assert!(
+        !admitted(),
+        "a previously absent ancestor policy must still deny"
+    );
+}
+
+#[test]
 fn unchanged_policy_bytes_compile_once_per_search() {
     let fixture = fixture();
     let root = fixture.0.join("root");
