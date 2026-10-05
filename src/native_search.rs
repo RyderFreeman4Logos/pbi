@@ -61,6 +61,7 @@ pub struct RawHit {
     pub score: f64,
     pub occurrences: usize,
     declaration: bool,
+    block_matches: usize,
 }
 
 /// Raw search shares the walk and file limits with verified search.
@@ -81,6 +82,7 @@ struct RawCandidate {
     length: usize,
     occurrences: usize,
     declaration: bool,
+    block_matches: usize,
 }
 
 struct Hit {
@@ -246,6 +248,7 @@ pub fn search_regex_repository(
                     score: 1.0,
                     occurrences: 1,
                     declaration: false,
+                    block_matches: 1,
                 });
             }
         }
@@ -330,7 +333,7 @@ pub fn search_raw_repository(
         let mut counts = vec![0usize; terms.len()];
         let mut length = 0usize;
         let source_lines = source.lines().collect::<Vec<_>>();
-        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
         for (index, line) in source_lines.iter().enumerate() {
             if Instant::now() >= limits.deadline {
                 return Err(SearchFailure::Deadline);
@@ -361,13 +364,14 @@ pub fn search_raw_repository(
                 if let Some(last) = blocks.last_mut() {
                     if line_number.saturating_sub(last.1 + 1) <= options.merge_threshold {
                         last.1 = line_number;
+                        last.2 += line_matches;
                         continue;
                     }
                 }
                 if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
                     return Err(SearchFailure::Limit);
                 }
-                blocks.push((line_number, line_number));
+                blocks.push((line_number, line_number, line_matches));
             }
         }
         if !options.exclude_filenames {
@@ -396,14 +400,14 @@ pub fn search_raw_repository(
             continue;
         }
         if blocks.is_empty() {
-            blocks.push((0, 0));
+            blocks.push((0, 0, 0));
         }
         let declarations = if path.extension().is_some_and(|extension| extension == "rs") {
             pbi_rs::matching_rust_declaration_lines(source, &terms)
         } else {
             Vec::new()
         };
-        for (start, end) in blocks {
+        for (start, end, block_matches) in blocks {
             if candidates.len() >= MAX_RAW_BLOCKS {
                 return Err(SearchFailure::Limit);
             }
@@ -425,6 +429,7 @@ pub fn search_raw_repository(
                 term_counts: counts.clone(),
                 length,
                 declaration: declarations.iter().any(|line| (start..=end).contains(line)),
+                block_matches,
             });
         }
     }
@@ -458,6 +463,7 @@ pub fn search_raw_repository(
                 score,
                 occurrences: candidate.occurrences,
                 declaration: candidate.declaration,
+                block_matches: candidate.block_matches,
             }
         })
         .collect::<Vec<_>>();
@@ -467,6 +473,9 @@ pub fn search_raw_repository(
             .cmp(&left.declaration)
             .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.file.cmp(&right.file))
+            // Keep file BM25 ranking; prefer its strongest matching block before
+            // compact search deduplicates it, rather than its earliest header.
+            .then_with(|| right.block_matches.cmp(&left.block_matches))
             .then_with(|| left.line.cmp(&right.line))
     });
     Ok((hits, freshness.finish()))
@@ -1127,6 +1136,51 @@ mod root_scope_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn raw_same_file_selects_matching_body_before_sparse_header() {
+        let fixture = Fixture::new("block-admission");
+        let source = "# orbit vector\n\n\n\n\n\n\n\nassemble:\n    orbit vector orbit vector\n    orbit vector\n";
+        fs::write(fixture.0.join("tasks"), source).expect("synthetic source");
+        let limits = SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(8),
+            max_results: 8,
+            language: None,
+            ignores: Vec::new(),
+        };
+        let options = super::RawSearchOptions {
+            exact: false,
+            stem: false,
+            exclude_filenames: false,
+            merge_threshold: 5,
+            strict: None,
+        };
+        let (hits, _) = super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+            .expect("bounded raw search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].line, Some(10));
+        assert_eq!(hits[0].end_line, Some(11));
+        assert_eq!(
+            hits[0].score, hits[1].score,
+            "file BM25 must stay unchanged"
+        );
+        for count in [128, 129] {
+            fs::write(
+                fixture.0.join("tasks"),
+                "orbit\n\n\n\n\n\n\n\n".repeat(count),
+            )
+            .expect("synthetic separated blocks");
+            let result = super::search_raw_repository(&fixture.0, "orbit", &limits, &options);
+            if count == 128 {
+                assert_eq!(
+                    result.expect("admit the unchanged block cap").0.len(),
+                    count
+                );
+            } else {
+                assert!(matches!(result, Err(SearchFailure::Limit)));
+            }
         }
     }
 
