@@ -47,7 +47,21 @@ impl Drop for Fixture {
 #[test]
 fn compact_streaming_keeps_strong_late_body_beyond_raw_block_cap() {
     let fixture = Fixture::new();
-    for count in [129, 512, 2048] {
+    fs::write(
+        fixture.root.join("tasks"),
+        "orbit\n\n\n\n\n\n\n\n".repeat(128),
+    )
+    .expect("admitted raw block boundary");
+    let raw = fixture.run(&["search", "--bm25", "orbit", "--max-results=2"], "raw");
+    assert!(raw.status.success());
+    assert!(raw.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&raw.stdout)
+            .matches("File: ")
+            .count(),
+        2
+    );
+    for count in [128, 129, 512, 2048] {
         let mut source = "orbit\n\n\n\n\n\n\n\n".repeat(count);
         source.push_str("orbit vector orbit vector\norbit vector\n");
         fs::write(fixture.root.join("tasks"), source).expect("separated blocks");
@@ -60,7 +74,10 @@ fn compact_streaming_keeps_strong_late_body_beyond_raw_block_cap() {
         let raw = fixture.run(&["search", "--bm25", "orbit vector"], "raw");
         assert_eq!(raw.status.code(), Some(1));
         assert!(raw.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&raw.stderr).contains("bounded limit"));
+        assert_eq!(
+            String::from_utf8_lossy(&raw.stderr).lines().next(),
+            Some("pbi-rs: raw source-block limit reached; use compact search without --bm25")
+        );
     }
 }
 
@@ -213,7 +230,10 @@ fn bounded_regex_candidate_root_result_and_output_caps() {
     let overflow = fixture.run(&["search", "--regex", "synthetic"], "regex");
     assert_eq!(overflow.status.code(), Some(1));
     assert!(overflow.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&overflow.stderr).contains("bounded limit"));
+    assert_eq!(
+        String::from_utf8_lossy(&overflow.stderr).lines().next(),
+        Some("pbi-rs: native search exceeded its bounded limit")
+    );
     fs::write(fixture.root.join("many.txt"), "synthetic\n".repeat(4)).expect("small candidate set");
     let capped = fixture.run(
         &["search", "--regex", "synthetic", "--max-results=2"],

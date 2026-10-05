@@ -47,6 +47,8 @@ pub struct SearchLimits {
 pub enum SearchFailure {
     Deadline,
     Limit,
+    /// Noncompact search cannot retain another source block in one file.
+    RawBlocksPerFileLimit,
     TargetLimit,
     Unavailable,
 }
@@ -380,7 +382,7 @@ pub fn search_raw_repository(
                     retain_block(&mut blocks, block, options.compact, &declarations)?;
                 }
                 if !options.compact && blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
-                    return Err(SearchFailure::Limit);
+                    return Err(SearchFailure::RawBlocksPerFileLimit);
                 }
                 pending = Some((line_number, line_number, line_matches));
             }
@@ -514,7 +516,7 @@ fn retain_block(
         }
     }
     if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
-        return Err(SearchFailure::Limit);
+        return Err(SearchFailure::RawBlocksPerFileLimit);
     }
     blocks.push(block);
     Ok(())
@@ -1219,7 +1221,7 @@ mod root_scope_tests {
                     count
                 );
             } else {
-                assert!(matches!(result, Err(SearchFailure::Limit)));
+                assert!(matches!(result, Err(SearchFailure::RawBlocksPerFileLimit)));
             }
         }
     }
