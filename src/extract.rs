@@ -560,25 +560,50 @@ pub(super) fn check_source_namespace(
     directories: &[File],
     file: &File,
 ) -> Result<(), SearchFailure> {
-    let mut path = root.to_path_buf();
-    let mut names = relative.components().filter_map(|part| {
+    let names = relative.components().filter_map(|part| {
         if let Component::Normal(name) = part {
             Some(name)
         } else {
             None
         }
     });
-    for owned in directories.iter().chain(std::iter::once(file)) {
+    if names.clone().count() != directories.len() {
+        return Err(SearchFailure::Unavailable);
+    }
+    let mut owners = directories.iter().chain(std::iter::once(file));
+    let root_owner = owners.next().ok_or(SearchFailure::Unavailable)?;
+    let held = root_owner
+        .metadata()
+        .map_err(|_| SearchFailure::Unavailable)?;
+    let named = std::fs::symlink_metadata(root).map_err(|_| SearchFailure::Unavailable)?;
+    if (held.dev(), held.ino(), held.file_type()) != (named.dev(), named.ino(), named.file_type()) {
+        return Err(SearchFailure::Unavailable);
+    }
+    let mut parent = root_owner;
+    for (name, owned) in names.zip(owners) {
         let held = owned.metadata().map_err(|_| SearchFailure::Unavailable)?;
-        let named = std::fs::symlink_metadata(&path).map_err(|_| SearchFailure::Unavailable)?;
-        if (held.dev(), held.ino(), held.file_type())
-            != (named.dev(), named.ino(), named.file_type())
+        let name = CString::new(name.as_encoded_bytes()).map_err(|_| SearchFailure::Unavailable)?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: live retained parent, single NUL-terminated component and writable stat storage.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                named.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
         {
             return Err(SearchFailure::Unavailable);
         }
-        if let Some(name) = names.next() {
-            path.push(name);
+        // SAFETY: successful fstatat initialized every stat field.
+        let named = unsafe { named.assume_init() };
+        if (held.dev(), held.ino(), held.mode() & libc::S_IFMT)
+            != (named.st_dev, named.st_ino, named.st_mode & libc::S_IFMT)
+        {
+            return Err(SearchFailure::Unavailable);
         }
+        parent = owned;
     }
     Ok(())
 }
@@ -797,6 +822,47 @@ impl<'ast> Visit<'ast> for RustBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_namespace_custody_uses_descriptor_relative_names() {
+        let fixture = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join(format!("extract-deep-{}", std::process::id()));
+        std::fs::create_dir(&fixture).expect("owned fixture");
+        let mut owner = File::open(&fixture).expect("root owner");
+        let mut directories = Vec::new();
+        let name = CString::new("child").expect("component");
+        let mut relative = std::path::PathBuf::new();
+        for _ in 0..1100 {
+            // SAFETY: retained parent and a single owned NUL-terminated name.
+            assert_eq!(
+                unsafe { libc::mkdirat(owner.as_raw_fd(), name.as_ptr(), 0o700) },
+                0
+            );
+            let child = open_at(&owner, std::ffi::OsStr::new("child"), true).expect("child owner");
+            directories.push(owner);
+            owner = child;
+            relative.push("child");
+        }
+        let pathname_error = std::fs::symlink_metadata(fixture.join(&relative))
+            .expect_err("synthetic accumulated pathname exceeds Linux PATH_MAX")
+            .raw_os_error();
+        let admitted = check_source_namespace(&fixture, &relative, &directories, &owner);
+        for parent in directories.iter().rev() {
+            // SAFETY: remove only the owned empty child using its retained parent.
+            assert_eq!(
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) },
+                0
+            );
+        }
+        std::fs::remove_dir(&fixture).expect("fixture cleanup");
+        assert_eq!(pathname_error, Some(libc::ENAMETOOLONG));
+        assert!(
+            admitted.is_ok(),
+            "deep custody must not repeatedly resolve accumulated pathnames: {admitted:?}"
+        );
+    }
 
     #[test]
     fn extract_namespace_replacement_and_policy_aba_fail_closed() {
