@@ -915,6 +915,7 @@ fn run_traced(
                 &query,
                 &limits,
                 &RawSearchOptions {
+                    compact: !raw,
                     exact: options.exact,
                     stem: options.stem,
                     exclude_filenames: options.exclude_filenames,

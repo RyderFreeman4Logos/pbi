@@ -66,6 +66,8 @@ pub struct RawHit {
 
 /// Raw search shares the walk and file limits with verified search.
 pub struct RawSearchOptions<'a> {
+    /// Compact output needs only the strongest merged block per file.
+    pub compact: bool,
     pub exact: bool,
     pub stem: bool,
     pub exclude_filenames: bool,
@@ -333,7 +335,13 @@ pub fn search_raw_repository(
         let mut counts = vec![0usize; terms.len()];
         let mut length = 0usize;
         let source_lines = source.lines().collect::<Vec<_>>();
-        let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
+        let declarations = if path.extension().is_some_and(|extension| extension == "rs") {
+            pbi_rs::matching_rust_declaration_lines(source, &terms)
+        } else {
+            Vec::new()
+        };
+        let mut blocks = Vec::new();
+        let mut pending: Option<(usize, usize, usize)> = None;
         for (index, line) in source_lines.iter().enumerate() {
             if Instant::now() >= limits.deadline {
                 return Err(SearchFailure::Deadline);
@@ -361,18 +369,24 @@ pub fn search_raw_repository(
                 || (!options.exact && line_matches > 0)
             {
                 let line_number = index + 1;
-                if let Some(last) = blocks.last_mut() {
+                if let Some(last) = pending.as_mut() {
                     if line_number.saturating_sub(last.1 + 1) <= options.merge_threshold {
                         last.1 = line_number;
                         last.2 += line_matches;
                         continue;
                     }
                 }
-                if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
+                if let Some(block) = pending.take() {
+                    retain_block(&mut blocks, block, options.compact, &declarations)?;
+                }
+                if !options.compact && blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
                     return Err(SearchFailure::Limit);
                 }
-                blocks.push((line_number, line_number, line_matches));
+                pending = Some((line_number, line_number, line_matches));
             }
+        }
+        if let Some(block) = pending {
+            retain_block(&mut blocks, block, options.compact, &declarations)?;
         }
         if !options.exclude_filenames {
             if let Some(name) = matching_filename {
@@ -402,11 +416,6 @@ pub fn search_raw_repository(
         if blocks.is_empty() {
             blocks.push((0, 0, 0));
         }
-        let declarations = if path.extension().is_some_and(|extension| extension == "rs") {
-            pbi_rs::matching_rust_declaration_lines(source, &terms)
-        } else {
-            Vec::new()
-        };
         for (start, end, block_matches) in blocks {
             if candidates.len() >= MAX_RAW_BLOCKS {
                 return Err(SearchFailure::Limit);
@@ -479,6 +488,36 @@ pub fn search_raw_repository(
             .then_with(|| left.line.cmp(&right.line))
     });
     Ok((hits, freshness.finish()))
+}
+
+// Completed blocks compete before snippet allocation. The pending block remains
+// separate until merged; compact retains one winner and scans every later line.
+fn retain_block(
+    blocks: &mut Vec<(usize, usize, usize)>,
+    block: (usize, usize, usize),
+    compact: bool,
+    declarations: &[usize],
+) -> Result<(), SearchFailure> {
+    if compact {
+        let key = |(start, end, matches)| {
+            (
+                declarations.iter().any(|line| (start..=end).contains(line)),
+                matches,
+                std::cmp::Reverse(start),
+            )
+        };
+        if let Some(best) = blocks.first_mut() {
+            if key(block) > key(*best) {
+                *best = block;
+            }
+            return Ok(());
+        }
+    }
+    if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
+        return Err(SearchFailure::Limit);
+    }
+    blocks.push(block);
+    Ok(())
 }
 
 fn raw_terms(query: &str) -> Vec<String> {
@@ -1151,6 +1190,7 @@ mod root_scope_tests {
             ignores: Vec::new(),
         };
         let options = super::RawSearchOptions {
+            compact: false,
             exact: false,
             stem: false,
             exclude_filenames: false,
@@ -1182,6 +1222,88 @@ mod root_scope_tests {
                 assert!(matches!(result, Err(SearchFailure::Limit)));
             }
         }
+    }
+
+    #[test]
+    fn compact_streaming_storage_and_bm25_match_raw_dedup() {
+        for count in [129, 512, 2048, 8192] {
+            let mut blocks = Vec::new();
+            for line in 1..=count {
+                super::retain_block(&mut blocks, (line, line, line), true, &[])
+                    .expect("compact retention");
+                assert_eq!(blocks.len(), 1, "one winner plus one pending block maximum");
+                assert_eq!(blocks[0], (line, line, line));
+            }
+            super::retain_block(&mut blocks, (count + 1, count + 1, 0), true, &[count + 1])
+                .expect("late declaration wins before match density");
+            assert_eq!(blocks[0].0, count + 1);
+        }
+        let fixture = Fixture::new("compact-bm25");
+        fs::write(
+            fixture.0.join("tasks"),
+            "orbit\n\n\n\n\n\n\n\n".repeat(128) + "unmatched trailing words\n",
+        )
+        .expect("full file statistics");
+        fs::write(fixture.0.join("other"), "orbit vector orbit\n").expect("other document");
+        fs::write(fixture.0.join("empty"), "nonmatching document words\n")
+            .expect("document frequency");
+        let limits = SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(8),
+            max_results: 8,
+            language: None,
+            ignores: Vec::new(),
+        };
+        let mut options = super::RawSearchOptions {
+            compact: false,
+            exact: false,
+            stem: false,
+            exclude_filenames: false,
+            merge_threshold: 5,
+            strict: None,
+        };
+        let (mut raw, freshness) =
+            super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+                .expect("raw baseline");
+        let mut seen = std::collections::HashSet::new();
+        raw.retain(|hit| seen.insert(hit.file.clone()));
+        options.compact = true;
+        let (compact, compact_freshness) =
+            super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+                .expect("compact equivalent");
+        assert_eq!(compact_freshness, freshness);
+        assert_eq!(compact.len(), raw.len());
+        for (left, right) in compact.iter().zip(&raw) {
+            assert_eq!(
+                (
+                    &left.file,
+                    left.line,
+                    left.end_line,
+                    left.score,
+                    left.occurrences
+                ),
+                (
+                    &right.file,
+                    right.line,
+                    right.end_line,
+                    right.score,
+                    right.occurrences
+                )
+            );
+        }
+        fs::write(
+            fixture.0.join("tasks"),
+            "orbit\n\n\n\n\n\n\n\n".repeat(2048) + "orbit vector orbit vector\norbit vector\n",
+        )
+        .expect("late body");
+        let (compact, _) =
+            super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+                .expect("full enumeration");
+        let hit = compact
+            .iter()
+            .find(|hit| hit.file == "tasks")
+            .expect("no noisy file discarded");
+        assert_eq!(hit.line, Some(2048 * 8 + 1));
+        assert_eq!(hit.occurrences, 2048 + 6, "every matching token counted");
     }
 
     #[test]

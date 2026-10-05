@@ -206,6 +206,7 @@ fn ancestor_symlink_substitution_is_denied_in_all_readers() {
                 "synthetic_external_marker",
                 &limits(),
                 &RawSearchOptions {
+                    compact: false,
                     exact: false,
                     stem: false,
                     exclude_filenames: false,
@@ -314,6 +315,7 @@ fn unreadable_policy_entry(policy: &str, directory: bool) {
     .expect("policy");
     fs::set_permissions(&denied, fs::Permissions::from_mode(0o0)).expect("unreadable");
     let raw = RawSearchOptions {
+        compact: false,
         exact: false,
         stem: false,
         exclude_filenames: false,

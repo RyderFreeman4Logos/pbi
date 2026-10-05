@@ -45,6 +45,26 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn compact_streaming_keeps_strong_late_body_beyond_raw_block_cap() {
+    let fixture = Fixture::new();
+    for count in [129, 512, 2048] {
+        let mut source = "orbit\n\n\n\n\n\n\n\n".repeat(count);
+        source.push_str("orbit vector orbit vector\norbit vector\n");
+        fs::write(fixture.root.join("tasks"), source).expect("separated blocks");
+        let output = fixture.run(&["search", "orbit vector"], "compact");
+        assert!(output.status.success(), "compact must scan beyond block128");
+        assert_eq!(
+            compact_locations(&output),
+            [format!("tasks:{}-{}", count * 8 + 1, count * 8 + 2)]
+        );
+        let raw = fixture.run(&["search", "--bm25", "orbit vector"], "raw");
+        assert_eq!(raw.status.code(), Some(1));
+        assert!(raw.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&raw.stderr).contains("bounded limit"));
+    }
+}
+
+#[test]
 fn bounded_regex_returns_original_source_lines_without_snippets() {
     let fixture = Fixture::new();
     fs::write(
