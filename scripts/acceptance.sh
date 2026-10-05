@@ -81,16 +81,17 @@ for index in $(seq 1 17); do
     printf '%s\n' 'fn capped_marker() {}' > "$fixture/capped/file-$index.rs"
 done
 set +e
-(cd "$fixture/capped" && pbi search capped_marker) > "$fixture/capped.out" 2> "$fixture/capped.err"
+(cd "$fixture/capped" && pbi search --max-results=32 capped_marker) > "$fixture/capped.out" 2> "$fixture/capped.err"
 capped_rc=$?
-(cd "$fixture/capped" && pbi search --bm25 capped_marker) > "$fixture/raw-capped.out" 2> "$fixture/raw-capped.err"
+(cd "$fixture/capped" && pbi search --bm25 --max-results=32 capped_marker) > "$fixture/raw-capped.out" 2> "$fixture/raw-capped.err"
 raw_capped_rc=$?
 set -e
-test "$capped_rc" -eq 1
-grep -q 'bounded target limit' "$fixture/capped.err"
-test "$raw_capped_rc" -eq 1
-test ! -s "$fixture/raw-capped.out"
-grep -q 'bounded target limit' "$fixture/raw-capped.err"
+test "$capped_rc" -eq 0
+grep -q '^file-17.rs:1$' "$fixture/capped.out"
+test ! -s "$fixture/capped.err"
+test "$raw_capped_rc" -eq 0
+grep -q '^File: file-17.rs, Lines: 1-1$' "$fixture/raw-capped.out"
+test ! -s "$fixture/raw-capped.err"
 
 debug=$(pbi --debug-config)
 printf '%s\n' "$debug" | grep -qx 'search_default=native_bounded_bm25_compact_no_probe'

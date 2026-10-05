@@ -26,7 +26,9 @@ use syn::visit::{self, Visit};
 const EXCLUDED: [&str; 5] = [".git", "target", "drafts", "node_modules", "__pycache__"];
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 20_000;
+const MAX_WALK_ENTRIES: usize = MAX_WALK_FILES;
 const MAX_ROOT_TARGETS: usize = 16;
+const MAX_ROOT_CHILDREN: usize = MAX_WALK_ENTRIES;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_PLAN_FILES: usize = 1;
 const MAX_PARSED_FUNCTIONS: usize = 512;
@@ -88,6 +90,38 @@ struct Hit {
     score: i32,
 }
 
+pub(crate) struct RootScope<'a> {
+    root: &'a Path,
+    file: File,
+    device: u64,
+}
+
+/// Open explicit root scopes only after enforcing their shared count bound.
+pub(crate) fn open_root_scopes<'a>(
+    roots: &[&'a Path],
+) -> Result<Vec<RootScope<'a>>, SearchFailure> {
+    if roots.len() > MAX_ROOT_TARGETS {
+        return Err(SearchFailure::TargetLimit);
+    }
+    roots
+        .iter()
+        .map(|root| {
+            let file = open_root(root)?;
+            let device = file
+                .metadata()
+                .map_err(|_| SearchFailure::Unavailable)?
+                .dev();
+            Ok(RootScope { root, file, device })
+        })
+        .collect()
+}
+
+fn open_root_scope(root: &Path) -> Result<RootScope<'_>, SearchFailure> {
+    open_root_scopes(&[root])?
+        .pop()
+        .ok_or(SearchFailure::Unavailable)
+}
+
 pub fn search_repository(
     root: &Path,
     query: &str,
@@ -97,11 +131,10 @@ pub fn search_repository(
     if terms.is_empty() || limits.max_results == 0 {
         return Ok(String::new());
     }
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let files = walk_owned(root, root_file, root_device, limits)?;
     let mut hits = Vec::new();
     for path in files {
         if Instant::now() >= limits.deadline {
@@ -110,7 +143,7 @@ pub fn search_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
             continue;
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -157,11 +190,10 @@ pub fn search_regex_repository(
     regex: &regex::Regex,
     limits: &SearchLimits,
 ) -> Result<Vec<RawHit>, SearchFailure> {
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let mut files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let mut files = walk_owned(root, root_file, root_device, limits)?;
     files.sort();
     let mut hits = Vec::new();
     for path in files {
@@ -171,7 +203,7 @@ pub fn search_regex_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
             continue;
         };
         let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -232,11 +264,10 @@ pub fn search_raw_repository(
     if terms.is_empty() || terms.len() > 32 {
         return Err(SearchFailure::Limit);
     }
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let mut files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let mut files = walk_owned(root, root_file, root_device, limits)?;
     files.sort();
     let mut freshness = DefaultHasher::new();
     let mut documents = 0usize;
@@ -251,7 +282,7 @@ pub fn search_raw_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
             continue;
         };
         path.hash(&mut freshness);
@@ -532,11 +563,10 @@ pub fn candidate_symbols(
     if parts.is_empty() {
         return Ok(Vec::new());
     }
-    let root_file = open_root(root)?;
-    let root_meta = root_file
-        .metadata()
-        .map_err(|_| SearchFailure::Unavailable)?;
-    let files = walk_owned(root, &root_file, root_meta.dev(), limits)?;
+    let scope = open_root_scope(root)?;
+    let root_file = &scope.file;
+    let root_device = scope.device;
+    let files = walk_owned(root, root_file, root_device, limits)?;
     let mut ranked = files
         .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
@@ -555,7 +585,7 @@ pub fn candidate_symbols(
         if Instant::now() >= limits.deadline {
             return Err(SearchFailure::Deadline);
         }
-        let Some(bytes) = read_source(root, &root_file, &path, root_meta.dev(), limits)? else {
+        let Some(bytes) = read_source(root, root_file, &path, root_device, limits)? else {
             continue;
         };
         let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -653,8 +683,11 @@ pub(super) fn walk(
     device: u64,
     limits: &SearchLimits,
 ) -> Result<Vec<PathBuf>, SearchFailure> {
-    let root_file = open_root(root)?;
-    walk_owned(root, &root_file, device, limits)
+    let scope = open_root_scope(root)?;
+    if scope.device != device {
+        return Err(SearchFailure::Unavailable);
+    }
+    walk_owned(scope.root, &scope.file, device, limits)
 }
 
 fn walk_owned(
@@ -685,7 +718,7 @@ fn walk_owned(
     )?;
     #[cfg(test)]
     issue_327_tests::after_policy_validation();
-    let mut root_targets = 0usize;
+    let mut root_children = 0usize;
     // Linux-only: enumerate the retained root, not a substituted named root.
     for entry in fs::read_dir(format!("/proc/self/fd/{}", root_file.as_raw_fd()))
         .map_err(|_| SearchFailure::Unavailable)?
@@ -708,10 +741,10 @@ fn walk_owned(
         {
             continue;
         }
-        if root_targets == MAX_ROOT_TARGETS {
-            return Err(SearchFailure::TargetLimit);
+        if root_children >= MAX_ROOT_CHILDREN {
+            return Err(SearchFailure::Limit);
         }
-        root_targets += 1;
+        root_children += 1;
     }
     let mut user_ignores = GitignoreBuilder::new(root);
     for pattern in &limits.ignores {
@@ -841,6 +874,7 @@ fn walk_owned(
         });
     let mut files = Vec::new();
     let mut file_count = 0usize;
+    let mut walk_entry_count = 0usize;
     for entry in walker.build() {
         if unsafe_ignore.load(Ordering::Relaxed) {
             return Err(SearchFailure::Unavailable);
@@ -851,6 +885,10 @@ fn walk_owned(
         let entry = entry.map_err(|_| SearchFailure::Unavailable)?;
         if entry.depth() == 0 {
             continue;
+        }
+        walk_entry_count += 1;
+        if walk_entry_count > MAX_WALK_ENTRIES {
+            return Err(SearchFailure::Limit);
         }
         let path = entry.path();
         let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
@@ -1021,5 +1059,81 @@ mod issue_326_tests {
         let candidates = candidate_symbols(&root, "where is issue326_hidden_candidate?", &limits())
             .expect("semantic candidate ingestion");
         assert!(candidates.len() == 1 && candidates[0].0 == "visible_candidate.rs");
+    }
+}
+
+#[cfg(test)]
+mod root_scope_tests {
+    use super::{open_root_scopes, walk, SearchFailure, SearchLimits, MAX_WALK_ENTRIES};
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos();
+            let root = PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp")
+                .join(format!("pbi-rs-{label}-{}-{nonce}", std::process::id()));
+            fs::create_dir_all(&root).expect("create safe test root");
+            Self(root)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn explicit_seventeenth_scope_rejects_at_descriptor_admission() {
+        let fixture = Fixture::new("root-scope-admission");
+        let roots = (0..17)
+            .map(|index| {
+                let root = fixture.0.join(format!("scope-{index}"));
+                fs::create_dir(&root).expect("create explicit root scope");
+                root
+            })
+            .collect::<Vec<_>>();
+        let roots = roots.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        assert_eq!(
+            open_root_scopes(&roots[..16])
+                .expect("admit sixteen explicit scopes")
+                .len(),
+            16
+        );
+        assert!(matches!(
+            open_root_scopes(&roots),
+            Err(SearchFailure::TargetLimit)
+        ));
+    }
+
+    #[test]
+    fn total_walk_entry_budget_fails_closed() {
+        let fixture = Fixture::new("walk-entry-budget");
+        let root = fixture.0.join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create bounded root");
+        for index in 0..=MAX_WALK_ENTRIES {
+            fs::create_dir(nested.join(format!("child-{index:05}")))
+                .expect("create nested walk entry");
+        }
+        let device = fs::metadata(&root).expect("root metadata").dev();
+        let limits = SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(120),
+            max_results: 16,
+            language: None,
+            ignores: Vec::new(),
+        };
+        assert!(matches!(
+            walk(&root, device, &limits),
+            Err(SearchFailure::Limit)
+        ));
     }
 }

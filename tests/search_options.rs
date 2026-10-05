@@ -201,17 +201,52 @@ fn bounded_regex_candidate_root_result_and_output_caps() {
     );
     assert!(capped.status.success());
     assert_eq!(compact_locations(&capped), ["many.txt:1", "many.txt:2"]);
-    for index in 0..16 {
+    for index in 0..17 {
         fs::write(
             fixture.root.join(format!("root-{index}.txt")),
             "synthetic\n",
         )
-        .expect("root target overflow");
+        .expect("root traversal fixture");
     }
-    let overflow = fixture.run(&["search", "--regex", "synthetic"], "regex");
-    assert_eq!(overflow.status.code(), Some(1));
-    assert!(overflow.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&overflow.stderr).contains("bounded target limit"));
+    let root_search = fixture.run(
+        &["search", "--regex", "synthetic", "--max-results=32"],
+        "regex",
+    );
+    assert!(
+        root_search.status.success(),
+        "a selected root with more than 16 children must be searched"
+    );
+    let mut expected = Vec::new();
+    let mut root_children = 0;
+    for entry in fs::read_dir(&fixture.root).expect("enumerate fixture root") {
+        let entry = entry.expect("fixture root entry");
+        root_children += 1;
+        if !entry.file_type().expect("fixture entry type").is_file() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .expect("fixture filename is UTF-8");
+        for (index, line) in fs::read_to_string(entry.path())
+            .expect("read expected fixture source")
+            .lines()
+            .enumerate()
+        {
+            if line.contains("synthetic") {
+                expected.push(format!("{name}:{}", index + 1));
+            }
+        }
+    }
+    assert!(root_children > 16, "fixture must exceed the old root cap");
+    expected.sort();
+    let mut locations = compact_locations(&root_search);
+    locations.sort();
+    assert_eq!(expected.len(), 21, "fixture's admitted match set");
+    assert_eq!(
+        locations, expected,
+        "search must return the exact admitted set"
+    );
 
     let fixture = Fixture::new();
     let name = format!("{}.txt", "n".repeat(240));
@@ -1647,7 +1682,7 @@ fn safe_flags_without_bm25_and_deferred_flags_stop_before_probe() {
 }
 
 #[test]
-fn root_scope_root_documents_consume_budget() {
+fn root_scope_root_documents_do_not_hide_nested_source() {
     let fixture = ScopeFixture::new();
     for index in 0..17 {
         fs::write(
@@ -1664,9 +1699,10 @@ fn root_scope_root_documents_consume_budget() {
     .expect("write depth-two source after noise");
     let output = fixture.run("saturated");
     assert!(
-        !output.status.success(),
-        "root documents must consume the target budget"
+        output.status.success(),
+        "selected-root contents stay searchable"
     );
+    assert_eq!(compact_locations(&output), ["src/nested/mod.rs:1"]);
 }
 
 #[test]
@@ -2159,7 +2195,7 @@ fn root_scope_rejects_early_display_stem() {
 }
 
 #[test]
-fn root_scope_overflow_is_not_complete() {
+fn root_scope_many_children_searches_complete_root() {
     let fixture = ScopeFixture::new();
     for index in 0..17 {
         fs::create_dir_all(fixture.root.join(format!("pkg-{index:02}/src"))).expect("pkg");
@@ -2176,13 +2212,11 @@ fn root_scope_overflow_is_not_complete() {
     )
     .expect("late source");
     let output = fixture.run("overflow");
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !output.status.success() || stdout.contains("Coverage: incomplete"),
-        "stdout={stdout} stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+        output.status.success(),
+        "bounded whole-root traversal must succeed"
     );
-    assert!(!stdout.contains("Coverage: complete"), "{stdout}");
+    assert_eq!(compact_locations(&output), ["pkg-zz/src/lib.rs:1"]);
 }
 
 #[test]
@@ -2331,7 +2365,7 @@ fn compact_output_keeps_ranked_source_blocks_and_both_files() {
 }
 
 #[test]
-fn native_search_honors_gitignore_root_cap_and_symlink() {
+fn native_search_honors_gitignore_with_many_children_and_symlink() {
     let fixture = ScopeFixture::new();
     fs::write(fixture.root.join(".gitignore"), "secret.rs\n").expect("gitignore");
     fs::write(
@@ -2355,14 +2389,13 @@ fn native_search_honors_gitignore_root_cap_and_symlink() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "stdout={stdout} stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+        "visible selected-root source should succeed"
     );
     assert!(
         stdout.contains("kept.rs")
             && !stdout.contains("secret.rs")
             && !stdout.contains("linked.rs"),
-        "{stdout}"
+        "ignored and symlinked sources must stay excluded"
     );
     assert!(!fixture.events.is_file());
     for index in 0..16 {
@@ -2372,9 +2405,18 @@ fn native_search_honors_gitignore_root_cap_and_symlink() {
         )
         .expect("decoy");
     }
-    let capped = fixture.run_args("unused", &["search", SCOPE_QUERY]);
-    assert_eq!(capped.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&capped.stderr).contains("bounded target limit"));
+    let expanded = fixture.run_args("unused", &["search", SCOPE_QUERY]);
+    let expanded_stdout = String::from_utf8_lossy(&expanded.stdout);
+    assert!(
+        expanded.status.success(),
+        "selected-root contents beyond 16 entries must remain searchable"
+    );
+    assert!(
+        expanded_stdout.contains("kept.rs")
+            && !expanded_stdout.contains("secret.rs")
+            && !expanded_stdout.contains("linked.rs"),
+        "ignored and symlinked sources must stay excluded after full-root traversal"
+    );
 }
 
 #[test]
