@@ -32,6 +32,44 @@ pub fn matching_rust_declaration_lines(source: &str, terms: &[String]) -> Vec<us
         .collect()
 }
 
+/// Exact query identifiers eligible for declaration-first file ranking.
+/// Retain source spelling: filename stems and rewritten prose are not symbols.
+pub fn named_search_terms(query: &str) -> Vec<String> {
+    raw_query_tokens(query)
+        .into_iter()
+        .filter(|token| {
+            !token.contains(['/', '.', '-'])
+                && (token.contains('_') || tokenized(token).len() > 1 || !token.is_ascii())
+        })
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+/// Foreign source anchors reuse the evidence lexical projection and names.
+/// Component matches select source windows only, leaving document BM25 unchanged.
+pub fn foreign_search_anchors(source: &str, terms: &[String]) -> (Vec<usize>, Vec<usize>) {
+    let mut declarations = Vec::new();
+    let mut components = Vec::new();
+    if source.len() as u64 > MAX_SOURCE_BYTES {
+        return (declarations, components);
+    }
+    for (index, line) in CodeView::new(source).code.lines().enumerate() {
+        if !production_source(line) {
+            continue;
+        }
+        if tokenized(line).iter().any(|part| terms.contains(part)) {
+            components.push(index + 1);
+        }
+        if foreign_declaration_name(line).is_some_and(|name| {
+            terms.contains(&name.to_lowercase())
+                || tokenized(&name).iter().any(|part| terms.contains(part))
+        }) {
+            declarations.push(index + 1);
+        }
+    }
+    (declarations, components)
+}
+
 #[cfg(test)]
 std::thread_local! {
     static WINDOW_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2163,6 +2201,9 @@ fn foreign_declaration_name(code_line: &str) -> Option<String> {
     let trimmed = code_line.trim_start();
     if trimmed.starts_with("```") || trimmed.starts_with('#') {
         return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("class ") {
+        return identifier_head(rest);
     }
     if let Some(rest) = trimmed.strip_prefix("def ") {
         return identifier_head(rest);

@@ -4,7 +4,7 @@
 //! `File:` ranges so the existing verifier remains the citation boundary.
 //!
 //! Verified locations use one lexical pass; raw results rank with BM25 over
-//! the same bounded walk, with exact Rust declarations before lexical mentions.
+//! the same bounded walk, with explicitly named Rust declarations before mentions.
 //! Neither path creates an index or a model request.
 
 use crate::extract::{check_source_namespace, open_source, policy_admitted, PolicyCompiler};
@@ -292,6 +292,11 @@ pub fn search_raw_repository(
     let mut document_frequency = vec![0usize; terms.len()];
     let mut candidates = Vec::new();
     let exact_phrase = query.trim().to_lowercase();
+    let named_terms = if terms.len() == 1 {
+        terms.clone()
+    } else {
+        pbi_rs::named_search_terms(query)
+    };
     for path in files {
         if Instant::now() >= limits.deadline {
             return Err(SearchFailure::Deadline);
@@ -337,11 +342,29 @@ pub fn search_raw_repository(
         let mut counts = vec![0usize; terms.len()];
         let mut length = 0usize;
         let source_lines = source.lines().collect::<Vec<_>>();
-        let declarations = if path.extension().is_some_and(|extension| extension == "rs") {
-            pbi_rs::matching_rust_declaration_lines(source, &terms)
+        let (declarations, component_lines) = if path
+            .extension()
+            .is_some_and(|extension| extension == "rs")
+        {
+            (
+                pbi_rs::matching_rust_declaration_lines(source, &terms),
+                Vec::new(),
+            )
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "py" | "js" | "ts" | "c" | "h" | "cc" | "cpp" | "cxx"))
+        {
+            pbi_rs::foreign_search_anchors(source, &terms)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        let priority_declarations =
+            if !named_terms.is_empty() && path.extension().is_some_and(|ext| ext == "rs") {
+                pbi_rs::matching_rust_declaration_lines(source, &named_terms)
+            } else {
+                Vec::new()
+            };
         let mut blocks = Vec::new();
         let mut pending: Option<(usize, usize, usize)> = None;
         for (index, line) in source_lines.iter().enumerate() {
@@ -368,7 +391,8 @@ pub fn search_raw_repository(
                 }
             }
             if (options.exact && normalized.contains(&exact_phrase))
-                || (!options.exact && line_matches > 0)
+                || (!options.exact
+                    && (line_matches > 0 || component_lines.binary_search(&(index + 1)).is_ok()))
             {
                 let line_number = index + 1;
                 if let Some(last) = pending.as_mut() {
@@ -439,7 +463,9 @@ pub fn search_raw_repository(
                 occurrences: counts.iter().sum(),
                 term_counts: counts.clone(),
                 length,
-                declaration: declarations.iter().any(|line| (start..=end).contains(line)),
+                declaration: priority_declarations
+                    .iter()
+                    .any(|line| (start..=end).contains(line)),
                 block_matches,
             });
         }

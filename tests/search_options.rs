@@ -82,6 +82,60 @@ fn compact_streaming_keeps_strong_late_body_beyond_raw_block_cap() {
 }
 
 #[test]
+fn generic_plugin_bag_keeps_late_executable_anchor_before_declaration_noise() {
+    let fixture = Fixture::new();
+    let query = "Orbit Vector memory provider register plugin search transport Cache RPC config integration reserved stub";
+    let plugin = "contrib/orbit-agent-plugin/vector/__init__.py";
+    fs::create_dir_all(fixture.root.join("tests")).expect("noise directory");
+    fs::create_dir_all(fixture.root.join("docs")).expect("documentation directory");
+    fs::create_dir_all(fixture.root.join(plugin).parent().expect("plugin parent"))
+        .expect("plugin directory");
+    for (index, word) in [
+        "memory",
+        "provider",
+        "register",
+        "search",
+        "transport",
+        "config",
+        "integration",
+        "stub",
+    ]
+    .iter()
+    .enumerate()
+    {
+        fs::write(
+            fixture.root.join(format!("tests/noise_{index}.rs")),
+            format!("pub fn {word}() {{}}\n"),
+        )
+        .expect("generic declaration noise");
+    }
+    fs::write(
+        fixture.root.join("docs/noise.md"),
+        "Orbit Vector Cache RPC config integration reserved stub\n",
+    )
+    .expect("documentation noise");
+    fs::write(fixture.root.join("transport.py"), "pass\n").expect("filename distractor");
+    let source = format!(
+        "\"\"\"{query}.\"\"\"\n{}class VectorMemoryProvider:\n    def search(self, query):\n        return self.transport.search(query)\n\ndef register_plugin(registry):\n    registry.register_memory_provider(VectorMemoryProvider())\n",
+        "unrelated_value = 0\n".repeat(160)
+    );
+    fs::write(fixture.root.join(plugin), source).expect("late plugin implementation");
+    let output = fixture.run(&["search", query], "compact");
+    assert!(output.status.success());
+    let locations = compact_locations(&output);
+    assert!(
+        locations
+            .iter()
+            .any(|location| location.starts_with(&format!("{plugin}:"))),
+        "plugin must be admitted inside the default result cap: {locations:?}"
+    );
+    assert!(
+        locations.contains(&format!("{plugin}:162-167")),
+        "plugin must cite the late implementation, not its keyword header: {locations:?}"
+    );
+}
+
+#[test]
 fn bounded_regex_returns_original_source_lines_without_snippets() {
     let fixture = Fixture::new();
     fs::write(
