@@ -47,7 +47,7 @@ pub fn named_search_terms(query: &str) -> Vec<String> {
 
 /// Foreign source anchors reuse the evidence lexical projection and names.
 /// Component matches select source windows only, leaving document BM25 unchanged.
-pub fn foreign_search_anchors(source: &str, terms: &[String]) -> (Vec<usize>, Vec<usize>) {
+pub fn foreign_search_anchors(source: &str, terms: &[String]) -> (Vec<(usize, usize)>, Vec<usize>) {
     let mut declarations = Vec::new();
     let mut components = Vec::new();
     if source.len() as u64 > MAX_SOURCE_BYTES {
@@ -60,11 +60,15 @@ pub fn foreign_search_anchors(source: &str, terms: &[String]) -> (Vec<usize>, Ve
         if tokenized(line).iter().any(|part| terms.contains(part)) {
             components.push(index + 1);
         }
-        if foreign_declaration_name(line).is_some_and(|name| {
-            terms.contains(&name.to_lowercase())
-                || tokenized(&name).iter().any(|part| terms.contains(part))
-        }) {
-            declarations.push(index + 1);
+        if let Some(name) = foreign_declaration_name(line) {
+            let parts = tokenized(&name);
+            let matches = terms
+                .iter()
+                .filter(|term| **term == name.to_lowercase() || parts.contains(term))
+                .count();
+            if matches > 0 {
+                declarations.push((index + 1, matches));
+            }
         }
     }
     (declarations, components)

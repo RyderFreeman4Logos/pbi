@@ -347,7 +347,10 @@ pub fn search_raw_repository(
             .is_some_and(|extension| extension == "rs")
         {
             (
-                pbi_rs::matching_rust_declaration_lines(source, &terms),
+                pbi_rs::matching_rust_declaration_lines(source, &terms)
+                    .into_iter()
+                    .map(|line| (line, 1))
+                    .collect(),
                 Vec::new(),
             )
         } else if path
@@ -524,12 +527,17 @@ fn retain_block(
     blocks: &mut Vec<(usize, usize, usize)>,
     block: (usize, usize, usize),
     compact: bool,
-    declarations: &[usize],
+    declarations: &[(usize, usize)],
 ) -> Result<(), SearchFailure> {
     if compact {
         let key = |(start, end, matches)| {
             (
-                declarations.iter().any(|line| (start..=end).contains(line)),
+                declarations
+                    .iter()
+                    .filter(|(line, _)| (start..=end).contains(line))
+                    .map(|(_, matches)| *matches)
+                    .max()
+                    .unwrap_or(0),
                 matches,
                 std::cmp::Reverse(start),
             )
@@ -1262,8 +1270,13 @@ mod root_scope_tests {
                 assert_eq!(blocks.len(), 1, "one winner plus one pending block maximum");
                 assert_eq!(blocks[0], (line, line, line));
             }
-            super::retain_block(&mut blocks, (count + 1, count + 1, 0), true, &[count + 1])
-                .expect("late declaration wins before match density");
+            super::retain_block(
+                &mut blocks,
+                (count + 1, count + 1, 0),
+                true,
+                &[(count + 1, 1)],
+            )
+            .expect("late declaration wins before match density");
             assert_eq!(blocks[0].0, count + 1);
         }
         let fixture = Fixture::new("compact-bm25");

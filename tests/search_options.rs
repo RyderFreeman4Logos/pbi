@@ -115,9 +115,15 @@ fn generic_plugin_bag_keeps_late_executable_anchor_before_declaration_noise() {
     )
     .expect("documentation noise");
     fs::write(fixture.root.join("transport.py"), "pass\n").expect("filename distractor");
+    let padding = format!(
+        "{}def load_config():\n    return \"{}\"\n{}",
+        "unrelated_value = 0\n".repeat(110),
+        query.repeat(3),
+        "unrelated_value = 0\n".repeat(48)
+    );
     let source = format!(
         "\"\"\"{query}.\"\"\"\n{}class VectorMemoryProvider:\n    def search(self, query):\n        return self.transport.search(query)\n\ndef register_plugin(registry):\n    registry.register_memory_provider(VectorMemoryProvider())\n",
-        "unrelated_value = 0\n".repeat(160)
+        padding
     );
     fs::write(fixture.root.join(plugin), source).expect("late plugin implementation");
     let output = fixture.run(&["search", query], "compact");
