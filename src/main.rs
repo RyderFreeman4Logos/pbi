@@ -1289,6 +1289,9 @@ fn search_cli_error(failure: SearchFailure) -> CliError {
     match failure {
         SearchFailure::Deadline => CliError::failed("native search exceeded its bounded deadline"),
         SearchFailure::Limit => CliError::failed("native search exceeded its bounded limit"),
+        SearchFailure::RawBlocksPerFileLimit => {
+            CliError::failed("raw source-block limit reached; use compact search without --bm25")
+        }
         SearchFailure::TargetLimit => {
             CliError::failed("native search exceeded the bounded target limit")
         }
