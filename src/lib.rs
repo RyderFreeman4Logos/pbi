@@ -38,10 +38,10 @@ pub fn named_search_terms(query: &str) -> Vec<String> {
     raw_query_tokens(query)
         .into_iter()
         .filter(|token| {
-            !token.contains(['/', '.', '-'])
+            !token.trim_end_matches('.').contains(['/', '.', '-'])
                 && (token.contains('_') || tokenized(token).len() > 1 || !token.is_ascii())
         })
-        .map(|token| token.to_lowercase())
+        .map(|token| control_word(&token))
         .collect()
 }
 

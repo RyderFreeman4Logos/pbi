@@ -82,6 +82,58 @@ fn compact_streaming_keeps_strong_late_body_beyond_raw_block_cap() {
 }
 
 #[test]
+fn named_symbol_sentence_punctuation_keeps_declaration_priority() {
+    let fixture = Fixture::new();
+    let noise = format!(
+        "fn noise() {{\n{}}}\n",
+        "    let _ = \"SourceLocation\";\n".repeat(100)
+    );
+    fs::write(fixture.root.join("a_noise.rs"), noise).expect("string-only distractor");
+    let declaration = format!(
+        "pub struct SourceLocation;\nfn padding() {{\n{}}}\n",
+        "    let _ = 0;\n".repeat(200)
+    );
+    fs::write(fixture.root.join("z_decl.rs"), declaration).expect("named declaration");
+    for query in [
+        "Where is SourceLocation.",
+        "Where is SourceLocation",
+        "Where is SourceLocation?",
+        "Where is SourceLocation!",
+        "Where is SourceLocation,",
+        "Where is 'SourceLocation'.",
+    ] {
+        let output = fixture.run(&["search", "--max-results=1", query], "compact");
+        assert!(output.status.success(), "punctuated named-symbol search");
+        assert!(output.stderr.is_empty(), "no named-symbol diagnostics");
+        assert_eq!(
+            compact_locations(&output),
+            ["z_decl.rs:1"],
+            "named declaration under cap"
+        );
+    }
+    for query in [
+        "Where is SourceLocation.rs",
+        "Where is src/SourceLocation.rs.",
+        "Where is module.SourceLocation.",
+        "memory provider register plugin search transport",
+    ] {
+        assert!(
+            pbi_rs::named_search_terms(query).is_empty(),
+            "paths and generic prose are not names"
+        );
+    }
+    assert_eq!(
+        pbi_rs::named_search_terms("Where is SourceLocation::display_relative."),
+        ["sourcelocation::display_relative"]
+    );
+    assert_eq!(pbi_rs::named_search_terms("Where is Café."), ["café"]);
+    assert_eq!(
+        pbi_rs::named_search_terms("Where is \"SourceLocation\"."),
+        ["sourcelocation"]
+    );
+}
+
+#[test]
 fn generic_plugin_bag_keeps_late_executable_anchor_before_declaration_noise() {
     let fixture = Fixture::new();
     let query = "Orbit Vector memory provider register plugin search transport Cache RPC config integration reserved stub";
