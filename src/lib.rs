@@ -1291,6 +1291,12 @@ impl CodeView {
                         index += 1;
                     }
                 }
+            } else if bytes[index..].starts_with(b"r\"\"\"") {
+                index = quoted_literal_end(bytes, index + 1, b'"', 3);
+            } else if bytes[index..].starts_with(b"\"\"\"") || bytes[index..].starts_with(b"'''") {
+                index = quoted_literal_end(bytes, index, bytes[index], 3);
+            } else if bytes[index] == b'`' {
+                index = quoted_literal_end(bytes, index, b'`', 1);
             } else if bytes[index] == b'\'' && character_end(source, index).is_some() {
                 index = character_end(source, index).unwrap_or(index + 1);
             } else {
@@ -1335,6 +1341,24 @@ impl CodeView {
             code: String::from_utf8_lossy(&code).into_owned(),
         }
     }
+}
+
+// Skip escaped Python triple-quoted and JavaScript template literals without parsing interpolation.
+fn quoted_literal_end(bytes: &[u8], start: usize, quote: u8, delimiter_len: usize) -> usize {
+    let mut index = start + delimiter_len;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes
+            .get(index..index + delimiter_len)
+            .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote))
+        {
+            return index + delimiter_len;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
 }
 
 // A character has one scalar or one escape followed by a closing apostrophe.

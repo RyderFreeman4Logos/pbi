@@ -142,6 +142,58 @@ fn generic_plugin_bag_keeps_late_executable_anchor_before_declaration_noise() {
 }
 
 #[test]
+fn compact_search_ignores_foreign_literal_declarations() {
+    let cases = [
+        (
+            "decoy.py",
+            concat!(
+                "DOC = \"\"\"Example plugin source ranker \"first\" second \"third\n",
+                "def plugin_source_ranker(): # plugin source ranker\n",
+                "    pass\n",
+                "\"\"\"\n"
+            ),
+            "def plugin_source_ranker(): # plugin source ranker\n    pass\n",
+        ),
+        (
+            "decoy.js",
+            concat!(
+                "const docs = `Example plugin source ranker:\n",
+                "function plugin_source_ranker() { // plugin source ranker\n",
+                "  return undefined;\n",
+                "}\n",
+                "`;\n"
+            ),
+            "function plugin_source_ranker() { // plugin source ranker\n  return undefined;\n}\n",
+        ),
+    ];
+
+    for (filename, literal, implementation) in cases {
+        let fixture = Fixture::new();
+        let implementation_line = literal.lines().count() + 51;
+        let source = format!("{literal}{}{implementation}", "\n".repeat(50));
+        fs::write(fixture.root.join(filename), source).expect("foreign literal fixture");
+        let output = fixture.run(
+            &["search", "--max-results=1", "plugin source ranker"],
+            "compact",
+        );
+        assert!(output.status.success(), "compact search must succeed");
+        let locations = compact_locations(&output);
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.starts_with(&format!("{filename}:{implementation_line}"))),
+            "executable implementation must outrank its literal example: {locations:?}"
+        );
+        assert!(
+            !locations
+                .iter()
+                .any(|location| location.starts_with(&format!("{filename}:1"))),
+            "literal declaration must not be selected: {locations:?}"
+        );
+    }
+}
+
+#[test]
 fn bounded_regex_returns_original_source_lines_without_snippets() {
     let fixture = Fixture::new();
     fs::write(
