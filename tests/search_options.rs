@@ -194,6 +194,97 @@ fn compact_search_ignores_foreign_literal_declarations() {
 }
 
 #[test]
+fn language_owner_rust_adjacent_literals_preserve_behavior() {
+    let mut results = Vec::new();
+    for literals in [
+        "r\"\"\"docs\"",
+        "\"\"\"docs\"",
+        "r\"\" \"docs\"",
+        "\"\" \"docs\"",
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("source.rs"), format!(
+            "macro_rules! adjacent {{ ($a:literal $b:literal) => {{}}; }}\nadjacent!({literals});\npub fn parse_conversion(input: &str) -> Result<u64, std::num::ParseIntError> {{\n    input.parse::<u64>()\n}}\n"
+        )).expect("legal adjacent literal fixture");
+        let output = fixture.run(
+            &["How does parse_conversion parse input and handle conversion errors?"],
+            "behavior",
+        );
+        results.push((
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    assert_eq!(results, vec![(Some(0), vec!["source.rs:3".to_string()]); 4]);
+}
+
+#[test]
+fn language_owner_foreign_literals_comments_preserve_real_anchor() {
+    let cases = [
+        ("py", "# plugin source ranker unmatched \"\"\" /* `\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("py", "note = 'plugin source ranker \\\ndef plugin_source_ranker():\\\nend'\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("py", "note = r\"\\\"\" # plugin source ranker\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("py", "note = f'''plugin source ranker\ndef plugin_source_ranker():\n'''\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("js", "/* plugin source ranker /* example */\n", "function plugin_source_ranker() { return 0; }\n"),
+        ("ts", "const docs = 'plugin source ranker \\\nfunction plugin_source_ranker() {}\\\nend';\n", "function plugin_source_ranker() { return 0; }\n"),
+        ("js", "const docs = `plugin source ranker ${`inner\nfunction plugin_source_ranker() {}\n`} tail`;\n", "function plugin_source_ranker() { return 0; }\n"),
+        ("cpp", "const char* docs = R\"tag(plugin source ranker \"\nclass PluginSourceRanker {};\n)tag\";\n", "class PluginSourceRanker {};\n"),
+        ("c", "// plugin source ranker \\\nint plugin_source_ranker();\n", "int plugin_source_ranker() { return 0; }\n"),
+        ("h", "// plugin source ranker \\\r\nint plugin_source_ranker();\r\n", "int plugin_source_ranker() { return 0; }\n"),
+        ("c", "const char* docs = \"\"\"plugin source ranker\";\n/* example /* nested marker */\nint marker = '\"x';\n", "int plugin_source_ranker() { return 0; }\n"),
+    ];
+    let mut results = Vec::new();
+    let mut expected = Vec::new();
+    for (extension, prefix, implementation) in cases {
+        let fixture = Fixture::new();
+        let filename = format!("owner.{extension}");
+        let line = prefix.lines().count() + 51;
+        fs::write(
+            fixture.root.join(&filename),
+            format!("{prefix}{}{implementation}", "\n".repeat(50)),
+        )
+        .expect("owned lexical fixture");
+        let output = fixture.run(
+            &["search", "--max-results=1", "plugin source ranker"],
+            "compact",
+        );
+        results.push((output.status.code(), compact_locations(&output)));
+        expected.push((Some(0), vec![format!("{filename}:{line}")]));
+    }
+    assert_eq!(results, expected);
+}
+
+#[test]
+fn foreign_component_hints_do_not_expand_raw_admission() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("owner.py"),
+        "def plugin_source_ranker():\n    return 0\n",
+    )
+    .expect("component-only source");
+    for (options, query) in [
+        (vec![], "plugin source ranker"),
+        (vec!["--bm25"], "plugin source ranker"),
+        (vec!["--bm25", "--exact"], "plugin source ranker"),
+        (
+            vec!["--bm25", "--strict-elastic-syntax"],
+            "plugin AND source AND ranker",
+        ),
+        (vec![], "plugin OR source OR ranker"),
+    ] {
+        let mut args = vec!["search"];
+        args.extend(options);
+        args.push(query);
+        let output = fixture.run(&args, "component-only");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn bounded_regex_returns_original_source_lines_without_snippets() {
     let fixture = Fixture::new();
     fs::write(

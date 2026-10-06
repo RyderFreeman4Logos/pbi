@@ -358,7 +358,7 @@ pub fn search_raw_repository(
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| matches!(ext, "py" | "js" | "ts" | "c" | "h" | "cc" | "cpp" | "cxx"))
         {
-            pbi_rs::foreign_search_anchors(source, &terms)
+            pbi_rs::foreign_search_anchors(source, &path, &terms)
         } else {
             (Vec::new(), Vec::new())
         };
