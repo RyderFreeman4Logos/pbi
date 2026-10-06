@@ -32,6 +32,54 @@ pub fn matching_rust_declaration_lines(source: &str, terms: &[String]) -> Vec<us
         .collect()
 }
 
+/// Exact query identifiers eligible for declaration-first file ranking.
+/// Retain source spelling: filename stems and rewritten prose are not symbols.
+pub fn named_search_terms(query: &str) -> Vec<String> {
+    raw_query_tokens(query)
+        .into_iter()
+        .filter(|token| {
+            !token.trim_end_matches('.').contains(['/', '.', '-'])
+                && (token.contains('_') || tokenized(token).len() > 1 || !token.is_ascii())
+        })
+        .map(|token| control_word(&token))
+        .collect()
+}
+
+/// Foreign source anchors reuse the evidence lexical projection and names.
+/// Component matches select windows only: they do not admit component-only files,
+/// alter raw document BM25, or broaden exact/strict query admission.
+pub fn foreign_search_anchors(
+    source: &str,
+    path: &Path,
+    terms: &[String],
+) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let owner = SourceOwner::for_path(path);
+    let mut declarations = Vec::new();
+    let mut components = Vec::new();
+    if source.len() as u64 > MAX_SOURCE_BYTES {
+        return (declarations, components);
+    }
+    for (index, line) in CodeView::new(source, owner).code.lines().enumerate() {
+        if !production_source(line) {
+            continue;
+        }
+        if tokenized(line).iter().any(|part| terms.contains(part)) {
+            components.push(index + 1);
+        }
+        if let Some(name) = foreign_declaration_name(line, owner) {
+            let parts = tokenized(&name);
+            let matches = terms
+                .iter()
+                .filter(|term| **term == name.to_lowercase() || parts.contains(term))
+                .count();
+            if matches > 0 {
+                declarations.push((index + 1, matches));
+            }
+        }
+    }
+    (declarations, components)
+}
+
 #[cfg(test)]
 std::thread_local! {
     static WINDOW_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1217,6 +1265,26 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
     features
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SourceOwner {
+    Rust,
+    Python,
+    JavaScript,
+    CFamily,
+}
+
+impl SourceOwner {
+    fn for_path(path: &Path) -> Self {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("py") => Self::Python,
+            Some("js" | "ts") => Self::JavaScript,
+            Some("c" | "h" | "cc" | "cpp" | "cxx") => Self::CFamily,
+            // Unknown paths keep the pre-339 Rust-compatible projection.
+            _ => Self::Rust,
+        }
+    }
+}
+
 struct CodeView {
     code: String,
 }
@@ -1224,22 +1292,21 @@ struct CodeView {
 impl CodeView {
     // Byte-preserving lexical projection; semantic proof uses the syntax tree.
     // Mask bytes, not lines, so every window still addresses the original source.
-    fn new(source: &str) -> Self {
+    fn new(source: &str, owner: SourceOwner) -> Self {
         let bytes = source.as_bytes();
         let mut code = bytes.to_vec();
         let mut index = 0;
         while index < bytes.len() {
             let start = index;
-            if bytes[index..].starts_with(b"//") {
-                index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            } else if bytes[index..].starts_with(b"/*") {
+            if (owner == SourceOwner::Python && bytes[index] == b'#')
+                || (owner != SourceOwner::Python && bytes[index..].starts_with(b"//"))
+            {
+                index = line_comment_end(bytes, index, owner == SourceOwner::CFamily);
+            } else if owner != SourceOwner::Python && bytes[index..].starts_with(b"/*") {
                 index += 2;
                 let mut depth = 1;
                 while index < bytes.len() && depth > 0 {
-                    if bytes[index..].starts_with(b"/*") {
+                    if owner == SourceOwner::Rust && bytes[index..].starts_with(b"/*") {
                         depth += 1;
                         index += 2;
                     } else if bytes[index..].starts_with(b"*/") {
@@ -1249,11 +1316,27 @@ impl CodeView {
                         index += 1;
                     }
                 }
-            } else if bytes[index] == b'\'' && character_end(source, index).is_some() {
+            } else if owner == SourceOwner::Python
+                && (bytes[index..].starts_with(b"\"\"\"") || bytes[index..].starts_with(b"'''"))
+            {
+                index = quoted_literal_end(bytes, index, bytes[index], 3);
+            } else if owner == SourceOwner::JavaScript && bytes[index] == b'`' {
+                index = template_literal_end(bytes, index);
+            } else if owner == SourceOwner::CFamily
+                && bytes[index..].starts_with(b"R\"")
+                && cpp_raw_literal_end(bytes, index).is_some()
+            {
+                index = cpp_raw_literal_end(bytes, index).unwrap_or(bytes.len());
+            } else if owner != SourceOwner::Rust && matches!(bytes[index], b'\'' | b'"') {
+                index = quoted_literal_end(bytes, index, bytes[index], 1);
+            } else if owner == SourceOwner::Rust
+                && bytes[index] == b'\''
+                && character_end(source, index).is_some()
+            {
                 index = character_end(source, index).unwrap_or(index + 1);
             } else {
                 let mut quote = index;
-                if bytes[index] == b'r' {
+                if owner == SourceOwner::Rust && bytes[index] == b'r' {
                     quote += 1;
                     while quote < bytes.len() && bytes[quote] == b'#' {
                         quote += 1;
@@ -1263,7 +1346,7 @@ impl CodeView {
                     index += 1;
                     continue;
                 }
-                let raw = bytes[index] == b'r';
+                let raw = owner == SourceOwner::Rust && bytes[index] == b'r';
                 let hashes = quote.saturating_sub(index + 1);
                 index = quote + 1;
                 while index < bytes.len() {
@@ -1293,6 +1376,130 @@ impl CodeView {
             code: String::from_utf8_lossy(&code).into_owned(),
         }
     }
+}
+
+// C-family comments own continued physical lines; Rust/JS/Python do not splice them.
+fn line_comment_end(bytes: &[u8], start: usize, splice: bool) -> usize {
+    let mut index = start;
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            let previous = if index > 0 && bytes[index - 1] == b'\r' {
+                index - 1
+            } else {
+                index
+            };
+            if !splice || previous == 0 || bytes[previous - 1] != b'\\' {
+                return index;
+            }
+        }
+        index += 1;
+    }
+    index
+}
+
+// C++ raw delimiters are at most 16 bytes; prefixes (u8/u/U/L) precede R.
+fn cpp_raw_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let delimiter_start = start + 2;
+    let mut open = delimiter_start;
+    while open < bytes.len() && bytes[open] != b'(' {
+        if open - delimiter_start == 16
+            || bytes[open].is_ascii_whitespace()
+            || matches!(bytes[open], b')' | b'\\')
+            || !bytes[open].is_ascii()
+        {
+            return None;
+        }
+        open += 1;
+    }
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let delimiter = &bytes[delimiter_start..open];
+    let mut index = open + 1;
+    while index < bytes.len() {
+        if bytes[index] == b')'
+            && bytes.get(index + 1..index + 1 + delimiter.len()) == Some(delimiter)
+            && bytes.get(index + 1 + delimiter.len()) == Some(&b'"')
+        {
+            return Some(index + delimiter.len() + 2);
+        }
+        index += 1;
+    }
+    Some(bytes.len())
+}
+
+// ponytail: whole templates (including executable interpolation) remain excluded.
+// A 64-frame ceiling masks through EOF instead of exposing nested literal text.
+// Regex literals in expressions remain a separate unsupported lexical family.
+fn template_literal_end(bytes: &[u8], start: usize) -> usize {
+    let mut frames = vec![0usize];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        let depth = frames.last().copied().unwrap_or(0);
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if depth == 0 {
+            if bytes[index] == b'`' {
+                frames.pop();
+                index += 1;
+                if frames.is_empty() {
+                    return index;
+                }
+            } else if bytes[index..].starts_with(b"${") {
+                if let Some(frame) = frames.last_mut() {
+                    *frame = 1;
+                }
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else if bytes[index] == b'`' {
+            if frames.len() == 64 {
+                return bytes.len();
+            }
+            frames.push(0);
+            index += 1;
+        } else if matches!(bytes[index], b'\'' | b'"') {
+            index = quoted_literal_end(bytes, index, bytes[index], 1);
+        } else if bytes[index..].starts_with(b"//") {
+            index = line_comment_end(bytes, index, false);
+        } else if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            while index < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+        } else {
+            if let Some(frame) = frames.last_mut() {
+                if bytes[index] == b'{' {
+                    *frame += 1;
+                }
+                if bytes[index] == b'}' {
+                    *frame -= 1;
+                }
+            }
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+// Owned ordinary/triple strings share escape-aware termination.
+fn quoted_literal_end(bytes: &[u8], start: usize, quote: u8, delimiter_len: usize) -> usize {
+    let mut index = start + delimiter_len;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes
+            .get(index..index + delimiter_len)
+            .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote))
+        {
+            return index + delimiter_len;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
 }
 
 // A character has one scalar or one escape followed by a closing apostrophe.
@@ -1599,7 +1806,7 @@ fn best_windows(
         .filter(|term| !group.terms.contains(term))
         .collect::<Vec<_>>();
     let source = lines.join("\n");
-    let view = CodeView::new(&source);
+    let view = CodeView::new(&source, SourceOwner::for_path(relative));
     // split, unlike lines(), preserves the cardinality of the original joined lines.
     let code_lines: Vec<&str> = view.code.split('\n').collect();
     let scopes = relevance_scope::Proofs::new(&source, &view.code);
@@ -2124,7 +2331,9 @@ fn declaration_names(
         }
         return rust_declaration_name(code_line).into_iter().collect();
     }
-    foreign_declaration_name(code_line).into_iter().collect()
+    foreign_declaration_name(code_line, SourceOwner::for_path(relative))
+        .into_iter()
+        .collect()
 }
 
 fn production_source(line: &str) -> bool {
@@ -2159,22 +2368,25 @@ fn rust_declaration_name(code_line: &str) -> Option<String> {
     None
 }
 
-fn foreign_declaration_name(code_line: &str) -> Option<String> {
+fn foreign_declaration_name(code_line: &str, owner: SourceOwner) -> Option<String> {
     let trimmed = code_line.trim_start();
     if trimmed.starts_with("```") || trimmed.starts_with('#') {
         return None;
     }
-    if let Some(rest) = trimmed.strip_prefix("def ") {
-        return identifier_head(rest);
+    // These are window-ranking hints, not complete declaration grammars.
+    let keywords: &[&str] = match owner {
+        SourceOwner::Python => &["class ", "def ", "async def "],
+        SourceOwner::JavaScript => &["class ", "function ", "async function "],
+        SourceOwner::CFamily => &["class "],
+        SourceOwner::Rust => return None,
+    };
+    for keyword in keywords {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            return identifier_head(rest);
+        }
     }
-    if let Some(rest) = trimmed.strip_prefix("async def ") {
-        return identifier_head(rest);
-    }
-    if let Some(rest) = trimmed.strip_prefix("function ") {
-        return identifier_head(rest);
-    }
-    if let Some(rest) = trimmed.strip_prefix("async function ") {
-        return identifier_head(rest);
+    if owner != SourceOwner::CFamily {
+        return None;
     }
     let mut parts = trimmed.split_whitespace();
     let first = parts.next()?;
@@ -2207,6 +2419,136 @@ fn lexical_harness_window(text: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn language_owner_projection_preserves_offsets_and_rust_tokens() {
+        let source = concat!(
+            "const A: &str = r##\"def fake() { /* */ }\"##;\r\n",
+            "const B: &[u8] = br#\"function fake() {}\"#;\r\n",
+            "const C: &[u8] = b\"class fake\";\r\n",
+            "/* outer /* fn fake() {} */ still comment */\r\n",
+            "fn real<'a>(x: &'a str) { let c = 'é'; let q = '\\''; let b = '\\\\'; }\r\n"
+        );
+        for path in ["source.rs", "source.unknown", "source"] {
+            let code = CodeView::new(source, SourceOwner::for_path(Path::new(path))).code;
+            assert_eq!(code.len(), source.len());
+            assert_eq!(
+                code.bytes()
+                    .enumerate()
+                    .filter(|(_, b)| matches!(b, b'\r' | b'\n'))
+                    .collect::<Vec<_>>(),
+                source
+                    .bytes()
+                    .enumerate()
+                    .filter(|(_, b)| matches!(b, b'\r' | b'\n'))
+                    .collect::<Vec<_>>()
+            );
+            assert!(!code.contains("fake"));
+            assert!(code.contains("fn real<'a>(x: &'a str)"));
+            assert!(!code.contains('é'));
+        }
+    }
+
+    #[test]
+    fn language_owner_foreign_projection_and_names_share_policy() {
+        let terms = vec![
+            "plugin".to_string(),
+            "source".to_string(),
+            "ranker".to_string(),
+        ];
+        for extension in ["py", "js", "ts", "c", "h", "cc", "cpp", "cxx"] {
+            let path = PathBuf::from(format!("source.{extension}"));
+            let owner = SourceOwner::for_path(&path);
+            let declaration = match owner {
+                SourceOwner::Python => "def plugin_source_ranker():",
+                SourceOwner::JavaScript => "function plugin_source_ranker() {}",
+                _ => "int plugin_source_ranker() {}",
+            };
+            let source = format!("note = 'é \\\r\n{declaration}';\r\n{declaration}\r\n");
+            let view = CodeView::new(&source, owner);
+            assert_eq!(view.code.len(), source.len());
+            let (anchors, components) = foreign_search_anchors(&source, &path, &terms);
+            assert_eq!(anchors, [(3, 3)]);
+            assert_eq!(components, [3]);
+            let code_line = view.code.lines().nth(2).expect("real declaration");
+            assert_eq!(
+                declaration_names(declaration, code_line, &path, 3, &[]),
+                ["plugin_source_ranker"]
+            );
+            for foreign in [
+                "def plugin_source_ranker():",
+                "function plugin_source_ranker() {}",
+                "int plugin_source_ranker() {}",
+            ] {
+                assert_eq!(
+                    foreign_declaration_name(foreign, owner).is_some(),
+                    foreign == declaration
+                );
+            }
+        }
+        let code = CodeView::new(
+            "value = numerator // plugin_source_ranker()\n",
+            SourceOwner::Python,
+        )
+        .code;
+        assert!(code.contains("// plugin_source_ranker()"));
+        for prefix in ["r", "b", "u", "f", "rf", "br"] {
+            let source = format!("note = {prefix}\"\"\"\ndef plugin_source_ranker():\n\"\"\"\ndef plugin_source_ranker():\n");
+            assert_eq!(
+                foreign_search_anchors(&source, Path::new("source.py"), &terms).0,
+                [(4, 3)]
+            );
+        }
+        for prefix in ["", "u8", "u", "U", "L"] {
+            let source = format!("const char* note = {prefix}R\"tag(é \"\nclass PluginSourceRanker {{}};\n)tag\";\nclass PluginSourceRanker {{}};\n");
+            assert_eq!(
+                foreign_search_anchors(&source, Path::new("source.cpp"), &terms).0,
+                [(4, 3)]
+            );
+        }
+        for owner in [
+            SourceOwner::Python,
+            SourceOwner::JavaScript,
+            SourceOwner::CFamily,
+        ] {
+            let code = CodeView::new(
+                "note = 'unclosed\nfunction plugin_source_ranker() {}",
+                owner,
+            )
+            .code;
+            assert!(!code.contains("plugin_source_ranker"));
+        }
+    }
+
+    #[test]
+    fn language_owner_templates_exclude_interpolation_and_bound_nesting() {
+        let source = "const docs = `é \\` ${(() => { function hidden() {} return `inner ${\"}\"}`; })()}`;\r\nfunction real() {}";
+        let code = CodeView::new(source, SourceOwner::JavaScript).code;
+        assert_eq!(code.len(), source.len());
+        assert!(!code.contains("hidden"));
+        assert!(code.contains("function real()"));
+        let nested = format!(
+            "{}function hidden() {{}}{}",
+            "`${".repeat(65),
+            "}`".repeat(65)
+        );
+        assert!(!CodeView::new(&nested, SourceOwner::JavaScript)
+            .code
+            .contains("hidden"));
+        // Explicit residual: regex is not division and requires a separate lexer boundary.
+        assert!(!CodeView::new(
+            "const re = /\"/;\nfunction real() {}",
+            SourceOwner::JavaScript
+        )
+        .code
+        .contains("real"));
+        assert!(CodeView::new(
+            "const n = numerator / denominator;\nfunction real() {}",
+            SourceOwner::JavaScript
+        )
+        .code
+        .contains("real"));
+    }
 
     struct Fixture {
         root: PathBuf,

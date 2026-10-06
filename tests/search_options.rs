@@ -82,6 +82,261 @@ fn compact_streaming_keeps_strong_late_body_beyond_raw_block_cap() {
 }
 
 #[test]
+fn named_symbol_sentence_punctuation_keeps_declaration_priority() {
+    let fixture = Fixture::new();
+    let noise = format!(
+        "fn noise() {{\n{}}}\n",
+        "    let _ = \"SourceLocation\";\n".repeat(100)
+    );
+    fs::write(fixture.root.join("a_noise.rs"), noise).expect("string-only distractor");
+    let declaration = format!(
+        "pub struct SourceLocation;\nfn padding() {{\n{}}}\n",
+        "    let _ = 0;\n".repeat(200)
+    );
+    fs::write(fixture.root.join("z_decl.rs"), declaration).expect("named declaration");
+    for query in [
+        "Where is SourceLocation.",
+        "Where is SourceLocation",
+        "Where is SourceLocation?",
+        "Where is SourceLocation!",
+        "Where is SourceLocation,",
+        "Where is 'SourceLocation'.",
+    ] {
+        let output = fixture.run(&["search", "--max-results=1", query], "compact");
+        assert!(output.status.success(), "punctuated named-symbol search");
+        assert!(output.stderr.is_empty(), "no named-symbol diagnostics");
+        assert_eq!(
+            compact_locations(&output),
+            ["z_decl.rs:1"],
+            "named declaration under cap"
+        );
+    }
+    for query in [
+        "Where is SourceLocation.rs",
+        "Where is src/SourceLocation.rs.",
+        "Where is module.SourceLocation.",
+        "memory provider register plugin search transport",
+    ] {
+        assert!(
+            pbi_rs::named_search_terms(query).is_empty(),
+            "paths and generic prose are not names"
+        );
+    }
+    assert_eq!(
+        pbi_rs::named_search_terms("Where is SourceLocation::display_relative."),
+        ["sourcelocation::display_relative"]
+    );
+    assert_eq!(pbi_rs::named_search_terms("Where is Café."), ["café"]);
+    assert_eq!(
+        pbi_rs::named_search_terms("Where is \"SourceLocation\"."),
+        ["sourcelocation"]
+    );
+}
+
+#[test]
+fn generic_plugin_bag_keeps_late_executable_anchor_before_declaration_noise() {
+    let fixture = Fixture::new();
+    let query = "Orbit Vector memory provider register plugin search transport Cache RPC config integration reserved stub";
+    let plugin = "contrib/orbit-agent-plugin/vector/__init__.py";
+    fs::create_dir_all(fixture.root.join("tests")).expect("noise directory");
+    fs::create_dir_all(fixture.root.join("docs")).expect("documentation directory");
+    fs::create_dir_all(fixture.root.join(plugin).parent().expect("plugin parent"))
+        .expect("plugin directory");
+    for (index, word) in [
+        "memory",
+        "provider",
+        "register",
+        "search",
+        "transport",
+        "config",
+        "integration",
+        "stub",
+    ]
+    .iter()
+    .enumerate()
+    {
+        fs::write(
+            fixture.root.join(format!("tests/noise_{index}.rs")),
+            format!("pub fn {word}() {{}}\n"),
+        )
+        .expect("generic declaration noise");
+    }
+    fs::write(
+        fixture.root.join("docs/noise.md"),
+        "Orbit Vector Cache RPC config integration reserved stub\n",
+    )
+    .expect("documentation noise");
+    fs::write(fixture.root.join("transport.py"), "pass\n").expect("filename distractor");
+    let padding = format!(
+        "{}def load_config():\n    return \"{}\"\n{}",
+        "unrelated_value = 0\n".repeat(110),
+        query.repeat(3),
+        "unrelated_value = 0\n".repeat(48)
+    );
+    let source = format!(
+        "\"\"\"{query}.\"\"\"\n{}class VectorMemoryProvider:\n    def search(self, query):\n        return self.transport.search(query)\n\ndef register_plugin(registry):\n    registry.register_memory_provider(VectorMemoryProvider())\n",
+        padding
+    );
+    fs::write(fixture.root.join(plugin), source).expect("late plugin implementation");
+    let output = fixture.run(&["search", query], "compact");
+    assert!(output.status.success());
+    let locations = compact_locations(&output);
+    assert!(
+        locations
+            .iter()
+            .any(|location| location.starts_with(&format!("{plugin}:"))),
+        "plugin must be admitted inside the default result cap: {locations:?}"
+    );
+    assert!(
+        locations.contains(&format!("{plugin}:162-167")),
+        "plugin must cite the late implementation, not its keyword header: {locations:?}"
+    );
+}
+
+#[test]
+fn compact_search_ignores_foreign_literal_declarations() {
+    let cases = [
+        (
+            "decoy.py",
+            concat!(
+                "DOC = \"\"\"Example plugin source ranker \"first\" second \"third\n",
+                "def plugin_source_ranker(): # plugin source ranker\n",
+                "    pass\n",
+                "\"\"\"\n"
+            ),
+            "def plugin_source_ranker(): # plugin source ranker\n    pass\n",
+        ),
+        (
+            "decoy.js",
+            concat!(
+                "const docs = `Example plugin source ranker:\n",
+                "function plugin_source_ranker() { // plugin source ranker\n",
+                "  return undefined;\n",
+                "}\n",
+                "`;\n"
+            ),
+            "function plugin_source_ranker() { // plugin source ranker\n  return undefined;\n}\n",
+        ),
+    ];
+
+    for (filename, literal, implementation) in cases {
+        let fixture = Fixture::new();
+        let implementation_line = literal.lines().count() + 51;
+        let source = format!("{literal}{}{implementation}", "\n".repeat(50));
+        fs::write(fixture.root.join(filename), source).expect("foreign literal fixture");
+        let output = fixture.run(
+            &["search", "--max-results=1", "plugin source ranker"],
+            "compact",
+        );
+        assert!(output.status.success(), "compact search must succeed");
+        let locations = compact_locations(&output);
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.starts_with(&format!("{filename}:{implementation_line}"))),
+            "executable implementation must outrank its literal example: {locations:?}"
+        );
+        assert!(
+            !locations
+                .iter()
+                .any(|location| location.starts_with(&format!("{filename}:1"))),
+            "literal declaration must not be selected: {locations:?}"
+        );
+    }
+}
+
+#[test]
+fn language_owner_rust_adjacent_literals_preserve_behavior() {
+    let mut results = Vec::new();
+    for literals in [
+        "r\"\"\"docs\"",
+        "\"\"\"docs\"",
+        "r\"\" \"docs\"",
+        "\"\" \"docs\"",
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("source.rs"), format!(
+            "macro_rules! adjacent {{ ($a:literal $b:literal) => {{}}; }}\nadjacent!({literals});\npub fn parse_conversion(input: &str) -> Result<u64, std::num::ParseIntError> {{\n    input.parse::<u64>()\n}}\n"
+        )).expect("legal adjacent literal fixture");
+        let output = fixture.run(
+            &["How does parse_conversion parse input and handle conversion errors?"],
+            "behavior",
+        );
+        results.push((
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    assert_eq!(results, vec![(Some(0), vec!["source.rs:3".to_string()]); 4]);
+}
+
+#[test]
+fn language_owner_foreign_literals_comments_preserve_real_anchor() {
+    let cases = [
+        ("py", "# plugin source ranker unmatched \"\"\" /* `\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("py", "note = 'plugin source ranker \\\ndef plugin_source_ranker():\\\nend'\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("py", "note = r\"\\\"\" # plugin source ranker\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("py", "note = f'''plugin source ranker\ndef plugin_source_ranker():\n'''\n", "def plugin_source_ranker():\n    return 0\n"),
+        ("js", "/* plugin source ranker /* example */\n", "function plugin_source_ranker() { return 0; }\n"),
+        ("ts", "const docs = 'plugin source ranker \\\nfunction plugin_source_ranker() {}\\\nend';\n", "function plugin_source_ranker() { return 0; }\n"),
+        ("js", "const docs = `plugin source ranker ${`inner\nfunction plugin_source_ranker() {}\n`} tail`;\n", "function plugin_source_ranker() { return 0; }\n"),
+        ("cpp", "const char* docs = R\"tag(plugin source ranker \"\nclass PluginSourceRanker {};\n)tag\";\n", "class PluginSourceRanker {};\n"),
+        ("c", "// plugin source ranker \\\nint plugin_source_ranker();\n", "int plugin_source_ranker() { return 0; }\n"),
+        ("h", "// plugin source ranker \\\r\nint plugin_source_ranker();\r\n", "int plugin_source_ranker() { return 0; }\n"),
+        ("c", "const char* docs = \"\"\"plugin source ranker\";\n/* example /* nested marker */\nint marker = '\"x';\n", "int plugin_source_ranker() { return 0; }\n"),
+    ];
+    let mut results = Vec::new();
+    let mut expected = Vec::new();
+    for (extension, prefix, implementation) in cases {
+        let fixture = Fixture::new();
+        let filename = format!("owner.{extension}");
+        let line = prefix.lines().count() + 51;
+        fs::write(
+            fixture.root.join(&filename),
+            format!("{prefix}{}{implementation}", "\n".repeat(50)),
+        )
+        .expect("owned lexical fixture");
+        let output = fixture.run(
+            &["search", "--max-results=1", "plugin source ranker"],
+            "compact",
+        );
+        results.push((output.status.code(), compact_locations(&output)));
+        expected.push((Some(0), vec![format!("{filename}:{line}")]));
+    }
+    assert_eq!(results, expected);
+}
+
+#[test]
+fn foreign_component_hints_do_not_expand_raw_admission() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("owner.py"),
+        "def plugin_source_ranker():\n    return 0\n",
+    )
+    .expect("component-only source");
+    for (options, query) in [
+        (vec![], "plugin source ranker"),
+        (vec!["--bm25"], "plugin source ranker"),
+        (vec!["--bm25", "--exact"], "plugin source ranker"),
+        (
+            vec!["--bm25", "--strict-elastic-syntax"],
+            "plugin AND source AND ranker",
+        ),
+        (vec![], "plugin OR source OR ranker"),
+    ] {
+        let mut args = vec!["search"];
+        args.extend(options);
+        args.push(query);
+        let output = fixture.run(&args, "component-only");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn bounded_regex_returns_original_source_lines_without_snippets() {
     let fixture = Fixture::new();
     fs::write(
