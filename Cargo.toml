@@ -12,6 +12,12 @@ name = "pbi_rs"
 path = "src/lib.rs"
 
 [dependencies]
+# Pure Rust grammar, run only in the bounded same-image parser worker.
+oxc_allocator = "=0.153.0"
+oxc_ast = "=0.153.0"
+oxc_ast_visit = "=0.153.0"
+oxc_parser = { version = "=0.153.0", default-features = false }
+oxc_span = "=0.153.0"
 # English-only Porter stemmer for the fixtures; none existed before #316.
 porter-stemmer = "=0.1.2"
 # Reuse the locked syntax crates; stemming adds only its English implementation

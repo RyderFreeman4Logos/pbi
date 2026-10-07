@@ -2,12 +2,15 @@ mod declaration_identity;
 #[cfg(test)]
 #[path = "definition_intent_tests.rs"]
 mod definition_intent_tests;
+pub mod grammar_worker;
+mod javascript_grammar;
 mod relevance_scope;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub mod semantic;
 
@@ -53,13 +56,26 @@ pub fn foreign_search_anchors(
     path: &Path,
     terms: &[String],
 ) -> (Vec<(usize, usize)>, Vec<usize>) {
+    foreign_search_anchors_bounded(source, path, terms, Instant::now() + Duration::from_secs(8))
+}
+
+/// Same ranking-only projection, bounded by the caller's existing run deadline.
+pub fn foreign_search_anchors_bounded(
+    source: &str,
+    path: &Path,
+    terms: &[String],
+    deadline: Instant,
+) -> (Vec<(usize, usize)>, Vec<usize>) {
     let owner = SourceOwner::for_path(path);
     let mut declarations = Vec::new();
     let mut components = Vec::new();
     if source.len() as u64 > MAX_SOURCE_BYTES {
         return (declarations, components);
     }
-    for (index, line) in CodeView::new(source, owner).code.lines().enumerate() {
+    let Ok(view) = CodeView::bounded(source, owner, deadline) else {
+        return (declarations, components);
+    };
+    for (index, line) in view.code.lines().enumerate() {
         if !production_source(line) {
             continue;
         }
@@ -508,6 +524,7 @@ pub enum EvidenceError {
     SourceOutsideRoot,
     InvalidLineRange,
     SourceUnavailable,
+    SourceSyntaxUnavailable,
 }
 
 impl fmt::Display for EvidenceError {
@@ -518,6 +535,9 @@ impl fmt::Display for EvidenceError {
             Self::SourceOutsideRoot => "source location crossed the repository boundary",
             Self::InvalidLineRange => "probe returned an invalid source line range",
             Self::SourceUnavailable => "source evidence could not be read",
+            Self::SourceSyntaxUnavailable => {
+                "source grammar could not be verified within its bounds"
+            }
         })
     }
 }
@@ -566,6 +586,24 @@ pub fn verify_probe_evidence(
     query: &str,
     max_results: usize,
 ) -> Result<EvidenceReport, EvidenceError> {
+    verify_probe_evidence_bounded(
+        probe_output,
+        root,
+        query,
+        max_results,
+        Instant::now() + Duration::from_secs(90),
+    )
+}
+
+/// Verify with the caller-owned overall deadline, parsing each approved file
+/// exactly once before selecting any query group or source window.
+pub fn verify_probe_evidence_bounded(
+    probe_output: &str,
+    root: &Path,
+    query: &str,
+    max_results: usize,
+    deadline: Instant,
+) -> Result<EvidenceReport, EvidenceError> {
     if probe_output.trim().is_empty() {
         return Err(EvidenceError::NoSourceLocations);
     }
@@ -606,6 +644,8 @@ pub fn verify_probe_evidence(
         if lines.is_empty() {
             continue;
         }
+        let view = CodeView::bounded(&source, SourceOwner::for_path(relative), deadline)
+            .map_err(|_| EvidenceError::SourceSyntaxUnavailable)?;
         for (group_index, group) in groups.iter().enumerate() {
             let raw_order = raw
                 .order
@@ -616,7 +656,7 @@ pub fn verify_probe_evidence(
                 &groups,
                 relative,
                 &path,
-                &lines,
+                (&lines, &view.code),
                 raw_order,
                 max_results,
             ));
@@ -1270,6 +1310,7 @@ enum SourceOwner {
     Rust,
     Python,
     JavaScript,
+    TypeScript,
     CFamily,
 }
 
@@ -1277,7 +1318,8 @@ impl SourceOwner {
     fn for_path(path: &Path) -> Self {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("py") => Self::Python,
-            Some("js" | "ts") => Self::JavaScript,
+            Some("js") => Self::JavaScript,
+            Some("ts") => Self::TypeScript,
             Some("c" | "h" | "cc" | "cpp" | "cxx") => Self::CFamily,
             // Unknown paths keep the pre-339 Rust-compatible projection.
             _ => Self::Rust,
@@ -1292,15 +1334,23 @@ struct CodeView {
 impl CodeView {
     // Byte-preserving lexical projection; semantic proof uses the syntax tree.
     // Mask bytes, not lines, so every window still addresses the original source.
+    #[cfg(test)]
     fn new(source: &str, owner: SourceOwner) -> Self {
+        Self::bounded(source, owner, Instant::now() + Duration::from_secs(8))
+            .expect("valid bounded projection")
+    }
+
+    fn bounded(source: &str, owner: SourceOwner, deadline: Instant) -> Result<Self, ()> {
+        if source.len() as u64 > MAX_SOURCE_BYTES || Instant::now() >= deadline {
+            return Err(());
+        }
+        if matches!(owner, SourceOwner::JavaScript | SourceOwner::TypeScript) {
+            return grammar_worker::project(source, owner == SourceOwner::TypeScript, deadline)
+                .map(|code| Self { code });
+        }
         let bytes = source.as_bytes();
         let mut code = bytes.to_vec();
         let mut index = 0;
-        let mut javascript_regex_allowed = true;
-        let mut javascript_property_name = false;
-        let mut javascript_angle_depth = 0usize;
-        let mut javascript_angle_braces = 0usize;
-        let mut javascript_regex_scan_budget = bytes.len();
         while index < bytes.len() {
             let start = index;
             if (owner == SourceOwner::Python && bytes[index] == b'#')
@@ -1321,32 +1371,10 @@ impl CodeView {
                         index += 1;
                     }
                 }
-            } else if owner == SourceOwner::JavaScript && bytes[index] == b'/' {
-                if javascript_regex_allowed {
-                    if let Some(end) = javascript_regex_literal_end(
-                        bytes,
-                        index,
-                        &mut javascript_regex_scan_budget,
-                    ) {
-                        index = end;
-                        javascript_regex_allowed = false;
-                    } else {
-                        javascript_regex_allowed = true;
-                        index += 1;
-                        continue;
-                    }
-                } else {
-                    javascript_regex_allowed = true;
-                    index += 1;
-                    continue;
-                }
             } else if owner == SourceOwner::Python
                 && (bytes[index..].starts_with(b"\"\"\"") || bytes[index..].starts_with(b"'''"))
             {
                 index = quoted_literal_end(bytes, index, bytes[index], 3);
-            } else if owner == SourceOwner::JavaScript && bytes[index] == b'`' {
-                index = template_literal_end(bytes, index);
-                javascript_regex_allowed = false;
             } else if owner == SourceOwner::CFamily
                 && bytes[index..].starts_with(b"R\"")
                 && cpp_raw_literal_end(bytes, index).is_some()
@@ -1354,113 +1382,11 @@ impl CodeView {
                 index = cpp_raw_literal_end(bytes, index).unwrap_or(bytes.len());
             } else if owner != SourceOwner::Rust && matches!(bytes[index], b'\'' | b'"') {
                 index = quoted_literal_end(bytes, index, bytes[index], 1);
-                if owner == SourceOwner::JavaScript {
-                    javascript_regex_allowed = false;
-                }
             } else if owner == SourceOwner::Rust
                 && bytes[index] == b'\''
                 && character_end(source, index).is_some()
             {
                 index = character_end(source, index).unwrap_or(index + 1);
-            } else if owner == SourceOwner::JavaScript {
-                if bytes[index].is_ascii_whitespace() {
-                    index += 1;
-                    continue;
-                }
-                if bytes[index].is_ascii_alphabetic()
-                    || matches!(bytes[index], b'_' | b'$' | b'#' | b'\\')
-                    || bytes[index] >= 0x80
-                {
-                    let mut end = index;
-                    while let Some(byte) = bytes.get(end) {
-                        if byte.is_ascii_alphanumeric()
-                            || matches!(byte, b'_' | b'$' | b'#' | b'\\')
-                            || *byte >= 0x80
-                        {
-                            if bytes[end..].starts_with(b"\\u{") {
-                                end += 3;
-                                while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
-                                    end += 1;
-                                }
-                                if bytes.get(end) == Some(&b'}') {
-                                    end += 1;
-                                }
-                            } else {
-                                end += 1;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    // Own private/escaped/non-ASCII names conservatively; only a whole keyword permits regex.
-                    // IdentifierName after member access is an operand, even if spelled as a keyword.
-                    javascript_regex_allowed = !javascript_property_name
-                        && javascript_regex_prefix_keyword(&bytes[index..end]);
-                    javascript_property_name = false;
-                    index = end;
-                    continue;
-                }
-                let byte = bytes[index];
-                javascript_property_name = byte == b'.';
-                match byte {
-                    // Prefix ! keeps expression-start state; TS postfix ! keeps operand state.
-                    b'!' => index += 1,
-                    // ponytail: unmatched < makes > ambiguous within a statement, not a type proof.
-                    // Count nested closes, but keep <=/<< and => as operators; no type parser.
-                    b'<' => {
-                        if matches!(bytes.get(index + 1), Some(b'=' | b'<')) {
-                            index += 2;
-                        } else {
-                            javascript_angle_depth += 1;
-                            index += 1;
-                        }
-                        javascript_regex_allowed = true;
-                    }
-                    b'>' => {
-                        javascript_regex_allowed = javascript_angle_depth == 0;
-                        javascript_angle_depth = javascript_angle_depth.saturating_sub(1);
-                        index += 1;
-                    }
-                    b'=' if bytes.get(index + 1) == Some(&b'>') => {
-                        javascript_regex_allowed = true;
-                        index += 2;
-                    }
-                    b'{' => {
-                        javascript_angle_braces += usize::from(javascript_angle_depth > 0);
-                        javascript_regex_allowed = true;
-                        index += 1;
-                    }
-                    b'}' => {
-                        javascript_angle_braces = javascript_angle_braces.saturating_sub(1);
-                        javascript_regex_allowed = false;
-                        index += 1;
-                    }
-                    b';' => {
-                        if javascript_angle_braces == 0 {
-                            javascript_angle_depth = 0;
-                        }
-                        javascript_regex_allowed = true;
-                        index += 1;
-                    }
-                    b'(' | b'[' | b',' | b':' | b'?' | b'=' | b'~' | b'*' | b'%' | b'&' | b'|'
-                    | b'^' => {
-                        javascript_regex_allowed = true;
-                        index += 1;
-                    }
-                    b'+' | b'-' if bytes.get(index + 1) == Some(&byte) => {
-                        javascript_regex_allowed = false;
-                        index += 2;
-                    }
-                    b'+' | b'-' => {
-                        javascript_regex_allowed = true;
-                        index += 1;
-                    }
-                    _ => {
-                        javascript_regex_allowed = false;
-                        index += 1;
-                    }
-                }
-                continue;
             } else {
                 let mut quote = index;
                 if owner == SourceOwner::Rust && bytes[index] == b'r' {
@@ -1498,10 +1424,10 @@ impl CodeView {
                 }
             }
         }
-        Self {
+        Ok(Self {
             // Retained UTF-8 is unchanged; each removed byte is ASCII whitespace.
             code: String::from_utf8_lossy(&code).into_owned(),
-        }
+        })
     }
 }
 
@@ -1522,70 +1448,6 @@ fn line_comment_end(bytes: &[u8], start: usize, splice: bool) -> usize {
         index += 1;
     }
     index
-}
-
-// ponytail: ambiguous slash contexts (including of/await/yield) decline without grammar proof.
-fn javascript_regex_prefix_keyword(word: &[u8]) -> bool {
-    matches!(
-        word,
-        b"return"
-            | b"throw"
-            | b"case"
-            | b"delete"
-            | b"void"
-            | b"typeof"
-            | b"instanceof"
-            | b"in"
-            | b"else"
-            | b"do"
-            | b"new"
-    )
-}
-
-fn javascript_regex_literal_end(
-    bytes: &[u8],
-    start: usize,
-    scan_budget: &mut usize,
-) -> Option<usize> {
-    let mut index = start.checked_add(1)?;
-    let mut in_character_class = false;
-    while index < bytes.len() {
-        let width = if bytes[index] == b'\\' { 2 } else { 1 };
-        if *scan_budget < width {
-            return None;
-        }
-        *scan_budget -= width;
-        match bytes[index] {
-            b'\n' | b'\r' => return None,
-            b'\\' => {
-                if matches!(bytes.get(index + 1), Some(b'\n' | b'\r')) {
-                    return None;
-                }
-                index += 2;
-            }
-            b'[' if !in_character_class => {
-                in_character_class = true;
-                index += 1;
-            }
-            b']' if in_character_class => {
-                in_character_class = false;
-                index += 1;
-            }
-            b'/' if !in_character_class => {
-                index += 1;
-                while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
-                    if *scan_budget == 0 {
-                        return None;
-                    }
-                    *scan_budget -= 1;
-                    index += 1;
-                }
-                return Some(index);
-            }
-            _ => index += 1,
-        }
-    }
-    None
 }
 
 // C++ raw delimiters are at most 16 bytes; prefixes (u8/u/U/L) precede R.
@@ -1617,62 +1479,6 @@ fn cpp_raw_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
         index += 1;
     }
     Some(bytes.len())
-}
-
-// ponytail: whole templates (including executable interpolation) remain excluded.
-// A 64-frame ceiling masks through EOF instead of exposing nested literal text.
-// Regex literals in expressions remain a separate unsupported lexical family.
-fn template_literal_end(bytes: &[u8], start: usize) -> usize {
-    let mut frames = vec![0usize];
-    let mut index = start + 1;
-    while index < bytes.len() {
-        let depth = frames.last().copied().unwrap_or(0);
-        if bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-        } else if depth == 0 {
-            if bytes[index] == b'`' {
-                frames.pop();
-                index += 1;
-                if frames.is_empty() {
-                    return index;
-                }
-            } else if bytes[index..].starts_with(b"${") {
-                if let Some(frame) = frames.last_mut() {
-                    *frame = 1;
-                }
-                index += 2;
-            } else {
-                index += 1;
-            }
-        } else if bytes[index] == b'`' {
-            if frames.len() == 64 {
-                return bytes.len();
-            }
-            frames.push(0);
-            index += 1;
-        } else if matches!(bytes[index], b'\'' | b'"') {
-            index = quoted_literal_end(bytes, index, bytes[index], 1);
-        } else if bytes[index..].starts_with(b"//") {
-            index = line_comment_end(bytes, index, false);
-        } else if bytes[index..].starts_with(b"/*") {
-            index += 2;
-            while index < bytes.len() && !bytes[index..].starts_with(b"*/") {
-                index += 1;
-            }
-            index = (index + 2).min(bytes.len());
-        } else {
-            if let Some(frame) = frames.last_mut() {
-                if bytes[index] == b'{' {
-                    *frame += 1;
-                }
-                if bytes[index] == b'}' {
-                    *frame -= 1;
-                }
-            }
-            index += 1;
-        }
-    }
-    bytes.len()
 }
 
 // Owned ordinary/triple strings share escape-aware termination.
@@ -1972,12 +1778,13 @@ fn best_windows(
     all_groups: &[QueryGroup],
     relative: &Path,
     path: &Path,
-    lines: &[&str],
+    views: (&[&str], &str),
     order: usize,
     max_results: usize,
 ) -> Vec<ScoredEvidence> {
     #[cfg(test)]
     WINDOW_SCANS.with(|scans| scans.set(scans.get() + 1));
+    let (lines, code) = views;
     let test_candidate = test_path(relative);
     let all_terms = all_groups
         .iter()
@@ -1997,10 +1804,8 @@ fn best_windows(
         .filter(|term| !group.terms.contains(term))
         .collect::<Vec<_>>();
     let source = lines.join("\n");
-    let view = CodeView::new(&source, SourceOwner::for_path(relative));
-    // split, unlike lines(), preserves the cardinality of the original joined lines.
-    let code_lines: Vec<&str> = view.code.split('\n').collect();
-    let scopes = relevance_scope::Proofs::new(&source, &view.code);
+    let code_lines: Vec<&str> = code.lines().collect();
+    let scopes = relevance_scope::Proofs::new(&source, code);
     let declarations = if relative
         .extension()
         .and_then(|extension| extension.to_str())
@@ -2567,7 +2372,9 @@ fn foreign_declaration_name(code_line: &str, owner: SourceOwner) -> Option<Strin
     // These are window-ranking hints, not complete declaration grammars.
     let keywords: &[&str] = match owner {
         SourceOwner::Python => &["class ", "def ", "async def "],
-        SourceOwner::JavaScript => &["class ", "function ", "async function "],
+        SourceOwner::JavaScript | SourceOwner::TypeScript => {
+            &["class ", "function ", "async function "]
+        }
         SourceOwner::CFamily => &["class "],
         SourceOwner::Rust => return None,
     };
@@ -2612,6 +2419,70 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn language_owner_whole_file_is_parsed_once_for_all_groups_and_ranges() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("src/owner.js");
+        fs::write(&path, "const r = /[\"'] hidden/;\r\nfunction alpha_owner() { return 1; }\r\nfunction beta_owner() { return 2; }\r\n").expect("synthetic source");
+        let locations = format!(
+            "File: {}, Lines: 1-3\nFile: {}, Lines: 2-3\n",
+            path.display(),
+            path.display()
+        );
+        grammar_worker::SPAWNS.with(|count| count.set(0));
+        let report = verify_probe_evidence_bounded(
+            &locations,
+            &fixture.root,
+            "alpha_owner OR beta_owner",
+            8,
+            Instant::now() + Duration::from_secs(8),
+        )
+        .expect("both source groups");
+        assert!(!report.evidence().is_empty());
+        grammar_worker::SPAWNS.with(|count| assert_eq!(count.get(), 1));
+        assert_eq!(
+            verify_probe_evidence_bounded(
+                &locations,
+                &fixture.root,
+                "alpha_owner",
+                8,
+                Instant::now()
+            )
+            .err(),
+            Some(EvidenceError::SourceSyntaxUnavailable)
+        );
+        grammar_worker::SPAWNS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn language_owner_javascript_comparison_is_not_typescript_type_arguments() {
+        let source = "const x = 1 < 2 > /[\"'] function hidden_ranker/;\nfunction real() {}";
+        let code = CodeView::new(source, SourceOwner::JavaScript).code;
+        assert_eq!(code.len(), source.len());
+        assert!(!code.contains("hidden_ranker"));
+        assert!(code.contains("function real()"));
+    }
+
+    #[test]
+    fn language_owner_grammar_reported_and_paired() {
+        let witnesses = [
+            "const value = 1 as Array<<T>()=>T> / function real() { return 1; } / 2;\n",
+            "if (true) /foo+/; const ratio = function real() { return 1; } / 2;\n",
+            "const value = 1 / /[\"'] function hidden_ranker/;\nfunction real() {}\n",
+            "const value = 1 / function operand() { const re = /[\"'] function hidden_ranker/; return 1; } / 2;\nfunction real() {}\n",
+            "const value = 1 << 2 > /[\"'] function hidden_ranker/;\nfunction real() {}\n",
+        ];
+        let mut missing = Vec::new();
+        for (index, source) in witnesses.iter().enumerate() {
+            let code = CodeView::new(source, SourceOwner::TypeScript).code;
+            if !code.contains("function real()") || code.contains("hidden_ranker") {
+                missing.push(index);
+            }
+            assert_eq!(code.len(), source.len());
+        }
+        assert!(missing.is_empty(), "grammar witnesses lost: {missing:?}");
+    }
+
+    #[test]
     fn language_owner_projection_preserves_offsets_and_rust_tokens() {
         let source = concat!(
             "const A: &str = r##\"def fake() { /* */ }\"##;\r\n",
@@ -2652,7 +2523,9 @@ mod tests {
             let owner = SourceOwner::for_path(&path);
             let declaration = match owner {
                 SourceOwner::Python => "def plugin_source_ranker():",
-                SourceOwner::JavaScript => "function plugin_source_ranker() {}",
+                SourceOwner::JavaScript | SourceOwner::TypeScript => {
+                    "function plugin_source_ranker() {}"
+                }
                 _ => "int plugin_source_ranker() {}",
             };
             let source = format!("note = 'é \\\r\n{declaration}';\r\n{declaration}\r\n");
@@ -2697,11 +2570,13 @@ mod tests {
                 [(4, 3)]
             );
         }
-        for owner in [
-            SourceOwner::Python,
+        assert!(CodeView::bounded(
+            "note = 'unclosed\nfunction plugin_source_ranker() {}",
             SourceOwner::JavaScript,
-            SourceOwner::CFamily,
-        ] {
+            Instant::now() + Duration::from_secs(8)
+        )
+        .is_err());
+        for owner in [SourceOwner::Python, SourceOwner::CFamily] {
             let code = CodeView::new(
                 "note = 'unclosed\nfunction plugin_source_ranker() {}",
                 owner,
@@ -2812,7 +2687,7 @@ function real() {}"#,
             } else {
                 format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n")
             };
-            let view = CodeView::new(&source, SourceOwner::JavaScript).code;
+            let view = CodeView::new(&source, SourceOwner::TypeScript).code;
             assert_eq!(view.len(), source.len());
             assert_eq!(
                 view.bytes()
@@ -2839,7 +2714,7 @@ function real() {}"#,
         }
         assert!(missing.is_empty(), "division operands masked: {missing:?}");
         let tail = format!("const of = 1;\nconst value = of {};\nconst re = /\"/;\n{}function plugin_source_ranker() {{ return 1; }}\n", "/ \"[\" / of ".repeat(48), "\n".repeat(50));
-        let code = CodeView::new(&tail, SourceOwner::JavaScript).code;
+        let code = CodeView::new(&tail, SourceOwner::TypeScript).code;
         assert!(code.contains("function plugin_source_ranker()"));
         assert_eq!(
             foreign_search_anchors(&tail, Path::new("owner.js"), &terms),
@@ -2855,7 +2730,7 @@ function real() {}"#,
             "1 !==",
         ] {
             let source = format!("function f() {{ {prefix} /[\"'/] function hidden \\/ café/gi; }}\nfunction real() {{}}");
-            let code = CodeView::new(&source, SourceOwner::JavaScript).code;
+            let code = CodeView::new(&source, SourceOwner::TypeScript).code;
             assert!(!code.contains("hidden"));
             assert!(!code.contains("/gi"));
             assert!(code.contains("function real()"));
@@ -2886,7 +2761,7 @@ function real() {}"#,
             "const value = 1 as \"value\" / function plugin_source_ranker() { return 1; } / 2;\n",
             "const value = 1 as Array<{x:number; y:number}> / function plugin_source_ranker() { return 1; } / 2;\n",
         ] {
-            let code = CodeView::new(source, SourceOwner::JavaScript).code;
+            let code = CodeView::new(source, SourceOwner::TypeScript).code;
             assert_eq!(code.len(), source.len());
             if !code.contains("function plugin_source_ranker() { return 1; }") {
                 missing.push(source);
@@ -2909,7 +2784,7 @@ function real() {}"#,
             let source = format!(
                 "const value = {prefix} /[\"'] function hidden_ranker/;\nfunction real() {{}}"
             );
-            let code = CodeView::new(&source, SourceOwner::JavaScript).code;
+            let code = CodeView::new(&source, SourceOwner::TypeScript).code;
             assert!(!code.contains("hidden_ranker"), "prefix={prefix}");
             assert!(code.contains("function real()"), "prefix={prefix}");
         }
@@ -2921,17 +2796,6 @@ function real() {}"#,
             "{}{}function plugin_source_ranker() {{ return 1; }}\n",
             "var re = /[\"'] function hidden_ranker/;\n".repeat(256),
             "\n".repeat(50)
-        );
-        let bytes = source.as_bytes();
-        let mut budget = bytes.len();
-        let mut end = 0;
-        for start in source.match_indices("/[\"']").map(|(start, _)| start) {
-            assert!(start >= end, "successful probes do not overlap");
-            end = javascript_regex_literal_end(bytes, start, &mut budget).expect("complete regex");
-        }
-        assert!(
-            budget > 0,
-            "source-sized budget cannot exhaust on disjoint probes"
         );
         let code = CodeView::new(&source, SourceOwner::JavaScript).code;
         assert!(!code.contains("hidden_ranker"));
@@ -3205,7 +3069,7 @@ function real() {}"#,
             &groups,
             Path::new("src/proxy.rs"),
             Path::new("src/proxy.rs"),
-            &lines,
+            (&lines, &CodeView::new(&source, SourceOwner::Rust).code),
             0,
             8,
         );
