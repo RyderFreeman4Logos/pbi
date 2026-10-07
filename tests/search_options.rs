@@ -331,6 +331,69 @@ fn compact_search_javascript_operand_division_preserves_executable_source() {
 }
 
 #[test]
+fn compact_typescript_type_close_division() {
+    let mut failures = Vec::new();
+    for source in [
+            "const identity = <T>(x: T) => x;\nconst value = identity<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const obj = { method: <T>(x: T) => x };\nconst value = obj.method<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as () => number / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = [] satisfies Array<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = {} as {x:number} / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<Array<number>> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = (identity<number>) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = (1 as Array<number>) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<number> /*gap*/ / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<number>\n / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = (1 as Array<number>)! / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<number> / function plugin_source_ranker() { return 1; } / 2;\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nfunction following_owner(){return 2;}\n",
+            "const value = 1 as number / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<() => number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as [number, number] / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as (number | string) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as \"value\" / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<{x:number; y:number}> / function plugin_source_ranker() { return 1; } / 2;\n",
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("owner.ts"), source).expect("valid TypeScript fixture");
+        let line = source.lines().position(|line| line.contains("function plugin_source_ranker")).expect("operand declaration") + 1;
+        let output = fixture.run(&["How does plugin_source_ranker work?"], "type-close");
+        let actual = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || actual != format!("owner.ts:{line}\n") {
+            failures.push((source, output.status.code(), actual.into_owned()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "type-close division lost: {failures:?}"
+    );
+    for prefix in [
+        "1 >",
+        "1 >=",
+        "1 >>",
+        "1 >>>",
+        "1 <",
+        "1 <=",
+        "1 <<",
+        "1 < 2; const next = 1 >",
+    ] {
+        let fixture = Fixture::new();
+        let source = format!("const value = {prefix} /[\"'] function hidden_ranker/;\n{}function plugin_source_ranker() {{ return 1; }}\n", "\n".repeat(50));
+        fs::write(fixture.root.join("owner.ts"), source).expect("comparison regex fixture");
+        let positive = fixture.run(&["How does plugin_source_ranker work?"], "comparison");
+        assert!(positive.status.success(), "prefix={prefix}");
+        assert_eq!(
+            String::from_utf8_lossy(&positive.stdout),
+            "owner.ts:52\n",
+            "prefix={prefix}"
+        );
+        let negative = fixture.run(&["How does hidden_ranker work?"], "comparison");
+        assert_eq!(negative.status.code(), Some(1), "prefix={prefix}");
+        assert!(negative.stdout.is_empty(), "prefix={prefix}");
+    }
+}
+
+#[test]
 fn language_owner_rust_adjacent_literals_preserve_behavior() {
     let mut results = Vec::new();
     for literals in [

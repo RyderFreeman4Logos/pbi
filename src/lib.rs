@@ -1298,6 +1298,8 @@ impl CodeView {
         let mut index = 0;
         let mut javascript_regex_allowed = true;
         let mut javascript_property_name = false;
+        let mut javascript_angle_depth = 0usize;
+        let mut javascript_angle_braces = 0usize;
         let mut javascript_regex_scan_budget = bytes.len();
         while index < bytes.len() {
             let start = index;
@@ -1403,8 +1405,45 @@ impl CodeView {
                 match byte {
                     // Prefix ! keeps expression-start state; TS postfix ! keeps operand state.
                     b'!' => index += 1,
-                    b'(' | b'[' | b'{' | b',' | b';' | b':' | b'?' | b'=' | b'~' | b'*' | b'%'
-                    | b'&' | b'|' | b'^' | b'<' | b'>' => {
+                    // ponytail: unmatched < makes > ambiguous within a statement, not a type proof.
+                    // Count nested closes, but keep <=/<< and => as operators; no type parser.
+                    b'<' => {
+                        if matches!(bytes.get(index + 1), Some(b'=' | b'<')) {
+                            index += 2;
+                        } else {
+                            javascript_angle_depth += 1;
+                            index += 1;
+                        }
+                        javascript_regex_allowed = true;
+                    }
+                    b'>' => {
+                        javascript_regex_allowed = javascript_angle_depth == 0;
+                        javascript_angle_depth = javascript_angle_depth.saturating_sub(1);
+                        index += 1;
+                    }
+                    b'=' if bytes.get(index + 1) == Some(&b'>') => {
+                        javascript_regex_allowed = true;
+                        index += 2;
+                    }
+                    b'{' => {
+                        javascript_angle_braces += usize::from(javascript_angle_depth > 0);
+                        javascript_regex_allowed = true;
+                        index += 1;
+                    }
+                    b'}' => {
+                        javascript_angle_braces = javascript_angle_braces.saturating_sub(1);
+                        javascript_regex_allowed = false;
+                        index += 1;
+                    }
+                    b';' => {
+                        if javascript_angle_braces == 0 {
+                            javascript_angle_depth = 0;
+                        }
+                        javascript_regex_allowed = true;
+                        index += 1;
+                    }
+                    b'(' | b'[' | b',' | b':' | b'?' | b'=' | b'~' | b'*' | b'%' | b'&' | b'|'
+                    | b'^' => {
                         javascript_regex_allowed = true;
                         index += 1;
                     }
@@ -2821,6 +2860,82 @@ function real() {}"#,
             assert!(!code.contains("/gi"));
             assert!(code.contains("function real()"));
         }
+    }
+
+    #[test]
+    fn language_owner_typescript_type_close_division() {
+        let mut missing = Vec::new();
+        for source in [
+            "const identity = <T>(x: T) => x;\nconst value = identity<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const obj = { method: <T>(x: T) => x };\nconst value = obj.method<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as () => number / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = [] satisfies Array<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = {} as {x:number} / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<Array<number>> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = (identity<number>) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = (1 as Array<number>) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<number> /*gap*/ / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<number>\n / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = (1 as Array<number>)! / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<number> / function plugin_source_ranker() { return 1; } / 2;\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nfunction following_owner(){return 2;}\n",
+            "const value = 1 as number / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<() => number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as [number, number] / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as (number | string) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as \"value\" / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<{x:number; y:number}> / function plugin_source_ranker() { return 1; } / 2;\n",
+        ] {
+            let code = CodeView::new(source, SourceOwner::JavaScript).code;
+            assert_eq!(code.len(), source.len());
+            if !code.contains("function plugin_source_ranker() { return 1; }") {
+                missing.push(source);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "type-close division masked: {missing:?}"
+        );
+        for prefix in [
+            "1 >",
+            "1 >=",
+            "1 >>",
+            "1 >>>",
+            "1 <",
+            "1 <=",
+            "1 <<",
+            "1 < 2; const next = 1 >",
+        ] {
+            let source = format!(
+                "const value = {prefix} /[\"'] function hidden_ranker/;\nfunction real() {{}}"
+            );
+            let code = CodeView::new(&source, SourceOwner::JavaScript).code;
+            assert!(!code.contains("hidden_ranker"), "prefix={prefix}");
+            assert!(code.contains("function real()"), "prefix={prefix}");
+        }
+    }
+
+    #[test]
+    fn language_owner_javascript_disjoint_regex_budget_preserves_tail() {
+        let source = format!(
+            "{}{}function plugin_source_ranker() {{ return 1; }}\n",
+            "var re = /[\"'] function hidden_ranker/;\n".repeat(256),
+            "\n".repeat(50)
+        );
+        let bytes = source.as_bytes();
+        let mut budget = bytes.len();
+        let mut end = 0;
+        for start in source.match_indices("/[\"']").map(|(start, _)| start) {
+            assert!(start >= end, "successful probes do not overlap");
+            end = javascript_regex_literal_end(bytes, start, &mut budget).expect("complete regex");
+        }
+        assert!(
+            budget > 0,
+            "source-sized budget cannot exhaust on disjoint probes"
+        );
+        let code = CodeView::new(&source, SourceOwner::JavaScript).code;
+        assert!(!code.contains("hidden_ranker"));
+        assert!(code.contains("function plugin_source_ranker()"));
     }
 
     #[test]
