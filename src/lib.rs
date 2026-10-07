@@ -1366,16 +1366,31 @@ impl CodeView {
                     continue;
                 }
                 if bytes[index].is_ascii_alphabetic()
-                    || matches!(bytes[index], b'_' | b'$')
+                    || matches!(bytes[index], b'_' | b'$' | b'#' | b'\\')
                     || bytes[index] >= 0x80
                 {
-                    let mut end = index + 1;
-                    while bytes.get(end).is_some_and(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || *byte >= 0x80
-                    }) {
-                        end += 1;
+                    let mut end = index;
+                    while let Some(byte) = bytes.get(end) {
+                        if byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'_' | b'$' | b'#' | b'\\')
+                            || *byte >= 0x80
+                        {
+                            if bytes[end..].starts_with(b"\\u{") {
+                                end += 3;
+                                while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
+                                    end += 1;
+                                }
+                                if bytes.get(end) == Some(&b'}') {
+                                    end += 1;
+                                }
+                            } else {
+                                end += 1;
+                            }
+                        } else {
+                            break;
+                        }
                     }
-                    // Own non-ASCII bytes conservatively; only a whole standalone keyword permits regex.
+                    // Own private/escaped/non-ASCII names conservatively; only a whole keyword permits regex.
                     // IdentifierName after member access is an operand, even if spelled as a keyword.
                     javascript_regex_allowed = !javascript_property_name
                         && javascript_regex_prefix_keyword(&bytes[index..end]);
@@ -2742,8 +2757,17 @@ function real() {}"#,
             "éthrow",
             "évalue",
             "obj.cafévalue",
+            "this.#return",
+            "this?. /* gap */ #throw",
+            "this.#value",
+            r"\u{e9}return",
+            r"obj.caf\u{e9}return",
         ] {
-            let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
+            let source = if operand.starts_with("this") {
+                format!("class C {{\r\n #return = 1; #throw = 1; #value = 1;\r\n m() {{ const value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2; }}\r\n}}\r\n")
+            } else {
+                format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n")
+            };
             let view = CodeView::new(&source, SourceOwner::JavaScript).code;
             assert_eq!(view.len(), source.len());
             assert_eq!(
@@ -2757,7 +2781,11 @@ function real() {}"#,
                     .filter(|(_, b)| matches!(b, b'\r' | b'\n'))
                     .collect::<Vec<_>>()
             );
-            let line = source.lines().count();
+            let line = source
+                .lines()
+                .position(|line| line.contains("function plugin_source_ranker"))
+                .expect("function expression line")
+                + 1;
             if !view.contains("function plugin_source_ranker() { return 1; }")
                 || foreign_search_anchors(&source, Path::new("owner.js"), &terms)
                     != (vec![], vec![line])

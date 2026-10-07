@@ -283,10 +283,23 @@ fn compact_search_javascript_operand_division_preserves_executable_source() {
         "éthrow",
         "évalue",
         "obj.cafévalue",
+        "this.#return",
+        "this?. /* gap */ #throw",
+        "this.#value",
+        r"\u{e9}return",
+        r"obj.caf\u{e9}return",
     ] {
         let fixture = Fixture::new();
-        let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
-        let line = source.lines().count();
+        let source = if operand.starts_with("this") {
+            format!("class C {{\r\n #return = 1; #throw = 1; #value = 1;\r\n m() {{ const value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2; }}\r\n}}\r\n")
+        } else {
+            format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n")
+        };
+        let line = source
+            .lines()
+            .position(|line| line.contains("function plugin_source_ranker"))
+            .expect("function expression line")
+            + 1;
         fs::write(fixture.root.join("owner.js"), source).expect("division fixture");
         for args in [
             vec!["search", "--max-results=1", "plugin_source_ranker"],
