@@ -25,10 +25,12 @@ pub(crate) fn spans(source: &str, typescript: bool) -> Result<Vec<(u32, u32)>, (
     let allocator = Allocator::default();
     // JS and TS have different ambiguity rules (e.g. chained comparisons).
     // Choose from parent-approved ownership, never retry under another grammar.
+    // Oxc resolves script vs ESM syntax during this same parse, preserving
+    // script-only identifiers while admitting import/export declarations.
     let kind = if typescript {
-        SourceType::ts().with_module(false)
+        SourceType::ts()
     } else {
-        SourceType::cjs()
+        SourceType::unambiguous()
     };
     let parsed = Parser::new(&allocator, source, kind)
         .with_options(ParseOptions {

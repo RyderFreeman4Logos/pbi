@@ -37,6 +37,23 @@ fn spans_reject_malformed_untrusted_responses() {
 }
 
 #[test]
+fn worker_accepts_script_and_module_grammar_without_retry() {
+    for typescript in [false, true] {
+        for source in [
+            "export function real() { return /hidden/; }\n",
+            "import value from 'hidden'; function real() { return value; }\n",
+            "const await = 1; const yield = 2; function real() { return await / yield; }\n",
+        ] {
+            SPAWNS.with(|count| count.set(0));
+            let code = project(source, typescript, deadline()).expect("valid script or module");
+            assert!(code.contains("function real()"));
+            assert!(!code.contains("hidden"));
+            SPAWNS.with(|count| assert_eq!(count.get(), 1));
+        }
+    }
+}
+
+#[test]
 fn worker_projection_preserves_utf8_and_masks_only_literals() {
     let source = "// café\r\nconst r = /[\"'] hidden/; const s = 'é'; const t = `hidden ${1}`;\r\nfunction real() {return 1 / 2;}\n";
     let code = project(source, false, deadline()).expect("contained grammar");
