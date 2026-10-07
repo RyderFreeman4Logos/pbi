@@ -1296,6 +1296,8 @@ impl CodeView {
         let bytes = source.as_bytes();
         let mut code = bytes.to_vec();
         let mut index = 0;
+        let mut javascript_regex_allowed = true;
+        let mut javascript_regex_scan_budget = bytes.len();
         while index < bytes.len() {
             let start = index;
             if (owner == SourceOwner::Python && bytes[index] == b'#')
@@ -1316,12 +1318,32 @@ impl CodeView {
                         index += 1;
                     }
                 }
+            } else if owner == SourceOwner::JavaScript && bytes[index] == b'/' {
+                if javascript_regex_allowed {
+                    if let Some(end) = javascript_regex_literal_end(
+                        bytes,
+                        index,
+                        &mut javascript_regex_scan_budget,
+                    ) {
+                        index = end;
+                        javascript_regex_allowed = false;
+                    } else {
+                        javascript_regex_allowed = true;
+                        index += 1;
+                        continue;
+                    }
+                } else {
+                    javascript_regex_allowed = true;
+                    index += 1;
+                    continue;
+                }
             } else if owner == SourceOwner::Python
                 && (bytes[index..].starts_with(b"\"\"\"") || bytes[index..].starts_with(b"'''"))
             {
                 index = quoted_literal_end(bytes, index, bytes[index], 3);
             } else if owner == SourceOwner::JavaScript && bytes[index] == b'`' {
                 index = template_literal_end(bytes, index);
+                javascript_regex_allowed = false;
             } else if owner == SourceOwner::CFamily
                 && bytes[index..].starts_with(b"R\"")
                 && cpp_raw_literal_end(bytes, index).is_some()
@@ -1329,11 +1351,56 @@ impl CodeView {
                 index = cpp_raw_literal_end(bytes, index).unwrap_or(bytes.len());
             } else if owner != SourceOwner::Rust && matches!(bytes[index], b'\'' | b'"') {
                 index = quoted_literal_end(bytes, index, bytes[index], 1);
+                if owner == SourceOwner::JavaScript {
+                    javascript_regex_allowed = false;
+                }
             } else if owner == SourceOwner::Rust
                 && bytes[index] == b'\''
                 && character_end(source, index).is_some()
             {
                 index = character_end(source, index).unwrap_or(index + 1);
+            } else if owner == SourceOwner::JavaScript {
+                if bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                    continue;
+                }
+                if bytes[index].is_ascii_alphabetic() || matches!(bytes[index], b'_' | b'$') {
+                    let mut end = index + 1;
+                    while bytes.get(end).is_some_and(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+                    }) {
+                        end += 1;
+                    }
+                    javascript_regex_allowed = javascript_regex_prefix_keyword(&bytes[index..end]);
+                    index = end;
+                    continue;
+                }
+                if bytes[index] >= 0x80 {
+                    javascript_regex_allowed = false;
+                    index += 1;
+                    continue;
+                }
+                let byte = bytes[index];
+                match byte {
+                    b'(' | b'[' | b'{' | b',' | b';' | b':' | b'?' | b'=' | b'!' | b'~' | b'*'
+                    | b'%' | b'&' | b'|' | b'^' | b'<' | b'>' => {
+                        javascript_regex_allowed = true;
+                        index += 1;
+                    }
+                    b'+' | b'-' if bytes.get(index + 1) == Some(&byte) => {
+                        javascript_regex_allowed = false;
+                        index += 2;
+                    }
+                    b'+' | b'-' => {
+                        javascript_regex_allowed = true;
+                        index += 1;
+                    }
+                    _ => {
+                        javascript_regex_allowed = false;
+                        index += 1;
+                    }
+                }
+                continue;
             } else {
                 let mut quote = index;
                 if owner == SourceOwner::Rust && bytes[index] == b'r' {
@@ -1395,6 +1462,73 @@ fn line_comment_end(bytes: &[u8], start: usize, splice: bool) -> usize {
         index += 1;
     }
     index
+}
+
+// ponytail: ambiguous slash contexts decline; add grammar cases only with a failing witness.
+fn javascript_regex_prefix_keyword(word: &[u8]) -> bool {
+    matches!(
+        word,
+        b"return"
+            | b"throw"
+            | b"case"
+            | b"delete"
+            | b"void"
+            | b"typeof"
+            | b"instanceof"
+            | b"in"
+            | b"of"
+            | b"yield"
+            | b"await"
+            | b"else"
+            | b"do"
+            | b"new"
+    )
+}
+
+fn javascript_regex_literal_end(
+    bytes: &[u8],
+    start: usize,
+    scan_budget: &mut usize,
+) -> Option<usize> {
+    let mut index = start.checked_add(1)?;
+    let mut in_character_class = false;
+    while index < bytes.len() {
+        let width = if bytes[index] == b'\\' { 2 } else { 1 };
+        if *scan_budget < width {
+            return None;
+        }
+        *scan_budget -= width;
+        match bytes[index] {
+            b'\n' | b'\r' => return None,
+            b'\\' => {
+                if matches!(bytes.get(index + 1), Some(b'\n' | b'\r')) {
+                    return None;
+                }
+                index += 2;
+            }
+            b'[' if !in_character_class => {
+                in_character_class = true;
+                index += 1;
+            }
+            b']' if in_character_class => {
+                in_character_class = false;
+                index += 1;
+            }
+            b'/' if !in_character_class => {
+                index += 1;
+                while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+                    if *scan_budget == 0 {
+                        return None;
+                    }
+                    *scan_budget -= 1;
+                    index += 1;
+                }
+                return Some(index);
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 // C++ raw delimiters are at most 16 bytes; prefixes (u8/u/U/L) precede R.
@@ -2521,6 +2655,74 @@ mod tests {
     }
 
     #[test]
+    fn language_owner_javascript_regex_literals_preserve_projection_and_hints() {
+        let literal =
+            r#"const matcher = /["'] café function plugin_source_ranker plugin source ranker/;"#;
+        let implementation = "function plugin_source_ranker() { return 0; }";
+        let source = format!("{literal}\r\n{}{implementation}\r\n", "\r\n".repeat(50));
+        let code = CodeView::new(&source, SourceOwner::JavaScript).code;
+        assert_eq!(code.len(), source.len());
+        assert_eq!(
+            code.bytes()
+                .enumerate()
+                .filter(|(_, byte)| matches!(byte, b'\r' | b'\n'))
+                .collect::<Vec<_>>(),
+            source
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| matches!(byte, b'\r' | b'\n'))
+                .collect::<Vec<_>>()
+        );
+        let literal_line = code.lines().next().expect("regex literal line");
+        assert!(!literal_line.contains("café"));
+        assert!(!literal_line.contains("plugin_source_ranker"));
+        assert!(code.contains("function plugin_source_ranker() { return 0; }"));
+
+        let terms = ["plugin", "source", "ranker"].map(str::to_string);
+        assert_eq!(
+            foreign_search_anchors(&source, Path::new("owner.js"), &terms),
+            (vec![(52, 3)], vec![52])
+        );
+
+        for (source, visible) in [
+            (
+                r#"const re = /"/;
+function real() {}"#,
+                "function real() {}",
+            ),
+            (
+                r#"const re = /\"/;
+function real() {}"#,
+                "function real() {}",
+            ),
+            (
+                r#"const re = /["/]/;
+function real() {}"#,
+                "function real() {}",
+            ),
+            (
+                r#"const re = /\//;
+function real() {}"#,
+                "function real() {}",
+            ),
+            (
+                r#"const re = /\$\{function fake\}/;
+function real() {}"#,
+                "function real() {}",
+            ),
+            (
+                "const value = numerator / denominator;\nfunction real() {}",
+                "function real() {}",
+            ),
+            ("return /\"/;\nfunction real() {}", "function real() {}"),
+        ] {
+            let view = CodeView::new(source, SourceOwner::JavaScript).code;
+            assert_eq!(view.len(), source.len());
+            assert!(view.contains(visible), "source={source:?}");
+        }
+    }
+
+    #[test]
     fn language_owner_templates_exclude_interpolation_and_bound_nesting() {
         let source = "const docs = `é \\` ${(() => { function hidden() {} return `inner ${\"}\"}`; })()}`;\r\nfunction real() {}";
         let code = CodeView::new(source, SourceOwner::JavaScript).code;
@@ -2535,8 +2737,7 @@ mod tests {
         assert!(!CodeView::new(&nested, SourceOwner::JavaScript)
             .code
             .contains("hidden"));
-        // Explicit residual: regex is not division and requires a separate lexer boundary.
-        assert!(!CodeView::new(
+        assert!(CodeView::new(
             "const re = /\"/;\nfunction real() {}",
             SourceOwner::JavaScript
         )

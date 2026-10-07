@@ -246,6 +246,26 @@ fn compact_search_ignores_foreign_literal_declarations() {
 }
 
 #[test]
+fn compact_search_ignores_foreign_regex_literal_declarations() {
+    let fixture = Fixture::new();
+    let literal =
+        r#"const matcher = /["'] café function plugin_source_ranker plugin source ranker/;"#;
+    let implementation = "function plugin_source_ranker() { return 0; }";
+    let source = format!("{literal}\r\n{}{implementation}\r\n", "\r\n".repeat(50));
+    fs::write(fixture.root.join("owner.js"), source).expect("regex literal fixture");
+    let output = fixture.run(
+        &["search", "--max-results=1", "plugin source ranker"],
+        "compact",
+    );
+    assert!(output.status.success(), "compact search must succeed");
+    assert_eq!(
+        compact_locations(&output),
+        ["owner.js:52"],
+        "the regex declaration-like literal is negative and following executable source is positive"
+    );
+}
+
+#[test]
 fn language_owner_rust_adjacent_literals_preserve_behavior() {
     let mut results = Vec::new();
     for literals in [
