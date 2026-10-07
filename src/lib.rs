@@ -1365,23 +1365,22 @@ impl CodeView {
                     index += 1;
                     continue;
                 }
-                if bytes[index].is_ascii_alphabetic() || matches!(bytes[index], b'_' | b'$') {
+                if bytes[index].is_ascii_alphabetic()
+                    || matches!(bytes[index], b'_' | b'$')
+                    || bytes[index] >= 0x80
+                {
                     let mut end = index + 1;
                     while bytes.get(end).is_some_and(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || *byte >= 0x80
                     }) {
                         end += 1;
                     }
+                    // Own non-ASCII bytes conservatively; only a whole standalone keyword permits regex.
                     // IdentifierName after member access is an operand, even if spelled as a keyword.
                     javascript_regex_allowed = !javascript_property_name
                         && javascript_regex_prefix_keyword(&bytes[index..end]);
                     javascript_property_name = false;
                     index = end;
-                    continue;
-                }
-                if bytes[index] >= 0x80 {
-                    javascript_regex_allowed = false;
-                    index += 1;
                     continue;
                 }
                 let byte = bytes[index];
@@ -2737,8 +2736,14 @@ function real() {}"#,
             "await",
             "yield",
             "obj.value",
+            "éreturn",
+            "caféreturn",
+            "obj.caféreturn",
+            "éthrow",
+            "évalue",
+            "obj.cafévalue",
         ] {
-            let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
+            let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
             let view = CodeView::new(&source, SourceOwner::JavaScript).code;
             assert_eq!(view.len(), source.len());
             assert_eq!(

@@ -277,9 +277,15 @@ fn compact_search_javascript_operand_division_preserves_executable_source() {
         "await",
         "yield",
         "obj.value",
+        "éreturn",
+        "caféreturn",
+        "obj.caféreturn",
+        "éthrow",
+        "évalue",
+        "obj.cafévalue",
     ] {
         let fixture = Fixture::new();
-        let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
+        let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
         let line = source.lines().count();
         fs::write(fixture.root.join("owner.js"), source).expect("division fixture");
         for args in [
