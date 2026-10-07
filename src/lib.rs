@@ -1401,8 +1401,10 @@ impl CodeView {
                 let byte = bytes[index];
                 javascript_property_name = byte == b'.';
                 match byte {
-                    b'(' | b'[' | b'{' | b',' | b';' | b':' | b'?' | b'=' | b'!' | b'~' | b'*'
-                    | b'%' | b'&' | b'|' | b'^' | b'<' | b'>' => {
+                    // Prefix ! keeps expression-start state; TS postfix ! keeps operand state.
+                    b'!' => index += 1,
+                    b'(' | b'[' | b'{' | b',' | b';' | b':' | b'?' | b'=' | b'~' | b'*' | b'%'
+                    | b'&' | b'|' | b'^' | b'<' | b'>' => {
                         javascript_regex_allowed = true;
                         index += 1;
                     }
@@ -2751,6 +2753,9 @@ function real() {}"#,
             "await",
             "yield",
             "obj.value",
+            "obj.value!",
+            "obj.return!",
+            "(obj.value)!",
             "éreturn",
             "caféreturn",
             "obj.caféreturn",
@@ -2787,7 +2792,7 @@ function real() {}"#,
                 .expect("function expression line")
                 + 1;
             if !view.contains("function plugin_source_ranker() { return 1; }")
-                || foreign_search_anchors(&source, Path::new("owner.js"), &terms)
+                || foreign_search_anchors(&source, Path::new("owner.ts"), &terms)
                     != (vec![], vec![line])
             {
                 missing.push(operand);
@@ -2801,7 +2806,15 @@ function real() {}"#,
             foreign_search_anchors(&tail, Path::new("owner.js"), &terms),
             (vec![(54, 3)], vec![54])
         );
-        for prefix in ["return", "return /* gap */", "return // gap\n"] {
+        for prefix in [
+            "return",
+            "return /* gap */",
+            "return // gap\n",
+            "!",
+            "!!",
+            "1 !=",
+            "1 !==",
+        ] {
             let source = format!("function f() {{ {prefix} /[\"'/] function hidden \\/ café/gi; }}\nfunction real() {{}}");
             let code = CodeView::new(&source, SourceOwner::JavaScript).code;
             assert!(!code.contains("hidden"));

@@ -277,6 +277,9 @@ fn compact_search_javascript_operand_division_preserves_executable_source() {
         "await",
         "yield",
         "obj.value",
+        "obj.value!",
+        "obj.return!",
+        "(obj.value)!",
         "éreturn",
         "caféreturn",
         "obj.caféreturn",
@@ -300,7 +303,12 @@ fn compact_search_javascript_operand_division_preserves_executable_source() {
             .position(|line| line.contains("function plugin_source_ranker"))
             .expect("function expression line")
             + 1;
-        fs::write(fixture.root.join("owner.js"), source).expect("division fixture");
+        let filename = if operand.ends_with('!') {
+            "owner.ts"
+        } else {
+            "owner.js"
+        };
+        fs::write(fixture.root.join(filename), source).expect("division fixture");
         for args in [
             vec!["search", "--max-results=1", "plugin_source_ranker"],
             vec!["How does plugin_source_ranker work?"],
@@ -314,7 +322,7 @@ fn compact_search_javascript_operand_division_preserves_executable_source() {
                     .map(str::to_owned)
                     .collect()
             };
-            if !output.status.success() || locations != [format!("owner.js:{line}")] {
+            if !output.status.success() || locations != [format!("{filename}:{line}")] {
                 failures.push((operand, args, output.status.code(), locations));
             }
         }
