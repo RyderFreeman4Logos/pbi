@@ -266,6 +266,44 @@ fn compact_search_ignores_foreign_regex_literal_declarations() {
 }
 
 #[test]
+fn compact_search_javascript_operand_division_preserves_executable_source() {
+    let mut failures = Vec::new();
+    for operand in [
+        "obj.return",
+        "obj?.throw",
+        "obj. /* gap */ new",
+        "obj. // gap\r\nreturn",
+        "of",
+        "await",
+        "yield",
+        "obj.value",
+    ] {
+        let fixture = Fixture::new();
+        let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
+        let line = source.lines().count();
+        fs::write(fixture.root.join("owner.js"), source).expect("division fixture");
+        for args in [
+            vec!["search", "--max-results=1", "plugin_source_ranker"],
+            vec!["How does plugin_source_ranker work?"],
+        ] {
+            let output = fixture.run(&args, "division");
+            let locations = if args[0] == "search" {
+                compact_locations(&output)
+            } else {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            };
+            if !output.status.success() || locations != [format!("owner.js:{line}")] {
+                failures.push((operand, args, output.status.code(), locations));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "division source lost: {failures:?}");
+}
+
+#[test]
 fn language_owner_rust_adjacent_literals_preserve_behavior() {
     let mut results = Vec::new();
     for literals in [

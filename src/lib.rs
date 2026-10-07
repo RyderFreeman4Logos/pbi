@@ -1297,6 +1297,7 @@ impl CodeView {
         let mut code = bytes.to_vec();
         let mut index = 0;
         let mut javascript_regex_allowed = true;
+        let mut javascript_property_name = false;
         let mut javascript_regex_scan_budget = bytes.len();
         while index < bytes.len() {
             let start = index;
@@ -1371,7 +1372,10 @@ impl CodeView {
                     }) {
                         end += 1;
                     }
-                    javascript_regex_allowed = javascript_regex_prefix_keyword(&bytes[index..end]);
+                    // IdentifierName after member access is an operand, even if spelled as a keyword.
+                    javascript_regex_allowed = !javascript_property_name
+                        && javascript_regex_prefix_keyword(&bytes[index..end]);
+                    javascript_property_name = false;
                     index = end;
                     continue;
                 }
@@ -1381,6 +1385,7 @@ impl CodeView {
                     continue;
                 }
                 let byte = bytes[index];
+                javascript_property_name = byte == b'.';
                 match byte {
                     b'(' | b'[' | b'{' | b',' | b';' | b':' | b'?' | b'=' | b'!' | b'~' | b'*'
                     | b'%' | b'&' | b'|' | b'^' | b'<' | b'>' => {
@@ -1464,7 +1469,7 @@ fn line_comment_end(bytes: &[u8], start: usize, splice: bool) -> usize {
     index
 }
 
-// ponytail: ambiguous slash contexts decline; add grammar cases only with a failing witness.
+// ponytail: ambiguous slash contexts (including of/await/yield) decline without grammar proof.
 fn javascript_regex_prefix_keyword(word: &[u8]) -> bool {
     matches!(
         word,
@@ -1476,9 +1481,6 @@ fn javascript_regex_prefix_keyword(word: &[u8]) -> bool {
             | b"typeof"
             | b"instanceof"
             | b"in"
-            | b"of"
-            | b"yield"
-            | b"await"
             | b"else"
             | b"do"
             | b"new"
@@ -2719,6 +2721,59 @@ function real() {}"#,
             let view = CodeView::new(source, SourceOwner::JavaScript).code;
             assert_eq!(view.len(), source.len());
             assert!(view.contains(visible), "source={source:?}");
+        }
+    }
+
+    #[test]
+    fn language_owner_javascript_operand_division_preserves_projection() {
+        let terms = ["plugin", "source", "ranker"].map(str::to_string);
+        let mut missing = Vec::new();
+        for operand in [
+            "obj.return",
+            "obj?.throw",
+            "obj. /* gap */ new",
+            "obj. // gap\r\nreturn",
+            "of",
+            "await",
+            "yield",
+            "obj.value",
+        ] {
+            let source = format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n");
+            let view = CodeView::new(&source, SourceOwner::JavaScript).code;
+            assert_eq!(view.len(), source.len());
+            assert_eq!(
+                view.bytes()
+                    .enumerate()
+                    .filter(|(_, b)| matches!(b, b'\r' | b'\n'))
+                    .collect::<Vec<_>>(),
+                source
+                    .bytes()
+                    .enumerate()
+                    .filter(|(_, b)| matches!(b, b'\r' | b'\n'))
+                    .collect::<Vec<_>>()
+            );
+            let line = source.lines().count();
+            if !view.contains("function plugin_source_ranker() { return 1; }")
+                || foreign_search_anchors(&source, Path::new("owner.js"), &terms)
+                    != (vec![], vec![line])
+            {
+                missing.push(operand);
+            }
+        }
+        assert!(missing.is_empty(), "division operands masked: {missing:?}");
+        let tail = format!("const of = 1;\nconst value = of {};\nconst re = /\"/;\n{}function plugin_source_ranker() {{ return 1; }}\n", "/ \"[\" / of ".repeat(48), "\n".repeat(50));
+        let code = CodeView::new(&tail, SourceOwner::JavaScript).code;
+        assert!(code.contains("function plugin_source_ranker()"));
+        assert_eq!(
+            foreign_search_anchors(&tail, Path::new("owner.js"), &terms),
+            (vec![(54, 3)], vec![54])
+        );
+        for prefix in ["return", "return /* gap */", "return // gap\n"] {
+            let source = format!("function f() {{ {prefix} /[\"'/] function hidden \\/ café/gi; }}\nfunction real() {{}}");
+            let code = CodeView::new(&source, SourceOwner::JavaScript).code;
+            assert!(!code.contains("hidden"));
+            assert!(!code.contains("/gi"));
+            assert!(code.contains("function real()"));
         }
     }
 
