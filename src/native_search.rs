@@ -23,6 +23,14 @@ use std::sync::Arc;
 use std::time::Instant;
 use syn::visit::{self, Visit};
 
+#[path = "search_partial.rs"]
+pub(crate) mod partial;
+
+#[cfg(test)]
+thread_local! {
+    static RETENTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const EXCLUDED: [&str; 5] = [".git", "target", "drafts", "node_modules", "__pycache__"];
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 20_000;
@@ -43,14 +51,6 @@ pub struct SearchLimits {
     pub ignores: Vec<String>,
 }
 
-#[derive(Debug)]
-pub enum SearchFailure {
-    Deadline,
-    Limit,
-    TargetLimit,
-    Unavailable,
-}
-
 /// One native BM25 result. Paths are repository relative and snippets come
 /// from a checked, bounded source file; these are search hits, not citations.
 pub struct RawHit {
@@ -62,6 +62,42 @@ pub struct RawHit {
     pub occurrences: usize,
     declaration: bool,
     block_matches: usize,
+}
+
+impl From<&partial::Location> for RawHit {
+    fn from(location: &partial::Location) -> Self {
+        Self {
+            file: location.file.clone(),
+            line: Some(location.line),
+            end_line: Some(location.line),
+            snippet: String::new(),
+            score: 0.0,
+            occurrences: 0,
+            declaration: false,
+            block_matches: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SearchFailure {
+    Deadline,
+    PartialDeadline(Vec<partial::Location>),
+    Limit,
+    TargetLimit,
+    Unavailable,
+}
+
+impl SearchFailure {
+    pub fn is_deadline(&self) -> bool {
+        matches!(self, Self::Deadline | Self::PartialDeadline(_))
+    }
+    pub fn locations(&self) -> &[partial::Location] {
+        match self {
+            Self::PartialDeadline(locations) => locations,
+            _ => &[],
+        }
+    }
 }
 
 /// Raw search shares the walk and file limits with verified search.
@@ -137,6 +173,17 @@ pub fn search_repository(
     query: &str,
     limits: &SearchLimits,
 ) -> Result<String, SearchFailure> {
+    partial::run(root, limits, |limits, progress| {
+        search_repository_inner(root, query, limits, progress)
+    })
+}
+
+fn search_repository_inner(
+    root: &Path,
+    query: &str,
+    limits: &SearchLimits,
+    progress: &mut partial::Progress,
+) -> Result<String, SearchFailure> {
     let terms = query_terms(query);
     if terms.is_empty() || limits.max_results == 0 {
         return Ok(String::new());
@@ -153,14 +200,16 @@ pub fn search_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) =
-            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        let Some(owned) =
+            read_owned_source(root, root_file, &path, root_device, limits, &scope.compiler)?
         else {
             continue;
         };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
+        let bytes = &owned.bytes;
+        let Ok(text) = std::str::from_utf8(bytes) else {
             continue;
         };
+        let first_hit = hits.len();
         if let Some(mut hit) = score_file(&path, text, &terms) {
             let count = text.lines().count();
             hit.end = if count <= 4 {
@@ -170,6 +219,17 @@ pub fn search_repository(
             };
             hits.push(hit);
         }
+        progress.retain(
+            owned,
+            hits[first_hit..]
+                .iter()
+                .inspect(|_| {
+                    #[cfg(test)]
+                    RETENTION_WORK.with(|count| count.set(count.get() + 1));
+                })
+                .map(|hit| hit.line),
+            limits,
+        )?;
     }
     hits.sort_by(|left, right| {
         right
@@ -202,6 +262,17 @@ pub fn search_regex_repository(
     regex: &regex::Regex,
     limits: &SearchLimits,
 ) -> Result<Vec<RawHit>, SearchFailure> {
+    partial::run(root, limits, |limits, progress| {
+        search_regex_repository_inner(root, regex, limits, progress)
+    })
+}
+
+fn search_regex_repository_inner(
+    root: &Path,
+    regex: &regex::Regex,
+    limits: &SearchLimits,
+    progress: &mut partial::Progress,
+) -> Result<Vec<RawHit>, SearchFailure> {
     let scope = open_root_scope(root)?;
     let root_file = &scope.file;
     let root_device = scope.device;
@@ -215,12 +286,13 @@ pub fn search_regex_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) =
-            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        let Some(owned) =
+            read_owned_source(root, root_file, &path, root_device, limits, &scope.compiler)?
         else {
             continue;
         };
-        let Ok(source) = std::str::from_utf8(&bytes) else {
+        let bytes = &owned.bytes;
+        let Ok(source) = std::str::from_utf8(bytes) else {
             continue;
         };
         let Some(relative) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
@@ -230,6 +302,7 @@ pub fn search_regex_repository(
         if relative.chars().any(char::is_control) {
             continue;
         }
+        let first_hit = hits.len();
         for (index, line) in source.lines().enumerate() {
             if Instant::now() >= limits.deadline {
                 return Err(SearchFailure::Deadline);
@@ -254,6 +327,14 @@ pub fn search_regex_repository(
                 });
             }
         }
+        let lines = hits[first_hit..]
+            .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                RETENTION_WORK.with(|count| count.set(count.get() + 1));
+            })
+            .filter_map(|hit| hit.line);
+        progress.retain(owned, lines, limits)?;
     }
     Ok(hits)
 }
@@ -265,6 +346,18 @@ pub fn search_raw_repository(
     query: &str,
     limits: &SearchLimits,
     options: &RawSearchOptions<'_>,
+) -> Result<(Vec<RawHit>, u64), SearchFailure> {
+    partial::run(root, limits, |limits, progress| {
+        search_raw_repository_inner(root, query, limits, options, progress)
+    })
+}
+
+fn search_raw_repository_inner(
+    root: &Path,
+    query: &str,
+    limits: &SearchLimits,
+    options: &RawSearchOptions<'_>,
+    progress: &mut partial::Progress,
 ) -> Result<(Vec<RawHit>, u64), SearchFailure> {
     let normalized_query = options
         .stem
@@ -302,14 +395,15 @@ pub fn search_raw_repository(
         if !language_matches(&path, limits.language.as_deref()) {
             continue;
         }
-        let Some(bytes) =
-            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        let Some(owned) =
+            read_owned_source(root, root_file, &path, root_device, limits, &scope.compiler)?
         else {
             continue;
         };
+        let bytes = &owned.bytes;
         path.hash(&mut freshness);
         bytes.hash(&mut freshness);
-        let Ok(source) = std::str::from_utf8(&bytes) else {
+        let Ok(source) = std::str::from_utf8(bytes) else {
             continue;
         };
         let normalized_source = options
@@ -445,6 +539,7 @@ pub fn search_raw_repository(
         }
         let omitted = matching_blocks.saturating_sub(blocks.len());
         let retained = blocks.len();
+        let first_candidate = candidates.len();
         for (index, (start, end, block_matches)) in blocks.into_iter().enumerate() {
             if candidates.len() >= MAX_RAW_BLOCKS {
                 return Err(SearchFailure::Limit);
@@ -477,6 +572,14 @@ pub fn search_raw_repository(
                 block_matches,
             });
         }
+        let lines = candidates[first_candidate..]
+            .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                RETENTION_WORK.with(|count| count.set(count.get() + 1));
+            })
+            .filter_map(|candidate| candidate.line);
+        progress.retain(owned, lines, limits)?;
     }
     if documents == 0 {
         return Ok((Vec::new(), freshness.finish()));
@@ -526,11 +629,6 @@ pub fn search_raw_repository(
     Ok((hits, freshness.finish()))
 }
 
-// Completed blocks compete before snippet allocation. The pending block remains
-// separate until merged. Compact keeps one winner. Raw keeps the strongest
-// MAX_RAW_BLOCKS_PER_FILE blocks so a later dense match is not dropped for an
-// earlier sparse one. ponytail: block_matches then start line, not BM25; the
-// file score is assigned only after the whole file is counted.
 fn retain_block(
     blocks: &mut Vec<(usize, usize, usize)>,
     block: (usize, usize, usize),
@@ -595,14 +693,14 @@ fn open_root(root: &Path) -> Result<File, SearchFailure> {
         .map_err(|_| SearchFailure::Unavailable)
 }
 
-fn read_source(
+fn read_owned_source(
     root: &Path,
     root_file: &File,
     path: &Path,
     device: u64,
     limits: &SearchLimits,
     compiler: &Arc<std::sync::Mutex<PolicyCompiler>>,
-) -> Result<Option<Vec<u8>>, SearchFailure> {
+) -> Result<Option<partial::Source>, SearchFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|_| SearchFailure::Unavailable)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -656,7 +754,7 @@ fn read_source(
     if Instant::now() >= limits.deadline {
         return Err(SearchFailure::Deadline);
     }
-    Ok(bytes)
+    Ok(bytes.map(|bytes| partial::Source::new(bytes, file, directories, relative.to_path_buf())))
 }
 
 /// Recheck and bound a descriptor opened by a no-follow source reader.
@@ -715,12 +813,13 @@ pub fn candidate_symbols(
         if Instant::now() >= limits.deadline {
             return Err(SearchFailure::Deadline);
         }
-        let Some(bytes) =
-            read_source(root, root_file, &path, root_device, limits, &scope.compiler)?
+        let Some(owned) =
+            read_owned_source(root, root_file, &path, root_device, limits, &scope.compiler)?
         else {
             continue;
         };
-        let Ok(source) = std::str::from_utf8(&bytes) else {
+        let bytes = &owned.bytes;
+        let Ok(source) = std::str::from_utf8(bytes) else {
             continue;
         };
         let Ok(parsed) = syn::parse_file(source) else {
@@ -891,6 +990,8 @@ fn walk_owned(
         .map_err(|_| SearchFailure::Unavailable)?;
     let unsafe_ignore = Arc::new(AtomicBool::new(false));
     let unsafe_ignore_filter = Arc::clone(&unsafe_ignore);
+    let walk_deadline = Arc::new(AtomicBool::new(false));
+    let walk_deadline_filter = Arc::clone(&walk_deadline);
     let policy_root = root.to_path_buf();
     let policy_owner = root_file
         .try_clone()
@@ -1006,6 +1107,10 @@ fn walk_owned(
             })();
             match admitted {
                 Ok(admitted) => admitted,
+                Err(SearchFailure::Deadline) => {
+                    walk_deadline_filter.store(true, Ordering::Relaxed);
+                    false
+                }
                 Err(_) => {
                     unsafe_ignore_filter.store(true, Ordering::Relaxed);
                     false
@@ -1045,6 +1150,9 @@ fn walk_owned(
     }
     if unsafe_ignore.load(Ordering::Relaxed) {
         return Err(SearchFailure::Unavailable);
+    }
+    if walk_deadline.load(Ordering::Relaxed) || Instant::now() >= limits.deadline {
+        return Err(SearchFailure::Deadline);
     }
     check_source_namespace(root, Path::new(""), &[], root_file)?;
     Ok(files)

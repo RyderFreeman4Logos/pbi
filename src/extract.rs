@@ -93,7 +93,9 @@ pub(super) fn run(arguments: &[String]) -> Result<String, crate::CliError> {
     };
     extract(&root, Path::new(path), line, &limits, max_bytes).map_err(|failure| {
         crate::CliError::failed(match failure {
-            SearchFailure::Deadline => "extract deadline exceeded",
+            SearchFailure::Deadline | SearchFailure::PartialDeadline(_) => {
+                "extract deadline exceeded"
+            }
             SearchFailure::Limit | SearchFailure::TargetLimit => "extract safety limit exceeded",
             SearchFailure::Unavailable => "extract source unavailable or invalid position",
         })
@@ -133,7 +135,9 @@ pub(super) fn run_symbols(arguments: &[String]) -> Result<String, crate::CliErro
     };
     let (source, _) = read_admitted_source(&root, path, &limits).map_err(|failure| {
         crate::CliError::failed(match failure {
-            SearchFailure::Deadline => "symbols deadline exceeded",
+            SearchFailure::Deadline | SearchFailure::PartialDeadline(_) => {
+                "symbols deadline exceeded"
+            }
             SearchFailure::Limit | SearchFailure::TargetLimit => "symbols safety limit exceeded",
             SearchFailure::Unavailable => "symbols source unavailable or invalid",
         })
@@ -145,7 +149,9 @@ pub(super) fn run_symbols(arguments: &[String]) -> Result<String, crate::CliErro
     }
     .map_err(|failure| {
         crate::CliError::failed(match failure {
-            SearchFailure::Deadline => "symbols deadline exceeded",
+            SearchFailure::Deadline | SearchFailure::PartialDeadline(_) => {
+                "symbols deadline exceeded"
+            }
             SearchFailure::Limit | SearchFailure::TargetLimit => "symbols safety limit exceeded",
             SearchFailure::Unavailable => "symbols source unavailable or invalid",
         })
@@ -779,7 +785,7 @@ pub(super) fn policy_admitted(
     Ok(admitted)
 }
 
-fn check_deadline(limits: &SearchLimits) -> Result<(), SearchFailure> {
+pub(super) fn check_deadline(limits: &SearchLimits) -> Result<(), SearchFailure> {
     if Instant::now() >= limits.deadline {
         Err(SearchFailure::Deadline)
     } else {
