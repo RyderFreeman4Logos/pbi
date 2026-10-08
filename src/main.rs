@@ -22,6 +22,7 @@ use native_search::{
     SearchFailure, SearchLimits,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::env;
 use std::fs;
@@ -40,7 +41,7 @@ use workflow_adk::{
     ModelRouteSnapshot,
 };
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_MAX_RESULTS: usize = 8;
 const SEARCH_OUTER_DEADLINE_SECONDS: u64 = 8;
 const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 90;
@@ -291,7 +292,7 @@ fn main() {
     let Some(trace_deadline) = started.checked_add(Duration::from_secs(deadline.unwrap_or(0)))
     else {
         eprintln!("pbi-rs: --timeout is too large");
-        emit_failure_receipt(&arguments, 2, None, None, started, deadline);
+        emit_failure_receipt(&arguments, 2, None, None, started, None);
         std::process::exit(2);
     };
     let trace = StageTrace::new(trace_deadline);
@@ -338,11 +339,15 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
     {
         return Some(
             extract::parse(&arguments[1..])
-                .ok()
-                .flatten()
+                .ok()?
                 .map(|options| options.timeout)
                 .unwrap_or(SEARCH_OUTER_DEADLINE_SECONDS),
-        );
+        )
+        .filter(|seconds| {
+            Instant::now()
+                .checked_add(Duration::from_secs(*seconds))
+                .is_some()
+        });
     }
     if arguments
         .first()
@@ -361,15 +366,19 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
     let requested = if search {
         match parse_search(&arguments[1..]) {
             Ok((_, _, options)) => options.timeout,
-            Err(_) => return Some(fallback),
+            Err(_) => return None,
         }
     } else {
         match parse_question(&arguments) {
             Ok((_, _, timeout)) => timeout,
-            Err(_) => return Some(fallback),
+            Err(_) => return None,
         }
     };
-    Some(requested.unwrap_or(fallback))
+    Some(requested.unwrap_or(fallback)).filter(|seconds| {
+        Instant::now()
+            .checked_add(Duration::from_secs(*seconds))
+            .is_some()
+    })
 }
 
 fn emit_failure_receipt(
@@ -396,10 +405,25 @@ fn emit_failure_receipt(
     let deadline_s = deadline
         .map(|seconds| seconds.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
+    // Only the supervisor owns its deadline; argv/environment cannot prove it.
+    let caller_deadline_s = "unknown";
     eprintln!(
-        "pbi-failure rc={code} stage={stage} stage_status={status} candidates={candidates} ranges={ranges} admission={admission} deadline_s={deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
+        "pbi-failure rc={code} version={VERSION} exe_sha256={} stage={stage} stage_status={status} candidates={candidates} ranges={ranges} admission={admission} deadline_s={deadline_s} caller_deadline_s={caller_deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
+        executable_sha256(),
         started.elapsed().as_millis()
     );
+}
+
+fn executable_sha256() -> String {
+    // ponytail: one full read of the running binary, streamed digest if receipts
+    // are ever emitted more than once per process.
+    let mut hasher = Sha256::new();
+    // Read the running inode, even if its launch path has been replaced.
+    match fs::read("/proc/self/exe") {
+        Ok(bytes) => hasher.update(bytes),
+        Err(_) => return "unknown".to_owned(),
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn redact_identity(present: bool) -> &'static str {
@@ -435,14 +459,15 @@ fn safe_arguments(arguments: &[String]) -> String {
     // Only a successful shared parser can authorize public numeric bounds.
     // Spelling alone never authorizes an operand, including after a parse error.
     let parsed = parse_local_route_prefix(arguments.to_vec());
-    let valid = parsed
-        .as_ref()
-        .is_ok_and(|(args, _)| match args.first().map(String::as_str) {
-            Some("search") => parse_search(&args[1..]).is_ok(),
-            Some("extract") => extract::parse(&args[1..]).is_ok(),
-            Some("symbols") => false,
-            _ => parse_question(args).is_ok(),
-        });
+    let valid = parsed_execution_timeout(arguments).is_some()
+        && parsed
+            .as_ref()
+            .is_ok_and(|(args, _)| match args.first().map(String::as_str) {
+                Some("search") => parse_search(&args[1..]).is_ok(),
+                Some("extract") => extract::parse(&args[1..]).is_ok(),
+                Some("symbols") => false,
+                _ => parse_question(args).is_ok(),
+            });
     let command_index = parsed
         .as_ref()
         .ok()
