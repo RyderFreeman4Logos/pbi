@@ -296,32 +296,50 @@ impl EvidenceReport {
             if start > lines.len() {
                 continue;
             }
-            let next_declaration =
-                if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
-                    declaration_identity::declarations(&source)
-                        .into_iter()
-                        .map(|declaration| declaration.line)
-                        .find(|line| *line >= start)
-                } else {
-                    None
-                };
+            let owner = SourceOwner::for_path(&path);
+            let next_declaration = if owner == SourceOwner::Rust {
+                declaration_identity::declarations(&source)
+                    .into_iter()
+                    .map(|declaration| declaration.line)
+                    .find(|line| *line >= start)
+            } else {
+                lines.iter().enumerate().find_map(|(offset, line)| {
+                    (offset + 1 >= start)
+                        .then_some(offset + 1)
+                        .filter(|_| foreign_declaration_name(line, owner).is_some())
+                })
+            };
             let end = next_declaration
                 .map(|line| line.saturating_sub(1))
                 .unwrap_or(start.saturating_add(MAX_FOLLOWING_LINES - 1))
                 .max(item.location().end_line())
                 .min(lines.len());
-            let first = item.location().start_line();
+            let first = if owner == SourceOwner::Rust {
+                item.location().start_line()
+            } else {
+                start
+            };
+            if owner != SourceOwner::Rust && (self.evidence.len() >= max_total || end < start) {
+                continue;
+            }
             let snippet = lines[first - 1..end].join("\n");
             if snippet.len() > 4096 {
                 continue;
             }
-            self.evidence[index] = SourceEvidence {
+            let extended = SourceEvidence {
                 location: SourceLocation::new(path, first, end),
                 target: item.target().to_owned(),
                 snippet,
                 symbol: item.symbol().map(str::to_owned),
                 relevance: item.relevance().to_owned(),
             };
+            if owner == SourceOwner::Rust {
+                self.evidence[index] = extended;
+            } else {
+                self.evidence.push(extended);
+                self.cited.push(start);
+                self.followed_from.push(Some(index));
+            }
         }
         let root_device = fs::metadata(&root)
             .map_err(|_| EvidenceError::SourceUnavailable)?

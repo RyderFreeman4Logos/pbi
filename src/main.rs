@@ -1256,19 +1256,13 @@ fn run_traced(
                 "semantic investigation exceeded its bounded deadline",
             ));
         }
-        let expanded_report = if explanatory_question || type_field_subject(&query).is_some() {
-            Some(
-                report
-                    .clone()
-                    .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
-                    .map_err(|error| {
-                        trace.point(TraceStage::Follow, TraceStatus::OtherError, 0);
-                        evidence_cli_error(error)
-                    })?,
-            )
-        } else {
-            None
-        };
+        let expanded_report = report
+            .clone()
+            .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
+            .map_err(|error| {
+                trace.point(TraceStage::Follow, TraceStatus::OtherError, 0);
+                evidence_cli_error(error)
+            })?;
         if Instant::now() >= deadline {
             trace.point(
                 TraceStage::Follow,
@@ -1279,7 +1273,7 @@ fn run_traced(
                 "semantic investigation exceeded its bounded deadline",
             ));
         }
-        let report = expanded_report.as_ref().unwrap_or(&report);
+        let report = &expanded_report;
         trace.point(TraceStage::Follow, TraceStatus::Ok, report.evidence().len());
         if let Some(publisher) = publisher {
             let cancellation = ModelRouteCancellation::new();
@@ -2735,6 +2729,81 @@ mod tests {
                 assert!(output.is_empty(), "{arguments:?}");
             }
         }
+    }
+
+    #[test]
+    fn python_function_body_citation_passes_the_public_answer() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-citation-span-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        let _env = RouteConfigEnvGuard::new(&root, &[("PBI_RS_ADK_ENABLE", Some("1".to_owned()))]);
+        publish_python_body_citation(&root);
+        drop(_env);
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    fn publish_python_body_citation(root: &Path) {
+        let source = "def admit(evidence):\n    binding = evidence.get(\"schema\")\n    if binding is None:\n        raise Hold(\"schema binding unknown\")\n    return binding\n\ndef wait_ready(before):\n    return before\n";
+        fs::write(root.join("guard.py"), source).expect("guard source");
+        let question = "Guard binary schema admission readiness";
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-8\n", root.join("guard.py").display()),
+            root,
+            question,
+            DEFAULT_MAX_RESULTS,
+        )
+        .expect("verified signature window");
+        let admitted = &report.evidence()[0];
+        assert!(
+            admitted.location().end_line() < 5,
+            "baseline window must stop before the body line"
+        );
+        let body = admitted.location().end_line() + 1;
+        let publisher = test_publisher(json!({
+            "answer": "Schema admission raises Hold when the binding is missing.",
+            "uncertainty": "Only the verified source was inspected.",
+            "citations": [{"path": "guard.py", "start_line": 7, "end_line": 7}]
+        }));
+        let mut output = Vec::new();
+        let error = run(
+            vec![question.to_owned()],
+            Some(TestRouteInjection::Publisher(&publisher)),
+            &mut output,
+        )
+        .expect_err("the next function stays citation_span");
+        assert!(
+            error.message.contains("reason=citation_span"),
+            "{}",
+            error.message
+        );
+        assert!(output.is_empty());
+        let grounded = test_publisher(json!({
+            "answer": "Schema admission raises Hold when the binding is missing.",
+            "uncertainty": "Only the verified source was inspected.",
+            "citations": [{"path": "guard.py", "start_line": body, "end_line": body}]
+        }));
+        let mut grounded_output = Vec::new();
+        let published = run(
+            vec![question.to_owned()],
+            Some(TestRouteInjection::Publisher(&grounded)),
+            &mut grounded_output,
+        );
+        assert!(
+            matches!(published, Ok(0)),
+            "body line of the admitted function must verify: {}",
+            published
+                .as_ref()
+                .err()
+                .map(|error| error.message.as_str())
+                .unwrap_or("ok")
+        );
+        let text = String::from_utf8(grounded_output).expect("utf8");
+        assert!(text.contains(&format!("guard.py:{body}")));
     }
 
     fn publish_answer_body_citations(root: &Path, question: &str) {
