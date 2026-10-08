@@ -82,7 +82,10 @@ fn deadline_retains_verified_identity_in_all_search_paths() {
             panic!("missing explicit partial outcome, mode={mode}")
         };
         assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0].file, "nested/a.rs");
+        assert!(
+            locations[0].file == "nested/a.rs",
+            "unexpected retained path"
+        );
         assert_eq!(locations[0].line, 2);
         assert!(
             search(&fixture.0, mode, &limits()).is_ok(),
@@ -220,16 +223,18 @@ fn assert_retention_work_stops_at_capacity(mode: usize) {
         )
         .map(|_| ()),
     };
-    assert!(result.is_ok(), "normal search failed: {result:?}");
+    assert!(result.is_ok(), "normal search failed");
     let locations = progress.verify(&fixture.0, &limits);
     assert_eq!(locations.len(), 8);
     for (location, path) in locations.iter().zip(files.iter().take(8)) {
-        assert_eq!(
-            location.file,
-            path.strip_prefix(&fixture.0)
-                .expect("relative")
-                .to_str()
-                .expect("utf8")
+        assert!(
+            location.file
+                == path
+                    .strip_prefix(&fixture.0)
+                    .expect("relative")
+                    .to_str()
+                    .expect("utf8"),
+            "unexpected retained path order"
         );
         assert_eq!(location.line, 2);
     }

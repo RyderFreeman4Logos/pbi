@@ -616,7 +616,10 @@ mod deadline_verification_tests {
         let control = verify_probe_evidence_bounded(&raw, &root, "deadline_marker", 8, deadline)
             .expect("control evidence");
         fs::remove_dir_all(&root).expect("cleanup");
-        assert_eq!(result, Err(EvidenceError::Deadline));
+        assert!(
+            matches!(result, Err(EvidenceError::Deadline)),
+            "verification expiry must fail closed"
+        );
         assert_eq!(
             calls.get(),
             2,

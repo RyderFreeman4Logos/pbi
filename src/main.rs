@@ -2155,7 +2155,7 @@ mod tests {
                 &mut out,
             );
             assert!(out.len() <= bytes, "partial byte budget bypassed");
-            let text = String::from_utf8(out).expect("UTF-8");
+            let text = String::from_utf8(out).unwrap_or_else(|_| panic!("invalid partial UTF-8"));
             assert!(
                 text.split(|c: char| !c.is_alphanumeric() && c != '_')
                     .filter(|s| !s.is_empty())
@@ -2169,19 +2169,21 @@ mod tests {
             assert!(!text.is_empty());
             assert!(!text.contains("snippet") && !text.contains("score"));
             match (format, files_only) {
-                ("json", false) => assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&text).unwrap(),
-                    json!([{"file":"safe.rs","line":2}])
+                ("json", false) => assert!(
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .is_ok_and(|value| value == json!([{"file":"safe.rs","line":2}])),
+                    "unexpected partial JSON locations"
                 ),
-                ("json", true) => assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&text).unwrap(),
-                    json!(["safe.rs"])
+                ("json", true) => assert!(
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .is_ok_and(|value| value == json!(["safe.rs"])),
+                    "unexpected partial JSON files"
                 ),
-                ("xml", _) => assert_eq!(
-                    text,
-                    "<results>\n<hit file=\"safe.rs\" line=\"2\" end_line=\"2\"/>\n</results>\n"
+                ("xml", _) => assert!(
+                    text == "<results>\n<hit file=\"safe.rs\" line=\"2\" end_line=\"2\"/>\n</results>\n",
+                    "unexpected partial XML locations"
                 ),
-                _ => assert_eq!(text, "safe.rs\n"),
+                _ => assert!(text == "safe.rs\n", "unexpected partial plain files"),
             }
         }
     }
