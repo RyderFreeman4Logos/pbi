@@ -71,13 +71,17 @@ fn compact_streaming_keeps_strong_late_body_beyond_raw_block_cap() {
             compact_locations(&output),
             [format!("tasks:{}-{}", count * 8 + 1, count * 8 + 2)]
         );
-        let raw = fixture.run(&["search", "--bm25", "orbit vector"], "raw");
-        assert_eq!(raw.status.code(), Some(1));
-        assert!(raw.stdout.is_empty());
-        assert_eq!(
-            String::from_utf8_lossy(&raw.stderr).lines().next(),
-            Some("pbi-rs: raw source-block limit reached; use compact search without --bm25")
+        let raw = fixture.run(
+            &["search", "--bm25", "orbit vector", "--max-results=2"],
+            "raw",
         );
+        assert!(
+            raw.status.success(),
+            "raw ranks the dense body inside the cap"
+        );
+        let stdout = String::from_utf8_lossy(&raw.stdout);
+        assert!(stdout.contains(&format!("{}-{}", count * 8 + 1, count * 8 + 2)));
+        assert!(stdout.matches("File: ").count() <= 2);
     }
 }
 
