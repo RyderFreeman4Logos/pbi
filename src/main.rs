@@ -4336,6 +4336,69 @@ mod tests {
     }
 
     #[test]
+    fn context_overflow_returns_before_the_injected_model_sends() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-overflow-send-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture");
+        let source = format!(
+            "fn over_marker() {{ let _ = \"budget marker \\\"quoted\\\"\"; {} }}\n",
+            "x".repeat(2821)
+        );
+        for index in 0..8 {
+            let mut line = source.trim_end_matches('\n').to_owned();
+            if index == 0 {
+                line.push_str(&"y".repeat(35));
+            }
+            line.push('\n');
+            fs::write(root.join(format!("beyond{index}.rs")), line).expect("window");
+        }
+        let _env = RouteConfigEnvGuard::new(&root, &[("PBI_RS_ADK_ENABLE", Some("1".to_owned()))]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publisher = owning_snapshot_publisher(
+            &admit_local_routes(vec![LocalModelRoute::new(
+                DEFAULT_LOCAL_BASE_URL,
+                DEFAULT_LOCAL_MODEL,
+                "CLIPROXY_API_KEY",
+            )])
+            .expect("admitted route"),
+            "{}",
+            &calls,
+            &Arc::new(Mutex::new(Vec::new())),
+        )
+        .expect("counting route");
+        let mut output = Vec::new();
+        let error = run(
+            vec![
+                "where is budget marker quoted".to_owned(),
+                "--timeout".to_owned(),
+                "30".to_owned(),
+            ],
+            Some(TestRouteInjection::Publisher(&publisher)),
+            &mut output,
+        )
+        .expect_err("oversized context");
+        assert!(
+            error
+                .message
+                .contains("semantic evidence exceeded the bounded context"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("bytes="), "{}", error.message);
+        assert!(error.message.contains("limit=24576"), "{}", error.message);
+        assert!(!error.message.contains("attempts="), "{}", error.message);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(output.is_empty());
+        drop(_env);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn candidate_tool_exposes_implementation_names_from_matching_source_files() {
         let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
             "pbi-rs-candidates-{}",

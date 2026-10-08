@@ -562,6 +562,95 @@ struct AllowedCitation {
     evidence_index: usize,
 }
 
+/// Serialized context bytes `investigate` measures before any model send.
+pub fn semantic_context_bytes(
+    question: &str,
+    root: &Path,
+    evidence: &[&SourceEvidence],
+    report: &EvidenceReport,
+    visible_indices: &[usize],
+    stop_candidates: &[usize],
+) -> Result<usize, SemanticError> {
+    semantic_context(
+        question,
+        root,
+        evidence,
+        report,
+        visible_indices,
+        stop_candidates,
+    )
+    .map(|(_, bytes, _)| bytes)
+}
+
+fn semantic_context(
+    question: &str,
+    root: &Path,
+    evidence: &[&SourceEvidence],
+    report: &EvidenceReport,
+    visible_indices: &[usize],
+    stop_candidates: &[usize],
+) -> Result<(Value, usize, Vec<AllowedCitation>), SemanticError> {
+    let mut allowed = Vec::with_capacity(visible_indices.len());
+    let mut evidence_json = Vec::with_capacity(visible_indices.len());
+    for &evidence_index in visible_indices {
+        let item = evidence
+            .get(evidence_index)
+            .ok_or(SemanticError::Protocol)?;
+        let path = item
+            .location()
+            .path()
+            .strip_prefix(root)
+            .ok()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or(SemanticError::SourceOutsideRoot)?;
+        allowed.push(AllowedCitation {
+            path: path.clone(),
+            start_line: item.location().start_line(),
+            end_line: item.location().end_line(),
+            evidence_index,
+        });
+        evidence_json.push(json!({
+            "id": evidence_index,
+            "path": path,
+            "start_line": item.location().start_line(),
+            "end_line": item.location().end_line(),
+            "target": item.target(),
+            "symbol": item.symbol(),
+            "snippet": item.snippet(),
+            "relevance": item.relevance(),
+        }));
+    }
+    let common_data = json!({
+        "question": question,
+        "verified_evidence": evidence_json,
+        "missing_targets": report.missing_targets(),
+        "direct_stop_candidate_ids": stop_candidates,
+    });
+    let bytes = serde_json::to_vec(&common_data)
+        .map_err(|_| SemanticError::Protocol)?
+        .len();
+    Ok((common_data, bytes, allowed))
+}
+
+#[cfg(test)]
+fn semantic_context_bytes_for_test(
+    question: &str,
+    root: &Path,
+    evidence: &[&SourceEvidence],
+    report: &EvidenceReport,
+) -> usize {
+    semantic_context_bytes(
+        question,
+        root,
+        evidence,
+        report,
+        &(0..evidence.len()).collect::<Vec<_>>(),
+        &[],
+    )
+    .expect("production context")
+}
+
 #[cfg(test)]
 #[path = "explicit_config_route_tests.rs"]
 mod explicit_config_route_tests;
@@ -711,46 +800,17 @@ pub async fn investigate(
     let visible = (0..evidence.len())
         .map(|index| visible_indices.contains(&index))
         .collect::<Vec<_>>();
-    let mut allowed = Vec::with_capacity(evidence.len());
-    let mut evidence_json = Vec::with_capacity(evidence.len());
-    for evidence_index in visible_indices {
-        let item = evidence[evidence_index];
-        let path = item
-            .location()
-            .path()
-            .strip_prefix(&root)
-            .ok()
-            .filter(|path| !path.as_os_str().is_empty())
-            .map(|path| path.to_string_lossy().into_owned())
-            .ok_or(SemanticError::SourceOutsideRoot)?;
-        allowed.push(AllowedCitation {
-            path: path.clone(),
-            start_line: item.location().start_line(),
-            end_line: item.location().end_line(),
-            evidence_index,
-        });
-        evidence_json.push(json!({
-            "id": evidence_index,
-            "path": path,
-            "start_line": item.location().start_line(),
-            "end_line": item.location().end_line(),
-            "target": item.target(),
-            "symbol": item.symbol(),
-            "snippet": item.snippet(),
-            "relevance": item.relevance(),
-        }));
-    }
-    let common_data = json!({
-        "question": question,
-        "verified_evidence": evidence_json,
-        "missing_targets": report.missing_targets(),
-        "direct_stop_candidate_ids": stop_candidates,
-    });
-    let common_data_bytes =
-        serde_json::to_vec(&common_data).map_err(|_| SemanticError::Protocol)?;
-    if common_data_bytes.len() > MAX_SEMANTIC_CONTEXT_BYTES {
+    let (common_data, common_data_bytes, allowed) = semantic_context(
+        question,
+        &root,
+        &evidence,
+        report,
+        &visible_indices,
+        &stop_candidates,
+    )?;
+    if common_data_bytes > MAX_SEMANTIC_CONTEXT_BYTES {
         return Err(SemanticError::InputTooLarge {
-            bytes: common_data_bytes.len(),
+            bytes: common_data_bytes,
             limit: MAX_SEMANTIC_CONTEXT_BYTES,
         });
     }
@@ -1638,6 +1698,52 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use workflow_adk::model_profiles::{FakeModelProfile, ModelProfileRegistry};
+
+    #[test]
+    fn production_context_counts_a_symbol_at_the_cap_boundary() {
+        let root = PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp/pbi-rs-context-root");
+        let window = |name: &str, marker: &str, width: usize| {
+            format!(
+                "fn {name}() {{ let _ = \"{marker}\"; {} }}",
+                "x".repeat(width)
+            )
+        };
+        let measure = |question: &str, source: &str, first_extra: &str, symbol: Option<&str>| {
+            let evidence = (0..8)
+                .map(|index| {
+                    let snippet = if index == 0 {
+                        format!("{source}{first_extra}")
+                    } else {
+                        source.to_owned()
+                    };
+                    SourceEvidence::admitted(
+                        root.join(format!("window{index}.rs")),
+                        question,
+                        snippet,
+                        symbol.map(str::to_owned),
+                        "terms=budget,marker code=assignment",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let report = EvidenceReport::from_admitted(evidence);
+            let refs = report.evidence().iter().collect::<Vec<_>>();
+            semantic_context_bytes_for_test(question, &root, &refs, &report)
+        };
+        let within = measure(
+            "where is budget marker",
+            &window("under_marker", "budget marker", 1500),
+            "",
+            None,
+        );
+        let base = window("over_marker", "budget marker \"quoted\"", 2778);
+        let padded = format!("{base}{}", "y".repeat(34));
+        let question = "where is budget marker quoted";
+        let limit = measure(question, &padded, "yy", Some("budget_marker"));
+        let past = measure(question, &padded, "yyy", Some("budget_marker"));
+        assert!(within <= 24 * 1024, "within {within}");
+        assert_eq!(limit, 24 * 1024, "limit {limit}");
+        assert_eq!(past, 24 * 1024 + 1, "past {past}");
+    }
 
     #[test]
     fn body_owner_shared_suffix_work_is_linear() {

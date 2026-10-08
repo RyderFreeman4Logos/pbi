@@ -179,6 +179,23 @@ impl SourceEvidence {
     pub fn relevance(&self) -> &str {
         &self.relevance
     }
+
+    #[cfg(test)]
+    pub(crate) fn admitted(
+        path: PathBuf,
+        target: impl Into<String>,
+        snippet: impl Into<String>,
+        symbol: Option<String>,
+        relevance: impl Into<String>,
+    ) -> Self {
+        Self {
+            location: SourceLocation::new(path, 1, 1),
+            target: target.into(),
+            snippet: snippet.into(),
+            symbol,
+            relevance: relevance.into(),
+        }
+    }
 }
 
 /// Verified evidence and explicit coverage state for one deterministic query.
@@ -193,6 +210,19 @@ pub struct EvidenceReport {
 }
 
 impl EvidenceReport {
+    #[cfg(test)]
+    pub(crate) fn from_admitted(evidence: Vec<SourceEvidence>) -> Self {
+        let count = evidence.len();
+        Self {
+            complete: true,
+            evidence,
+            missing_targets: Vec::new(),
+            cited: vec![1; count],
+            followed_from: vec![None; count],
+            call_edges: Vec::new(),
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         self.complete
     }
