@@ -134,33 +134,38 @@ impl StageTrace {
     }
 
     fn point(&self, stage: TraceStage, status: TraceStatus, count: usize) {
+        self.point_to(stage, status, count, &mut io::stderr());
+    }
+
+    fn point_to(
+        &self,
+        stage: TraceStage,
+        status: TraceStatus,
+        count: usize,
+        output: &mut impl Write,
+    ) {
+        let completed = matches!(status, TraceStatus::Ok | TraceStatus::NoSource);
+        let bucket = match count {
+            0 => "0",
+            1 => "1",
+            2 => "2",
+            3 => "3",
+            4 => "4",
+            5 => "5",
+            6 => "6",
+            7 => "7",
+            8 => "8",
+            _ => "9+",
+        };
+        // Search counts include retained, verified partials even on a deadline.
+        let recorded = if matches!(stage, TraceStage::InitialSearch | TraceStage::RevisedSearch)
+            || completed
+        {
+            bucket
+        } else {
+            "unknown"
+        };
         if !matches!(stage, TraceStage::Terminal) || self.last.get().is_none() {
-            let field = match stage {
-                TraceStage::Candidates => "candidates",
-                TraceStage::InitialVerify
-                | TraceStage::RevisedVerify
-                | TraceStage::Anchor
-                | TraceStage::Follow => "ranges",
-                TraceStage::Answer => "admission",
-                _ => "",
-            };
-            let completed = matches!(status, TraceStatus::Ok | TraceStatus::NoSource);
-            let recorded = if !completed || field.is_empty() {
-                "unknown"
-            } else {
-                match count {
-                    0 => "0",
-                    1 => "1",
-                    2 => "2",
-                    3 => "3",
-                    4 => "4",
-                    5 => "5",
-                    6 => "6",
-                    7 => "7",
-                    8 => "8",
-                    _ => "9+",
-                }
-            };
             self.last
                 .set(Some((stage.label(), status.label(), recorded)));
         }
@@ -168,15 +173,17 @@ impl StageTrace {
             return;
         }
         let now = Instant::now();
-        eprintln!(
+        writeln!(
+            output,
             "pbi-stage stage={} status={} elapsed_ms={} delta_ms={} remaining_ms={} count={}",
             stage.label(),
             status.label(),
             now.duration_since(self.started).as_millis(),
             now.duration_since(self.previous.replace(now)).as_millis(),
             self.deadline.saturating_duration_since(now).as_millis(),
-            count,
-        );
+            recorded,
+        )
+        .expect("failed printing stage trace");
         self.rows.set(self.rows.get() + 1);
     }
 
@@ -2489,6 +2496,31 @@ mod tests {
         assert!(String::from_utf8_lossy(&output).contains("entries and revision"));
         drop(_env);
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn stage_trace_renders_observed_counts() {
+        let mut trace = StageTrace::new(Instant::now() + Duration::from_secs(1));
+        trace.enabled = true;
+        for stage in [TraceStage::Answer, TraceStage::Candidates, TraceStage::Plan] {
+            for (status, expected) in [
+                (TraceStatus::Deadline, "unknown"),
+                (TraceStatus::OtherError, "unknown"),
+                (TraceStatus::Ok, "0"),
+                (TraceStatus::NoSource, "0"),
+            ] {
+                let mut rendered = Vec::new();
+                trace.point_to(stage, status, 0, &mut rendered);
+                assert_eq!(
+                    trace.observed(),
+                    Some((stage.label(), status.label(), expected))
+                );
+                assert!(
+                    rendered.ends_with(format!(" count={expected}\n").as_bytes()),
+                    "stage line must use the same observed count as the failure receipt"
+                );
+            }
+        }
     }
 
     #[test]
