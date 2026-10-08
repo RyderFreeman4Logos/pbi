@@ -936,15 +936,15 @@ fn run_traced(
         }
         .map_err(|error| {
             let partial = error.locations();
-            let deadline = error.is_deadline();
-            let status = if deadline {
+            let is_deadline = error.is_deadline();
+            let status = if is_deadline {
                 TraceStatus::Deadline
             } else {
                 TraceStatus::OtherError
             };
             trace.point(TraceStage::InitialSearch, status, partial.len());
-            if deadline && !partial.is_empty() {
-                return print_partial_locations(partial);
+            if is_deadline && !partial.is_empty() {
+                return print_partial_locations(partial, &options, deadline, &mut io::stdout());
             }
             search_cli_error(error)
         })?;
@@ -972,7 +972,7 @@ fn run_traced(
             return Err(CliError::failed("raw search session exhausted"));
         }
         let end = cursor.saturating_add(options.max_results).min(hits.len());
-        let (output, emitted) = render_raw_hits(&hits[cursor..end], &options, deadline)?;
+        let (output, emitted) = render_raw_hits(&hits[cursor..end], &options, deadline, false)?;
         if let Some(state) = session.as_ref() {
             state
                 .advance(freshness, cursor + emitted)
@@ -1073,7 +1073,7 @@ fn run_traced(
                 };
                 trace.point(search_stage, status, partial.len());
                 if error.is_deadline() && !partial.is_empty() {
-                    let _ = print_partial_locations(partial);
+                    let _ = print_partial_locations(partial, &options, deadline, &mut io::stdout());
                 }
                 search_cli_error(error)
             })?;
@@ -1311,12 +1311,22 @@ fn evidence_cli_error(error: EvidenceError) -> CliError {
     }
 }
 
-fn print_partial_locations(hits: &[native_search::partial::Location]) -> CliError {
-    let mut output = Vec::new();
-    for hit in hits {
-        let _ = writeln!(output, "{}:{}", hit.file, hit.line);
+fn print_partial_locations(
+    hits: &[native_search::partial::Location],
+    options: &SearchOptions,
+    deadline: Instant,
+    writer: &mut dyn Write,
+) -> CliError {
+    // Reuse normal formatting/budgets, but project only custody-checked locations.
+    // Formatting failure must remain an incomplete deadline, never a success.
+    let mut hits = hits.iter().map(RawHit::from).collect::<Vec<_>>();
+    if options.files_only {
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|hit| seen.insert(hit.file.clone()));
     }
-    let _ = io::stdout().write_all(&output);
+    if let Ok((output, _)) = render_raw_hits(&hits, options, deadline, true) {
+        let _ = writer.write_all(&output);
+    }
     CliError::failed("native search exceeded its bounded deadline")
 }
 
@@ -1363,6 +1373,7 @@ fn render_raw_hits(
     hits: &[RawHit],
     options: &SearchOptions,
     deadline: Instant,
+    locations_only: bool,
 ) -> Result<(Vec<u8>, usize), CliError> {
     if options.files_only && options.frequency {
         return Err(CliError::usage(
@@ -1389,7 +1400,7 @@ fn render_raw_hits(
                 "raw search formatting exceeded its deadline",
             ));
         }
-        let next = render_raw_prefix(&hits[..count], format, options);
+        let next = render_raw_prefix(&hits[..count], format, options, locations_only);
         let tokens = String::from_utf8_lossy(&next)
             .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
             .filter(|word| !word.is_empty())
@@ -1406,13 +1417,20 @@ fn render_raw_hits(
     Ok((output, emitted))
 }
 
-fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> Vec<u8> {
+fn render_raw_prefix(
+    hits: &[RawHit],
+    format: &str,
+    options: &SearchOptions,
+    locations_only: bool,
+) -> Vec<u8> {
     if format == "json" {
         let entries = hits
             .iter()
             .map(|hit| {
                 if options.files_only {
                     json!(hit.file)
+                } else if locations_only {
+                    json!({"file": hit.file, "line": hit.line})
                 } else {
                     let mut value = json!({
                         "file": hit.file,
@@ -1462,14 +1480,22 @@ fn render_raw_prefix(hits: &[RawHit], format: &str, options: &SearchOptions) -> 
                 )
             },
         );
-        if options.files_only {
+        if options.files_only || locations_only {
+            let label = if options.files_only { &file } else { &location };
             match format {
                 "xml" | "outline-xml" => {
-                    output.push_str(&format!("<file path=\"{}\"/>\n", escape_xml(&file)));
+                    if options.files_only {
+                        output.push_str(&format!("<file path=\"{}\"/>\n", escape_xml(&file)));
+                    } else {
+                        output.push_str(&format!(
+                            "<hit file=\"{}\"{xml_location}/>\n",
+                            escape_xml(&file)
+                        ));
+                    }
                 }
-                "markdown" => output.push_str(&format!("- `{file}`\n")),
-                "color" => output.push_str(&format!("\x1b[36m{file}\x1b[0m\n")),
-                _ => output.push_str(&format!("{file}\n")),
+                "markdown" => output.push_str(&format!("- `{label}`\n")),
+                "color" => output.push_str(&format!("\x1b[36m{label}\x1b[0m\n")),
+                _ => output.push_str(&format!("{label}\n")),
             }
             continue;
         }
@@ -2099,6 +2125,66 @@ fn parse_timeout_seconds(value: &str) -> Result<u64, CliError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_output_respects_caller_budgets_and_formats() {
+        use super::*;
+        let hits = vec![native_search::partial::Location {
+            file: "safe.rs".into(),
+            line: 2,
+        }];
+        for (format, files_only, bytes, tokens) in [
+            ("plain", false, 1, 100),
+            ("plain", false, 100, 1),
+            ("json", false, 100, 100),
+            ("xml", false, 100, 100),
+            ("json", true, 100, 100),
+            ("plain", true, 100, 100),
+        ] {
+            let options = SearchOptions {
+                format: Some(format.into()),
+                files_only,
+                max_bytes: Some(bytes.to_string()),
+                max_tokens: Some(tokens.to_string()),
+                ..SearchOptions::default()
+            };
+            let mut out = Vec::new();
+            print_partial_locations(
+                &hits,
+                &options,
+                Instant::now() + Duration::from_secs(1),
+                &mut out,
+            );
+            assert!(out.len() <= bytes, "partial byte budget bypassed");
+            let text = String::from_utf8(out).expect("UTF-8");
+            assert!(
+                text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|s| !s.is_empty())
+                    .count()
+                    <= tokens
+            );
+            if bytes == 1 || tokens == 1 {
+                assert!(text.is_empty());
+                continue;
+            }
+            assert!(!text.is_empty());
+            assert!(!text.contains("snippet") && !text.contains("score"));
+            match (format, files_only) {
+                ("json", false) => assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                    json!([{"file":"safe.rs","line":2}])
+                ),
+                ("json", true) => assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                    json!(["safe.rs"])
+                ),
+                ("xml", _) => assert_eq!(
+                    text,
+                    "<results>\n<hit file=\"safe.rs\" line=\"2\" end_line=\"2\"/>\n</results>\n"
+                ),
+                _ => assert_eq!(text, "safe.rs\n"),
+            }
+        }
+    }
     use super::*;
     use adk_rust::{
         AdkError, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse,

@@ -59,6 +59,21 @@ pub struct RawHit {
     block_matches: usize,
 }
 
+impl From<&partial::Location> for RawHit {
+    fn from(location: &partial::Location) -> Self {
+        Self {
+            file: location.file.clone(),
+            line: Some(location.line),
+            end_line: Some(location.line),
+            snippet: String::new(),
+            score: 0.0,
+            occurrences: 0,
+            declaration: false,
+            block_matches: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SearchFailure {
     Deadline,
