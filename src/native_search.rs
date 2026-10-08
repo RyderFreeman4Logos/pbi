@@ -47,8 +47,6 @@ pub struct SearchLimits {
 pub enum SearchFailure {
     Deadline,
     Limit,
-    /// Noncompact search cannot retain another source block in one file.
-    RawBlocksPerFileLimit,
     TargetLimit,
     Unavailable,
 }
@@ -369,6 +367,7 @@ pub fn search_raw_repository(
                 Vec::new()
             };
         let mut blocks = Vec::new();
+        let mut matching_blocks = 0usize;
         let mut pending: Option<(usize, usize, usize)> = None;
         for (index, line) in source_lines.iter().enumerate() {
             if Instant::now() >= limits.deadline {
@@ -406,15 +405,14 @@ pub fn search_raw_repository(
                     }
                 }
                 if let Some(block) = pending.take() {
+                    matching_blocks += 1;
                     retain_block(&mut blocks, block, options.compact, &declarations)?;
-                }
-                if !options.compact && blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
-                    return Err(SearchFailure::RawBlocksPerFileLimit);
                 }
                 pending = Some((line_number, line_number, line_matches));
             }
         }
         if let Some(block) = pending {
+            matching_blocks += 1;
             retain_block(&mut blocks, block, options.compact, &declarations)?;
         }
         if !options.exclude_filenames {
@@ -445,18 +443,25 @@ pub fn search_raw_repository(
         if blocks.is_empty() {
             blocks.push((0, 0, 0));
         }
-        for (start, end, block_matches) in blocks {
+        let omitted = matching_blocks.saturating_sub(blocks.len());
+        let retained = blocks.len();
+        for (index, (start, end, block_matches)) in blocks.into_iter().enumerate() {
             if candidates.len() >= MAX_RAW_BLOCKS {
                 return Err(SearchFailure::Limit);
             }
             let snippet = if start == 0 {
                 String::new()
             } else {
-                source_lines[start - 1..end]
+                let body = source_lines[start - 1..end]
                     .join("\n")
                     .chars()
                     .take(512)
-                    .collect()
+                    .collect::<String>();
+                if omitted == 0 || index + 1 != retained {
+                    body
+                } else {
+                    format!("{body}\n[bounded selection: {omitted} weaker blocks omitted]")
+                }
             };
             candidates.push(RawCandidate {
                 file: relative.to_owned(),
@@ -522,35 +527,47 @@ pub fn search_raw_repository(
 }
 
 // Completed blocks compete before snippet allocation. The pending block remains
-// separate until merged; compact retains one winner and scans every later line.
+// separate until merged. Compact keeps one winner. Raw keeps the strongest
+// MAX_RAW_BLOCKS_PER_FILE blocks so a later dense match is not dropped for an
+// earlier sparse one. ponytail: block_matches then start line, not BM25; the
+// file score is assigned only after the whole file is counted.
 fn retain_block(
     blocks: &mut Vec<(usize, usize, usize)>,
     block: (usize, usize, usize),
     compact: bool,
     declarations: &[(usize, usize)],
 ) -> Result<(), SearchFailure> {
+    let key = |(start, end, matches)| {
+        (
+            declarations
+                .iter()
+                .filter(|(line, _)| (start..=end).contains(line))
+                .map(|(_, matches)| *matches)
+                .max()
+                .unwrap_or(0),
+            matches,
+            std::cmp::Reverse(start),
+        )
+    };
     if compact {
-        let key = |(start, end, matches)| {
-            (
-                declarations
-                    .iter()
-                    .filter(|(line, _)| (start..=end).contains(line))
-                    .map(|(_, matches)| *matches)
-                    .max()
-                    .unwrap_or(0),
-                matches,
-                std::cmp::Reverse(start),
-            )
-        };
         if let Some(best) = blocks.first_mut() {
             if key(block) > key(*best) {
                 *best = block;
             }
             return Ok(());
         }
-    }
-    if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
-        return Err(SearchFailure::RawBlocksPerFileLimit);
+    } else if blocks.len() >= MAX_RAW_BLOCKS_PER_FILE {
+        let weakest = blocks
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| key(**left).cmp(&key(**right)))
+            .map(|(index, _)| index);
+        if let Some(index) = weakest {
+            if key(block) > key(blocks[index]) {
+                blocks[index] = block;
+            }
+        }
+        return Ok(());
     }
     blocks.push(block);
     Ok(())
@@ -1248,16 +1265,51 @@ mod root_scope_tests {
                 "orbit\n\n\n\n\n\n\n\n".repeat(count),
             )
             .expect("synthetic separated blocks");
-            let result = super::search_raw_repository(&fixture.0, "orbit", &limits, &options);
-            if count == 128 {
-                assert_eq!(
-                    result.expect("admit the unchanged block cap").0.len(),
-                    count
+            let admitted = super::search_raw_repository(&fixture.0, "orbit", &limits, &options)
+                .expect("equal blocks stay inside the cap")
+                .0;
+            assert_eq!(admitted.len(), 128.min(count));
+            if count == 129 {
+                assert!(
+                    admitted
+                        .iter()
+                        .any(|hit| hit.snippet.contains("bounded selection")),
+                    "omitted equal blocks must be explicit"
                 );
-            } else {
-                assert!(matches!(result, Err(SearchFailure::RawBlocksPerFileLimit)));
             }
         }
+    }
+
+    #[test]
+    fn raw_ranks_dense_block_inside_per_file_cap() {
+        let fixture = Fixture::new("block-rank");
+        let mut source = "orbit\n\n\n\n\n\n\n\n".repeat(129);
+        source.push_str("orbit vector orbit vector\norbit vector\n");
+        fs::write(fixture.0.join("owner"), &source).expect("dense body after the cap");
+        fs::write(fixture.0.join("unrelated"), "deadline only\n").expect("negative control");
+        let limits = SearchLimits {
+            deadline: Instant::now() + Duration::from_secs(8),
+            max_results: 8,
+            language: None,
+            ignores: Vec::new(),
+        };
+        let options = super::RawSearchOptions {
+            compact: false,
+            exact: false,
+            stem: false,
+            exclude_filenames: false,
+            merge_threshold: 5,
+            strict: None,
+        };
+        let (hits, _) = super::search_raw_repository(&fixture.0, "orbit vector", &limits, &options)
+            .expect("rank before the per-file cap");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.file == "owner" && hit.line == Some(129 * 8 + 1)),
+            "the dense body must outrank earlier single-term blocks"
+        );
+        assert!(hits.iter().all(|hit| hit.file != "unrelated"));
+        assert!(hits.len() <= 128, "per-file retention stays 128");
     }
 
     #[test]
