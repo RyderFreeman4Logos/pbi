@@ -41,7 +41,7 @@ use workflow_adk::{
     ModelRouteSnapshot,
 };
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_MAX_RESULTS: usize = 8;
 const SEARCH_OUTER_DEADLINE_SECONDS: u64 = 8;
 const MESSAGE_OUTER_DEADLINE_SECONDS: u64 = 90;
@@ -292,7 +292,7 @@ fn main() {
     let Some(trace_deadline) = started.checked_add(Duration::from_secs(deadline.unwrap_or(0)))
     else {
         eprintln!("pbi-rs: --timeout is too large");
-        emit_failure_receipt(&arguments, 2, None, None, started, deadline);
+        emit_failure_receipt(&arguments, 2, None, None, started, None);
         std::process::exit(2);
     };
     let trace = StageTrace::new(trace_deadline);
@@ -339,11 +339,15 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
     {
         return Some(
             extract::parse(&arguments[1..])
-                .ok()
-                .flatten()
+                .ok()?
                 .map(|options| options.timeout)
                 .unwrap_or(SEARCH_OUTER_DEADLINE_SECONDS),
-        );
+        )
+        .filter(|seconds| {
+            Instant::now()
+                .checked_add(Duration::from_secs(*seconds))
+                .is_some()
+        });
     }
     if arguments
         .first()
@@ -362,15 +366,19 @@ fn parsed_execution_timeout(arguments: &[String]) -> Option<u64> {
     let requested = if search {
         match parse_search(&arguments[1..]) {
             Ok((_, _, options)) => options.timeout,
-            Err(_) => return Some(fallback),
+            Err(_) => return None,
         }
     } else {
         match parse_question(&arguments) {
             Ok((_, _, timeout)) => timeout,
-            Err(_) => return Some(fallback),
+            Err(_) => return None,
         }
     };
-    Some(requested.unwrap_or(fallback))
+    Some(requested.unwrap_or(fallback)).filter(|seconds| {
+        Instant::now()
+            .checked_add(Duration::from_secs(*seconds))
+            .is_some()
+    })
 }
 
 fn emit_failure_receipt(
@@ -397,7 +405,8 @@ fn emit_failure_receipt(
     let deadline_s = deadline
         .map(|seconds| seconds.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
-    let caller_deadline_s = caller_deadline_seconds(arguments);
+    // Only the supervisor owns its deadline; argv/environment cannot prove it.
+    let caller_deadline_s = "unknown";
     eprintln!(
         "pbi-failure rc={code} version={VERSION} exe_sha256={} stage={stage} stage_status={status} candidates={candidates} ranges={ranges} admission={admission} deadline_s={deadline_s} caller_deadline_s={caller_deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
         executable_sha256(),
@@ -409,22 +418,12 @@ fn executable_sha256() -> String {
     // ponytail: one full read of the running binary, streamed digest if receipts
     // are ever emitted more than once per process.
     let mut hasher = Sha256::new();
-    match env::current_exe().and_then(fs::read) {
+    // Read the running inode, even if its launch path has been replaced.
+    match fs::read("/proc/self/exe") {
         Ok(bytes) => hasher.update(bytes),
         Err(_) => return "unknown".to_owned(),
     }
     format!("{:x}", hasher.finalize())
-}
-
-fn caller_deadline_seconds(arguments: &[String]) -> String {
-    // Only an explicit caller-owned flag is evidence. A missing or unparsable
-    // value stays unknown; the internal --timeout is a different deadline.
-    arguments
-        .iter()
-        .find_map(|argument| argument.strip_prefix("--pbi-caller-deadline="))
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|seconds| seconds.to_string())
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn redact_identity(present: bool) -> &'static str {
@@ -460,14 +459,15 @@ fn safe_arguments(arguments: &[String]) -> String {
     // Only a successful shared parser can authorize public numeric bounds.
     // Spelling alone never authorizes an operand, including after a parse error.
     let parsed = parse_local_route_prefix(arguments.to_vec());
-    let valid = parsed
-        .as_ref()
-        .is_ok_and(|(args, _)| match args.first().map(String::as_str) {
-            Some("search") => parse_search(&args[1..]).is_ok(),
-            Some("extract") => extract::parse(&args[1..]).is_ok(),
-            Some("symbols") => false,
-            _ => parse_question(args).is_ok(),
-        });
+    let valid = parsed_execution_timeout(arguments).is_some()
+        && parsed
+            .as_ref()
+            .is_ok_and(|(args, _)| match args.first().map(String::as_str) {
+                Some("search") => parse_search(&args[1..]).is_ok(),
+                Some("extract") => extract::parse(&args[1..]).is_ok(),
+                Some("symbols") => false,
+                _ => parse_question(args).is_ok(),
+            });
     let command_index = parsed
         .as_ref()
         .ok()
@@ -555,7 +555,6 @@ fn known_option(value: &str) -> bool {
             | "--model-name"
             | "--force-provider"
             | "--timeout"
-            | "--pbi-caller-deadline"
             | "--regex"
             | "--bm25"
             | "--stem"
@@ -1777,9 +1776,6 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool, Option<u64>), C
                 }
                 timeout = Some(parse_timeout_seconds(&value[10..])?);
             }
-            value if value.starts_with("--pbi-caller-deadline=") => {
-                parse_timeout_seconds(&value["--pbi-caller-deadline=".len()..])?;
-            }
             "--model-name" | "--force-provider" => {
                 // Discard exactly one operand if present, even option-looking.
                 index += 1;
@@ -1894,10 +1890,6 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                     return Err(CliError::usage("--timeout cannot be used multiple times"));
                 }
                 options.timeout = Some(parse_timeout_seconds(&value[10..])?);
-                index += 1;
-            }
-            value if value.starts_with("--pbi-caller-deadline=") => {
-                parse_timeout_seconds(&value["--pbi-caller-deadline=".len()..])?;
                 index += 1;
             }
             "--max-results" => {

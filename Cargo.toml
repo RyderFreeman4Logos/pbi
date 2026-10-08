@@ -39,7 +39,6 @@ workflow-runtime = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-k
 
 [dev-dependencies]
 adk-rust = { version = "=2.1.0", default-features = false, features = ["agents", "models", "graph", "guardrail", "telemetry", "openai"] }
-sha2 = "=0.10.9"
 workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb", features = ["test-support"] }
 
 [[bin]]

@@ -2535,20 +2535,24 @@ fn equals_timeout_receipt_uses_enforced_deadline() {
         (
             vec!["search", "--timeout=4", "--timeout", "0", "missing_symbol"],
             "2",
-            "8",
+            "unknown",
         ),
         (
             vec!["search", "--timeout", "0", "--timeout=4", "missing_symbol"],
             "2",
-            "8",
+            "unknown",
         ),
         (
             vec!["--timeout=0", "--timeout", "4", "missing_symbol"],
             "2",
-            "90",
+            "unknown",
         ),
-        (vec!["search", "--timeout=fast", "missing_symbol"], "2", "8"),
-        (vec!["--timeout=fast", "missing_symbol"], "2", "90"),
+        (
+            vec!["search", "--timeout=fast", "missing_symbol"],
+            "2",
+            "unknown",
+        ),
+        (vec!["--timeout=fast", "missing_symbol"], "2", "unknown"),
     ];
     for (args, code, deadline) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
@@ -2561,19 +2565,34 @@ fn equals_timeout_receipt_uses_enforced_deadline() {
         assert_eq!(
             output.status.code(),
             Some(code.parse().unwrap()),
-            "{args:?} {stderr}"
+            "expected timeout exit"
         );
-        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "invalid or expired invocation must not answer"
+        );
         let receipt = stderr
             .lines()
             .find_map(|line| line.strip_prefix("pbi-failure "))
-            .unwrap_or_else(|| panic!("missing receipt for {args:?}: {stderr}"));
+            .expect("failure receipt required");
         let fields: std::collections::HashMap<&str, &str> = receipt
             .split(' ')
             .filter_map(|part| part.split_once('='))
             .collect();
-        assert_eq!(fields["deadline_s"], deadline, "{args:?} {stderr}");
-        assert!(!stderr.contains("fast"), "{args:?} {stderr}");
+        assert!(
+            fields.get("deadline_s").copied() == Some(deadline),
+            "only enforced deadline may be reported"
+        );
+        assert!(
+            !stderr.contains("fast"),
+            "rejected value must remain private"
+        );
+        if code == "2" {
+            assert!(
+                fields.get("stage").copied() == Some("unknown"),
+                "parse error must not invent a stage"
+            );
+        }
     }
 }
 
@@ -2627,87 +2646,120 @@ fn zero_timeout_answer_stays_at_initial_search() {
 
 #[test]
 fn same_invocation_failure_receipt_binds_identity_and_deadlines() {
+    use sha2::{Digest, Sha256};
     let fixture = Fixture::new();
+    let expected = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(env!("CARGO_BIN_EXE_pbi-rs")).expect("test binary"))
+    );
+    // Caller deadlines belong to the supervising process, not untrusted argv or env.
     let cases = [
-        (vec!["--timeout=0", "missing_symbol"], "0", "unknown"),
-        (vec!["search", "missing_symbol"], "8", "unknown"),
+        (
+            vec!["--timeout=0", "missing_symbol"],
+            1,
+            "0",
+            "initial_search",
+        ),
+        (vec!["search", "missing_symbol"], 1, "8", "initial_verify"),
+        (
+            vec![
+                "--timeout=0",
+                "--model-name",
+                "--pbi-caller-deadline=3",
+                "missing_symbol",
+            ],
+            1,
+            "0",
+            "initial_search",
+        ),
+        (
+            vec!["--timeout=0", "--", "--pbi-caller-deadline=3"],
+            1,
+            "0",
+            "initial_search",
+        ),
+        (
+            vec!["--message", "--pbi-caller-deadline=3", "--timeout=0"],
+            1,
+            "0",
+            "initial_search",
+        ),
         (
             vec!["--timeout=0", "--pbi-caller-deadline=3", "missing_symbol"],
-            "0",
-            "3",
+            2,
+            "unknown",
+            "unknown",
+        ),
+        (
+            vec!["--timeout=nope", "missing_symbol"],
+            2,
+            "unknown",
+            "unknown",
+        ),
+        (
+            vec!["search", "--timeout=18446744073709551615", "missing_symbol"],
+            2,
+            "unknown",
+            "unknown",
+        ),
+        (
+            vec!["--timeout=0", "--timeout=1", "missing_symbol"],
+            2,
+            "unknown",
+            "unknown",
+        ),
+        (
+            vec!["extract", "missing.rs", "--timeout=nope"],
+            2,
+            "unknown",
+            "unknown",
         ),
     ];
-    for (args, internal, caller) in cases {
+    for (args, exit, internal, stage) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
             .env_clear()
             .env("PBI_RS_ADK_ENABLE", "0")
+            .env("PBI_CALLER_DEADLINE_SECONDS", "3")
             .current_dir(&fixture.root)
             .args(&args)
             .output()
             .expect("receipt invocation");
-        assert_eq!(output.status.code(), Some(1), "deadline must fail closed");
-        assert!(output.stdout.is_empty(), "deadline stdout must stay empty");
+        assert_eq!(output.status.code(), Some(exit), "fail closed");
+        assert!(output.stdout.is_empty(), "failure stdout must stay empty");
         let stderr = String::from_utf8(output.stderr).expect("static UTF-8 receipt");
         let fields = failure_fields(&stderr);
-        assert_eq!(
-            fields.get("version").copied(),
-            Some("0.1.0"),
+        assert!(
+            fields.get("version").copied() == Some(env!("CARGO_PKG_VERSION")),
             "tool version required"
         );
-        let digest = fields.get("exe_sha256").copied().unwrap_or("");
-        assert_eq!(digest.len(), 64, "executable digest required");
         assert!(
-            digest.chars().all(|byte| byte.is_ascii_hexdigit()),
-            "executable digest must be hex"
+            fields.get("exe_sha256").copied() == Some(expected.as_str()),
+            "digest must match this invocation"
         );
-        assert_ne!(digest, "0".repeat(64), "digest must be computed");
-        assert_eq!(
-            fields.get("deadline_s").copied(),
-            Some(internal),
-            "internal deadline required"
+        assert!(
+            fields.get("deadline_s").copied() == Some(internal),
+            "validated internal deadline required"
         );
-        assert_eq!(
-            fields.get("caller_deadline_s").copied(),
-            Some(caller),
-            "caller deadline required"
+        assert!(
+            fields.get("caller_deadline_s").copied() == Some("unknown"),
+            "unowned caller deadline must remain unknown"
         );
-        assert!(!stderr.contains("missing_symbol"), "query leaked");
-        assert!(!stderr.contains('/'), "path leaked");
-        let expected = {
-            use sha2::{Digest, Sha256};
-            let bytes = std::fs::read(env!("CARGO_BIN_EXE_pbi-rs")).expect("test binary");
-            format!("{:x}", Sha256::digest(bytes))
-        };
-        assert_eq!(digest, expected, "digest must match this invocation");
+        assert!(
+            fields.get("stage").copied() == Some(stage),
+            "observed stage required"
+        );
+        assert!(
+            !stderr.contains("missing_symbol")
+                && !stderr.contains("missing.rs")
+                && !stderr.contains("nope"),
+            "operand leaked"
+        );
+        assert!(
+            !stderr.contains("18446744073709551615") && !stderr.contains('/'),
+            "unvalidated bound or path leaked"
+        );
+        assert!(stderr.len() < 4096, "bounded receipt required");
     }
-    let rejected = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
-        .env_clear()
-        .env("PBI_RS_ADK_ENABLE", "0")
-        .current_dir(&fixture.root)
-        .args([
-            "--timeout=0",
-            "--pbi-caller-deadline=nope",
-            "missing_symbol",
-        ])
-        .output()
-        .expect("rejected caller deadline");
-    assert_eq!(
-        rejected.status.code(),
-        Some(2),
-        "bad caller deadline fails closed"
-    );
-    let rejected_stderr = String::from_utf8(rejected.stderr).expect("static UTF-8 receipt");
-    assert_eq!(
-        failure_fields(&rejected_stderr)
-            .get("caller_deadline_s")
-            .copied(),
-        Some("unknown"),
-        "unparsed caller deadline stays unknown"
-    );
-    assert!(
-        !rejected_stderr.contains("nope"),
-        "rejected caller value leaked"
-    );
 }
 
 fn failure_fields(stderr: &str) -> std::collections::HashMap<&str, &str> {
