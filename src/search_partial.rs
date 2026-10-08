@@ -44,6 +44,11 @@ impl Progress {
         limits: &SearchLimits,
     ) -> Result<(), SearchFailure> {
         let capacity = limits.max_results.min(8).saturating_sub(self.locations);
+        if capacity == 0 {
+            #[cfg(test)]
+            tests::after_file()?;
+            return Ok(());
+        }
         let Some(relative) = source.relative.to_str() else {
             return Ok(());
         };

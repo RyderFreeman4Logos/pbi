@@ -26,6 +26,11 @@ use syn::visit::{self, Visit};
 #[path = "search_partial.rs"]
 pub(crate) mod partial;
 
+#[cfg(test)]
+thread_local! {
+    static RETENTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const EXCLUDED: [&str; 5] = [".git", "target", "drafts", "node_modules", "__pycache__"];
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 20_000;
@@ -204,6 +209,7 @@ fn search_repository_inner(
         let Ok(text) = std::str::from_utf8(bytes) else {
             continue;
         };
+        let first_hit = hits.len();
         if let Some(mut hit) = score_file(&path, text, &terms) {
             let count = text.lines().count();
             hit.end = if count <= 4 {
@@ -215,8 +221,12 @@ fn search_repository_inner(
         }
         progress.retain(
             owned,
-            hits.iter()
-                .filter(|hit| hit.path == path)
+            hits[first_hit..]
+                .iter()
+                .inspect(|_| {
+                    #[cfg(test)]
+                    RETENTION_WORK.with(|count| count.set(count.get() + 1));
+                })
                 .map(|hit| hit.line),
             limits,
         )?;
@@ -292,6 +302,7 @@ fn search_regex_repository_inner(
         if relative.chars().any(char::is_control) {
             continue;
         }
+        let first_hit = hits.len();
         for (index, line) in source.lines().enumerate() {
             if Instant::now() >= limits.deadline {
                 return Err(SearchFailure::Deadline);
@@ -316,12 +327,14 @@ fn search_regex_repository_inner(
                 });
             }
         }
-        let lines = hits
+        let lines = hits[first_hit..]
             .iter()
-            .filter(|hit| hit.file == relative)
-            .filter_map(|hit| hit.line)
-            .collect::<Vec<_>>();
-        progress.retain(owned, lines.into_iter(), limits)?;
+            .inspect(|_| {
+                #[cfg(test)]
+                RETENTION_WORK.with(|count| count.set(count.get() + 1));
+            })
+            .filter_map(|hit| hit.line);
+        progress.retain(owned, lines, limits)?;
     }
     Ok(hits)
 }
@@ -526,6 +539,7 @@ fn search_raw_repository_inner(
         }
         let omitted = matching_blocks.saturating_sub(blocks.len());
         let retained = blocks.len();
+        let first_candidate = candidates.len();
         for (index, (start, end, block_matches)) in blocks.into_iter().enumerate() {
             if candidates.len() >= MAX_RAW_BLOCKS {
                 return Err(SearchFailure::Limit);
@@ -558,12 +572,14 @@ fn search_raw_repository_inner(
                 block_matches,
             });
         }
-        let lines = candidates
+        let lines = candidates[first_candidate..]
             .iter()
-            .filter(|candidate| candidate.file == relative)
-            .filter_map(|candidate| candidate.line)
-            .collect::<Vec<_>>();
-        progress.retain(owned, lines.into_iter(), limits)?;
+            .inspect(|_| {
+                #[cfg(test)]
+                RETENTION_WORK.with(|count| count.set(count.get() + 1));
+            })
+            .filter_map(|candidate| candidate.line);
+        progress.retain(owned, lines, limits)?;
     }
     if documents == 0 {
         return Ok((Vec::new(), freshness.finish()));
