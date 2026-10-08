@@ -950,13 +950,23 @@ fn decode_answer(
                     && end_line <= allowed.end_line
             })
             .ok_or_else(|| citation_mismatch("citation_span", &admitted))?;
-        if citations
-            .iter()
-            .any(|item: &SourceEvidence| item == evidence[matched.evidence_index])
-        {
+        if selected.iter().any(|item: &AllowedCitation| {
+            item.path == path
+                && item.start_line == start_line
+                && item.end_line == end_line
+                && item.evidence_index == matched.evidence_index
+        }) {
             return Err(citation_mismatch("duplicate_evidence", &admitted));
         }
         citations.push(evidence[matched.evidence_index].clone());
+        if citations
+            .iter()
+            .filter(|item: &&SourceEvidence| *item == evidence[matched.evidence_index])
+            .count()
+            > 1
+        {
+            citations.pop();
+        }
         selected.push(AllowedCitation {
             path: matched.path.clone(),
             start_line,
@@ -1964,6 +1974,155 @@ mod tests {
         )
         .expect("the precise subspan remains verified");
         assert_eq!(answer.citations().len(), 1);
+        let both = json!({
+            "answer":"The guard at src/lib.rs:1 owns the check; src/lib.rs:2 returns SourceOutsideRoot.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[
+                {"path":"src/lib.rs","start_line":1,"end_line":1},
+                {"path":"src/lib.rs","start_line":2,"end_line":2}
+            ]
+        });
+        let Ok(split) = decode_answer(
+            both,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        ) else {
+            panic!("two legal non-overlapping subspans share one window");
+        };
+        assert_eq!(split.citations().len(), 1, "one evidence owner");
+        let reversed = json!({
+            "answer":"src/lib.rs:2 returns SourceOutsideRoot after the guard at src/lib.rs:1.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[
+                {"path":"src/lib.rs","start_line":2,"end_line":2},
+                {"path":"src/lib.rs","start_line":1,"end_line":1}
+            ]
+        });
+        assert!(
+            decode_answer(
+                reversed,
+                &allowed,
+                &[item],
+                &report,
+                &[],
+                &[true],
+                "test-route".to_owned(),
+            )
+            .is_ok(),
+            "order must not collapse distinct legal subspans"
+        );
+        let repeated = json!({
+            "answer":"The guard at src/lib.rs:2 returns SourceOutsideRoot.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[
+                {"path":"src/lib.rs","start_line":2,"end_line":2},
+                {"path":"src/lib.rs","start_line":2,"end_line":2}
+            ]
+        });
+        let duplicate = decode_answer(
+            repeated,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        );
+        assert!(
+            matches!(
+                duplicate,
+                Err(SemanticError::CitationMismatch {
+                    reason: "duplicate_evidence",
+                    ..
+                })
+            ),
+            "identical citation must stay duplicate_evidence"
+        );
+        let outside = json!({
+            "answer":"The guard at src/lib.rs:2 returns SourceOutsideRoot.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[
+                {"path":"src/lib.rs","start_line":2,"end_line":2},
+                {"path":"src/lib.rs","start_line":3,"end_line":3}
+            ]
+        });
+        let refused = decode_answer(
+            outside,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(SemanticError::CitationMismatch {
+                    reason: "citation_span",
+                    ..
+                })
+            ),
+            "out-of-window citation must stay citation_span"
+        );
+        let bad_body = json!({
+            "answer":"See src/lib.rs:9 and src/lib.rs:2.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[
+                {"path":"src/lib.rs","start_line":1,"end_line":1},
+                {"path":"src/lib.rs","start_line":2,"end_line":2}
+            ]
+        });
+        let body = decode_answer(
+            bad_body,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        );
+        assert!(
+            matches!(
+                body,
+                Err(SemanticError::CitationMismatch {
+                    reason: "body_span",
+                    ..
+                })
+            ),
+            "unselected body span must stay body_span"
+        );
+        let bad_path = json!({
+            "answer":"See ../outside.rs:1 and src/lib.rs:2.",
+            "uncertainty":"Only the verified source span was inspected.",
+            "citations":[
+                {"path":"src/lib.rs","start_line":1,"end_line":1},
+                {"path":"src/lib.rs","start_line":2,"end_line":2}
+            ]
+        });
+        let path = decode_answer(
+            bad_path,
+            &allowed,
+            &[item],
+            &report,
+            &[],
+            &[true],
+            "test-route".to_owned(),
+        );
+        assert!(
+            matches!(
+                path,
+                Err(SemanticError::CitationMismatch {
+                    reason: "body_path",
+                    ..
+                })
+            ),
+            "body path must stay body_path"
+        );
     }
 
     #[test]
