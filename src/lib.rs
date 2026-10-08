@@ -2803,6 +2803,32 @@ function real() {}"#,
     }
 
     #[test]
+    fn language_owner_typescript_template_literal_types() {
+        for literal in [
+            "`prefix ${string}\r\nfunction hidden_ranker() {}\r\n`",
+            "`prefix\r\nfunction hidden_ranker() {}\r\n`",
+            "`prefix ${`inner ${string}\r\nfunction nested_ranker() {}\r\n`}\r\nfunction hidden_ranker() {}\r\n`",
+        ] {
+            let source = format!("type Label = {literal};\r\n{}function plugin_source_ranker() {{ return 1; }}\r\n", "\r\n".repeat(50));
+            let code = CodeView::new(&source, SourceOwner::TypeScript).code;
+            assert!(!code.contains("hidden_ranker"), "literal leaked: {literal}");
+            assert!(!code.contains("nested_ranker"), "interpolation leaked: {literal}");
+            assert!(code.contains("function plugin_source_ranker() { return 1; }"));
+            assert_eq!(code.len(), source.len());
+            assert_eq!(
+                code.bytes().enumerate().filter(|(_, b)| matches!(b, b'\r' | b'\n')).collect::<Vec<_>>(),
+                source.bytes().enumerate().filter(|(_, b)| matches!(b, b'\r' | b'\n')).collect::<Vec<_>>()
+            );
+            let line = source.lines().count();
+            let terms = ["plugin", "source", "ranker"].map(str::to_string);
+            assert_eq!(foreign_search_anchors(&source, Path::new("owner.ts"), &terms), (vec![(line, 3)], vec![line]));
+            for name in ["hidden_ranker", "nested_ranker"] {
+                assert_eq!(foreign_search_anchors(&source, Path::new("owner.ts"), &[name.to_string()]), (vec![], vec![]));
+            }
+        }
+    }
+
+    #[test]
     fn language_owner_templates_exclude_interpolation_and_bound_nesting() {
         let source = "const docs = `é \\` ${(() => { function hidden() {} return `inner ${\"}\"}`; })()}`;\r\nfunction real() {}";
         let code = CodeView::new(source, SourceOwner::JavaScript).code;

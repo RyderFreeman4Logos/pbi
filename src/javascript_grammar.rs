@@ -1,6 +1,6 @@
 //! Called only by the isolated worker, never by parent projection code.
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{RegExpLiteral, StringLiteral, TemplateLiteral};
+use oxc_ast::ast::{RegExpLiteral, StringLiteral, TSTemplateLiteralType, TemplateLiteral};
 use oxc_ast_visit::Visit;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{SourceType, Span};
@@ -17,6 +17,10 @@ impl<'a> Visit<'a> for Literals {
     // Deliberately exclude the whole template, including interpolation. This
     // preserves the existing evidence policy without a second lexical parser.
     fn visit_template_literal(&mut self, node: &TemplateLiteral<'a>) {
+        self.0.push(node.span);
+    }
+    // Interpolated TS template types have a separate node, but the same policy.
+    fn visit_ts_template_literal_type(&mut self, node: &TSTemplateLiteralType<'a>) {
         self.0.push(node.span);
     }
 }

@@ -246,6 +246,31 @@ fn compact_search_ignores_foreign_literal_declarations() {
 }
 
 #[test]
+fn typescript_template_literal_types_exclude_pseudo_declarations() {
+    for literal in [
+        "`prefix ${string}\r\nfunction hidden_ranker() {}\r\n`",
+        "`prefix\r\nfunction hidden_ranker() {}\r\n`",
+        "`prefix ${`inner ${string}\r\nfunction nested_ranker() {}\r\n`}\r\nfunction hidden_ranker() {}\r\n`",
+    ] {
+        let fixture = Fixture::new();
+        let source = format!("type Label = {literal};\r\n{}function plugin_source_ranker() {{ return 1; }} // plugin source ranker\r\n", "\r\n".repeat(50));
+        let line = source.lines().count();
+        fs::write(fixture.root.join("owner.ts"), source).expect("template type fixture");
+        let ranked = fixture.run(&["search", "--max-results=1", "plugin source ranker"], "template-type");
+        assert!(ranked.status.success(), "literal={literal}");
+        assert_eq!(compact_locations(&ranked), [format!("owner.ts:{line}")]);
+        let positive = fixture.run(&["How does plugin_source_ranker work?"], "template-type");
+        assert!(positive.status.success(), "literal={literal}");
+        assert_eq!(String::from_utf8_lossy(&positive.stdout), format!("owner.ts:{line}\n"));
+        for query in ["How does hidden_ranker work?", "How does nested_ranker work?"] {
+            let negative = fixture.run(&[query], "template-type");
+            assert_eq!(negative.status.code(), Some(1), "literal={literal}, query={query}");
+            assert!(negative.stdout.is_empty(), "literal={literal}, query={query}");
+        }
+    }
+}
+
+#[test]
 fn compact_search_ignores_foreign_regex_literal_declarations() {
     let fixture = Fixture::new();
     let literal =
