@@ -1982,7 +1982,7 @@ mod tests {
                 {"path":"src/lib.rs","start_line":2,"end_line":2}
             ]
         });
-        let split = decode_answer(
+        let Ok(split) = decode_answer(
             both,
             &allowed,
             &[item],
@@ -1990,8 +1990,9 @@ mod tests {
             &[],
             &[true],
             "test-route".to_owned(),
-        )
-        .expect("two legal non-overlapping subspans share one window");
+        ) else {
+            panic!("two legal non-overlapping subspans share one window");
+        };
         assert_eq!(split.citations().len(), 1, "one evidence owner");
         let reversed = json!({
             "answer":"src/lib.rs:2 returns SourceOutsideRoot after the guard at src/lib.rs:1.",
@@ -2030,10 +2031,15 @@ mod tests {
             &[],
             &[true],
             "test-route".to_owned(),
-        )
-        .expect_err("an identical citation is duplicate evidence");
+        );
         assert!(
-            duplicate.to_string().contains("reason=duplicate_evidence"),
+            matches!(
+                duplicate,
+                Err(SemanticError::CitationMismatch {
+                    reason: "duplicate_evidence",
+                    ..
+                })
+            ),
             "identical citation must stay duplicate_evidence"
         );
         let outside = json!({
@@ -2052,10 +2058,15 @@ mod tests {
             &[],
             &[true],
             "test-route".to_owned(),
-        )
-        .expect_err("line 3 is outside the admitted window");
+        );
         assert!(
-            refused.to_string().contains("reason=citation_span"),
+            matches!(
+                refused,
+                Err(SemanticError::CitationMismatch {
+                    reason: "citation_span",
+                    ..
+                })
+            ),
             "out-of-window citation must stay citation_span"
         );
         let bad_body = json!({
@@ -2074,10 +2085,15 @@ mod tests {
             &[],
             &[true],
             "test-route".to_owned(),
-        )
-        .expect_err("body line 9 is not a selected span");
+        );
         assert!(
-            body.to_string().contains("reason=body_span"),
+            matches!(
+                body,
+                Err(SemanticError::CitationMismatch {
+                    reason: "body_span",
+                    ..
+                })
+            ),
             "unselected body span must stay body_span"
         );
         let bad_path = json!({
@@ -2096,10 +2112,15 @@ mod tests {
             &[],
             &[true],
             "test-route".to_owned(),
-        )
-        .expect_err("a body path outside the selected span is refused");
+        );
         assert!(
-            path.to_string().contains("reason=body_path"),
+            matches!(
+                path,
+                Err(SemanticError::CitationMismatch {
+                    reason: "body_path",
+                    ..
+                })
+            ),
             "body path must stay body_path"
         );
     }
