@@ -935,15 +935,16 @@ fn run_traced(
             )
         }
         .map_err(|error| {
-            let partial = native_search::take_partial_hits();
-            let status = if matches!(error, SearchFailure::Deadline) {
+            let partial = error.locations();
+            let deadline = error.is_deadline();
+            let status = if deadline {
                 TraceStatus::Deadline
             } else {
                 TraceStatus::OtherError
             };
             trace.point(TraceStage::InitialSearch, status, partial.len());
-            if !partial.is_empty() {
-                return print_partial_locations(&partial);
+            if deadline && !partial.is_empty() {
+                return print_partial_locations(partial);
             }
             search_cli_error(error)
         })?;
@@ -1064,12 +1065,16 @@ fn run_traced(
                 },
             )
             .map_err(|error| {
-                let status = if matches!(error, SearchFailure::Deadline) {
+                let partial = error.locations();
+                let status = if error.is_deadline() {
                     TraceStatus::Deadline
                 } else {
                     TraceStatus::OtherError
                 };
-                trace.point(search_stage, status, 0);
+                trace.point(search_stage, status, partial.len());
+                if error.is_deadline() && !partial.is_empty() {
+                    let _ = print_partial_locations(partial);
+                }
                 search_cli_error(error)
             })?;
             trace.point(search_stage, TraceStatus::Ok, found.lines().count());
@@ -1094,35 +1099,23 @@ fn run_traced(
                 verify_limit,
                 deadline,
             );
-            if Instant::now() >= deadline {
-                if let Ok(report) = &verified {
-                    if !report.evidence().is_empty() {
-                        trace.point(verify_stage, TraceStatus::Deadline, report.evidence().len());
-                        let _ = print_evidence(report, &root);
-                        return Err(CliError::failed(
-                            "source verification exceeded its bounded deadline",
-                        ));
-                    }
-                }
+            if Instant::now() >= deadline || matches!(verified, Err(EvidenceError::Deadline)) {
                 trace.point(verify_stage, TraceStatus::Deadline, 0);
-                return Err(CliError::failed(
-                    "source verification exceeded its bounded deadline",
-                ));
+                return Err(evidence_cli_error(EvidenceError::Deadline));
             }
-            match verified {
-                Ok(report) => {
-                    trace.point(verify_stage, TraceStatus::Ok, report.evidence().len());
-                    Ok(Some(report))
-                }
+            let report = match verified {
+                Ok(report) => report,
                 Err(EvidenceError::NoSourceLocations) => {
                     trace.point(verify_stage, TraceStatus::NoSource, 0);
-                    Ok(None)
+                    return Ok(None);
                 }
                 Err(error) => {
                     trace.point(verify_stage, TraceStatus::OtherError, 0);
-                    Err(evidence_cli_error(error))
+                    return Err(evidence_cli_error(error));
                 }
-            }
+            };
+            trace.point(verify_stage, TraceStatus::Ok, report.evidence().len());
+            Ok(Some(report))
         };
     #[cfg(test)]
     let report = match _test_route_injection {
@@ -1171,7 +1164,7 @@ fn run_traced(
                 },
             )
             .map_err(|error| {
-                let status = if matches!(error, SearchFailure::Deadline) {
+                let status = if error.is_deadline() {
                     TraceStatus::Deadline
                 } else {
                     TraceStatus::OtherError
@@ -1226,7 +1219,6 @@ fn run_traced(
                 TraceStatus::Deadline,
                 report.evidence().len(),
             );
-            let _ = print_evidence(&report, &root);
             return Err(CliError::failed(
                 "semantic investigation exceeded its bounded deadline",
             ));
@@ -1250,7 +1242,6 @@ fn run_traced(
                 TraceStatus::Deadline,
                 report.evidence().len(),
             );
-            let _ = print_evidence(&report, &root);
             return Err(CliError::failed(
                 "semantic investigation exceeded its bounded deadline",
             ));
@@ -1320,11 +1311,10 @@ fn evidence_cli_error(error: EvidenceError) -> CliError {
     }
 }
 
-fn print_partial_locations(hits: &[RawHit]) -> CliError {
+fn print_partial_locations(hits: &[native_search::partial::Location]) -> CliError {
     let mut output = Vec::new();
     for hit in hits {
-        let Some(line) = hit.line else { continue };
-        let _ = writeln!(output, "{}:{line}", hit.file);
+        let _ = writeln!(output, "{}:{}", hit.file, hit.line);
     }
     let _ = io::stdout().write_all(&output);
     CliError::failed("native search exceeded its bounded deadline")
@@ -1332,7 +1322,9 @@ fn print_partial_locations(hits: &[RawHit]) -> CliError {
 
 fn search_cli_error(failure: SearchFailure) -> CliError {
     match failure {
-        SearchFailure::Deadline => CliError::failed("native search exceeded its bounded deadline"),
+        SearchFailure::Deadline | SearchFailure::PartialDeadline(_) => {
+            CliError::failed("native search exceeded its bounded deadline")
+        }
         SearchFailure::Limit => CliError::failed("native search exceeded its bounded limit"),
         SearchFailure::TargetLimit => {
             CliError::failed("native search exceeded the bounded target limit")
@@ -1589,7 +1581,7 @@ fn print_evidence(report: &pbi_rs::EvidenceReport, root: &Path) -> Result<(), Cl
             .map_err(|_| CliError::failed("source location is outside the repository"))?;
         let line = report
             .cited_line(index)
-            .unwrap_or_else(|| item.location().start_line());
+            .ok_or_else(|| CliError::failed("source citation was not verified"))?;
         writeln!(output, "{}:{line}", relative.to_string_lossy())
             .map_err(|_| CliError::failed("cannot write source evidence"))?;
     }

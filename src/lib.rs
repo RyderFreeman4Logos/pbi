@@ -555,6 +555,7 @@ pub enum EvidenceError {
     InvalidLineRange,
     SourceUnavailable,
     SourceSyntaxUnavailable,
+    Deadline,
 }
 
 impl fmt::Display for EvidenceError {
@@ -564,6 +565,7 @@ impl fmt::Display for EvidenceError {
             Self::NoSourceLocations => "no source locations found",
             Self::SourceOutsideRoot => "source location crossed the repository boundary",
             Self::InvalidLineRange => "probe returned an invalid source line range",
+            Self::Deadline => "source verification exceeded its bounded deadline",
             Self::SourceUnavailable => "source evidence could not be read",
             Self::SourceSyntaxUnavailable => {
                 "source grammar could not be verified within its bounds"
@@ -573,6 +575,61 @@ impl fmt::Display for EvidenceError {
 }
 
 impl std::error::Error for EvidenceError {}
+
+#[cfg(test)]
+mod deadline_verification_tests {
+    use super::*;
+    #[test]
+    fn verification_expiry_never_returns_earlier_uncustodied_windows() {
+        let root = std::env::temp_dir().join(format!(
+            "pbi-verify-deadline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&root).expect("root");
+        fs::write(
+            root.join("a.rs"),
+            "fn decoy() {}\nfn deadline_marker() {}\n",
+        )
+        .expect("source");
+        fs::write(root.join("b.rs"), "fn deadline_marker() {}\n").expect("source");
+        let raw = format!(
+            "File: {}, Lines: 1-2\nFile: {}, Lines: 1-1\n",
+            root.join("a.rs").display(),
+            root.join("b.rs").display()
+        );
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let before = Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let result =
+            verify_probe_evidence_with_clock(&raw, &root, "deadline_marker", 8, deadline, || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    before
+                } else {
+                    deadline
+                }
+            });
+        let control = verify_probe_evidence_bounded(&raw, &root, "deadline_marker", 8, deadline)
+            .expect("control evidence");
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(result, Err(EvidenceError::Deadline));
+        assert_eq!(
+            calls.get(),
+            2,
+            "expiry must occur after first-file verification"
+        );
+        let index = control
+            .evidence()
+            .iter()
+            .position(|item| item.location().path() == root.join("a.rs"))
+            .expect("first source retained by control");
+        assert_eq!(control.cited_line(index), Some(2));
+    }
+}
 
 #[derive(Clone, Debug)]
 struct RawLocation {
@@ -627,43 +684,30 @@ pub fn verify_probe_evidence(
 
 /// Verify with the caller-owned overall deadline, parsing each approved file
 /// exactly once before selecting any query group or source window.
-fn partial_verified(choices: &[Vec<ScoredEvidence>]) -> Result<EvidenceReport, EvidenceError> {
-    let mut evidence = Vec::new();
-    for group in choices {
-        for choice in group {
-            if evidence.len() >= 8 {
-                break;
-            }
-            let mut item = choice.evidence.clone();
-            item.snippet.clear();
-            if evidence.iter().any(|seen: &SourceEvidence| {
-                seen.location().path() == item.location().path()
-                    && seen.location().start_line() == item.location().start_line()
-            }) {
-                continue;
-            }
-            evidence.push(item);
-        }
-    }
-    if evidence.is_empty() {
-        return Err(EvidenceError::NoSourceLocations);
-    }
-    Ok(EvidenceReport {
-        complete: false,
-        evidence,
-        missing_targets: vec!["deadline".to_owned()],
-        cited: Vec::new(),
-        followed_from: Vec::new(),
-        call_edges: Vec::new(),
-    })
-}
-
 pub fn verify_probe_evidence_bounded(
     probe_output: &str,
     root: &Path,
     query: &str,
     max_results: usize,
     deadline: Instant,
+) -> Result<EvidenceReport, EvidenceError> {
+    verify_probe_evidence_with_clock(
+        probe_output,
+        root,
+        query,
+        max_results,
+        deadline,
+        Instant::now,
+    )
+}
+
+fn verify_probe_evidence_with_clock(
+    probe_output: &str,
+    root: &Path,
+    query: &str,
+    max_results: usize,
+    deadline: Instant,
+    now: impl Fn() -> Instant,
 ) -> Result<EvidenceReport, EvidenceError> {
     if probe_output.trim().is_empty() {
         return Err(EvidenceError::NoSourceLocations);
@@ -684,6 +728,9 @@ pub fn verify_probe_evidence_bounded(
     let mut choices: Vec<Vec<ScoredEvidence>> = vec![Vec::new(); groups.len()];
     let mut scanned_paths = HashSet::new();
     for raw in raw_locations {
+        if now() >= deadline {
+            return Err(EvidenceError::Deadline);
+        }
         let Some(path) = resolve_candidate_path(&raw.path, &root) else {
             continue;
         };
@@ -707,9 +754,9 @@ pub fn verify_probe_evidence_bounded(
         }
         let view = match CodeView::bounded(&source, SourceOwner::for_path(relative), deadline) {
             Ok(view) => view,
-            Err(_) if Instant::now() >= deadline && !choices.iter().all(Vec::is_empty) => {
-                return partial_verified(&choices);
-            }
+            // Earlier windows do not retain descriptor/policy custody. Never
+            // publish them after the verification deadline.
+            Err(_) if now() >= deadline => return Err(EvidenceError::Deadline),
             Err(_) => return Err(EvidenceError::SourceSyntaxUnavailable),
         };
         for (group_index, group) in groups.iter().enumerate() {
@@ -854,6 +901,9 @@ pub fn verify_probe_evidence_bounded(
         }
     }
 
+    if now() >= deadline {
+        return Err(EvidenceError::Deadline);
+    }
     let covered = owners
         .iter()
         .map(|group_owners| !group_owners.is_empty())
@@ -2514,7 +2564,7 @@ mod tests {
                 Instant::now()
             )
             .err(),
-            Some(EvidenceError::SourceSyntaxUnavailable)
+            Some(EvidenceError::Deadline)
         );
         grammar_worker::SPAWNS.with(|count| assert_eq!(count.get(), 1));
     }
