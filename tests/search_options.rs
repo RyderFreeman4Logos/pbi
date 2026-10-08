@@ -2625,6 +2625,91 @@ fn zero_timeout_answer_stays_at_initial_search() {
     );
 }
 
+#[test]
+fn same_invocation_failure_receipt_binds_identity_and_deadlines() {
+    let fixture = Fixture::new();
+    let cases = [
+        (vec!["--timeout=0", "missing_symbol"], "0", "unknown"),
+        (vec!["search", "missing_symbol"], "8", "unknown"),
+        (
+            vec!["--timeout=0", "--pbi-caller-deadline=3", "missing_symbol"],
+            "0",
+            "3",
+        ),
+    ];
+    for (args, internal, caller) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+            .env_clear()
+            .env("PBI_RS_ADK_ENABLE", "0")
+            .current_dir(&fixture.root)
+            .args(&args)
+            .output()
+            .expect("receipt invocation");
+        assert_eq!(output.status.code(), Some(1), "deadline must fail closed");
+        assert!(output.stdout.is_empty(), "deadline stdout must stay empty");
+        let stderr = String::from_utf8(output.stderr).expect("static UTF-8 receipt");
+        let fields = failure_fields(&stderr);
+        assert_eq!(
+            fields.get("version").copied(),
+            Some("0.1.0"),
+            "tool version required"
+        );
+        let digest = fields.get("exe_sha256").copied().unwrap_or("");
+        assert_eq!(digest.len(), 64, "executable digest required");
+        assert!(
+            digest.chars().all(|byte| byte.is_ascii_hexdigit()),
+            "executable digest must be hex"
+        );
+        assert_ne!(digest, "0".repeat(64), "digest must be computed");
+        assert_eq!(
+            fields.get("deadline_s").copied(),
+            Some(internal),
+            "internal deadline required"
+        );
+        assert_eq!(
+            fields.get("caller_deadline_s").copied(),
+            Some(caller),
+            "caller deadline required"
+        );
+        assert!(!stderr.contains("missing_symbol"), "query leaked");
+        assert!(!stderr.contains('/'), "path leaked");
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let bytes = std::fs::read(env!("CARGO_BIN_EXE_pbi-rs")).expect("test binary");
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        assert_eq!(digest, expected, "digest must match this invocation");
+    }
+    let rejected = Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+        .env_clear()
+        .env("PBI_RS_ADK_ENABLE", "0")
+        .current_dir(&fixture.root)
+        .args([
+            "--timeout=0",
+            "--pbi-caller-deadline=nope",
+            "missing_symbol",
+        ])
+        .output()
+        .expect("rejected caller deadline");
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "bad caller deadline fails closed"
+    );
+    let rejected_stderr = String::from_utf8(rejected.stderr).expect("static UTF-8 receipt");
+    assert_eq!(
+        failure_fields(&rejected_stderr)
+            .get("caller_deadline_s")
+            .copied(),
+        Some("unknown"),
+        "unparsed caller deadline stays unknown"
+    );
+    assert!(
+        !rejected_stderr.contains("nope"),
+        "rejected caller value leaked"
+    );
+}
+
 fn failure_fields(stderr: &str) -> std::collections::HashMap<&str, &str> {
     stderr
         .lines()

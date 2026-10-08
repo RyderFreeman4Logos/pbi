@@ -1973,6 +1973,7 @@ dependencies = [
  "proc-macro2",
  "regex",
  "serde_json",
+ "sha2",
  "syn 2.0.119",
  "tokio",
  "toml",

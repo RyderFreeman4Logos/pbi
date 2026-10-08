@@ -22,6 +22,7 @@ use native_search::{
     SearchFailure, SearchLimits,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::env;
 use std::fs;
@@ -396,10 +397,34 @@ fn emit_failure_receipt(
     let deadline_s = deadline
         .map(|seconds| seconds.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
+    let caller_deadline_s = caller_deadline_seconds(arguments);
     eprintln!(
-        "pbi-failure rc={code} stage={stage} stage_status={status} candidates={candidates} ranges={ranges} admission={admission} deadline_s={deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
+        "pbi-failure rc={code} version={VERSION} exe_sha256={} stage={stage} stage_status={status} candidates={candidates} ranges={ranges} admission={admission} deadline_s={deadline_s} caller_deadline_s={caller_deadline_s} elapsed_ms={} cwd={cwd} exe={exe} argv0={argv0} argv_count={argv_count} argv={argv}",
+        executable_sha256(),
         started.elapsed().as_millis()
     );
+}
+
+fn executable_sha256() -> String {
+    // ponytail: one full read of the running binary, streamed digest if receipts
+    // are ever emitted more than once per process.
+    let mut hasher = Sha256::new();
+    match env::current_exe().and_then(fs::read) {
+        Ok(bytes) => hasher.update(bytes),
+        Err(_) => return "unknown".to_owned(),
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn caller_deadline_seconds(arguments: &[String]) -> String {
+    // Only an explicit caller-owned flag is evidence. A missing or unparsable
+    // value stays unknown; the internal --timeout is a different deadline.
+    arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--pbi-caller-deadline="))
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn redact_identity(present: bool) -> &'static str {
@@ -530,6 +555,7 @@ fn known_option(value: &str) -> bool {
             | "--model-name"
             | "--force-provider"
             | "--timeout"
+            | "--pbi-caller-deadline"
             | "--regex"
             | "--bm25"
             | "--stem"
@@ -1751,6 +1777,9 @@ fn parse_question(arguments: &[String]) -> Result<(String, bool, Option<u64>), C
                 }
                 timeout = Some(parse_timeout_seconds(&value[10..])?);
             }
+            value if value.starts_with("--pbi-caller-deadline=") => {
+                parse_timeout_seconds(&value["--pbi-caller-deadline=".len()..])?;
+            }
             "--model-name" | "--force-provider" => {
                 // Discard exactly one operand if present, even option-looking.
                 index += 1;
@@ -1865,6 +1894,10 @@ fn parse_search(arguments: &[String]) -> Result<(bool, String, SearchOptions), C
                     return Err(CliError::usage("--timeout cannot be used multiple times"));
                 }
                 options.timeout = Some(parse_timeout_seconds(&value[10..])?);
+                index += 1;
+            }
+            value if value.starts_with("--pbi-caller-deadline=") => {
+                parse_timeout_seconds(&value["--pbi-caller-deadline=".len()..])?;
                 index += 1;
             }
             "--max-results" => {

@@ -590,6 +590,7 @@ mod deadline_verification_tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).expect("root");
+        let root = fs::canonicalize(&root).expect("canonical root");
         fs::write(
             root.join("a.rs"),
             "fn decoy() {}\nfn deadline_marker() {}\n",
