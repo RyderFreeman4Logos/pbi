@@ -3075,3 +3075,131 @@ fn native_search_refuses_symlinked_nested_gitignore_outside_root() {
     );
     assert!(output.stdout.is_empty());
 }
+
+fn context_window(name: &str, marker: &str, width: usize) -> String {
+    // Longer windows lose to the one matching line, so the padding is on that line.
+    format!(
+        "fn {name}() {{ let _ = \"{marker}\"; {} }}\n",
+        "x".repeat(width)
+    )
+}
+
+fn context_bytes(
+    question: &str,
+    files: &[(String, String)],
+    target: &str,
+    relevance: &str,
+) -> usize {
+    let evidence = files
+        .iter()
+        .enumerate()
+        .map(|(index, (name, source))| {
+            serde_json::json!({
+                "id": index,
+                "path": name,
+                "start_line": 1,
+                "end_line": 1,
+                "target": target,
+                "symbol": serde_json::Value::Null,
+                "snippet": source.trim_end_matches('\n'),
+                "relevance": relevance,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "question": question,
+        "verified_evidence": evidence,
+        "missing_targets": [],
+        "direct_stop_candidate_ids": [],
+    }))
+    .expect("serialize")
+    .len()
+}
+
+#[test]
+fn eight_windows_report_context_overflow_bytes_without_raising_the_cap() {
+    let question = "where is budget marker";
+    let under = context_window("under_marker", "budget marker", 1500);
+    let over = context_window("over_marker", "budget marker \"quoted\"", 2821);
+    let files = |prefix: &str, source: &str| -> Vec<(String, String)> {
+        (0..8)
+            .map(|index| (format!("{prefix}{index}.rs"), source.to_owned()))
+            .collect()
+    };
+    let within = files("within", &under);
+    let beyond = files("beyond", &over);
+    let bump = |source: &str, extra: usize| {
+        let mut line = source.trim_end_matches('\n').to_owned();
+        line.push_str(&"y".repeat(extra));
+        line.push('\n');
+        line
+    };
+    let mut at_limit = beyond.clone();
+    let mut one_past = beyond.clone();
+    at_limit[0].1 = bump(&at_limit[0].1, 34);
+    one_past[0].1 = bump(&one_past[0].1, 35);
+    let within_bytes = context_bytes(
+        question,
+        &within,
+        "budget marker",
+        "terms=budget,marker code=assignment",
+    );
+    let limit_bytes = context_bytes(
+        "where is budget marker quoted",
+        &at_limit,
+        "budget marker quoted",
+        "terms=budget,marker,quoted code=assignment",
+    );
+    let past_bytes = context_bytes(
+        "where is budget marker quoted",
+        &one_past,
+        "budget marker quoted",
+        "terms=budget,marker,quoted code=assignment",
+    );
+    assert!(within_bytes <= 24 * 1024, "within {within_bytes}");
+    assert_eq!(limit_bytes, 24 * 1024, "limit {limit_bytes}");
+    assert_eq!(past_bytes, 24 * 1024 + 1, "past {past_bytes}");
+    // Quote escaping must be counted as serialized bytes, not source characters.
+    assert!(past_bytes > one_past[0].1.len() * 8);
+    let run = |files: &[(String, String)], adk: &str, args: &[&str]| {
+        let fixture = Fixture::new();
+        for (name, source) in files {
+            fs::write(fixture.root.join(name), source).expect("window");
+        }
+        Command::new(env!("CARGO_BIN_EXE_pbi-rs"))
+            .env_clear()
+            .env("PBI_RS_ADK_ENABLE", adk)
+            .env("CLIPROXY_BASE_URL", "http://localhost:18317/v1")
+            .env("LOCAL_MODEL", "abliterated-qwen-latest-27b-none")
+            .env("CLIPROXY_API_KEY", "synthetic-not-a-provider-secret")
+            .current_dir(&fixture.root)
+            .args(args)
+            .output()
+            .expect("run")
+    };
+    let ok = run(&within, "0", &[question, "--timeout", "30"]);
+    let ok_err = String::from_utf8_lossy(&ok.stderr);
+    assert!(ok.status.success(), "ordinary evidence: {ok_err}");
+    assert!(!ok_err.contains("context_overflow"));
+    assert!(!ok_err.contains("attempts="));
+    let blocked = run(
+        &one_past,
+        "1",
+        &["where is budget marker quoted", "--timeout", "30"],
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert_eq!(blocked.status.code(), Some(1), "{stderr}");
+    assert!(
+        blocked.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&blocked.stdout)
+    );
+    assert!(stderr.contains("stage=answer"), "{stderr}");
+    assert!(stderr.contains("context_overflow"), "{stderr}");
+    assert!(stderr.contains(&format!("bytes={past_bytes}")), "{stderr}");
+    assert!(stderr.contains("limit=24576"), "{stderr}");
+    assert!(!stderr.contains("attempts="), "{stderr}");
+    assert!(!stderr.contains("budget marker"), "{stderr}");
+    assert!(!stderr.contains("quoted"), "{stderr}");
+    assert!(!stderr.contains(".rs"), "{stderr}");
+}

@@ -102,7 +102,10 @@ pub enum SemanticError {
     EmptyQuestion,
     NoEvidence,
     SourceOutsideRoot,
-    InputTooLarge,
+    InputTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     Protocol,
     Cancelled,
     PlanningDeadlineExceeded,
@@ -126,11 +129,17 @@ impl fmt::Display for SemanticError {
                 "semantic model route failed: {kind:?}; attempts={attempts}"
             );
         }
+        if let Self::InputTooLarge { bytes, limit } = self {
+            return write!(
+                formatter,
+                "semantic evidence exceeded the bounded context; bytes={bytes}; limit={limit}"
+            );
+        }
         formatter.write_str(match self {
             Self::EmptyQuestion => "semantic question is empty",
             Self::NoEvidence => "semantic investigation requires verified source evidence",
             Self::SourceOutsideRoot => "semantic citation crossed the repository boundary",
-            Self::InputTooLarge => "semantic evidence exceeded the bounded context",
+            Self::InputTooLarge { .. } => unreachable!("overflow bytes are formatted above"),
             Self::Protocol => "semantic invocation protocol could not be built",
             Self::Cancelled => "semantic investigation was cancelled",
             Self::PlanningDeadlineExceeded => "semantic planning exceeded its bounded deadline",
@@ -740,7 +749,10 @@ pub async fn investigate(
     let common_data_bytes =
         serde_json::to_vec(&common_data).map_err(|_| SemanticError::Protocol)?;
     if common_data_bytes.len() > MAX_SEMANTIC_CONTEXT_BYTES {
-        return Err(SemanticError::InputTooLarge);
+        return Err(SemanticError::InputTooLarge {
+            bytes: common_data_bytes.len(),
+            limit: MAX_SEMANTIC_CONTEXT_BYTES,
+        });
     }
 
     let mut output_schema: Value =

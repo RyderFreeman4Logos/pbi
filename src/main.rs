@@ -87,6 +87,7 @@ enum TraceStatus {
     NoSource,
     Deadline,
     RouteError,
+    ContextOverflow,
     InvalidOutput,
     OtherError,
 }
@@ -99,6 +100,7 @@ impl TraceStatus {
             Self::NoSource => "no_source",
             Self::Deadline => "deadline",
             Self::RouteError => "route_error",
+            Self::ContextOverflow => "context_overflow",
             Self::InvalidOutput => "invalid_output",
             Self::OtherError => "other_error",
         }
@@ -207,6 +209,7 @@ fn semantic_trace_status(error: &SemanticError) -> TraceStatus {
             TraceStatus::InvalidOutput
         }
         SemanticError::NoEvidence => TraceStatus::NoSource,
+        SemanticError::InputTooLarge { .. } => TraceStatus::ContextOverflow,
         _ => TraceStatus::OtherError,
     }
 }
