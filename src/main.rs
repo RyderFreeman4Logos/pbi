@@ -9,7 +9,9 @@ use pbi_rs::semantic::{
     explicit_admitted_routes_from_environment, local_route_publisher_from_admitted_routes,
     DEFAULT_LOCAL_BASE_URL, DEFAULT_LOCAL_MODEL, ENV_TEST_LOCK,
 };
-use pbi_rs::{verify_probe_evidence, EvidenceError, SourceEvidence};
+#[cfg(test)]
+use pbi_rs::verify_probe_evidence;
+use pbi_rs::{EvidenceError, SourceEvidence};
 
 mod extract;
 mod native_search;
@@ -267,6 +269,7 @@ fn usage() {
 }
 
 fn main() {
+    pbi_rs::grammar_worker::dispatch();
     let Some(arguments) = utf8_arguments() else {
         eprintln!("pbi-rs: arguments must be UTF-8");
         emit_failure_receipt(&[], 2, None, None, Instant::now(), None);
@@ -1077,7 +1080,13 @@ fn run_traced(
                     "source verification exceeded its bounded deadline",
                 ));
             }
-            let verified = verify_probe_evidence(&found, &root, evidence_query, verify_limit);
+            let verified = pbi_rs::verify_probe_evidence_bounded(
+                &found,
+                &root,
+                evidence_query,
+                verify_limit,
+                deadline,
+            );
             if Instant::now() >= deadline {
                 trace.point(verify_stage, TraceStatus::Deadline, 0);
                 return Err(CliError::failed(

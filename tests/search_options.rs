@@ -246,6 +246,179 @@ fn compact_search_ignores_foreign_literal_declarations() {
 }
 
 #[test]
+fn typescript_template_literal_types_exclude_pseudo_declarations() {
+    for literal in [
+        "`prefix ${string}\r\nfunction hidden_ranker() {}\r\n`",
+        "`prefix\r\nfunction hidden_ranker() {}\r\n`",
+        "`prefix ${`inner ${string}\r\nfunction nested_ranker() {}\r\n`}\r\nfunction hidden_ranker() {}\r\n`",
+    ] {
+        let fixture = Fixture::new();
+        let source = format!("type Label = {literal};\r\n{}function plugin_source_ranker() {{ return 1; }} // plugin source ranker\r\n", "\r\n".repeat(50));
+        let line = source.lines().count();
+        fs::write(fixture.root.join("owner.ts"), source).expect("template type fixture");
+        let ranked = fixture.run(&["search", "--max-results=1", "plugin source ranker"], "template-type");
+        assert!(ranked.status.success(), "literal={literal}");
+        assert_eq!(compact_locations(&ranked), [format!("owner.ts:{line}")]);
+        let positive = fixture.run(&["How does plugin_source_ranker work?"], "template-type");
+        assert!(positive.status.success(), "literal={literal}");
+        assert_eq!(String::from_utf8_lossy(&positive.stdout), format!("owner.ts:{line}\n"));
+        for query in ["How does hidden_ranker work?", "How does nested_ranker work?"] {
+            let negative = fixture.run(&[query], "template-type");
+            assert_eq!(negative.status.code(), Some(1), "literal={literal}, query={query}");
+            assert!(negative.stdout.is_empty(), "literal={literal}, query={query}");
+        }
+    }
+}
+
+#[test]
+fn compact_search_ignores_foreign_regex_literal_declarations() {
+    let fixture = Fixture::new();
+    let literal =
+        r#"const matcher = /["'] café function plugin_source_ranker plugin source ranker/;"#;
+    let implementation = "function plugin_source_ranker() { return 0; }";
+    let source = format!("{literal}\r\n{}{implementation}\r\n", "\r\n".repeat(50));
+    fs::write(fixture.root.join("owner.js"), source).expect("regex literal fixture");
+    let output = fixture.run(
+        &["search", "--max-results=1", "plugin source ranker"],
+        "compact",
+    );
+    assert!(output.status.success(), "compact search must succeed");
+    assert_eq!(
+        compact_locations(&output),
+        ["owner.js:52"],
+        "the regex declaration-like literal is negative and following executable source is positive"
+    );
+}
+
+#[test]
+fn compact_search_javascript_operand_division_preserves_executable_source() {
+    let mut failures = Vec::new();
+    for operand in [
+        "obj.return",
+        "obj?.throw",
+        "obj. /* gap */ new",
+        "obj. // gap\r\nreturn",
+        "of",
+        "await",
+        "yield",
+        "obj.value",
+        "obj.value!",
+        "obj.return!",
+        "(obj.value)!",
+        "éreturn",
+        "caféreturn",
+        "obj.caféreturn",
+        "éthrow",
+        "évalue",
+        "obj.cafévalue",
+        "this.#return",
+        "this?. /* gap */ #throw",
+        "this.#value",
+        r"\u{e9}return",
+        r"obj.caf\u{e9}return",
+    ] {
+        let fixture = Fixture::new();
+        let source = if operand.starts_with("this") {
+            format!("class C {{\r\n #return = 1; #throw = 1; #value = 1;\r\n m() {{ const value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2; }}\r\n}}\r\n")
+        } else {
+            format!("const obj = {{ return: 1, throw: 1, new: 1, value: 1 }}; const of = 1, await = 1, yield = 1, éreturn = 1, caféreturn = 1, éthrow = 1, évalue = 1;\r\nconst value = {operand} / function plugin_source_ranker() {{ return 1; }} / 2;\r\n")
+        };
+        let line = source
+            .lines()
+            .position(|line| line.contains("function plugin_source_ranker"))
+            .expect("function expression line")
+            + 1;
+        let filename = if operand.ends_with('!') {
+            "owner.ts"
+        } else {
+            "owner.js"
+        };
+        fs::write(fixture.root.join(filename), source).expect("division fixture");
+        for args in [
+            vec!["search", "--max-results=1", "plugin_source_ranker"],
+            vec!["How does plugin_source_ranker work?"],
+        ] {
+            let output = fixture.run(&args, "division");
+            let locations = if args[0] == "search" {
+                compact_locations(&output)
+            } else {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            };
+            if !output.status.success() || locations != [format!("{filename}:{line}")] {
+                failures.push((operand, args, output.status.code(), locations));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "division source lost: {failures:?}");
+}
+
+#[test]
+fn compact_typescript_type_close_division() {
+    let mut failures = Vec::new();
+    for source in [
+            "const identity = <T>(x: T) => x;\nconst value = identity<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const obj = { method: <T>(x: T) => x };\nconst value = obj.method<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as () => number / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = [] satisfies Array<number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = {} as {x:number} / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<Array<number>> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = (identity<number>) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = (1 as Array<number>) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<number> /*gap*/ / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const identity = <T>(x: T) => x;\nconst value = identity<number>\n / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = (1 as Array<number>)! / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<number> / function plugin_source_ranker() { return 1; } / 2;\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nfunction following_owner(){return 2;}\n",
+            "const value = 1 as number / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<() => number> / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as [number, number] / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as (number | string) / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as \"value\" / function plugin_source_ranker() { return 1; } / 2;\n",
+            "const value = 1 as Array<{x:number; y:number}> / function plugin_source_ranker() { return 1; } / 2;\n",
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("owner.ts"), source).expect("valid TypeScript fixture");
+        let line = source.lines().position(|line| line.contains("function plugin_source_ranker")).expect("operand declaration") + 1;
+        let output = fixture.run(&["How does plugin_source_ranker work?"], "type-close");
+        let actual = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || actual != format!("owner.ts:{line}\n") {
+            failures.push((source, output.status.code(), actual.into_owned()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "type-close division lost: {failures:?}"
+    );
+    for prefix in [
+        "1 >",
+        "1 >=",
+        "1 >>",
+        "1 >>>",
+        "1 <",
+        "1 <=",
+        "1 <<",
+        "1 < 2; const next = 1 >",
+    ] {
+        let fixture = Fixture::new();
+        let source = format!("const value = {prefix} /[\"'] function hidden_ranker/;\n{}function plugin_source_ranker() {{ return 1; }}\n", "\n".repeat(50));
+        fs::write(fixture.root.join("owner.ts"), source).expect("comparison regex fixture");
+        let positive = fixture.run(&["How does plugin_source_ranker work?"], "comparison");
+        assert!(positive.status.success(), "prefix={prefix}");
+        assert_eq!(
+            String::from_utf8_lossy(&positive.stdout),
+            "owner.ts:52\n",
+            "prefix={prefix}"
+        );
+        let negative = fixture.run(&["How does hidden_ranker work?"], "comparison");
+        assert_eq!(negative.status.code(), Some(1), "prefix={prefix}");
+        assert!(negative.stdout.is_empty(), "prefix={prefix}");
+    }
+}
+
+#[test]
 fn language_owner_rust_adjacent_literals_preserve_behavior() {
     let mut results = Vec::new();
     for literals in [
