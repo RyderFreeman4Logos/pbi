@@ -3142,3 +3142,5 @@ fn eight_windows_report_context_overflow_bytes_without_raising_the_cap() {
     assert!(!stderr.contains("quoted"), "{stderr}");
     assert!(!stderr.contains(".rs"), "{stderr}");
 }
+
+mod deadline_partials;

@@ -43,14 +43,6 @@ pub struct SearchLimits {
     pub ignores: Vec<String>,
 }
 
-#[derive(Debug)]
-pub enum SearchFailure {
-    Deadline,
-    Limit,
-    TargetLimit,
-    Unavailable,
-}
-
 /// One native BM25 result. Paths are repository relative and snippets come
 /// from a checked, bounded source file; these are search hits, not citations.
 pub struct RawHit {
@@ -62,6 +54,14 @@ pub struct RawHit {
     pub occurrences: usize,
     declaration: bool,
     block_matches: usize,
+}
+
+#[derive(Debug)]
+pub enum SearchFailure {
+    Deadline,
+    Limit,
+    TargetLimit,
+    Unavailable,
 }
 
 /// Raw search shares the walk and file limits with verified search.
@@ -289,6 +289,7 @@ pub fn search_raw_repository(
     let mut total_length = 0usize;
     let mut document_frequency = vec![0usize; terms.len()];
     let mut candidates = Vec::new();
+    let _ = take_partial_hits();
     let exact_phrase = query.trim().to_lowercase();
     let named_terms = if terms.len() == 1 {
         terms.clone()
@@ -371,7 +372,7 @@ pub fn search_raw_repository(
         let mut pending: Option<(usize, usize, usize)> = None;
         for (index, line) in source_lines.iter().enumerate() {
             if Instant::now() >= limits.deadline {
-                return Err(SearchFailure::Deadline);
+                return partial_raw_deadline(candidates);
             }
             let normalized = if options.stem {
                 crate::strict_query::stem_text(line, Some(limits.deadline))
@@ -524,6 +525,40 @@ pub fn search_raw_repository(
             .then_with(|| left.line.cmp(&right.line))
     });
     Ok((hits, freshness.finish()))
+}
+
+fn partial_raw_deadline(
+    candidates: Vec<RawCandidate>,
+) -> Result<(Vec<RawHit>, u64), SearchFailure> {
+    let hits = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let line = candidate.line?;
+            Some(RawHit {
+                file: candidate.file,
+                line: Some(line),
+                end_line: candidate.end_line,
+                snippet: String::new(),
+                score: 0.0,
+                occurrences: candidate.occurrences,
+                declaration: candidate.declaration,
+                block_matches: candidate.block_matches,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !hits.is_empty() {
+        PARTIAL_HITS.with(|slot| *slot.borrow_mut() = hits);
+    }
+    Err(SearchFailure::Deadline)
+}
+
+std::thread_local! {
+    static PARTIAL_HITS: std::cell::RefCell<Vec<RawHit>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn take_partial_hits() -> Vec<RawHit> {
+    PARTIAL_HITS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 // Completed blocks compete before snippet allocation. The pending block remains

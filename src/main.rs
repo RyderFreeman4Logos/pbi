@@ -935,12 +935,16 @@ fn run_traced(
             )
         }
         .map_err(|error| {
+            let partial = native_search::take_partial_hits();
             let status = if matches!(error, SearchFailure::Deadline) {
                 TraceStatus::Deadline
             } else {
                 TraceStatus::OtherError
             };
-            trace.point(TraceStage::InitialSearch, status, 0);
+            trace.point(TraceStage::InitialSearch, status, partial.len());
+            if !partial.is_empty() {
+                return print_partial_locations(&partial);
+            }
             search_cli_error(error)
         })?;
         trace.point(TraceStage::InitialSearch, TraceStatus::Ok, hits.len());
@@ -1091,6 +1095,15 @@ fn run_traced(
                 deadline,
             );
             if Instant::now() >= deadline {
+                if let Ok(report) = &verified {
+                    if !report.evidence().is_empty() {
+                        trace.point(verify_stage, TraceStatus::Deadline, report.evidence().len());
+                        let _ = print_evidence(report, &root);
+                        return Err(CliError::failed(
+                            "source verification exceeded its bounded deadline",
+                        ));
+                    }
+                }
                 trace.point(verify_stage, TraceStatus::Deadline, 0);
                 return Err(CliError::failed(
                     "source verification exceeded its bounded deadline",
@@ -1208,7 +1221,12 @@ fn run_traced(
             report.evidence().len(),
         );
         if Instant::now() >= deadline {
-            trace.point(TraceStage::Follow, TraceStatus::Deadline, 0);
+            trace.point(
+                TraceStage::Follow,
+                TraceStatus::Deadline,
+                report.evidence().len(),
+            );
+            let _ = print_evidence(&report, &root);
             return Err(CliError::failed(
                 "semantic investigation exceeded its bounded deadline",
             ));
@@ -1227,7 +1245,12 @@ fn run_traced(
             None
         };
         if Instant::now() >= deadline {
-            trace.point(TraceStage::Follow, TraceStatus::Deadline, 0);
+            trace.point(
+                TraceStage::Follow,
+                TraceStatus::Deadline,
+                report.evidence().len(),
+            );
+            let _ = print_evidence(&report, &root);
             return Err(CliError::failed(
                 "semantic investigation exceeded its bounded deadline",
             ));
@@ -1295,6 +1318,16 @@ fn evidence_cli_error(error: EvidenceError) -> CliError {
     } else {
         CliError::failed(error.to_string())
     }
+}
+
+fn print_partial_locations(hits: &[RawHit]) -> CliError {
+    let mut output = Vec::new();
+    for hit in hits {
+        let Some(line) = hit.line else { continue };
+        let _ = writeln!(output, "{}:{line}", hit.file);
+    }
+    let _ = io::stdout().write_all(&output);
+    CliError::failed("native search exceeded its bounded deadline")
 }
 
 fn search_cli_error(failure: SearchFailure) -> CliError {

@@ -627,6 +627,37 @@ pub fn verify_probe_evidence(
 
 /// Verify with the caller-owned overall deadline, parsing each approved file
 /// exactly once before selecting any query group or source window.
+fn partial_verified(choices: &[Vec<ScoredEvidence>]) -> Result<EvidenceReport, EvidenceError> {
+    let mut evidence = Vec::new();
+    for group in choices {
+        for choice in group {
+            if evidence.len() >= 8 {
+                break;
+            }
+            let mut item = choice.evidence.clone();
+            item.snippet.clear();
+            if evidence.iter().any(|seen: &SourceEvidence| {
+                seen.location().path() == item.location().path()
+                    && seen.location().start_line() == item.location().start_line()
+            }) {
+                continue;
+            }
+            evidence.push(item);
+        }
+    }
+    if evidence.is_empty() {
+        return Err(EvidenceError::NoSourceLocations);
+    }
+    Ok(EvidenceReport {
+        complete: false,
+        evidence,
+        missing_targets: vec!["deadline".to_owned()],
+        cited: Vec::new(),
+        followed_from: Vec::new(),
+        call_edges: Vec::new(),
+    })
+}
+
 pub fn verify_probe_evidence_bounded(
     probe_output: &str,
     root: &Path,
@@ -674,8 +705,13 @@ pub fn verify_probe_evidence_bounded(
         if lines.is_empty() {
             continue;
         }
-        let view = CodeView::bounded(&source, SourceOwner::for_path(relative), deadline)
-            .map_err(|_| EvidenceError::SourceSyntaxUnavailable)?;
+        let view = match CodeView::bounded(&source, SourceOwner::for_path(relative), deadline) {
+            Ok(view) => view,
+            Err(_) if Instant::now() >= deadline && !choices.iter().all(Vec::is_empty) => {
+                return partial_verified(&choices);
+            }
+            Err(_) => return Err(EvidenceError::SourceSyntaxUnavailable),
+        };
         for (group_index, group) in groups.iter().enumerate() {
             let raw_order = raw
                 .order
