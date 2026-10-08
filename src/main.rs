@@ -144,7 +144,8 @@ impl StageTrace {
                 TraceStage::Answer => "admission",
                 _ => "",
             };
-            let recorded = if matches!(status, TraceStatus::Start) || field.is_empty() {
+            let completed = matches!(status, TraceStatus::Ok | TraceStatus::NoSource);
+            let recorded = if !completed || field.is_empty() {
                 "unknown"
             } else {
                 match count {
@@ -2522,15 +2523,18 @@ mod tests {
         arguments.push("--timeout=1".to_owned());
         let started = Instant::now();
         let mut output = Vec::new();
-        let error = run(
+        let trace = StageTrace::new(started + Duration::from_secs(1));
+        let error = run_traced(
             arguments,
             Some(TestRouteInjection::Factory {
                 build: &factory,
                 deadline: Duration::from_secs(30),
             }),
             &mut output,
+            &trace,
         )
         .expect_err("pending model must reach the requested deadline");
+        assert_eq!(trace.observed(), Some(("answer", "deadline", "unknown")));
         assert_eq!(
             error.message,
             "semantic investigation exceeded its bounded deadline"
