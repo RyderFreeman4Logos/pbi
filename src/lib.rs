@@ -1497,60 +1497,59 @@ fn python_owner_end(view: &CodeView, location: &SourceLocation) -> Option<usize>
     };
     // A verified window may start at decorators rather than its declaration.
     // Resolve only through the already-admitted prefix, never a future sibling.
-    let anchor = if lines.get(first)?.trim_start().starts_with('@') {
-        let column = indent(lines[first]);
-        let mut declaration = None;
-        for line_number in view
-            .statement_starts
-            .iter()
-            .copied()
-            .filter(|line| *line > first + 1 && *line <= location.end_line())
-        {
-            let index = line_number - 1;
-            let line = source_lines.get(index)?;
-            if indent(line) != column {
-                return None;
+    let anchor =
+        if lines.get(first)?.trim_start().starts_with('@') {
+            let column = indent(lines[first]);
+            let mut declaration = None;
+            for statement in view.statements.iter().filter(|statement| {
+                statement.start > first + 1 && statement.end <= location.end_line()
+            }) {
+                let index = statement.start - 1;
+                let line = source_lines.get(index)?;
+                if indent(line) != column {
+                    return None;
+                }
+                if statement.declaration == PythonDeclaration::Known {
+                    declaration = Some(index);
+                    break;
+                }
+                if !line.trim_start().starts_with('@') {
+                    return None;
+                }
             }
-            if python_declaration_name(lines.get(index)?).is_some() {
-                declaration = Some(index);
-                break;
-            }
-            if !line.trim_start().starts_with('@') {
-                return None;
-            }
-        }
-        declaration?
-    } else {
-        first
-    };
+            declaration?
+        } else {
+            first
+        };
     let mut owners = Vec::new();
-    for line_number in view
-        .statement_starts
+    for statement in view
+        .statements
         .iter()
-        .copied()
-        .filter(|line| *line <= anchor + 1)
+        .filter(|statement| statement.start <= anchor + 1)
     {
-        let line = source_lines.get(line_number - 1)?;
+        let line = source_lines.get(statement.start - 1)?;
         let column = indent(line);
         while owners.last().is_some_and(|owner| *owner >= column) {
             owners.pop();
         }
-        if python_declaration_name(lines.get(line_number - 1)?).is_some() {
-            owners.push(column);
+        match statement.declaration {
+            PythonDeclaration::Known => owners.push(column),
+            PythonDeclaration::Other => (),
+            _ => return None,
         }
     }
     let owner = *owners.last()?;
     let end = view
-        .statement_starts
+        .statements
         .iter()
-        .copied()
-        .find(|line| {
-            *line > anchor + 1
-                && source_lines
-                    .get(line - 1)
-                    .is_some_and(|text| indent(text) <= owner)
+        .find(|statement| {
+            statement.start > anchor + 1
+                && (statement.declaration == PythonDeclaration::Unknown
+                    || source_lines
+                        .get(statement.start - 1)
+                        .is_some_and(|text| indent(text) <= owner))
         })
-        .map(|line| line - 1)
+        .map(|statement| statement.start - 1)
         .unwrap_or(lines.len());
     (end >= location.end_line()).then_some(end)
 }
@@ -1577,10 +1576,28 @@ impl SourceOwner {
     }
 }
 
+// Header states of the existing lexical scan, not another parser.
+// Only a complete code-token prefix can establish declaration authority.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PythonDeclaration {
+    Start,
+    Async,
+    Name,
+    Known,
+    Other,
+    Unknown,
+}
+
+struct PythonStatement {
+    start: usize,
+    end: usize,
+    declaration: PythonDeclaration,
+}
+
 struct CodeView {
     code: String,
     source_lines: Option<String>,
-    statement_starts: Vec<usize>,
+    statements: Vec<PythonStatement>,
 }
 
 impl CodeView {
@@ -1601,12 +1618,12 @@ impl CodeView {
                 .map(|code| Self {
                     code,
                     source_lines: None,
-                    statement_starts: Vec::new(),
+                    statements: Vec::new(),
                 });
         }
         let bytes = source.as_bytes();
         let mut code = bytes.to_vec();
-        let mut statement_starts = Vec::new();
+        let mut statements: Vec<PythonStatement> = Vec::new();
         let mut index = 0;
         let mut line = 1usize;
         let mut brackets = Vec::new();
@@ -1616,13 +1633,15 @@ impl CodeView {
         let python_open = owner == SourceOwner::Python;
         while index < bytes.len() {
             let start = index;
+            if let Some(statement) = statements.last_mut() {
+                if !line_start {
+                    statement.end = line;
+                }
+            }
             if (owner == SourceOwner::Python && bytes[index] == b'#')
                 || (owner != SourceOwner::Python && bytes[index..].starts_with(b"//"))
             {
                 index = line_comment_end(bytes, index, owner == SourceOwner::CFamily);
-                if owner == SourceOwner::Python && line_start && brackets.is_empty() && !continued {
-                    line_start = false;
-                }
             } else if owner != SourceOwner::Python && bytes[index..].starts_with(b"/*") {
                 index += 2;
                 let mut comment_depth = 1;
@@ -1641,7 +1660,11 @@ impl CodeView {
                 let (quote, prefix_len, delimiter_len) =
                     python_string_quote(bytes, index).expect("quote");
                 if line_start && brackets.is_empty() && !continued {
-                    statement_starts.push(line);
+                    statements.push(PythonStatement {
+                        start: line,
+                        end: line,
+                        declaration: PythonDeclaration::Other,
+                    });
                 }
                 let (end, valid) =
                     python_quoted_end(bytes, index + prefix_len, quote, delimiter_len);
@@ -1678,8 +1701,57 @@ impl CodeView {
                             b' ' | b'\t' | 12 | b'\n' | b'\r' | b')' | b']' | b'}'
                         )
                     {
-                        statement_starts.push(line);
+                        statements.push(PythonStatement {
+                            start: line,
+                            end: line,
+                            declaration: PythonDeclaration::Start,
+                        });
                         line_start = false;
+                    }
+                    if let Some(statement) = statements.last_mut() {
+                        if matches!(
+                            statement.declaration,
+                            PythonDeclaration::Start
+                                | PythonDeclaration::Async
+                                | PythonDeclaration::Name
+                        ) && (bytes[index].is_ascii_alphabetic() || bytes[index] == b'_')
+                        {
+                            index += 1;
+                            while bytes.get(index).is_some_and(|byte| {
+                                byte.is_ascii_alphanumeric() || *byte == b'_' || *byte >= 128
+                            }) {
+                                index += 1;
+                            }
+                            statement.declaration =
+                                match (statement.declaration, &bytes[start..index]) {
+                                    (PythonDeclaration::Start, b"def" | b"class") => {
+                                        PythonDeclaration::Name
+                                    }
+                                    (PythonDeclaration::Start, b"async") => {
+                                        PythonDeclaration::Async
+                                    }
+                                    (PythonDeclaration::Start, _) => PythonDeclaration::Other,
+                                    (PythonDeclaration::Async, b"def") => PythonDeclaration::Name,
+                                    (PythonDeclaration::Async, b"for" | b"with") => {
+                                        PythonDeclaration::Other
+                                    }
+                                    (PythonDeclaration::Name, word) if word.is_ascii() => {
+                                        PythonDeclaration::Known
+                                    }
+                                    _ => PythonDeclaration::Unknown,
+                                };
+                            continue;
+                        }
+                        if statement.declaration == PythonDeclaration::Start {
+                            statement.declaration = PythonDeclaration::Other;
+                        } else if matches!(
+                            statement.declaration,
+                            PythonDeclaration::Async | PythonDeclaration::Name
+                        ) && !matches!(bytes[index], b' ' | b'\t' | 12 | b'\r' | b'\\')
+                            && !(bytes[index] == b'\n' && continued)
+                        {
+                            statement.declaration = PythonDeclaration::Unknown;
+                        }
                     }
                     if owner == SourceOwner::Python && matches!(bytes[index], b'(' | b'[' | b'{') {
                         if brackets.len() < 64 {
@@ -1741,6 +1813,15 @@ impl CodeView {
                     }
                 }
             }
+            // Masked strings/comments cannot complete a pending declaration.
+            if let Some(statement) = statements.last_mut() {
+                if matches!(
+                    statement.declaration,
+                    PythonDeclaration::Async | PythonDeclaration::Name
+                ) {
+                    statement.declaration = PythonDeclaration::Unknown;
+                }
+            }
             for byte in &mut code[start..index] {
                 if *byte != b'\n' && *byte != b'\r' {
                     *byte = b' ';
@@ -1761,7 +1842,7 @@ impl CodeView {
             // Incomplete projection remains useful for ranking, never for owner expansion.
             source_lines: (python_open && ownership_valid && brackets.is_empty())
                 .then(|| source.to_owned()),
-            statement_starts,
+            statements,
         })
     }
 }
@@ -2750,8 +2831,8 @@ fn rust_declaration_name(code_line: &str) -> Option<String> {
     None
 }
 
-// Python keywords are tokens separated by horizontal whitespace, not fixed
-// strings. Share this fact between ranking hints and logical owner boundaries.
+// Physical-line ranking hints only. Owner authority comes exclusively from
+// CodeView's complete logical statements, including continued declarations.
 fn python_declaration_name(code_line: &str) -> Option<String> {
     let mut rest = code_line.trim_start_matches([' ', '\t', '\x0c']);
     let mut keyword = || {
@@ -4443,6 +4524,108 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             "extension must stay in the admitted slot"
         );
         followed.evidence()[0].location().end_line()
+    }
+
+    #[test]
+    fn python_logical_preserves_non_declaration_async_suites() {
+        for suite in ["async for row in rows:", "async with lock:"] {
+            let source = format!("async def outer():\n    {suite}\n        value = 1\n    return value\nforeign = 2\n");
+            assert_eq!(python_owner_window(&source, 2, 2), 4);
+            let source = format!("async def outer():\n    {suite}\n        value = 1\n    # comment\n    return value\nforeign = 2\n");
+            assert_eq!(python_owner_window(&source, 2, 2), 5);
+        }
+    }
+
+    fn python_logical_declaration_cases(headers: &[&str]) {
+        for header in headers {
+            for (indent, body, newline) in [("    ", "        ", "\n"), ("\t", "\t\t", "\r\n")] {
+                let source = format!("def outer():\n{indent}{header}\n{body}value = 1\n{body}return_value = value\n{indent}foreign_statement = 2\n{indent}return foreign_statement\n").replace('\n', newline);
+                let last = header.lines().count() + 3;
+                for first in 2..last {
+                    assert!(
+                        python_owner_window(&source, first, first) == last,
+                        "complete logical declaration must exclude foreign outer statements"
+                    );
+                }
+                let decorated = source.replacen(
+                    &header.replace('\n', newline),
+                    &format!("@ready(\n{body}setting=True,\n{indent})\n{indent}{header}")
+                        .replace('\n', newline),
+                    1,
+                );
+                let header_end = header.lines().count() + 4;
+                assert!(
+                    python_owner_window(&decorated, 2, header_end) == last + 3,
+                    "decorator must resolve the same continued declaration"
+                );
+                assert!(
+                    python_owner_window(&decorated, 2, header_end - 1) == header_end - 1,
+                    "incomplete admitted header cannot authorize a future declaration"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn python_logical_split_def() {
+        python_logical_declaration_cases(&[
+            "def \\\n        admit_schema():",
+            "def\x0c\\\n\\\n        admit_schema():",
+            "def admit_schema\\\n        ():",
+        ]);
+    }
+
+    #[test]
+    fn python_logical_split_class() {
+        python_logical_declaration_cases(&[
+            "class \\\n        admit_schema:",
+            "class\t\\\n\\\n        admit_schema:",
+        ]);
+    }
+
+    #[test]
+    fn python_logical_split_async() {
+        python_logical_declaration_cases(&[
+            "async \\\n        def admit_schema():",
+            "async def \\\n        admit_schema():",
+            "async\x0c\\\n        def\t\\\n        admit_schema():",
+        ]);
+    }
+
+    #[test]
+    fn python_logical_unknown_cannot_inherit_outer_owner() {
+        for header in [
+            "async \\\n        class admit_schema:",
+            "def \\\n        # no declaration name\n        admit_schema():",
+            "def \\\n        'admit_schema'():",
+            "def \\\n        (admit_schema):",
+        ] {
+            let source = format!(
+                "def outer():\n    {header}\n        value = 1\n    foreign_statement = 2\n"
+            );
+            for first in 2..=header.lines().count() + 2 {
+                assert!(
+                    python_owner_window(&source, first, first) == first,
+                    "unknown declaration must abstain rather than inherit outer authority"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn python_logical_masked_declarations_and_multiline_signature() {
+        let source = "def outer(\n    setting=(1, # def fake():\n        2),\n):\n    literal = 'def \\\n        fake():'\n    # class fake:\n    return setting\nforeign_statement = 2\n";
+        for first in [1, 2, 4, 5, 6, 8] {
+            assert!(
+                python_owner_window(source, first, first) == 8,
+                "masked bytes must not introduce owners"
+            );
+        }
+        let bare = "def outer():\n    def admit_schema():\n        return 1\n    'bare literal'\n    foreign_statement = 2\n";
+        assert!(
+            python_owner_window(bare, 2, 2) == 3,
+            "bare literal must retain its dedent boundary"
+        );
     }
 
     #[test]
