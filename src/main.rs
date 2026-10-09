@@ -1258,16 +1258,13 @@ fn run_traced(
         }
         let expanded_report = if explanatory_question
             || type_field_subject(&query).is_some()
-            // Location questions retain their verified declaration windows;
-            // other Python questions may need the owning suite, not just why/how.
-            || (!query.trim_start().to_ascii_lowercase().starts_with("where ")
-                && report.evidence().iter().any(|item| {
-                    item.location()
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        == Some("py")
-                })) {
+            || report.evidence().iter().any(|item| {
+                item.location()
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    == Some("py")
+            }) {
             Some(
                 report
                     .clone()
@@ -2842,6 +2839,7 @@ mod tests {
         }
         for (question, start) in [
             (question, 2),
+            ("Where does admit_schema return its result?", 2),
             ("Guard binary schema admission readiness", body),
         ] {
             let found = search_repository(
@@ -3978,6 +3976,45 @@ mod tests {
         assert!(output
             .contains("- receipt.py:1 | target=exact_reuse_receipt | symbol=exact_reuse_receipt"));
         assert!(output.ends_with("  1: def exact_reuse_receipt():\n"));
+    }
+
+    #[test]
+    fn location_paraphrase_keeps_original_python_evidence() {
+        let root = env::temp_dir().join(format!(
+            "pbi-rs-location-paraphrase-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("receipt.py"),
+            "def exact_reuse_receipt():\n    return True\n",
+        )
+        .expect("source");
+        let guard = RouteConfigEnvGuard::new(&root, &[]);
+        let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1.";
+        let publisher = test_publisher(json!({
+            "answer": answer,
+            "uncertainty": "Only the verified source span was inspected.",
+            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+        }));
+        let mut output = Vec::new();
+        assert!(matches!(
+            run(
+                vec![
+                    "--message".to_owned(),
+                    "exact_reuse_receipt is where?".to_owned(),
+                ],
+                Some(TestRouteInjection::Publisher(&publisher)),
+                &mut output,
+            ),
+            Ok(0)
+        ));
+        assert_semantic_message_output(&output, answer);
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture");
     }
 
     #[test]

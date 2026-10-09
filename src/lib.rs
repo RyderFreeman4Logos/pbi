@@ -207,6 +207,7 @@ pub struct EvidenceReport {
     cited: Vec<usize>,
     followed_from: Vec<Option<usize>>,
     call_edges: Vec<(usize, usize)>,
+    original_windows: Vec<(usize, SourceEvidence)>,
 }
 
 impl EvidenceReport {
@@ -220,6 +221,7 @@ impl EvidenceReport {
             cited: vec![1; count],
             followed_from: vec![None; count],
             call_edges: Vec::new(),
+            original_windows: Vec::new(),
         }
     }
 
@@ -346,6 +348,16 @@ impl EvidenceReport {
             let snippet = lines[first - 1..end].join("\n");
             if snippet.len() > 4096 {
                 continue;
+            }
+            // Retain the verified location window without spending another
+            // model evidence slot. Body citations still use the expanded owner.
+            if owner == SourceOwner::Python
+                && !self
+                    .original_windows
+                    .iter()
+                    .any(|(saved, _)| *saved == index)
+            {
+                self.original_windows.push((index, item.clone()));
             }
             self.evidence[index] = SourceEvidence {
                 location: SourceLocation::new(path, first, end),
@@ -965,6 +977,7 @@ fn verify_probe_evidence_with_clock(
         cited,
         followed_from: vec![None; evidence_count],
         call_edges: Vec::new(),
+        original_windows: Vec::new(),
     })
 }
 
@@ -4263,6 +4276,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             cited: vec![5],
             followed_from: vec![None],
             call_edges: Vec::new(),
+            original_windows: Vec::new(),
         }
         .with_following_lines(&fixture.root, 3)
         .expect("bounded calls");
@@ -4306,6 +4320,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             cited: vec![2],
             followed_from: vec![None],
             call_edges: Vec::new(),
+            original_windows: Vec::new(),
         }
         .with_following_lines(&fixture.root, 2)
         .expect("bounded calls");
@@ -4338,6 +4353,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             cited: vec![1, 9],
             followed_from: vec![None, None],
             call_edges: Vec::new(),
+            original_windows: Vec::new(),
         }
         .with_following_lines(&fixture.root, 5)
         .expect("bounded call graph");

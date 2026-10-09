@@ -1036,6 +1036,26 @@ fn decode_answer(
             }
         }
     }
+    // Expansion admits body spans; it does not force a declaration citation to
+    // publish the whole body. Preserve its original evidence only when every
+    // selected span for that window fits, after all citation guards have run.
+    for (index, original) in &report.original_windows {
+        if selected.iter().any(|item| item.evidence_index == *index)
+            && selected
+                .iter()
+                .filter(|item| item.evidence_index == *index)
+                .all(|item| {
+                    original.location().start_line() <= item.start_line
+                        && item.end_line <= original.location().end_line()
+                })
+        {
+            for citation in &mut citations {
+                if citation == evidence[*index] {
+                    *citation = original.clone();
+                }
+            }
+        }
+    }
     Ok(SemanticAnswer {
         answer,
         uncertainty,
