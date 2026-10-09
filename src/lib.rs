@@ -283,8 +283,13 @@ impl EvidenceReport {
     ) -> Result<Self, EvidenceError> {
         let root = fs::canonicalize(root).map_err(|_| EvidenceError::SourceUnavailable)?;
         let count = max_total.saturating_sub(self.evidence.len());
-        for index in 0..count.min(self.evidence.len()) {
+        for index in 0..self.evidence.len().min(max_total) {
             let item = self.evidence[index].clone();
+            let owner = SourceOwner::for_path(item.location().path());
+            // Python extends in place, so it needs no spare evidence slot.
+            if index >= count && owner != SourceOwner::Python {
+                continue;
+            }
             let path = resolve_candidate_path(item.location().path(), &root)
                 .ok_or(EvidenceError::SourceOutsideRoot)?;
             if source_is_too_large(&path) {
@@ -296,55 +301,59 @@ impl EvidenceReport {
             if start > lines.len() {
                 continue;
             }
-            let owner = SourceOwner::for_path(&path);
-            let indent_of = |line: &str| line.len() - line.trim_start().len();
-            let anchor = item.location().start_line().saturating_sub(1);
-            let anchor_indent = lines.get(anchor).map(|line| indent_of(line)).unwrap_or(0);
-            let next_declaration = if owner == SourceOwner::Rust {
-                declaration_identity::declarations(&source)
-                    .into_iter()
-                    .map(|declaration| declaration.line)
-                    .find(|line| *line >= start)
+            let end = if owner == SourceOwner::Python {
+                let view =
+                    CodeView::bounded(&source, owner, Instant::now() + Duration::from_secs(8))
+                        .map_err(|_| EvidenceError::SourceUnavailable)?;
+                let Some(end) = python_owner_end(&view.code, item.location()) else {
+                    continue;
+                };
+                end
             } else {
-                lines.iter().enumerate().find_map(|(offset, line)| {
-                    (offset + 1 >= start
-                        && !line.trim().is_empty()
-                        && indent_of(line) <= anchor_indent
-                        && foreign_declaration_name(line, owner).is_some())
-                    .then_some(offset + 1)
-                })
+                let next_declaration =
+                    if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                        declaration_identity::declarations(&source)
+                            .into_iter()
+                            .map(|declaration| declaration.line)
+                            .find(|line| *line >= start)
+                    } else {
+                        None
+                    };
+                next_declaration
+                    .map(|line| line.saturating_sub(1))
+                    .unwrap_or(start.saturating_add(MAX_FOLLOWING_LINES - 1))
+                    .max(item.location().end_line())
+                    .min(lines.len())
             };
-            let end = next_declaration
-                .map(|line| line.saturating_sub(1))
-                .unwrap_or(start.saturating_add(MAX_FOLLOWING_LINES - 1))
-                .max(item.location().end_line())
-                .min(lines.len());
-            let first = if owner == SourceOwner::Rust {
-                item.location().start_line()
-            } else {
-                start
-            };
-            if owner != SourceOwner::Rust && (self.evidence.len() >= max_total || end < start) {
-                continue;
+            let first = item.location().start_line();
+            let mut bounded_end = end;
+            if owner == SourceOwner::Python {
+                let mut bytes = 0;
+                bounded_end = first - 1;
+                for line in &lines[first - 1..end] {
+                    let next = bytes + line.len() + usize::from(bounded_end >= first);
+                    if next > 4096 {
+                        break;
+                    }
+                    bytes = next;
+                    bounded_end += 1;
+                }
+                if bounded_end < item.location().end_line() {
+                    continue;
+                }
             }
+            let end = bounded_end;
             let snippet = lines[first - 1..end].join("\n");
             if snippet.len() > 4096 {
                 continue;
             }
-            let extended = SourceEvidence {
+            self.evidence[index] = SourceEvidence {
                 location: SourceLocation::new(path, first, end),
                 target: item.target().to_owned(),
                 snippet,
                 symbol: item.symbol().map(str::to_owned),
                 relevance: item.relevance().to_owned(),
             };
-            if owner == SourceOwner::Rust {
-                self.evidence[index] = extended;
-            } else {
-                self.evidence.push(extended);
-                self.cited.push(start);
-                self.followed_from.push(Some(index));
-            }
         }
         let root_device = fs::metadata(&root)
             .map_err(|_| EvidenceError::SourceUnavailable)?
@@ -1446,6 +1455,75 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
         add(&mut features, "unknown-field-handling");
     }
     features
+}
+
+// Reuse the byte/line-preserving projection, never raw string contents. This
+// conservative suite boundary is not a Python parser: unsupported continuation
+// shapes may shorten a window, but cannot justify crossing a dedent.
+fn python_owner_end(code: &str, location: &SourceLocation) -> Option<usize> {
+    let lines = code.lines().collect::<Vec<_>>();
+    let first = location.start_line().checked_sub(1)?;
+    let indent = |line: &str| {
+        line.bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | 12))
+            .fold(0, |column, byte| match byte {
+                b'\t' => (column / 8 + 1) * 8,
+                12 => 0,
+                _ => column + 1,
+            })
+    };
+    // A verified window may start at decorators rather than its declaration.
+    // Resolve only through the already-admitted prefix, never a future sibling.
+    let anchor = if lines.get(first)?.trim_start().starts_with('@') {
+        let column = indent(lines[first]);
+        let mut declaration = None;
+        for (index, line) in lines
+            .iter()
+            .enumerate()
+            .take(location.end_line())
+            .skip(first + 1)
+        {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if indent(line) != column {
+                return None;
+            }
+            if foreign_declaration_name(line, SourceOwner::Python).is_some() {
+                declaration = Some(index);
+                break;
+            }
+            if !line.trim_start().starts_with('@') {
+                return None;
+            }
+        }
+        declaration?
+    } else {
+        first
+    };
+    let mut owners = Vec::new();
+    for line in lines.get(..=anchor)? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let column = indent(line);
+        while owners.last().is_some_and(|owner| *owner >= column) {
+            owners.pop();
+        }
+        if foreign_declaration_name(line, SourceOwner::Python).is_some() {
+            owners.push(column);
+        }
+    }
+    let owner = *owners.last()?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(anchor + 1)
+        .find_map(|(index, line)| {
+            (!line.trim().is_empty() && indent(line) <= owner).then_some(index)
+        })
+        .unwrap_or(lines.len());
+    (end >= location.end_line()).then_some(end)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -4047,6 +4125,103 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         assert!(
             selected.contains("can_retry = outage_hold::wait(runtime).await"),
             "assignment use left the module stop path: {selected}"
+        );
+    }
+
+    #[test]
+    fn python_follow_keeps_strings_and_signature_in_one_window() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("guard.py");
+        let source = "def admit(evidence):\n    binding = evidence\n    text = r\"\"\"\ndef fake_sibling():\n    return False\n\"\"\"\n    def nested():\n        return binding\n    return nested()\n\n@ready\ndef sibling():\n    return False\n";
+        fs::write(&path, source).expect("write fixture");
+        let mut report = EvidenceReport::from_admitted(vec![SourceEvidence::admitted(
+            path.clone(),
+            "admit",
+            "",
+            Some("admit".to_owned()),
+            "",
+        )]);
+        report.evidence[0].location = SourceLocation::new(path, 1, 2);
+        let followed = report
+            .with_following_lines(&fixture.root, 8)
+            .unwrap_or_else(|_| panic!("follow must succeed"));
+        assert!(
+            followed
+                .evidence()
+                .iter()
+                .any(|item| item.snippet().contains("return nested()")),
+            "string pseudo-declaration must not cut off the return"
+        );
+        assert!(
+            followed
+                .evidence()
+                .iter()
+                .any(|item| item.location().start_line() == 1 && item.location().end_line() >= 9),
+            "signature and body must share one admitted window"
+        );
+        assert!(
+            followed
+                .evidence()
+                .iter()
+                .all(|item| item.location().end_line() < 11),
+            "sibling decorator and declaration must remain outside the window"
+        );
+    }
+
+    #[test]
+    fn python_follow_resolves_interior_and_nested_owners() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("guard.py");
+        let source = "class Guard:\n\tasync def admit(self):\n\t\tbinding = 1\n\t\tdef nested():\n\t\t\tvalue = binding\n\t\t\treturn value\n\t\treturn nested()\n\t@ready\n\tdef sibling(self):\n\t\treturn False\n";
+        fs::write(&path, source).expect("write fixture");
+        for (first, last, end) in [(2, 3, 7), (3, 3, 7), (4, 5, 6), (5, 5, 6)] {
+            let mut report = EvidenceReport::from_admitted(vec![SourceEvidence::admitted(
+                path.clone(),
+                "admit",
+                "",
+                None,
+                "",
+            )]);
+            report.evidence[0].location = SourceLocation::new(path.clone(), first, last);
+            let followed = report
+                .with_following_lines(&fixture.root, 8)
+                .unwrap_or_else(|_| panic!("follow must succeed"));
+            assert!(
+                followed.evidence().len() == 1,
+                "extension must not spend another evidence slot"
+            );
+            assert!(
+                followed.evidence()[0].location().start_line() == first
+                    && followed.evidence()[0].location().end_line() == end,
+                "extension must stop at the owning suite boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn python_follow_obeys_byte_and_slot_caps_at_eof() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("guard.py");
+        let source = format!(
+            "def admit():\n    binding = 1\n{}    return binding\n",
+            "    binding += 1\n".repeat(400)
+        );
+        fs::write(&path, &source).expect("write fixture");
+        let item = SourceEvidence::admitted(path.clone(), "admit", "def admit():", None, "");
+        let report = EvidenceReport::from_admitted(vec![item; 8]);
+        let followed = report
+            .with_following_lines(&fixture.root, 8)
+            .unwrap_or_else(|_| panic!("follow must succeed"));
+        assert!(
+            followed.evidence().len() == 8,
+            "extension must retain the evidence cap"
+        );
+        assert!(
+            followed
+                .evidence()
+                .iter()
+                .all(|item| item.snippet().len() <= 4096 && item.location().end_line() > 9),
+            "a full inventory must retain a bounded body prefix"
         );
     }
 

@@ -1256,13 +1256,30 @@ fn run_traced(
                 "semantic investigation exceeded its bounded deadline",
             ));
         }
-        let expanded_report = report
-            .clone()
-            .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
-            .map_err(|error| {
-                trace.point(TraceStage::Follow, TraceStatus::OtherError, 0);
-                evidence_cli_error(error)
-            })?;
+        let expanded_report = if explanatory_question
+            || type_field_subject(&query).is_some()
+            // Location questions retain their verified declaration windows;
+            // other Python questions may need the owning suite, not just why/how.
+            || (!query.trim_start().to_ascii_lowercase().starts_with("where ")
+                && report.evidence().iter().any(|item| {
+                    item.location()
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        == Some("py")
+                })) {
+            Some(
+                report
+                    .clone()
+                    .with_following_lines(&root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
+                    .map_err(|error| {
+                        trace.point(TraceStage::Follow, TraceStatus::OtherError, 0);
+                        evidence_cli_error(error)
+                    })?,
+            )
+        } else {
+            None
+        };
         if Instant::now() >= deadline {
             trace.point(
                 TraceStage::Follow,
@@ -1273,7 +1290,7 @@ fn run_traced(
                 "semantic investigation exceeded its bounded deadline",
             ));
         }
-        let report = &expanded_report;
+        let report = expanded_report.as_ref().unwrap_or(&report);
         trace.point(TraceStage::Follow, TraceStatus::Ok, report.evidence().len());
         if let Some(publisher) = publisher {
             let cancellation = ModelRouteCancellation::new();
@@ -2751,7 +2768,7 @@ mod tests {
         // Past the old eight-line cap: decorator, blank line, indent, nested def.
         let lines = [
             "@ready",
-            "def admit(evidence):",
+            "def admit_schema(evidence):",
             "    binding = evidence.get(\"schema\")",
             "",
             "    if binding is None:",
@@ -2761,8 +2778,13 @@ mod tests {
             "    ready = nested()",
             "    checked = ready",
             "    held = checked",
+            "    text = r\"\"\"",
+            "def fake_sibling():",
+            "    return False",
+            "\"\"\"",
             "    return held",
             "",
+            "@ready",
             "def wait_ready(before):",
             "    return before",
         ];
@@ -2779,56 +2801,123 @@ mod tests {
             + 1;
         assert!(body > 8, "fixture must outrun the old fixed window");
         fs::write(root.join("guard.py"), source).expect("guard source");
-        let question = "Guard binary schema admission readiness";
-        let publisher = test_publisher(json!({
-            "answer": "Schema admission raises Hold when the binding is missing.",
-            "uncertainty": "Only the verified source was inspected.",
-            "citations": [{"path": "guard.py", "start_line": next_fn, "end_line": next_fn}]
-        }));
-        let mut output = Vec::new();
-        let error = run(
-            vec![question.to_owned()],
-            Some(TestRouteInjection::Publisher(&publisher)),
-            &mut output,
+        let question = "What does admit_schema do?";
+        let found = search_repository(
+            root,
+            question,
+            &SearchLimits {
+                deadline: Instant::now() + Duration::from_secs(8),
+                max_results: DEFAULT_MAX_RESULTS,
+                language: None,
+                ignores: Vec::new(),
+            },
         )
-        .expect_err("the next function stays citation_span");
+        .unwrap_or_else(|_| panic!("fixture search must succeed"));
+        let admitted = verify_probe_evidence(&found, root, question, DEFAULT_MAX_RESULTS)
+            .unwrap_or_else(|_| panic!("fixture verification must succeed"));
         assert!(
-            error.message.contains("reason=citation_span"),
-            "{}",
-            error.message
+            admitted
+                .evidence()
+                .iter()
+                .any(|item| item.location().start_line() <= 2 && item.location().end_line() < body),
+            "fixture must admit the signature before following the body"
         );
-        assert!(output.is_empty());
-        let grounded = test_publisher(json!({
-            "answer": "Schema admission raises Hold when the binding is missing.",
-            "uncertainty": "Only the verified source was inspected.",
-            "citations": [{"path": "guard.py", "start_line": body, "end_line": body}]
-        }));
-        let mut grounded_output = Vec::new();
-        let published = run(
-            vec![question.to_owned()],
-            Some(TestRouteInjection::Publisher(&grounded)),
-            &mut grounded_output,
-        );
-        assert!(
-            matches!(published, Ok(0)),
-            "body line of the admitted function must verify: {}",
-            published
-                .as_ref()
-                .err()
-                .map(|error| error.message.as_str())
-                .unwrap_or("ok")
-        );
-        let text = String::from_utf8(grounded_output).expect("utf8");
-        assert!(
-            text.lines().any(|line| line.starts_with("guard.py:") && {
-                let range = line.trim_start_matches("guard.py:");
-                let mut parts = range.split('-');
-                let start = parts.next().and_then(|value| value.parse::<usize>().ok());
-                let end = parts.next().and_then(|value| value.parse::<usize>().ok());
-                start.is_some_and(|start| start <= body) && end.is_some_and(|end| body <= end)
-            }),
-            "published window must cover the function body: {text}"
-        );
+        for rejected_line in [next_fn - 1, next_fn] {
+            let publisher = test_publisher(json!({
+                "answer": "Schema admission raises Hold when the binding is missing.",
+                "uncertainty": "Only the verified source was inspected.",
+                "citations": [{"path": "guard.py", "start_line": rejected_line, "end_line": rejected_line}]
+            }));
+            let mut output = Vec::new();
+            let rejected = run(
+                vec![question.to_owned()],
+                Some(TestRouteInjection::Publisher(&publisher)),
+                &mut output,
+            );
+            assert!(
+                matches!(rejected, Err(CliError { code: 1, ref message, .. }) if message.contains("reason=citation_span")),
+                "the next function must remain outside the admitted span"
+            );
+            assert!(output.is_empty());
+        }
+        for (question, start) in [
+            (question, 2),
+            ("Guard binary schema admission readiness", body),
+        ] {
+            let found = search_repository(
+                root,
+                question,
+                &SearchLimits {
+                    deadline: Instant::now() + Duration::from_secs(8),
+                    max_results: DEFAULT_MAX_RESULTS,
+                    language: None,
+                    ignores: Vec::new(),
+                },
+            )
+            .unwrap_or_else(|_| panic!("positive search failed"));
+            let report = verify_probe_evidence(&found, root, question, DEFAULT_MAX_RESULTS)
+                .unwrap_or_else(|_| panic!("positive admission failed"));
+            assert!(
+                !question_code_anchor_missing(question, &report),
+                "positive anchor missing"
+            );
+            let followed = report
+                .with_following_lines(root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
+                .unwrap_or_else(|_| panic!("positive owner expansion failed"));
+            if start == 2 {
+                assert!(
+                    followed
+                        .evidence()
+                        .iter()
+                        .any(|item| item.location().start_line() <= start
+                            && body <= item.location().end_line()),
+                    "signature case lost at owner expansion"
+                );
+            } else {
+                assert!(
+                    followed
+                        .evidence()
+                        .iter()
+                        .any(|item| item.location().start_line() <= start
+                            && body <= item.location().end_line()),
+                    "keyword case lost at owner expansion"
+                );
+            }
+            let grounded = test_publisher(json!({
+                "answer": "Schema admission raises Hold when the binding is missing.",
+                "uncertainty": "Only the verified source was inspected.",
+                "citations": [{"path": "guard.py", "start_line": start, "end_line": body}]
+            }));
+            let mut grounded_output = Vec::new();
+            let published = run(
+                vec![question.to_owned()],
+                Some(TestRouteInjection::Publisher(&grounded)),
+                &mut grounded_output,
+            );
+            match published {
+                Ok(0) => (),
+                Err(CliError { ref message, .. }) if message.contains("reason=citation_span") => {
+                    panic!("positive publication rejected citation span")
+                }
+                Err(CliError { ref message, .. }) if message.contains("reason=stop_id") => {
+                    panic!("positive publication requires stop id")
+                }
+                Err(_) => panic!("positive publication failed outside citation span or stop id"),
+                Ok(_) => panic!("positive publication returned nonzero"),
+            }
+            let text = String::from_utf8(grounded_output)
+                .unwrap_or_else(|_| panic!("answer must be UTF-8"));
+            assert!(
+                text.lines().any(|line| line.starts_with("guard.py:") && {
+                    let range = line.trim_start_matches("guard.py:");
+                    let mut parts = range.split('-');
+                    let start = parts.next().and_then(|value| value.parse::<usize>().ok());
+                    let end = parts.next().and_then(|value| value.parse::<usize>().ok());
+                    start.is_some_and(|start| start <= body) && end.is_some_and(|end| body <= end)
+                }),
+                "published window must cover the function body"
+            );
+        }
     }
 
     fn publish_answer_body_citations(root: &Path, question: &str) {
