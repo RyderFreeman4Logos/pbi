@@ -299,6 +299,15 @@ impl EvidenceReport {
             }
             let source = fs::read_to_string(&path).map_err(|_| EvidenceError::SourceUnavailable)?;
             let lines = source.lines().collect::<Vec<_>>();
+            // Restored narrow citations and expanded citations must describe
+            // the same verified bytes, not merely the same line numbers.
+            if owner == SourceOwner::Python
+                && lines
+                    .get(item.location().start_line().saturating_sub(1)..item.location().end_line())
+                    .is_none_or(|range| range.join("\n") != item.snippet())
+            {
+                return Err(EvidenceError::SourceUnavailable);
+            }
             let start = item.location().end_line().saturating_add(1);
             if start > lines.len() {
                 continue;
@@ -1491,19 +1500,18 @@ fn python_owner_end(view: &CodeView, location: &SourceLocation) -> Option<usize>
     let anchor = if lines.get(first)?.trim_start().starts_with('@') {
         let column = indent(lines[first]);
         let mut declaration = None;
-        for (index, line) in source_lines
+        for line_number in view
+            .statement_starts
             .iter()
-            .enumerate()
-            .take(first + 8)
-            .skip(first + 1)
+            .copied()
+            .filter(|line| *line > first + 1 && *line <= location.end_line())
         {
-            if line.trim().is_empty() {
-                continue;
-            }
+            let index = line_number - 1;
+            let line = source_lines.get(index)?;
             if indent(line) != column {
                 return None;
             }
-            if foreign_declaration_name(line, SourceOwner::Python).is_some() {
+            if python_declaration_name(lines.get(index)?).is_some() {
                 declaration = Some(index);
                 break;
             }
@@ -1527,7 +1535,7 @@ fn python_owner_end(view: &CodeView, location: &SourceLocation) -> Option<usize>
         while owners.last().is_some_and(|owner| *owner >= column) {
             owners.pop();
         }
-        if foreign_declaration_name(line, SourceOwner::Python).is_some() {
+        if python_declaration_name(lines.get(line_number - 1)?).is_some() {
             owners.push(column);
         }
     }
@@ -1607,9 +1615,6 @@ impl CodeView {
         let mut line_start = true;
         let python_open = owner == SourceOwner::Python;
         while index < bytes.len() {
-            if python_open && brackets.len() > 64 {
-                return Err(());
-            }
             let start = index;
             if (owner == SourceOwner::Python && bytes[index] == b'#')
                 || (owner != SourceOwner::Python && bytes[index..].starts_with(b"//"))
@@ -1677,14 +1682,17 @@ impl CodeView {
                         line_start = false;
                     }
                     if owner == SourceOwner::Python && matches!(bytes[index], b'(' | b'[' | b'{') {
-                        brackets.push(bytes[index]);
+                        if brackets.len() < 64 {
+                            brackets.push(bytes[index]);
+                        } else {
+                            ownership_valid = false;
+                        }
                     } else if owner == SourceOwner::Python
                         && matches!(bytes[index], b')' | b']' | b'}')
                     {
-                        let open = brackets.pop().ok_or(())?;
                         ownership_valid &= matches!(
-                            (open, bytes[index]),
-                            (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                            (brackets.pop(), bytes[index]),
+                            (Some(b'('), b')') | (Some(b'['), b']') | (Some(b'{'), b'}')
                         );
                     } else if owner == SourceOwner::Python && bytes[index] == b'\\' {
                         let mut ahead = index + 1;
@@ -2742,6 +2750,26 @@ fn rust_declaration_name(code_line: &str) -> Option<String> {
     None
 }
 
+// Python keywords are tokens separated by horizontal whitespace, not fixed
+// strings. Share this fact between ranking hints and logical owner boundaries.
+fn python_declaration_name(code_line: &str) -> Option<String> {
+    let mut rest = code_line.trim_start_matches([' ', '\t', '\x0c']);
+    let mut keyword = || {
+        let (word, tail) = rest.split_once([' ', '\t', '\x0c'])?;
+        rest = tail.trim_start_matches([' ', '\t', '\x0c']);
+        Some(word)
+    };
+    let first = keyword()?;
+    if first == "async" {
+        if keyword()? != "def" {
+            return None;
+        }
+    } else if !matches!(first, "def" | "class") {
+        return None;
+    }
+    identifier_head(rest)
+}
+
 fn foreign_declaration_name(code_line: &str, owner: SourceOwner) -> Option<String> {
     let trimmed = code_line.trim_start();
     if trimmed.starts_with("```") || trimmed.starts_with('#') {
@@ -2749,7 +2777,7 @@ fn foreign_declaration_name(code_line: &str, owner: SourceOwner) -> Option<Strin
     }
     // These are window-ranking hints, not complete declaration grammars.
     let keywords: &[&str] = match owner {
-        SourceOwner::Python => &["class ", "def ", "async def "],
+        SourceOwner::Python => return python_declaration_name(trimmed),
         SourceOwner::JavaScript | SourceOwner::TypeScript => {
             &["class ", "function ", "async function "]
         }
@@ -4299,6 +4327,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             "",
         )]);
         report.evidence[0].location = SourceLocation::new(path, 1, 2);
+        report.evidence[0].snippet = source.lines().take(2).collect::<Vec<_>>().join("\n");
         let followed = report
             .with_following_lines(&fixture.root, 8)
             .unwrap_or_else(|_| panic!("follow must succeed"));
@@ -4340,6 +4369,12 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
                 "",
             )]);
             report.evidence[0].location = SourceLocation::new(path.clone(), first, last);
+            report.evidence[0].snippet = source
+                .lines()
+                .skip(first - 1)
+                .take(last - first + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
             let followed = report
                 .with_following_lines(&fixture.root, 8)
                 .unwrap_or_else(|_| panic!("follow must succeed"));
@@ -4394,6 +4429,12 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             "",
         )]);
         report.evidence[0].location = SourceLocation::new(path, start, end);
+        report.evidence[0].snippet = source
+            .lines()
+            .skip(start - 1)
+            .take(end - start + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
         let followed = report
             .with_following_lines(&fixture.root, 8)
             .unwrap_or_else(|_| panic!("follow must succeed"));
@@ -4402,6 +4443,138 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             "extension must stay in the admitted slot"
         );
         followed.evidence()[0].location().end_line()
+    }
+
+    #[test]
+    fn python_four_class_projection_abstains_without_losing_lexical_consumers() {
+        for source in [
+            "def admit_schema():\n    return 1\n)\n".to_owned(),
+            format!(
+                "def admit_schema():\n    return {}1{}\n",
+                "(".repeat(65),
+                ")".repeat(65)
+            ),
+        ] {
+            let view = CodeView::bounded(
+                &source,
+                SourceOwner::Python,
+                Instant::now() + Duration::from_secs(8),
+            );
+            assert!(view.is_ok(), "ownership limits must preserve projection");
+            let view = view.unwrap_or_else(|_| panic!("projection required"));
+            assert!(
+                view.code.contains("def admit_schema"),
+                "declaration must remain searchable"
+            );
+            let (anchors, _) = foreign_search_anchors(
+                &source,
+                Path::new("guard.py"),
+                &["admit_schema".to_owned()],
+            );
+            assert!(
+                anchors.iter().any(|(line, _)| *line == 1),
+                "existing search hints must survive owner abstention"
+            );
+            let fixture = Fixture::new();
+            let path = fixture.root.join("guard.py");
+            fs::write(&path, &source).expect("write fixture");
+            assert!(
+                verify_probe_evidence(
+                    &format!("File: {}, Lines: 1-1\n", path.display()),
+                    &fixture.root,
+                    "admit_schema",
+                    8
+                )
+                .is_ok(),
+                "existing verification must survive owner abstention"
+            );
+            assert!(
+                python_owner_end(&view, &SourceLocation::new(PathBuf::from("guard.py"), 1, 1))
+                    .is_none(),
+                "unsupported ownership must abstain"
+            );
+        }
+    }
+
+    #[test]
+    fn python_four_class_declaration_whitespace_preserves_nested_ownership() {
+        for declaration in [
+            "def  admit_schema():",
+            "def\tadmit_schema():",
+            "class  admit_schema:",
+            "class\tadmit_schema:",
+            "async  def\tadmit_schema():",
+            "async\tdef  admit_schema():",
+        ] {
+            let source = format!("def outer():\n    {declaration}\n        value = 1\n        return_value = value\n    foreign_statement = 2\n    return foreign_statement\n");
+            let (anchors, _) = foreign_search_anchors(
+                &source,
+                Path::new("guard.py"),
+                &["admit_schema".to_owned()],
+            );
+            assert!(
+                anchors.iter().any(|(line, _)| *line == 2),
+                "ranking and ownership must share declaration facts"
+            );
+            for first in [2, 3] {
+                assert!(
+                    python_owner_window(&source, first, first) == 4,
+                    "nested owner must exclude foreign outer statements"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn python_four_class_decorators_use_only_admitted_logical_prefix() {
+        for prefix in [
+            "@ready(\n    setting=True,\n)\n".to_owned(),
+            "@ready\n".repeat(12),
+        ] {
+            let declaration = prefix.lines().count() + 1;
+            let source = format!(
+                "{prefix}def admit_schema():\n    return 1\ndef sibling():\n    return False\n"
+            );
+            assert!(
+                python_owner_window(&source, 1, declaration) == declaration + 1,
+                "admitted decorator prefix must include its body"
+            );
+            assert!(
+                python_owner_window(&source, 1, declaration - 1) == declaration - 1,
+                "future declaration cannot authorize expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn python_four_class_changed_snapshot_fails_before_synthesis() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("guard.py");
+        let old = "def admit_schema(old):\n    return old\n";
+        fs::write(&path, old).expect("write fixture");
+        let report = verify_probe_evidence(
+            &format!("File: {}, Lines: 1-1\n", path.display()),
+            &fixture.root,
+            "admit_schema",
+            8,
+        )
+        .unwrap_or_else(|_| panic!("verified fixture required"));
+        let stable = report
+            .clone()
+            .with_following_lines(&fixture.root, 8)
+            .unwrap_or_else(|_| panic!("stable snapshot must follow"));
+        assert!(
+            stable
+                .evidence()
+                .iter()
+                .all(|item| item.snippet().contains("old")),
+            "stable follow must retain verified bytes"
+        );
+        fs::write(&path, "def admit_schema(new):\n    return new\n").expect("mutate fixture");
+        assert!(
+            report.with_following_lines(&fixture.root, 8).is_err(),
+            "changed verified range must fail before synthesis"
+        );
     }
 
     #[test]
@@ -4473,7 +4646,7 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         );
         let decorated =
             "@ready\ndef admit_schema():\n    return 1\ndef sibling():\n    return False\n";
-        let decorated_end = python_owner_window(decorated, 1, 1);
+        let decorated_end = python_owner_window(decorated, 1, 2);
         assert!(
             decorated_end == 3,
             "a decorator window ends before the sibling: got {decorated_end}"
