@@ -82,7 +82,7 @@ pub fn foreign_search_anchors_bounded(
         if tokenized(line).iter().any(|part| terms.contains(part)) {
             components.push(index + 1);
         }
-        if let Some(name) = foreign_declaration_name(line, owner) {
+        if let Some(name) = view.declaration_name(line, owner, index + 1) {
             let parts = tokenized(&name);
             let matches = terms
                 .iter()
@@ -826,7 +826,7 @@ fn verify_probe_evidence_with_clock(
                 &groups,
                 relative,
                 &path,
-                (&lines, &view.code),
+                (&lines, &view),
                 raw_order,
                 max_results,
             ));
@@ -1485,7 +1485,11 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
 fn python_owner_end(view: &CodeView, location: &SourceLocation) -> Option<usize> {
     let lines = view.code.lines().collect::<Vec<_>>();
     let source_lines = view.source_lines.as_ref()?.lines().collect::<Vec<_>>();
-    let first = location.start_line().checked_sub(1)?;
+    // Resolve every physical anchor through the same complete logical interval.
+    let first = view
+        .statement(location.start_line())?
+        .start
+        .checked_sub(1)?;
     let indent = |line: &str| {
         line.bytes()
             .take_while(|byte| matches!(byte, b' ' | b'\t' | 12))
@@ -1592,6 +1596,7 @@ struct PythonStatement {
     start: usize,
     end: usize,
     declaration: PythonDeclaration,
+    name: Option<String>,
 }
 
 struct CodeView {
@@ -1601,6 +1606,23 @@ struct CodeView {
 }
 
 impl CodeView {
+    fn statement(&self, line: usize) -> Option<&PythonStatement> {
+        let index = self
+            .statements
+            .partition_point(|statement| statement.end < line);
+        self.statements
+            .get(index)
+            .filter(|statement| statement.start <= line)
+    }
+
+    fn declaration_name(&self, code_line: &str, owner: SourceOwner, line: usize) -> Option<String> {
+        if owner == SourceOwner::Python {
+            self.statement(line)?.name.clone()
+        } else {
+            foreign_declaration_name(code_line, owner)
+        }
+    }
+
     // Byte-preserving lexical projection; semantic proof uses the syntax tree.
     // Mask bytes, not lines, so every window still addresses the original source.
     #[cfg(test)]
@@ -1664,6 +1686,7 @@ impl CodeView {
                         start: line,
                         end: line,
                         declaration: PythonDeclaration::Other,
+                        name: None,
                     });
                 }
                 let (end, valid) =
@@ -1705,6 +1728,7 @@ impl CodeView {
                             start: line,
                             end: line,
                             declaration: PythonDeclaration::Start,
+                            name: None,
                         });
                         line_start = false;
                     }
@@ -1736,6 +1760,7 @@ impl CodeView {
                                         PythonDeclaration::Other
                                     }
                                     (PythonDeclaration::Name, word) if word.is_ascii() => {
+                                        statement.name = Some(source[start..index].to_owned());
                                         PythonDeclaration::Known
                                     }
                                     _ => PythonDeclaration::Unknown,
@@ -2245,13 +2270,14 @@ fn best_windows(
     all_groups: &[QueryGroup],
     relative: &Path,
     path: &Path,
-    views: (&[&str], &str),
+    views: (&[&str], &CodeView),
     order: usize,
     max_results: usize,
 ) -> Vec<ScoredEvidence> {
     #[cfg(test)]
     WINDOW_SCANS.with(|scans| scans.set(scans.get() + 1));
-    let (lines, code) = views;
+    let (lines, view) = views;
+    let code = &view.code;
     let test_candidate = test_path(relative);
     let all_terms = all_groups
         .iter()
@@ -2381,6 +2407,7 @@ fn best_windows(
                         relative,
                         start + offset + 1,
                         &declarations,
+                        view,
                     )
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&group.terms[0]))
@@ -2402,6 +2429,7 @@ fn best_windows(
                         start + offset,
                         relative,
                         &declarations,
+                        view,
                     )
                 });
             if (group.definition || definition_request_shape(&raw_query_tokens(&group.label)))
@@ -2442,6 +2470,7 @@ fn best_windows(
                         start + offset,
                         relative,
                         &declarations,
+                        view,
                     )
                 });
                 if !signature {
@@ -2501,6 +2530,7 @@ fn best_windows(
                             relative,
                             start + offset + 1,
                             &declarations,
+                            view,
                         )
                         .iter()
                         .any(|name| same_name(name, group))
@@ -2522,12 +2552,14 @@ fn best_windows(
                         start + offset,
                         relative,
                         &declarations,
+                        view,
                     ) || declaration_names(
                         line,
                         code_lines[start + offset],
                         relative,
                         start + offset + 1,
                         &declarations,
+                        view,
                     )
                     .iter()
                     .any(|name| same_name(name, group))
@@ -2563,6 +2595,7 @@ fn best_windows(
                         start + offset,
                         relative,
                         &declarations,
+                        view,
                     )
                     .then(|| {
                         declaration_names(
@@ -2571,6 +2604,7 @@ fn best_windows(
                             relative,
                             start + offset + 1,
                             &declarations,
+                            view,
                         )
                         .into_iter()
                         .find(|name| name == group.symbol.as_deref().unwrap_or(name))
@@ -2744,6 +2778,7 @@ fn defines_requested(
     index: usize,
     relative: &Path,
     declarations: &[declaration_identity::Declaration],
+    view: &CodeView,
 ) -> bool {
     let code_line = code_lines.get(index).copied().unwrap_or("");
     if !group.definition || code_line.trim().is_empty() {
@@ -2752,7 +2787,7 @@ fn defines_requested(
     let Some(symbol) = &group.symbol else {
         return false;
     };
-    let names = declaration_names(line, code_line, relative, index + 1, declarations);
+    let names = declaration_names(line, code_line, relative, index + 1, declarations, view);
     let declared = names.iter().any(|name| rust_identity_matches(name, symbol));
     if !declared {
         return false;
@@ -2775,6 +2810,7 @@ fn declaration_names(
     relative: &Path,
     line_number: usize,
     declarations: &[declaration_identity::Declaration],
+    view: &CodeView,
 ) -> Vec<String> {
     let rust = relative
         .extension()
@@ -2794,7 +2830,7 @@ fn declaration_names(
         }
         return rust_declaration_name(code_line).into_iter().collect();
     }
-    foreign_declaration_name(code_line, SourceOwner::for_path(relative))
+    view.declaration_name(code_line, SourceOwner::for_path(relative), line_number)
         .into_iter()
         .collect()
 }
@@ -2831,26 +2867,6 @@ fn rust_declaration_name(code_line: &str) -> Option<String> {
     None
 }
 
-// Physical-line ranking hints only. Owner authority comes exclusively from
-// CodeView's complete logical statements, including continued declarations.
-fn python_declaration_name(code_line: &str) -> Option<String> {
-    let mut rest = code_line.trim_start_matches([' ', '\t', '\x0c']);
-    let mut keyword = || {
-        let (word, tail) = rest.split_once([' ', '\t', '\x0c'])?;
-        rest = tail.trim_start_matches([' ', '\t', '\x0c']);
-        Some(word)
-    };
-    let first = keyword()?;
-    if first == "async" {
-        if keyword()? != "def" {
-            return None;
-        }
-    } else if !matches!(first, "def" | "class") {
-        return None;
-    }
-    identifier_head(rest)
-}
-
 fn foreign_declaration_name(code_line: &str, owner: SourceOwner) -> Option<String> {
     let trimmed = code_line.trim_start();
     if trimmed.starts_with("```") || trimmed.starts_with('#') {
@@ -2858,7 +2874,7 @@ fn foreign_declaration_name(code_line: &str, owner: SourceOwner) -> Option<Strin
     }
     // These are window-ranking hints, not complete declaration grammars.
     let keywords: &[&str] = match owner {
-        SourceOwner::Python => return python_declaration_name(trimmed),
+        SourceOwner::Python => return None,
         SourceOwner::JavaScript | SourceOwner::TypeScript => {
             &["class ", "function ", "async function "]
         }
@@ -3023,7 +3039,7 @@ mod tests {
             assert_eq!(components, [3]);
             let code_line = view.code.lines().nth(2).expect("real declaration");
             assert_eq!(
-                declaration_names(declaration, code_line, &path, 3, &[]),
+                declaration_names(declaration, code_line, &path, 3, &[], &view),
                 ["plugin_source_ranker"]
             );
             for foreign in [
@@ -3032,7 +3048,12 @@ mod tests {
                 "int plugin_source_ranker() {}",
             ] {
                 assert_eq!(
-                    foreign_declaration_name(foreign, owner).is_some(),
+                    if owner == SourceOwner::Python {
+                        CodeView::new(foreign, owner).declaration_name(foreign, owner, 1)
+                    } else {
+                        foreign_declaration_name(foreign, owner)
+                    }
+                    .is_some(),
                     foreign == declaration
                 );
             }
@@ -3582,7 +3603,7 @@ function real() {}"#,
             &groups,
             Path::new("src/proxy.rs"),
             Path::new("src/proxy.rs"),
-            (&lines, &CodeView::new(&source, SourceOwner::Rust).code),
+            (&lines, &CodeView::new(&source, SourceOwner::Rust)),
             0,
             8,
         );
@@ -4524,6 +4545,99 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
             "extension must stay in the admitted slot"
         );
         followed.evidence()[0].location().end_line()
+    }
+
+    #[test]
+    fn python_anchor_interval_decorator_ranges() {
+        for prefix in [
+            "    @ready(\n        lambda: admit_schema(),\n    )\n".to_owned(),
+            "    @ready(\n        call(\n            '# def fake():',\n            # @fake\n            1,\n        ),\n    )\n    @other(\n        True,\n    )\n".to_owned(),
+            format!("    @ready(\n{}    )\n", "        None,\n".repeat(14)),
+        ] {
+            for header in [
+                "    def \\\n        admit_schema():\n",
+                "    async \\\n        def admit_schema(\n            setting=True,\n        ):\n",
+                "    class \\\n        admit_schema(\n            object,\n        ):\n",
+            ] {
+                let source = format!("def outer():\n{prefix}{header}        value = 1\n        return_value = value\n    foreign_statement = 2\n    return foreign_statement\ndef sibling():\n    pass\n");
+                let declaration = prefix.lines().count() + 2;
+                let header_end = declaration + header.lines().count() - 1;
+                let owner_end = header_end + 2;
+                for first in 2..=header_end {
+                    for last in first..=header_end {
+                        let expected = if first < declaration && last < header_end {
+                            last
+                        } else {
+                            owner_end
+                        };
+                        assert!(
+                            python_owner_window(&source, first, last) == expected,
+                            "all decorator/signature anchors must use one admitted logical owner"
+                        );
+                    }
+                }
+                assert!(
+                    python_owner_window(&source, header_end + 1, header_end + 1) == owner_end,
+                    "body anchor must retain the nested owner"
+                );
+                assert!(
+                    python_owner_window(&source, owner_end + 1, owner_end + 1) == owner_end + 2,
+                    "post-body anchor must not inherit the ended nested owner"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn python_anchor_interval_unknown_and_interrupted_decorators() {
+        for tail in [
+            "    assignment = 1\n    def admit_schema():\n        pass\n",
+            "    async \\\n        class admit_schema:\n        pass\n",
+            "    def \\\n        'admit_schema'():\n        pass\n",
+        ] {
+            let prefix = "def outer():\n    @ready(\n        None,\n    )\n";
+            let source = format!("{prefix}{tail}    foreign_statement = 2\n");
+            for first in 2..=4 {
+                for last in first..source.lines().count() {
+                    assert!(
+                        python_owner_window(&source, first, last) == last,
+                        "unknown or interrupted decorator chain must never borrow outer authority"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn python_anchor_interval_ranking_shares_complete_declarations() {
+        for header in [
+            "    def \\\n        admit_schema():\n",
+            "    async \\\n        def \\\n        admit_schema():\n",
+            "    class \\\n        admit_schema:\n",
+        ] {
+            let source = format!("def outer():\n    @ready(\n        lambda: admit_schema(),\n    )\n{header}        pass\n    foreign = 1\n");
+            let (anchors, _) = foreign_search_anchors(
+                &source,
+                Path::new("guard.py"),
+                &["admit_schema".to_owned()],
+            );
+            assert!(
+                anchors.iter().any(|(line, _)| *line == 5)
+                    && anchors.iter().all(|(line, _)| *line >= 5),
+                "ranking must use the logical declaration, never its decorator call"
+            );
+        }
+    }
+
+    #[test]
+    fn python_anchor_interval_continuation_strings_comments() {
+        let source = "def outer():\n    def admit_schema(\n        setting=(1, # def fake():\n            2),\n    ):\n        value = call(\n            '''text\n@fake\ndef fake():\ntext''',\n            # fake boundary\n            setting,\n        )\n        return value\n    foreign = 1\ndef sibling():\n    pass\n";
+        for first in 2..=14 {
+            assert!(
+                python_owner_window(source, first, first) == 14,
+                "continuation interior must resolve before indentation lookup"
+            );
+        }
     }
 
     #[test]
