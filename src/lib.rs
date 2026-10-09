@@ -297,6 +297,9 @@ impl EvidenceReport {
                 continue;
             }
             let owner = SourceOwner::for_path(&path);
+            let indent_of = |line: &str| line.len() - line.trim_start().len();
+            let anchor = item.location().start_line().saturating_sub(1);
+            let anchor_indent = lines.get(anchor).map(|line| indent_of(line)).unwrap_or(0);
             let next_declaration = if owner == SourceOwner::Rust {
                 declaration_identity::declarations(&source)
                     .into_iter()
@@ -304,9 +307,11 @@ impl EvidenceReport {
                     .find(|line| *line >= start)
             } else {
                 lines.iter().enumerate().find_map(|(offset, line)| {
-                    (offset + 1 >= start)
-                        .then_some(offset + 1)
-                        .filter(|_| foreign_declaration_name(line, owner).is_some())
+                    (offset + 1 >= start
+                        && !line.trim().is_empty()
+                        && indent_of(line) <= anchor_indent
+                        && foreign_declaration_name(line, owner).is_some())
+                    .then_some(offset + 1)
                 })
             };
             let end = next_declaration

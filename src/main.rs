@@ -2748,26 +2748,42 @@ mod tests {
     }
 
     fn publish_python_body_citation(root: &Path) {
-        let source = "def admit(evidence):\n    binding = evidence.get(\"schema\")\n    if binding is None:\n        raise Hold(\"schema binding unknown\")\n    return binding\n\ndef wait_ready(before):\n    return before\n";
+        // Past the old eight-line cap: decorator, blank line, indent, nested def.
+        let lines = [
+            "@ready",
+            "def admit(evidence):",
+            "    binding = evidence.get(\"schema\")",
+            "",
+            "    if binding is None:",
+            "        raise Hold(\"schema binding unknown\")",
+            "    def nested():",
+            "        return binding",
+            "    ready = nested()",
+            "    checked = ready",
+            "    held = checked",
+            "    return held",
+            "",
+            "def wait_ready(before):",
+            "    return before",
+        ];
+        let source = lines.join("\n") + "\n";
+        let next_fn = lines
+            .iter()
+            .position(|line| *line == "def wait_ready(before):")
+            .unwrap()
+            + 1;
+        let body = lines
+            .iter()
+            .position(|line| line.contains("return held"))
+            .unwrap()
+            + 1;
+        assert!(body > 8, "fixture must outrun the old fixed window");
         fs::write(root.join("guard.py"), source).expect("guard source");
         let question = "Guard binary schema admission readiness";
-        let report = verify_probe_evidence(
-            &format!("File: {}, Lines: 1-8\n", root.join("guard.py").display()),
-            root,
-            question,
-            DEFAULT_MAX_RESULTS,
-        )
-        .expect("verified signature window");
-        let admitted = &report.evidence()[0];
-        assert!(
-            admitted.location().end_line() < 5,
-            "baseline window must stop before the body line"
-        );
-        let body = admitted.location().end_line() + 1;
         let publisher = test_publisher(json!({
             "answer": "Schema admission raises Hold when the binding is missing.",
             "uncertainty": "Only the verified source was inspected.",
-            "citations": [{"path": "guard.py", "start_line": 7, "end_line": 7}]
+            "citations": [{"path": "guard.py", "start_line": next_fn, "end_line": next_fn}]
         }));
         let mut output = Vec::new();
         let error = run(
@@ -2803,7 +2819,16 @@ mod tests {
                 .unwrap_or("ok")
         );
         let text = String::from_utf8(grounded_output).expect("utf8");
-        assert!(text.contains(&format!("guard.py:{body}")));
+        assert!(
+            text.lines().any(|line| line.starts_with("guard.py:") && {
+                let range = line.trim_start_matches("guard.py:");
+                let mut parts = range.split('-');
+                let start = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let end = parts.next().and_then(|value| value.parse::<usize>().ok());
+                start.is_some_and(|start| start <= body) && end.is_some_and(|end| body <= end)
+            }),
+            "published window must cover the function body: {text}"
+        );
     }
 
     fn publish_answer_body_citations(root: &Path, question: &str) {
