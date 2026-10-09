@@ -4730,7 +4730,7 @@ mod tests {
     }
 
     #[test]
-    fn context_overflow_returns_before_the_injected_model_sends() {
+    fn context_overflow_fits_ranked_evidence_before_injected_model_sends() {
         let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
             "pbi-rs-overflow-send-{}",
             SystemTime::now()
@@ -4753,6 +4753,12 @@ mod tests {
         }
         let _env = RouteConfigEnvGuard::new(&root, &[("PBI_RS_ADK_ENABLE", Some("1".to_owned()))]);
         let calls = Arc::new(AtomicUsize::new(0));
+        let response = serde_json::json!({
+            "answer": "The quoted budget marker is in the retained evidence.",
+            "uncertainty": "Lower-ranked evidence may have been omitted from this bounded context.",
+            "citations": [{"path": "beyond0.rs", "start_line": 1, "end_line": 1}]
+        })
+        .to_string();
         let publisher = owning_snapshot_publisher(
             &admit_local_routes(vec![LocalModelRoute::new(
                 DEFAULT_LOCAL_BASE_URL,
@@ -4760,13 +4766,13 @@ mod tests {
                 "CLIPROXY_API_KEY",
             )])
             .expect("admitted route"),
-            "{}",
+            &response,
             &calls,
             &Arc::new(Mutex::new(Vec::new())),
         )
         .expect("counting route");
         let mut output = Vec::new();
-        let error = run(
+        let result = run(
             vec![
                 "where is budget marker quoted".to_owned(),
                 "--timeout".to_owned(),
@@ -4774,20 +4780,19 @@ mod tests {
             ],
             Some(TestRouteInjection::Publisher(&publisher)),
             &mut output,
-        )
-        .expect_err("oversized context");
-        assert!(
-            error
-                .message
-                .contains("semantic evidence exceeded the bounded context"),
-            "{}",
-            error.message
         );
-        assert!(error.message.contains("bytes="), "{}", error.message);
-        assert!(error.message.contains("limit=24576"), "{}", error.message);
-        assert!(!error.message.contains("attempts="), "{}", error.message);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(output.is_empty());
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => panic!("bounded context should reach the injected model"),
+        };
+        assert_eq!(result, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            output
+                .windows(b"beyond0.rs:".len())
+                .any(|window| window == b"beyond0.rs:"),
+            "highest-ranked evidence should remain citeable"
+        );
         drop(_env);
         fs::remove_dir_all(root).expect("remove fixture");
     }
