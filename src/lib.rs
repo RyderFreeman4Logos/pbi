@@ -1601,12 +1601,13 @@ impl CodeView {
         let mut statement_starts = Vec::new();
         let mut index = 0;
         let mut line = 1usize;
-        let mut depth = 0i32;
+        let mut brackets = Vec::new();
+        let mut ownership_valid = true;
         let mut continued = false;
         let mut line_start = true;
         let python_open = owner == SourceOwner::Python;
         while index < bytes.len() {
-            if python_open && depth > 64 {
+            if python_open && brackets.len() > 64 {
                 return Err(());
             }
             let start = index;
@@ -1614,7 +1615,7 @@ impl CodeView {
                 || (owner != SourceOwner::Python && bytes[index..].starts_with(b"//"))
             {
                 index = line_comment_end(bytes, index, owner == SourceOwner::CFamily);
-                if owner == SourceOwner::Python && line_start && depth == 0 && !continued {
+                if owner == SourceOwner::Python && line_start && brackets.is_empty() && !continued {
                     line_start = false;
                 }
             } else if owner != SourceOwner::Python && bytes[index..].starts_with(b"/*") {
@@ -1632,12 +1633,15 @@ impl CodeView {
                     }
                 }
             } else if owner == SourceOwner::Python && python_string_quote(bytes, index).is_some() {
-                let (quote, prefix_len, delimiter_len, raw) =
+                let (quote, prefix_len, delimiter_len) =
                     python_string_quote(bytes, index).expect("quote");
-                if line_start && depth == 0 && !continued {
+                if line_start && brackets.is_empty() && !continued {
                     statement_starts.push(line);
                 }
-                index = python_quoted_end(bytes, index + prefix_len, quote, delimiter_len, raw);
+                let (end, valid) =
+                    python_quoted_end(bytes, index + prefix_len, quote, delimiter_len);
+                index = end;
+                ownership_valid &= valid;
                 line_start = bytes.get(index.saturating_sub(1)) == Some(&b'\n');
             } else if owner == SourceOwner::CFamily
                 && bytes[index..].starts_with(b"R\"")
@@ -1662,34 +1666,26 @@ impl CodeView {
                 if bytes.get(quote) != Some(&b'"') {
                     if owner == SourceOwner::Python
                         && line_start
-                        && depth == 0
+                        && brackets.is_empty()
                         && !continued
                         && !matches!(
                             bytes[index],
-                            b' ' | b'\t'
-                                | 12
-                                | b'\n'
-                                | b'\r'
-                                | b'('
-                                | b'['
-                                | b'{'
-                                | b')'
-                                | b']'
-                                | b'}'
+                            b' ' | b'\t' | 12 | b'\n' | b'\r' | b')' | b']' | b'}'
                         )
                     {
                         statement_starts.push(line);
                         line_start = false;
                     }
                     if owner == SourceOwner::Python && matches!(bytes[index], b'(' | b'[' | b'{') {
-                        depth += 1;
+                        brackets.push(bytes[index]);
                     } else if owner == SourceOwner::Python
                         && matches!(bytes[index], b')' | b']' | b'}')
                     {
-                        depth -= 1;
-                        if python_open && depth < 0 {
-                            return Err(());
-                        }
+                        let open = brackets.pop().ok_or(())?;
+                        ownership_valid &= matches!(
+                            (open, bytes[index]),
+                            (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                        );
                     } else if owner == SourceOwner::Python && bytes[index] == b'\\' {
                         let mut ahead = index + 1;
                         while matches!(bytes.get(ahead), Some(b' ' | b'\t' | 12)) {
@@ -1705,11 +1701,15 @@ impl CodeView {
                         {
                             continued = true;
                         }
+                        ownership_valid &= continued
+                            && ahead + 1 < bytes.len()
+                            && (ahead == index + 1
+                                || (ahead == index + 2 && bytes[index + 1] == b'\r'));
                     }
                     index += 1;
                     if bytes[index - 1] == b'\n' {
                         line += 1;
-                        line_start = !continued && depth == 0;
+                        line_start = !continued && brackets.is_empty();
                         continued = false;
                     }
                     continue;
@@ -1750,24 +1750,18 @@ impl CodeView {
         Ok(Self {
             // Retained UTF-8 is unchanged; each removed byte is ASCII whitespace.
             code: String::from_utf8_lossy(&code).into_owned(),
-            source_lines: (owner == SourceOwner::Python).then(|| source.to_owned()),
+            // Incomplete projection remains useful for ranking, never for owner expansion.
+            source_lines: (python_open && ownership_valid && brackets.is_empty())
+                .then(|| source.to_owned()),
             statement_starts,
         })
     }
 }
 
-// A Python string prefix is one of the runs the projection tests already admit.
-fn python_string_quote(bytes: &[u8], index: usize) -> Option<(u8, usize, usize, bool)> {
+fn python_string_quote(bytes: &[u8], index: usize) -> Option<(u8, usize, usize)> {
     let rest = bytes.get(index..)?;
-    let prefixes: &[(&[u8], bool)] = &[
-        (b"rf", true),
-        (b"br", true),
-        (b"r", true),
-        (b"b", false),
-        (b"u", false),
-        (b"f", false),
-    ];
-    for (prefix, raw) in prefixes {
+    let prefixes: &[&[u8]] = &[b"rf", b"fr", b"br", b"rb", b"r", b"b", b"u", b"f"];
+    for prefix in prefixes {
         if rest.len() >= prefix.len()
             && rest[..prefix.len()].eq_ignore_ascii_case(prefix)
             && matches!(rest.get(prefix.len()), Some(b'\'' | b'"'))
@@ -1777,7 +1771,7 @@ fn python_string_quote(bytes: &[u8], index: usize) -> Option<(u8, usize, usize, 
                 .get(prefix.len()..prefix.len() + 3)
                 .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote));
             let delimiter_len = if repeated { 3 } else { 1 };
-            return Some((quote, prefix.len(), delimiter_len, *raw));
+            return Some((quote, prefix.len(), delimiter_len));
         }
     }
     if matches!(rest.first(), Some(b'\'' | b'"')) {
@@ -1785,34 +1779,34 @@ fn python_string_quote(bytes: &[u8], index: usize) -> Option<(u8, usize, usize, 
         let repeated = rest
             .get(..3)
             .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote));
-        return Some((quote, 0, if repeated { 3 } else { 1 }, false));
+        return Some((quote, 0, if repeated { 3 } else { 1 }));
     }
     None
 }
 
-fn python_quoted_end(
-    bytes: &[u8],
-    start: usize,
-    quote: u8,
-    delimiter_len: usize,
-    raw: bool,
-) -> usize {
+fn python_quoted_end(bytes: &[u8], start: usize, quote: u8, delimiter_len: usize) -> (usize, bool) {
     let mut index = start + delimiter_len;
+    let mut valid = true;
     while index < bytes.len() {
-        if !raw && bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-        } else if raw && bytes[index] == b'\\' && bytes.get(index + 1) == Some(&quote) {
-            index += 2;
+        // Raw strings retain backslashes, but quote termination still uses escape parity.
+        if bytes[index] == b'\\' {
+            let escaped = if bytes[index + 1..].starts_with(b"\r\n") {
+                3
+            } else {
+                2
+            };
+            index = (index + escaped).min(bytes.len());
         } else if bytes
             .get(index..index + delimiter_len)
             .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote))
         {
-            return index + delimiter_len;
+            return (index + delimiter_len, valid);
         } else {
+            valid &= delimiter_len == 3 || !matches!(bytes[index], b'\n' | b'\r');
             index += 1;
         }
     }
-    bytes.len()
+    (bytes.len(), false)
 }
 
 // C-family comments own continued physical lines; Rust/JS/Python do not splice them.
@@ -4488,6 +4482,97 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
         assert!(
             python_owner_window(fake, 1, 1) == 3,
             "a declaration inside a string does not end the owner"
+        );
+    }
+
+    #[test]
+    fn python_follow_raw_prefixes_and_quote_parity() {
+        for prefix in ["fr", "rf", "Fr", "rF", "rb", "br"] {
+            for escapes in [0, 2, 4] {
+                let source = format!(
+                    "def admit_schema():\n    text = {prefix}\"{}\"\n    return text\n\"module\"\n",
+                    "\\".repeat(escapes)
+                );
+                assert!(
+                    python_owner_window(&source, 1, 1) == 3,
+                    "closed raw string must retain body and exclude dedent"
+                );
+                assert!(
+                    python_owner_window(&source, 3, 3) == 3,
+                    "interior owner uses the same statement metadata"
+                );
+            }
+            for escapes in [1, 3] {
+                let source = format!(
+                    "def admit_schema():\n    text = {prefix}\"{}\"still string\"\n    return text\n",
+                    "\\".repeat(escapes)
+                );
+                assert!(
+                    python_owner_window(&source, 1, 1) == 3,
+                    "escaped raw quote must not end the string"
+                );
+            }
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "def admit_schema():{newline}    text = {prefix}\"first\\{newline}second\"{newline}    return text{newline}"
+                );
+                assert!(
+                    python_owner_window(&source, 1, 1) == 4,
+                    "escaped physical newlines retain the valid owner"
+                );
+            }
+            let source = format!(
+                "def admit_schema():\n    return 1\n{prefix}\"\"\"module\ndef fake():\n\"\"\"\n"
+            );
+            assert!(
+                python_owner_window(&source, 1, 1) == 2,
+                "raw prefixed standalone string is a real dedent"
+            );
+        }
+    }
+
+    #[test]
+    fn python_follow_declines_malformed_source_ownership() {
+        let fragments = [
+            "    text = \"unterminated",
+            "    text = fr\"unterminated",
+            "    text = rf\"\"\"unterminated\nforeign data",
+            "    text = \"first\nsecond\"",
+            "    value = (\nforeign_data",
+            "    value = [)\nforeign_data",
+            "    value = {]\nforeign_data",
+            "    value = 1 + \\",
+            "    value = 1 + \\\n",
+            "    value = 1 + \\ \nforeign_data",
+        ];
+        let mut extended = 0;
+        for fragment in fragments {
+            let source = format!("def admit_schema():\n    value = 0\n{fragment}");
+            // Projection remains available to its existing ranking consumers.
+            assert!(
+                CodeView::bounded(
+                    &source,
+                    SourceOwner::Python,
+                    Instant::now() + Duration::from_secs(8)
+                )
+                .is_ok(),
+                "malformed ownership must not disable compatible projection"
+            );
+            extended += usize::from(python_owner_window(&source, 1, 1) != 1);
+            extended += usize::from(python_owner_window(&source, 2, 2) != 2);
+        }
+        assert!(
+            extended == 0,
+            "malformed source must not expand owners: {extended}"
+        );
+    }
+
+    #[test]
+    fn python_follow_stops_at_grouped_dedented_expression() {
+        let source = "def admit_schema():\n    return 1\n(\n    \"module data\"\n)\n";
+        assert!(
+            python_owner_window(source, 1, 1) == 2,
+            "opening bracket starts a dedented logical statement"
         );
     }
 
