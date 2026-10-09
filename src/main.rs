@@ -1256,7 +1256,15 @@ fn run_traced(
                 "semantic investigation exceeded its bounded deadline",
             ));
         }
-        let expanded_report = if explanatory_question || type_field_subject(&query).is_some() {
+        let expanded_report = if explanatory_question
+            || type_field_subject(&query).is_some()
+            || report.evidence().iter().any(|item| {
+                item.location()
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    == Some("py")
+            }) {
             Some(
                 report
                     .clone()
@@ -2737,6 +2745,179 @@ mod tests {
         }
     }
 
+    #[test]
+    fn python_function_body_citation_passes_the_public_answer() {
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-citation-span-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        let _env = RouteConfigEnvGuard::new(&root, &[("PBI_RS_ADK_ENABLE", Some("1".to_owned()))]);
+        publish_python_body_citation(&root);
+        drop(_env);
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    fn publish_python_body_citation(root: &Path) {
+        // Past the old eight-line cap: decorator, blank line, indent, nested def.
+        let lines = [
+            "@ready",
+            "def admit_schema(evidence):",
+            "    binding = evidence.get(\"schema\")",
+            "",
+            "    if binding is None:",
+            "        raise Hold(\"schema binding unknown\")",
+            "    def nested():",
+            "        return binding",
+            "    ready = nested()",
+            "    checked = ready",
+            "    held = checked",
+            "    text = r\"\"\"",
+            "def fake_sibling():",
+            "    return False",
+            "\"\"\"",
+            "    return held",
+            "",
+            "@ready",
+            "def wait_ready(before):",
+            "    return before",
+        ];
+        let source = lines.join("\n") + "\n";
+        let next_fn = lines
+            .iter()
+            .position(|line| *line == "def wait_ready(before):")
+            .unwrap()
+            + 1;
+        let body = lines
+            .iter()
+            .position(|line| line.contains("return held"))
+            .unwrap()
+            + 1;
+        assert!(body > 8, "fixture must outrun the old fixed window");
+        fs::write(root.join("guard.py"), source).expect("guard source");
+        let question = "What does admit_schema do?";
+        let found = search_repository(
+            root,
+            question,
+            &SearchLimits {
+                deadline: Instant::now() + Duration::from_secs(8),
+                max_results: DEFAULT_MAX_RESULTS,
+                language: None,
+                ignores: Vec::new(),
+            },
+        )
+        .unwrap_or_else(|_| panic!("fixture search must succeed"));
+        let admitted = verify_probe_evidence(&found, root, question, DEFAULT_MAX_RESULTS)
+            .unwrap_or_else(|_| panic!("fixture verification must succeed"));
+        assert!(
+            admitted
+                .evidence()
+                .iter()
+                .any(|item| item.location().start_line() <= 2 && item.location().end_line() < body),
+            "fixture must admit the signature before following the body"
+        );
+        for rejected_line in [next_fn - 1, next_fn] {
+            let publisher = test_publisher(json!({
+                "answer": "Schema admission raises Hold when the binding is missing.",
+                "uncertainty": "Only the verified source was inspected.",
+                "citations": [{"path": "guard.py", "start_line": rejected_line, "end_line": rejected_line}]
+            }));
+            let mut output = Vec::new();
+            let rejected = run(
+                vec![question.to_owned()],
+                Some(TestRouteInjection::Publisher(&publisher)),
+                &mut output,
+            );
+            assert!(
+                matches!(rejected, Err(CliError { code: 1, ref message, .. }) if message.contains("reason=citation_span")),
+                "the next function must remain outside the admitted span"
+            );
+            assert!(output.is_empty());
+        }
+        for (question, start) in [
+            (question, 2),
+            ("Where does admit_schema return its result?", 2),
+            ("Guard binary schema admission readiness", body),
+        ] {
+            let found = search_repository(
+                root,
+                question,
+                &SearchLimits {
+                    deadline: Instant::now() + Duration::from_secs(8),
+                    max_results: DEFAULT_MAX_RESULTS,
+                    language: None,
+                    ignores: Vec::new(),
+                },
+            )
+            .unwrap_or_else(|_| panic!("positive search failed"));
+            let report = verify_probe_evidence(&found, root, question, DEFAULT_MAX_RESULTS)
+                .unwrap_or_else(|_| panic!("positive admission failed"));
+            assert!(
+                !question_code_anchor_missing(question, &report),
+                "positive anchor missing"
+            );
+            let followed = report
+                .with_following_lines(root, pbi_rs::semantic::MAX_SEMANTIC_EVIDENCE)
+                .unwrap_or_else(|_| panic!("positive owner expansion failed"));
+            if start == 2 {
+                assert!(
+                    followed
+                        .evidence()
+                        .iter()
+                        .any(|item| item.location().start_line() <= start
+                            && body <= item.location().end_line()),
+                    "signature case lost at owner expansion"
+                );
+            } else {
+                assert!(
+                    followed
+                        .evidence()
+                        .iter()
+                        .any(|item| item.location().start_line() <= start
+                            && body <= item.location().end_line()),
+                    "keyword case lost at owner expansion"
+                );
+            }
+            let grounded = test_publisher(json!({
+                "answer": "Schema admission raises Hold when the binding is missing.",
+                "uncertainty": "Only the verified source was inspected.",
+                "citations": [{"path": "guard.py", "start_line": start, "end_line": body}]
+            }));
+            let mut grounded_output = Vec::new();
+            let published = run(
+                vec![question.to_owned()],
+                Some(TestRouteInjection::Publisher(&grounded)),
+                &mut grounded_output,
+            );
+            match published {
+                Ok(0) => (),
+                Err(CliError { ref message, .. }) if message.contains("reason=citation_span") => {
+                    panic!("positive publication rejected citation span")
+                }
+                Err(CliError { ref message, .. }) if message.contains("reason=stop_id") => {
+                    panic!("positive publication requires stop id")
+                }
+                Err(_) => panic!("positive publication failed outside citation span or stop id"),
+                Ok(_) => panic!("positive publication returned nonzero"),
+            }
+            let text = String::from_utf8(grounded_output)
+                .unwrap_or_else(|_| panic!("answer must be UTF-8"));
+            assert!(
+                text.lines().any(|line| line.starts_with("guard.py:") && {
+                    let range = line.trim_start_matches("guard.py:");
+                    let mut parts = range.split('-');
+                    let start = parts.next().and_then(|value| value.parse::<usize>().ok());
+                    let end = parts.next().and_then(|value| value.parse::<usize>().ok());
+                    start.is_some_and(|start| start <= body) && end.is_some_and(|end| body <= end)
+                }),
+                "published window must cover the function body"
+            );
+        }
+    }
+
     fn publish_answer_body_citations(root: &Path, question: &str) {
         let mut failures = Vec::new();
         let filter = env::var("PBI_RS_BODY_CASE_FILTER").ok();
@@ -3795,6 +3976,45 @@ mod tests {
         assert!(output
             .contains("- receipt.py:1 | target=exact_reuse_receipt | symbol=exact_reuse_receipt"));
         assert!(output.ends_with("  1: def exact_reuse_receipt():\n"));
+    }
+
+    #[test]
+    fn location_paraphrase_keeps_original_python_evidence() {
+        let root = env::temp_dir().join(format!(
+            "pbi-rs-location-paraphrase-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        fs::write(
+            root.join("receipt.py"),
+            "def exact_reuse_receipt():\n    return True\n",
+        )
+        .expect("source");
+        let guard = RouteConfigEnvGuard::new(&root, &[]);
+        let answer = "The check is implemented by exact_reuse_receipt in receipt.py:1.";
+        let publisher = test_publisher(json!({
+            "answer": answer,
+            "uncertainty": "Only the verified source span was inspected.",
+            "citations": [{"path": "receipt.py", "start_line": 1, "end_line": 1}]
+        }));
+        let mut output = Vec::new();
+        assert!(matches!(
+            run(
+                vec![
+                    "--message".to_owned(),
+                    "exact_reuse_receipt is where?".to_owned(),
+                ],
+                Some(TestRouteInjection::Publisher(&publisher)),
+                &mut output,
+            ),
+            Ok(0)
+        ));
+        assert_semantic_message_output(&output, answer);
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture");
     }
 
     #[test]
