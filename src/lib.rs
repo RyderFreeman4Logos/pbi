@@ -307,7 +307,7 @@ impl EvidenceReport {
                 let view =
                     CodeView::bounded(&source, owner, Instant::now() + Duration::from_secs(8))
                         .map_err(|_| EvidenceError::SourceUnavailable)?;
-                let Some(end) = python_owner_end(&view.code, item.location()) else {
+                let Some(end) = python_owner_end(&view, item.location()) else {
                     continue;
                 };
                 end
@@ -1473,8 +1473,9 @@ fn requested_features(group: &QueryGroup) -> Vec<&'static str> {
 // Reuse the byte/line-preserving projection, never raw string contents. This
 // conservative suite boundary is not a Python parser: unsupported continuation
 // shapes may shorten a window, but cannot justify crossing a dedent.
-fn python_owner_end(code: &str, location: &SourceLocation) -> Option<usize> {
-    let lines = code.lines().collect::<Vec<_>>();
+fn python_owner_end(view: &CodeView, location: &SourceLocation) -> Option<usize> {
+    let lines = view.code.lines().collect::<Vec<_>>();
+    let source_lines = view.source_lines.as_ref()?.lines().collect::<Vec<_>>();
     let first = location.start_line().checked_sub(1)?;
     let indent = |line: &str| {
         line.bytes()
@@ -1490,10 +1491,10 @@ fn python_owner_end(code: &str, location: &SourceLocation) -> Option<usize> {
     let anchor = if lines.get(first)?.trim_start().starts_with('@') {
         let column = indent(lines[first]);
         let mut declaration = None;
-        for (index, line) in lines
+        for (index, line) in source_lines
             .iter()
             .enumerate()
-            .take(location.end_line())
+            .take(first + 8)
             .skip(first + 1)
         {
             if line.trim().is_empty() {
@@ -1515,10 +1516,13 @@ fn python_owner_end(code: &str, location: &SourceLocation) -> Option<usize> {
         first
     };
     let mut owners = Vec::new();
-    for line in lines.get(..=anchor)? {
-        if line.trim().is_empty() {
-            continue;
-        }
+    for line_number in view
+        .statement_starts
+        .iter()
+        .copied()
+        .filter(|line| *line <= anchor + 1)
+    {
+        let line = source_lines.get(line_number - 1)?;
         let column = indent(line);
         while owners.last().is_some_and(|owner| *owner >= column) {
             owners.pop();
@@ -1528,13 +1532,17 @@ fn python_owner_end(code: &str, location: &SourceLocation) -> Option<usize> {
         }
     }
     let owner = *owners.last()?;
-    let end = lines
+    let end = view
+        .statement_starts
         .iter()
-        .enumerate()
-        .skip(anchor + 1)
-        .find_map(|(index, line)| {
-            (!line.trim().is_empty() && indent(line) <= owner).then_some(index)
+        .copied()
+        .find(|line| {
+            *line > anchor + 1
+                && source_lines
+                    .get(line - 1)
+                    .is_some_and(|text| indent(text) <= owner)
         })
+        .map(|line| line - 1)
         .unwrap_or(lines.len());
     (end >= location.end_line()).then_some(end)
 }
@@ -1563,6 +1571,8 @@ impl SourceOwner {
 
 struct CodeView {
     code: String,
+    source_lines: Option<String>,
+    statement_starts: Vec<usize>,
 }
 
 impl CodeView {
@@ -1580,35 +1590,55 @@ impl CodeView {
         }
         if matches!(owner, SourceOwner::JavaScript | SourceOwner::TypeScript) {
             return grammar_worker::project(source, owner == SourceOwner::TypeScript, deadline)
-                .map(|code| Self { code });
+                .map(|code| Self {
+                    code,
+                    source_lines: None,
+                    statement_starts: Vec::new(),
+                });
         }
         let bytes = source.as_bytes();
         let mut code = bytes.to_vec();
+        let mut statement_starts = Vec::new();
         let mut index = 0;
+        let mut line = 1usize;
+        let mut depth = 0i32;
+        let mut continued = false;
+        let mut line_start = true;
+        let python_open = owner == SourceOwner::Python;
         while index < bytes.len() {
+            if python_open && depth > 64 {
+                return Err(());
+            }
             let start = index;
             if (owner == SourceOwner::Python && bytes[index] == b'#')
                 || (owner != SourceOwner::Python && bytes[index..].starts_with(b"//"))
             {
                 index = line_comment_end(bytes, index, owner == SourceOwner::CFamily);
+                if owner == SourceOwner::Python && line_start && depth == 0 && !continued {
+                    line_start = false;
+                }
             } else if owner != SourceOwner::Python && bytes[index..].starts_with(b"/*") {
                 index += 2;
-                let mut depth = 1;
-                while index < bytes.len() && depth > 0 {
+                let mut comment_depth = 1;
+                while index < bytes.len() && comment_depth > 0 {
                     if owner == SourceOwner::Rust && bytes[index..].starts_with(b"/*") {
-                        depth += 1;
+                        comment_depth += 1;
                         index += 2;
                     } else if bytes[index..].starts_with(b"*/") {
-                        depth -= 1;
+                        comment_depth -= 1;
                         index += 2;
                     } else {
                         index += 1;
                     }
                 }
-            } else if owner == SourceOwner::Python
-                && (bytes[index..].starts_with(b"\"\"\"") || bytes[index..].starts_with(b"'''"))
-            {
-                index = quoted_literal_end(bytes, index, bytes[index], 3);
+            } else if owner == SourceOwner::Python && python_string_quote(bytes, index).is_some() {
+                let (quote, prefix_len, delimiter_len, raw) =
+                    python_string_quote(bytes, index).expect("quote");
+                if line_start && depth == 0 && !continued {
+                    statement_starts.push(line);
+                }
+                index = python_quoted_end(bytes, index + prefix_len, quote, delimiter_len, raw);
+                line_start = bytes.get(index.saturating_sub(1)) == Some(&b'\n');
             } else if owner == SourceOwner::CFamily
                 && bytes[index..].starts_with(b"R\"")
                 && cpp_raw_literal_end(bytes, index).is_some()
@@ -1630,7 +1660,58 @@ impl CodeView {
                     }
                 }
                 if bytes.get(quote) != Some(&b'"') {
+                    if owner == SourceOwner::Python
+                        && line_start
+                        && depth == 0
+                        && !continued
+                        && !matches!(
+                            bytes[index],
+                            b' ' | b'\t'
+                                | 12
+                                | b'\n'
+                                | b'\r'
+                                | b'('
+                                | b'['
+                                | b'{'
+                                | b')'
+                                | b']'
+                                | b'}'
+                        )
+                    {
+                        statement_starts.push(line);
+                        line_start = false;
+                    }
+                    if owner == SourceOwner::Python && matches!(bytes[index], b'(' | b'[' | b'{') {
+                        depth += 1;
+                    } else if owner == SourceOwner::Python
+                        && matches!(bytes[index], b')' | b']' | b'}')
+                    {
+                        depth -= 1;
+                        if python_open && depth < 0 {
+                            return Err(());
+                        }
+                    } else if owner == SourceOwner::Python && bytes[index] == b'\\' {
+                        let mut ahead = index + 1;
+                        while matches!(bytes.get(ahead), Some(b' ' | b'\t' | 12)) {
+                            ahead += 1;
+                        }
+                        if matches!(bytes.get(ahead), Some(b'\r')) {
+                            ahead += 1;
+                        }
+                        if bytes.get(ahead) == Some(&b'\n')
+                            && bytes[index + 1..ahead]
+                                .iter()
+                                .all(|byte| matches!(byte, b' ' | b'\t' | 12 | b'\r'))
+                        {
+                            continued = true;
+                        }
+                    }
                     index += 1;
+                    if bytes[index - 1] == b'\n' {
+                        line += 1;
+                        line_start = !continued && depth == 0;
+                        continued = false;
+                    }
                     continue;
                 }
                 let raw = owner == SourceOwner::Rust && bytes[index] == b'r';
@@ -1657,12 +1738,81 @@ impl CodeView {
                     *byte = b' ';
                 }
             }
+            let mut cursor = start;
+            while cursor < index {
+                if bytes[cursor] == b'\n' {
+                    line += 1;
+                    continued = false;
+                }
+                cursor += 1;
+            }
         }
         Ok(Self {
             // Retained UTF-8 is unchanged; each removed byte is ASCII whitespace.
             code: String::from_utf8_lossy(&code).into_owned(),
+            source_lines: (owner == SourceOwner::Python).then(|| source.to_owned()),
+            statement_starts,
         })
     }
+}
+
+// A Python string prefix is one of the runs the projection tests already admit.
+fn python_string_quote(bytes: &[u8], index: usize) -> Option<(u8, usize, usize, bool)> {
+    let rest = bytes.get(index..)?;
+    let prefixes: &[(&[u8], bool)] = &[
+        (b"rf", true),
+        (b"br", true),
+        (b"r", true),
+        (b"b", false),
+        (b"u", false),
+        (b"f", false),
+    ];
+    for (prefix, raw) in prefixes {
+        if rest.len() >= prefix.len()
+            && rest[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && matches!(rest.get(prefix.len()), Some(b'\'' | b'"'))
+        {
+            let quote = rest[prefix.len()];
+            let repeated = rest
+                .get(prefix.len()..prefix.len() + 3)
+                .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote));
+            let delimiter_len = if repeated { 3 } else { 1 };
+            return Some((quote, prefix.len(), delimiter_len, *raw));
+        }
+    }
+    if matches!(rest.first(), Some(b'\'' | b'"')) {
+        let quote = rest[0];
+        let repeated = rest
+            .get(..3)
+            .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote));
+        return Some((quote, 0, if repeated { 3 } else { 1 }, false));
+    }
+    None
+}
+
+fn python_quoted_end(
+    bytes: &[u8],
+    start: usize,
+    quote: u8,
+    delimiter_len: usize,
+    raw: bool,
+) -> usize {
+    let mut index = start + delimiter_len;
+    while index < bytes.len() {
+        if !raw && bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if raw && bytes[index] == b'\\' && bytes.get(index + 1) == Some(&quote) {
+            index += 2;
+        } else if bytes
+            .get(index..index + delimiter_len)
+            .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == quote))
+        {
+            return index + delimiter_len;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
 }
 
 // C-family comments own continued physical lines; Rust/JS/Python do not splice them.
@@ -4235,6 +4385,109 @@ fn parse_field(key: &str) -> Result<(), FieldError> {
                 .iter()
                 .all(|item| item.snippet().len() <= 4096 && item.location().end_line() > 9),
             "a full inventory must retain a bounded body prefix"
+        );
+    }
+
+    fn python_owner_window(source: &str, start: usize, end: usize) -> usize {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("guard.py");
+        fs::write(&path, source).expect("write fixture");
+        let mut report = EvidenceReport::from_admitted(vec![SourceEvidence::admitted(
+            path.clone(),
+            "admit",
+            "",
+            None,
+            "",
+        )]);
+        report.evidence[0].location = SourceLocation::new(path, start, end);
+        let followed = report
+            .with_following_lines(&fixture.root, 8)
+            .unwrap_or_else(|_| panic!("follow must succeed"));
+        assert!(
+            followed.evidence().len() == 1,
+            "extension must stay in the admitted slot"
+        );
+        followed.evidence()[0].location().end_line()
+    }
+
+    #[test]
+    fn python_follow_keeps_aligned_signature_close_inside_the_owner() {
+        let source = "def admit_schema(\n    evidence,\n):\n    return evidence\n";
+        let end = python_owner_window(source, 1, 1);
+        assert!(
+            end == 4,
+            "aligned signature close must not end the owner: got {end}"
+        );
+    }
+
+    #[test]
+    fn python_follow_stops_at_a_dedented_string_statement() {
+        let source = "def admit_schema():\n    value = 0\n    value += 1\n    value += 1\n    value += 1\n    value += 1\n    value += 1\n    value += 1\n    return value\n\"\"\"Module-only data\nnot owned by the function\n\"\"\"\n\ndef sibling():\n    return False\n";
+        let end = python_owner_window(source, 1, 1);
+        assert!(
+            end == 9,
+            "a dedented string statement must end the owner: got {end}"
+        );
+    }
+
+    #[test]
+    fn python_follow_keeps_bracket_and_backslash_continuations() {
+        let bracket = "def admit_schema(\n    evidence,\n    [\n        1,\n    ],\n):\n    return evidence\n";
+        assert!(
+            python_owner_window(bracket, 1, 1) == 7,
+            "aligned bracket closes stay inside the signature"
+        );
+        let slash = "def admit_schema():\n    value = 1 + \\\n        2\n    return value\n";
+        assert!(
+            python_owner_window(slash, 1, 1) == 4,
+            "an explicit backslash does not start the next physical line"
+        );
+    }
+
+    #[test]
+    fn python_follow_ignores_comments_and_prefixed_strings() {
+        let comments =
+            "def admit_schema():\n    return 1\n# module note\ndef sibling():\n    return False\n";
+        let comment_end = python_owner_window(comments, 1, 1);
+        assert!(
+            comment_end == 3,
+            "a comment is not a statement, so the sibling ends the owner: got {comment_end}"
+        );
+        let prefixed = "def admit_schema():\n    return 1\nrf\"\"\"module\nstill module\n\"\"\"\n";
+        assert!(
+            python_owner_window(prefixed, 1, 1) == 2,
+            "a prefixed dedented string ends the owner"
+        );
+        let bare = "def admit_schema():\n    return 1\n\"module\"\n";
+        assert!(
+            python_owner_window(bare, 1, 1) == 2,
+            "a bare dedented string ends the owner"
+        );
+    }
+
+    #[test]
+    fn python_follow_keeps_nested_interior_and_sibling_edges() {
+        let nested =
+            "def admit_schema():\n    async def nested():\n        return 1\n    return nested()\n";
+        assert!(
+            python_owner_window(nested, 1, 1) == 4,
+            "a nested declaration stays inside the owner"
+        );
+        assert!(
+            python_owner_window(nested, 2, 2) == 3,
+            "an interior anchor ends at its own suite"
+        );
+        let decorated =
+            "@ready\ndef admit_schema():\n    return 1\ndef sibling():\n    return False\n";
+        let decorated_end = python_owner_window(decorated, 1, 1);
+        assert!(
+            decorated_end == 3,
+            "a decorator window ends before the sibling: got {decorated_end}"
+        );
+        let fake = "def admit_schema():\n    text = \"def sibling():\"\n    return text\n";
+        assert!(
+            python_owner_window(fake, 1, 1) == 3,
+            "a declaration inside a string does not end the owner"
         );
     }
 
