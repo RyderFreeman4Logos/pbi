@@ -39,6 +39,8 @@ const ADK_ENABLE_ENV: &str = "PBI_RS_ADK_ENABLE";
 
 pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+const SEMANTIC_SYSTEM_PROMPT: &str = "Answer only from VERIFIED_EVIDENCE. When omitted_evidence_targets is present, treat those verified but omitted targets as unexamined and state uncertainty when relevant. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. For why-stop questions, choose stop_evidence_id from direct_stop_candidate_ids; explain that executable false return and its caller. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.";
+
 const OUTPUT_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
@@ -633,6 +635,23 @@ fn semantic_context(
     Ok((common_data, bytes, allowed))
 }
 
+fn semantic_request_bytes(
+    question: &str,
+    common_data: &Value,
+    output_schema: &Value,
+) -> Result<usize, SemanticError> {
+    let protocol = PromptProtocol::new(
+        SEMANTIC_SYSTEM_PROMPT,
+        Vec::new(),
+        output_schema.clone(),
+        common_data.clone(),
+        TrustDomain::ConditionallyTrustedContent,
+    )
+    .map_err(|_| SemanticError::Protocol)?;
+    let prompt = protocol.render(question);
+    Ok(prompt.system().len() + prompt.user_prefix().len() + prompt.dynamic_suffix().len())
+}
+
 fn bounded_semantic_context(
     question: &str,
     root: &Path,
@@ -640,10 +659,11 @@ fn bounded_semantic_context(
     report: &EvidenceReport,
     original_visible_indices: &[usize],
     stop_candidates: &[usize],
+    output_schema: &Value,
 ) -> Result<(Value, usize, Vec<AllowedCitation>, Vec<usize>), SemanticError> {
     let mut visible_indices = original_visible_indices.to_vec();
     loop {
-        let (mut common_data, mut bytes, allowed) = semantic_context(
+        let (mut common_data, _, allowed) = semantic_context(
             question,
             root,
             evidence,
@@ -662,10 +682,8 @@ fn bounded_semantic_context(
         }
         if !omitted_targets.is_empty() {
             common_data["omitted_evidence_targets"] = json!(omitted_targets);
-            bytes = serde_json::to_vec(&common_data)
-                .map_err(|_| SemanticError::Protocol)?
-                .len();
         }
+        let bytes = semantic_request_bytes(question, &common_data, output_schema)?;
         if bytes <= MAX_SEMANTIC_CONTEXT_BYTES {
             return Ok((common_data, bytes, allowed, visible_indices));
         }
@@ -844,6 +862,16 @@ pub async fn investigate(
     } else {
         visible_indices.extend(0..evidence.len());
     }
+    let mut output_schema: Value =
+        serde_json::from_str(OUTPUT_SCHEMA).map_err(|_| SemanticError::Protocol)?;
+    if stop_question {
+        output_schema["properties"]["stop_evidence_id"] =
+            json!({"type":"integer", "enum": stop_candidates});
+        output_schema["required"]
+            .as_array_mut()
+            .ok_or(SemanticError::Protocol)?
+            .push(json!("stop_evidence_id"));
+    }
     let (common_data, common_data_bytes, allowed, visible_indices) = bounded_semantic_context(
         question,
         &root,
@@ -851,6 +879,7 @@ pub async fn investigate(
         report,
         &visible_indices,
         &stop_candidates,
+        &output_schema,
     )?;
     if common_data_bytes > MAX_SEMANTIC_CONTEXT_BYTES {
         return Err(SemanticError::InputTooLarge {
@@ -862,18 +891,8 @@ pub async fn investigate(
         .map(|index| visible_indices.contains(&index))
         .collect::<Vec<_>>();
 
-    let mut output_schema: Value =
-        serde_json::from_str(OUTPUT_SCHEMA).map_err(|_| SemanticError::Protocol)?;
-    if stop_question {
-        output_schema["properties"]["stop_evidence_id"] =
-            json!({"type":"integer", "enum": stop_candidates});
-        output_schema["required"]
-            .as_array_mut()
-            .ok_or(SemanticError::Protocol)?
-            .push(json!("stop_evidence_id"));
-    }
     let protocol = PromptProtocol::new(
-        "Answer only from VERIFIED_EVIDENCE. When omitted_evidence_targets is present, treat those verified but omitted targets as unexamined and state uncertainty when relevant. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. For why-stop questions, choose stop_evidence_id from direct_stop_candidate_ids; explain that executable false return and its caller. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
+        SEMANTIC_SYSTEM_PROMPT,
         Vec::new(),
         output_schema.clone(),
         common_data,
@@ -1785,7 +1804,7 @@ mod tests {
                 SourceEvidence::admitted(
                     fixture.root.join(format!("window{index}.rs")),
                     format!("target {index}"),
-                    format!("{marker}{}", "x".repeat(4096 - marker.len())),
+                    format!("{marker}{}", "x".repeat(4400 - marker.len())),
                     Some(format!("window{index}")),
                     "terms=target code=function",
                 )
@@ -1800,6 +1819,24 @@ mod tests {
             "fixture must exceed the unchanged context budget"
         );
         assert_eq!(MAX_SEMANTIC_CONTEXT_BYTES, 24 * 1024);
+        let schema = serde_json::from_str(OUTPUT_SCHEMA).expect("output schema");
+        let (common_data, _, _, visible_indices) = bounded_semantic_context(
+            question,
+            &fixture.root,
+            &refs,
+            &report,
+            &(0..refs.len()).collect::<Vec<_>>(),
+            &[],
+            &schema,
+        )
+        .expect("full prompt fits unchanged context budget");
+        let request_bytes = semantic_request_bytes(question, &common_data, &schema)
+            .expect("rendered request byte count");
+        assert!(
+            request_bytes <= MAX_SEMANTIC_CONTEXT_BYTES,
+            "model prompt must fit the unchanged context budget"
+        );
+        assert_eq!(visible_indices.first(), Some(&0));
 
         let publisher = publisher(serde_json::json!({
             "answer": "The first ranked window contains the verified fact.",
