@@ -1988,6 +1988,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn body_citation_cannot_escape_its_owned_window() {
+        let citation = AllowedCitation {
+            path: "a.py".to_owned(),
+            start_line: 1,
+            end_line: 1,
+            evidence_index: 0,
+        };
+
+        assert_eq!(
+            answer_body_citations_match("See (a.py:2).", &[&citation]),
+            Err("body_span")
+        );
+    }
+
     struct FailingAdapter {
         calls: AtomicUsize,
         pending: bool,
