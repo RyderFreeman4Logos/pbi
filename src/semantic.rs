@@ -39,6 +39,8 @@ const ADK_ENABLE_ENV: &str = "PBI_RS_ADK_ENABLE";
 
 pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+const SEMANTIC_SYSTEM_PROMPT: &str = "Answer only from VERIFIED_EVIDENCE. When omitted_evidence_targets is present, treat those verified but omitted targets as unexamined and state uncertainty when relevant. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. For why-stop questions, choose stop_evidence_id from direct_stop_candidate_ids; explain that executable false return and its caller. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.";
+
 const OUTPUT_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
@@ -562,7 +564,7 @@ struct AllowedCitation {
     evidence_index: usize,
 }
 
-/// Serialized context bytes `investigate` measures before any model send.
+/// Measure serialized bytes for a supplied semantic evidence selection.
 pub fn semantic_context_bytes(
     question: &str,
     root: &Path,
@@ -631,6 +633,69 @@ fn semantic_context(
         .map_err(|_| SemanticError::Protocol)?
         .len();
     Ok((common_data, bytes, allowed))
+}
+
+fn semantic_request_bytes(
+    question: &str,
+    common_data: &Value,
+    output_schema: &Value,
+) -> Result<usize, SemanticError> {
+    let protocol = PromptProtocol::new(
+        SEMANTIC_SYSTEM_PROMPT,
+        Vec::new(),
+        output_schema.clone(),
+        common_data.clone(),
+        TrustDomain::ConditionallyTrustedContent,
+    )
+    .map_err(|_| SemanticError::Protocol)?;
+    let prompt = protocol.render(question);
+    Ok(prompt.system().len() + prompt.user_prefix().len() + prompt.dynamic_suffix().len())
+}
+
+fn bounded_semantic_context(
+    question: &str,
+    root: &Path,
+    evidence: &[&SourceEvidence],
+    report: &EvidenceReport,
+    original_visible_indices: &[usize],
+    stop_candidates: &[usize],
+    output_schema: &Value,
+) -> Result<(Value, usize, Vec<AllowedCitation>, Vec<usize>), SemanticError> {
+    let mut visible_indices = original_visible_indices.to_vec();
+    loop {
+        let (mut common_data, _, allowed) = semantic_context(
+            question,
+            root,
+            evidence,
+            report,
+            &visible_indices,
+            stop_candidates,
+        )?;
+        let mut omitted_targets = Vec::<String>::new();
+        for &index in original_visible_indices {
+            if !visible_indices.contains(&index) {
+                let target = evidence.get(index).ok_or(SemanticError::Protocol)?.target();
+                if !omitted_targets.iter().any(|omitted| omitted == target) {
+                    omitted_targets.push(target.to_owned());
+                }
+            }
+        }
+        if !omitted_targets.is_empty() {
+            common_data["omitted_evidence_targets"] = json!(omitted_targets);
+        }
+        let bytes = semantic_request_bytes(question, &common_data, output_schema)?;
+        if bytes <= MAX_SEMANTIC_CONTEXT_BYTES {
+            return Ok((common_data, bytes, allowed, visible_indices));
+        }
+        if !stop_candidates.is_empty() || visible_indices.len() <= 1 {
+            return Err(SemanticError::InputTooLarge {
+                bytes,
+                limit: MAX_SEMANTIC_CONTEXT_BYTES,
+            });
+        }
+        // Keep the evidence report's order and remove only its trailing window.
+        visible_indices.pop();
+    }
 }
 
 #[cfg(test)]
@@ -797,24 +862,6 @@ pub async fn investigate(
     } else {
         visible_indices.extend(0..evidence.len());
     }
-    let visible = (0..evidence.len())
-        .map(|index| visible_indices.contains(&index))
-        .collect::<Vec<_>>();
-    let (common_data, common_data_bytes, allowed) = semantic_context(
-        question,
-        &root,
-        &evidence,
-        report,
-        &visible_indices,
-        &stop_candidates,
-    )?;
-    if common_data_bytes > MAX_SEMANTIC_CONTEXT_BYTES {
-        return Err(SemanticError::InputTooLarge {
-            bytes: common_data_bytes,
-            limit: MAX_SEMANTIC_CONTEXT_BYTES,
-        });
-    }
-
     let mut output_schema: Value =
         serde_json::from_str(OUTPUT_SCHEMA).map_err(|_| SemanticError::Protocol)?;
     if stop_question {
@@ -825,8 +872,27 @@ pub async fn investigate(
             .ok_or(SemanticError::Protocol)?
             .push(json!("stop_evidence_id"));
     }
+    let (common_data, common_data_bytes, allowed, visible_indices) = bounded_semantic_context(
+        question,
+        &root,
+        &evidence,
+        report,
+        &visible_indices,
+        &stop_candidates,
+        &output_schema,
+    )?;
+    if common_data_bytes > MAX_SEMANTIC_CONTEXT_BYTES {
+        return Err(SemanticError::InputTooLarge {
+            bytes: common_data_bytes,
+            limit: MAX_SEMANTIC_CONTEXT_BYTES,
+        });
+    }
+    let visible = (0..evidence.len())
+        .map(|index| visible_indices.contains(&index))
+        .collect::<Vec<_>>();
+
     let protocol = PromptProtocol::new(
-        "Answer only from VERIFIED_EVIDENCE. For why questions, state the direct stop condition and cite its return branch; also state how the caller uses that return value and cite the caller. For why-stop questions, choose stop_evidence_id from direct_stop_candidate_ids; explain that executable false return and its caller. If you explain a budget, cite the definition that computes it, not just a call to that definition. Distinguish later branches and independent limits, respecting short-circuit expressions. An unmatched name does not imply a separate implementation; do not speculate about one. Return one compact answer, explicit uncertainty, and citations that exactly match a verified path and line span. Do not invent files, lines, symbols, or facts. No repository tools are available to this model.",
+        SEMANTIC_SYSTEM_PROMPT,
         Vec::new(),
         output_schema.clone(),
         common_data,
@@ -1728,6 +1794,84 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use workflow_adk::model_profiles::{FakeModelProfile, ModelProfileRegistry};
+
+    #[test]
+    fn context_overflow_keeps_a_bounded_ranked_prefix() {
+        let fixture = Fixture::new();
+        let evidence = (0..MAX_SEMANTIC_EVIDENCE)
+            .map(|index| {
+                let marker = format!("snippet_marker_{index}");
+                SourceEvidence::admitted(
+                    fixture.root.join(format!("window{index}.rs")),
+                    format!("target {index}"),
+                    format!("{marker}{}", "x".repeat(4400 - marker.len())),
+                    Some(format!("window{index}")),
+                    "terms=target code=function",
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = EvidenceReport::from_admitted(evidence);
+        let refs = report.evidence().iter().collect::<Vec<_>>();
+        let question = "where is the first target";
+        assert!(
+            semantic_context_bytes_for_test(question, &fixture.root, &refs, &report)
+                > MAX_SEMANTIC_CONTEXT_BYTES,
+            "fixture must exceed the unchanged context budget"
+        );
+        assert_eq!(MAX_SEMANTIC_CONTEXT_BYTES, 24 * 1024);
+        let schema = serde_json::from_str(OUTPUT_SCHEMA).expect("output schema");
+        let (common_data, _, _, visible_indices) = bounded_semantic_context(
+            question,
+            &fixture.root,
+            &refs,
+            &report,
+            &(0..refs.len()).collect::<Vec<_>>(),
+            &[],
+            &schema,
+        )
+        .expect("full prompt fits unchanged context budget");
+        let request_bytes = semantic_request_bytes(question, &common_data, &schema)
+            .expect("rendered request byte count");
+        assert!(
+            request_bytes <= MAX_SEMANTIC_CONTEXT_BYTES,
+            "model prompt must fit the unchanged context budget"
+        );
+        assert_eq!(visible_indices.first(), Some(&0));
+
+        let publisher = publisher(serde_json::json!({
+            "answer": "The first ranked window contains the verified fact.",
+            "uncertainty": "Some lower-ranked evidence was omitted from the bounded context.",
+            "citations": [{"path": "window0.rs", "start_line": 1, "end_line": 1}]
+        }));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(investigate(
+            question,
+            &fixture.root,
+            &report,
+            &publisher.policy(deadline),
+            deadline,
+            &ModelRouteCancellation::new(),
+        ));
+        assert!(
+            result.is_ok(),
+            "bounded context should retain highest-ranked evidence instead of overflowing"
+        );
+        let Ok(answer) = result else {
+            panic!("bounded context should permit the verified response");
+        };
+        assert_eq!(answer.citations().len(), 1);
+        assert!(
+            answer.citations()[0]
+                .location()
+                .path()
+                .ends_with("window0.rs"),
+            "highest-ranked evidence should remain citeable"
+        );
+    }
 
     #[test]
     fn production_context_counts_a_symbol_at_the_cap_boundary() {
