@@ -276,7 +276,7 @@ fn usage() {
                 pbi-rs search [--bm25] [--stem] [--regex] [--timeout <SECONDS>] [--max-results <N>] [--language/-l <LANGUAGE>] [--ignore/-i <PATTERN>]... <query>\n\
                 pbi-rs [--model-route <BASE_URL> <MODEL> <CREDENTIAL_HANDLE_NAME>]... --message <question> [--timeout <SECONDS>] [--json]\n\
                 pbi-rs --debug-config\n\
-         A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. --regex searches original UTF-8 lines case-sensitively and returns locations only (8192 pattern bytes, 1 MiB compiled/DFA limits, 64 nesting depth, 4096 candidates). It cannot combine with --bm25, --exact, --stem, --strict-elastic-syntax, --session, or raw options. Questions return verified source citations; search prints compact native BM25 locations and scores. --bm25 shows source blocks from the same ranker; neither search path calls a model."
+         A configured approved local route enables model answers by default; PBI_RS_ADK_ENABLE=0 disables them. A selected TOML endpoint may explicitly set auth=\"no_auth\"; omission and CLI route arguments require credentials. Route arguments must precede the question; credential handles are names only. --timeout bounds the entire run in seconds (default: {MESSAGE_OUTER_DEADLINE_SECONDS} for answers, {SEARCH_OUTER_DEADLINE_SECONDS} for search). Search is read-only and bounded. --regex searches original UTF-8 lines case-sensitively and returns locations only (8192 pattern bytes, 1 MiB compiled/DFA limits, 64 nesting depth, 4096 candidates). It cannot combine with --bm25, --exact, --stem, --strict-elastic-syntax, --session, or raw options. Questions return verified source citations; search prints compact native BM25 locations and scores. --bm25 shows source blocks from the same ranker; neither search path calls a model."
     );
 }
 
@@ -685,7 +685,7 @@ fn debug_config_output(route_specs: Vec<LocalModelRoute>) -> Result<String, Sema
         (route.base_url().to_owned(), route.model().to_owned())
     };
     Ok(format!(
-        "search_default=native_bounded_bm25_compact_no_probe\nsearch_bm25_opt_in=native_bounded_raw_no_model\nsearch_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_route_enable=approved_config_or_PBI_RS_ADK_ENABLE_1\nmodel_route_disable=PBI_RS_ADK_ENABLE_0\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
+        "search_default=native_bounded_bm25_compact_no_probe\nsearch_bm25_opt_in=native_bounded_raw_no_model\nsearch_outer_deadline_seconds={SEARCH_OUTER_DEADLINE_SECONDS}\nmodel_path=adk_workflow_kit_authorized_route_snapshot\nmodel_route_enable=approved_config_or_PBI_RS_ADK_ENABLE_1\nmodel_route_disable=PBI_RS_ADK_ENABLE_0\nmodel_route_policy=approved_local_only\nmodel_route_snapshot=ordered_authorized_candidates_bounded_by_kit\nmodel_route_chain=repeatable_cli_routes_or_single_default\nmodel_route_credentials=handle_names_only_values_not_emitted\nmodel_route_auth_policy=explicit_endpoint_no_auth_else_credential\nprimary_model={model}\nbase_url={base_url}\napi_key=[REDACTED]\n",
     ))
 }
 
@@ -4015,6 +4015,176 @@ mod tests {
         assert_semantic_message_output(&output, answer);
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn no_auth_both_cli_forms_keep_production_binding_and_reject_forged_answers() {
+        use workflow_adk::model_profiles::OpenAiCompatibleAuth;
+        let root = std::path::PathBuf::from("/mnt/ssd/mirror-rootfs/home/obj/tmp").join(format!(
+            "pbi-rs-no-auth-cli-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&root).expect("fixture");
+        fs::write(
+            root.join("receipt.py"),
+            "def exact_reuse_receipt():\n    return True\n",
+        )
+        .expect("source");
+        let config = root.join("models.toml");
+        let config_text = format!("primary_model = \"{DEFAULT_LOCAL_MODEL}\"\n[[endpoints]]\nmodel = \"{DEFAULT_LOCAL_MODEL}\"\nbase_url = \"{DEFAULT_LOCAL_BASE_URL}\"\nauth = \"no_auth\"\n");
+        fs::write(&config, &config_text).expect("config");
+        let _env = RouteConfigEnvGuard::new(
+            &root,
+            &[
+                (
+                    "PBI_CONFIG_FILE",
+                    Some(config.to_string_lossy().into_owned()),
+                ),
+                ("PBI_RS_ADK_ENABLE", None),
+                ("PBI_RS_CREDENTIAL_HANDLE", None),
+                ("CLIPROXY_API_KEY", None),
+                ("OPENAI_API_KEY", None),
+                ("LOCAL_ROUTER_API_KEY", None),
+                ("CLIPROXY_BASE_URL", None),
+                ("LOCAL_ROUTER_BASEURL", None),
+                ("LOCAL_MODEL", None),
+                ("LLM_MODEL", None),
+            ],
+        );
+        let valid = json!({"answer":"exact_reuse_receipt returns True in receipt.py:1.", "uncertainty":"Only this verified source was inspected.", "citations":[{"path":"receipt.py","start_line":1,"end_line":1}]});
+        let mut cases = vec![(valid.clone(), true), (serde_json::Value::Null, false)];
+        for (path, start, end) in [
+            ("../outside.py", 1, 1),
+            ("/outside.py", 1, 1),
+            ("fabricated.py", 1, 1),
+            ("receipt.py", 99, 99),
+            ("receipt.py", 2, 1),
+        ] {
+            let mut response = valid.clone();
+            response["citations"] = json!([{"path":path,"start_line":start,"end_line":end}]);
+            cases.push((response, false));
+        }
+        for (field, value) in [
+            ("answer", json!("forged ../outside.py:1")),
+            ("answer", json!("")),
+            ("uncertainty", json!("")),
+            ("citations", json!([])),
+            (
+                "citations",
+                json!([valid["citations"][0].clone(), valid["citations"][0].clone()]),
+            ),
+        ] {
+            let mut response = valid.clone();
+            response[field] = value;
+            cases.push((response, false));
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let builds = AtomicUsize::new(0);
+        for (response, accepted) in cases {
+            let factory = |routes: &[AdmittedLocalModelRoute]| {
+                builds.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].auth(), &OpenAiCompatibleAuth::NoAuth);
+                // Keep the REAL production registry. Kit binds it before replacing provider I/O,
+                // so a credential regression fails even though the response is hermetic.
+                let publisher =
+                    local_route_publisher_from_admitted_routes(routes, Duration::from_secs(30))?;
+                let policy = publisher.policy(Instant::now());
+                let snapshot = policy
+                    .snapshot()
+                    .clone()
+                    .with_test_llm(
+                        routes[0].candidate(),
+                        Arc::new(TestRouteLlm {
+                            calls: calls.clone(),
+                            behavior: TestModelBehavior::Respond(response.to_string()),
+                            seen: None,
+                        }),
+                    )
+                    .map_err(|_| SemanticRouteError::Profile)?;
+                Ok(ModelRoutePublisher::new(snapshot))
+            };
+            for message in [false, true] {
+                let mut args = if message {
+                    vec!["--message".to_owned()]
+                } else {
+                    vec![]
+                };
+                args.extend([
+                    "where is exact_reuse_receipt?".to_owned(),
+                    "--json".to_owned(),
+                ]);
+                let before = calls.load(Ordering::SeqCst);
+                let mut output = Vec::new();
+                let result = run(
+                    args,
+                    Some(TestRouteInjection::Factory {
+                        build: &factory,
+                        deadline: Duration::from_secs(30),
+                    }),
+                    &mut output,
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+                if accepted {
+                    assert!(matches!(result, Ok(0)));
+                    let output: serde_json::Value =
+                        serde_json::from_slice(&output).expect("public JSON");
+                    let answer = output["response"].as_str().expect("answer");
+                    assert!(answer.contains("receipt.py:1"));
+                    assert!(
+                        answer.contains("Uncertainty: Only this verified source was inspected.")
+                    );
+                    assert!(output["sessionId"].is_null() && output["tokenUsage"].is_null());
+                } else {
+                    assert!(matches!(result, Err(CliError { code: 1, .. })));
+                    assert!(
+                        output.is_empty(),
+                        "invalid model output must never be published"
+                    );
+                }
+            }
+        }
+        let before = builds.load(Ordering::SeqCst);
+        let forbidden_factory = |_: &[AdmittedLocalModelRoute]| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            panic!("invalid route must fail before publisher construction")
+        };
+        for text in [
+            config_text.replace("no_auth", "none"),
+            config_text.replace(DEFAULT_LOCAL_BASE_URL, "http://localhost:8317/v1"),
+            config_text.replace(DEFAULT_LOCAL_MODEL, "unapproved-model"),
+        ] {
+            fs::write(&config, text).expect("invalid config");
+            for message in [false, true] {
+                let args = if message {
+                    vec![
+                        "--message".to_owned(),
+                        "where is exact_reuse_receipt?".to_owned(),
+                    ]
+                } else {
+                    vec!["where is exact_reuse_receipt?".to_owned()]
+                };
+                let mut output = Vec::new();
+                assert!(matches!(
+                    run(
+                        args,
+                        Some(TestRouteInjection::Factory {
+                            build: &forbidden_factory,
+                            deadline: Duration::from_secs(30)
+                        }),
+                        &mut output
+                    ),
+                    Err(CliError { code: 78, .. })
+                ));
+                assert!(output.is_empty());
+            }
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), before);
+        drop(_env);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

@@ -367,3 +367,15 @@ fn invalid_fifo_and_oversize_keep_static_rc78() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn debug_no_auth_config_needs_no_key_or_model_construction() {
+    let dir = fixture("no-auth");
+    let path = config(&dir, &format!("primary_model = \"{NONE}\"\n[[endpoints]]\nmodel = \"{NONE}\"\nbase_url = \"{LOCAL}\"\nauth = \"no_auth\"\n"));
+    let _env = route_env(&dir, &[("PBI_CONFIG_FILE", Some(path))]);
+    let stdout = debug(&["--debug-config"]).unwrap_or_else(|error| panic!("{}", error.message));
+    assert_selected(&stdout, LOCAL, NONE);
+    assert!(stdout.contains("model_route_auth_policy=explicit_endpoint_no_auth_else_credential\n"));
+    drop(_env);
+    fs::remove_dir_all(dir).expect("cleanup");
+}

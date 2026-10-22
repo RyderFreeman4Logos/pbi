@@ -34,13 +34,20 @@ regex = { version = "=1.13.1", default-features = false, features = ["std", "uni
 libc = "=0.2.189"
 toml = "=0.9.12"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
-workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb" }
-workflow-runtime = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb" }
+workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4" }
+workflow-runtime = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4" }
 
 [dev-dependencies]
-adk-rust = { version = "=2.1.0", default-features = false, features = ["agents", "models", "graph", "guardrail", "telemetry", "openai"] }
-workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "b9b1684d13533af74809fef5cc757cea8912c1fb", features = ["test-support"] }
+adk-rust = { version = "=2.3.0", default-features = false, features = ["agents", "models", "graph", "guardrail", "telemetry", "openai"] }
+workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4", features = ["test-support"] }
 
 [[bin]]
 name = "pbi-rs"
 path = "src/main.rs"
+
+# Dependency workspace patches do not propagate to consumers. Keep Kit's delivered SDK identity.
+[patch.crates-io]
+adk-core = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "1b73faf4f06004e028034e617270fc3003e75cad" }
+adk-graph = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "1b73faf4f06004e028034e617270fc3003e75cad" }
+adk-action = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "1b73faf4f06004e028034e617270fc3003e75cad" }
+adk-model = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "1b73faf4f06004e028034e617270fc3003e75cad" }

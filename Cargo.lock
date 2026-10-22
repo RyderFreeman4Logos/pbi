@@ -4,12 +4,12 @@ version = 4
 
 [[package]]
 name = "adk-agent"
-version = "2.2.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e150b28775ad28d4a4d0a49267a64298052346b8faf6f93ce075d025faecdcb8"
+checksum = "24e216ce9361811c6f9737aaca0a71bc84bd5f78f6ea855c8ea0f3a561181f8d"
 dependencies = [
  "adk-core",
- "adk-telemetry",
+ "adk-telemetry 2.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "async-stream",
  "async-trait",
  "chrono",
@@ -26,9 +26,8 @@ dependencies = [
 
 [[package]]
 name = "adk-core"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "040e96a250780592a2d9fb2e1813bcfa035d191494c383675b785ad36d889388"
+version = "2.3.0"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
 dependencies = [
  "async-trait",
  "chrono",
@@ -43,9 +42,8 @@ dependencies = [
 
 [[package]]
 name = "adk-graph"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61088da266986040901884ca089ab684c09f1ee82193849aa6407f722553f075"
+version = "2.3.0"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -62,9 +60,9 @@ dependencies = [
 
 [[package]]
 name = "adk-guardrail"
-version = "2.2.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71dcb5aedadb877a19124fce03b28d9818bbfb89ea466d91f3781b508bdfaeb8"
+checksum = "72ae3213439d46d78db13fb44a03716069c0f2603c873aa3937f9c174e6c0709"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -79,12 +77,11 @@ dependencies = [
 
 [[package]]
 name = "adk-model"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b5170b6a23b7df96213d5062c0ecc9fd987c6a8cfed73db97d36b834b1a9e33"
+version = "2.3.0"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
 dependencies = [
  "adk-core",
- "adk-telemetry",
+ "adk-telemetry 2.3.0 (git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad)",
  "anyhow",
  "async-openai",
  "async-stream",
@@ -103,17 +100,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-rust"
-version = "2.1.0"
+name = "adk-runner"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5244ddd601fb2f9a9671a2407312d8c25914b211381e6e6bf62e0b8eadba72e"
+checksum = "f359e6760f53e27d35d70a15b469eb4401341e6a96897d564262f59524b597ad"
+dependencies = [
+ "adk-core",
+ "adk-session",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "adk-rust"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "505a83604d4e5919b011cdb59c0aa93ec40bec86ea86e3b2930c32a122408a52"
 dependencies = [
  "adk-agent",
  "adk-core",
  "adk-graph",
  "adk-guardrail",
  "adk-model",
- "adk-telemetry",
+ "adk-runner",
+ "adk-session",
+ "adk-telemetry 2.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "anyhow",
  "async-trait",
  "futures",
@@ -124,10 +143,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-telemetry"
-version = "2.2.0"
+name = "adk-session"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56a2070444d3220c60513f32f0438d79fdc74a2c987b01be150c47f4c33df9de"
+checksum = "631237f2080e4921009a4dbfd920e18e04dafc277de85e690c1682690ba9009b"
+dependencies = [
+ "adk-core",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "adk-telemetry"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e075f0cdf10076fb13b4ecd78486cca1572f0465da5f6e0770e8f7093ece028"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "adk-telemetry"
+version = "2.3.0"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
 dependencies = [
  "thiserror",
  "tracing",
@@ -1502,6 +1546,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2701,19 +2751,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3013,6 +3050,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -3218,12 +3256,6 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -3717,7 +3749,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "workflow-adk"
 version = "0.2.4"
-source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=b9b1684d13533af74809fef5cc757cea8912c1fb#b9b1684d13533af74809fef5cc757cea8912c1fb"
+source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4#87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4"
 dependencies = [
  "adk-rust",
  "jsonschema 0.45.1",
@@ -3725,6 +3757,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "url",
  "workflow-compiler",
  "workflow-ir",
  "workflow-runtime",
@@ -3734,23 +3767,23 @@ dependencies = [
 [[package]]
 name = "workflow-compiler"
 version = "0.2.4"
-source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=b9b1684d13533af74809fef5cc757cea8912c1fb#b9b1684d13533af74809fef5cc757cea8912c1fb"
+source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4#87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4"
 dependencies = [
  "jsonschema 0.45.1",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2",
  "toml",
  "workflow-ir",
  "workflow-runtime",
  "workflow-spec",
+ "yaml_serde",
 ]
 
 [[package]]
 name = "workflow-ir"
 version = "0.2.4"
-source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=b9b1684d13533af74809fef5cc757cea8912c1fb#b9b1684d13533af74809fef5cc757cea8912c1fb"
+source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4#87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3762,7 +3795,7 @@ dependencies = [
 [[package]]
 name = "workflow-runtime"
 version = "0.2.4"
-source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=b9b1684d13533af74809fef5cc757cea8912c1fb#b9b1684d13533af74809fef5cc757cea8912c1fb"
+source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4#87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3784,7 +3817,7 @@ dependencies = [
 [[package]]
 name = "workflow-spec"
 version = "0.2.4"
-source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=b9b1684d13533af74809fef5cc757cea8912c1fb#b9b1684d13533af74809fef5cc757cea8912c1fb"
+source = "git+https://github.com/RyderFreeman4Logos/adk-workflow-kit?rev=87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4#87ea1f3cff5e9c97b83fcf75841c62f6ac1bbfa4"
 dependencies = [
  "serde",
  "serde_path_to_error",
@@ -3797,6 +3830,19 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
+]
 
 [[package]]
 name = "yoke"
@@ -3908,3 +3954,8 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "adk-action"
+version = "2.3.0"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"

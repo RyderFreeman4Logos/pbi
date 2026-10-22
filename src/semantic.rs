@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use syn::visit::{self, Visit};
 use workflow_adk::model_profiles::{
     CredentialBroker, CredentialHandle, ModelProfileRegistry, ModelRuntimeConfig,
-    OpenAiCompatibleProfile,
+    OpenAiCompatibleAuth, OpenAiCompatibleProfile,
 };
 use workflow_adk::{
     EscalationPolicy, InferenceBudget, ModelInvocationSpec, ModelProfileIdentity, ModelRole,
@@ -195,10 +195,11 @@ impl std::error::Error for SemanticRouteError {}
 pub struct LocalModelRoute {
     base_url: String,
     model: String,
-    credential_handle: String,
+    auth: OpenAiCompatibleAuth,
 }
 
 impl LocalModelRoute {
+    /// Authenticated route using an environment handle; admission validates its name.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -207,7 +208,18 @@ impl LocalModelRoute {
         Self {
             base_url: base_url.into(),
             model: model.into(),
-            credential_handle: credential_handle.into(),
+            auth: OpenAiCompatibleAuth::Credential(CredentialHandle::environment(
+                credential_handle,
+            )),
+        }
+    }
+
+    /// Explicit unauthenticated route; endpoint/model admission still applies.
+    pub fn new_no_auth(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            auth: OpenAiCompatibleAuth::NoAuth,
         }
     }
 }
@@ -216,11 +228,23 @@ impl LocalModelRoute {
 pub struct AdmittedLocalModelRoute {
     base_url: String,
     model: String,
-    credential_handle: String,
+    auth: OpenAiCompatibleAuth,
     profile_name: String,
 }
 
 impl AdmittedLocalModelRoute {
+    /// The explicit Kit transport policy, never a resolved secret.
+    pub fn auth(&self) -> &OpenAiCompatibleAuth {
+        &self.auth
+    }
+
+    fn profile_version(&self) -> &'static str {
+        match &self.auth {
+            OpenAiCompatibleAuth::Credential(_) => "1",
+            OpenAiCompatibleAuth::NoAuth => "2",
+        }
+    }
+
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -234,7 +258,11 @@ impl AdmittedLocalModelRoute {
     }
 
     pub fn candidate(&self) -> ModelRouteCandidate {
-        ModelRouteCandidate::new(ModelRole::Worker, self.profile_name.clone(), "1")
+        ModelRouteCandidate::new(
+            ModelRole::Worker,
+            self.profile_name.clone(),
+            self.profile_version(),
+        )
     }
 }
 
@@ -252,11 +280,11 @@ pub fn admit_local_routes(
         .enumerate()
         .map(|(index, route)| {
             validate_local_route(&route.base_url, &route.model)?;
-            select_explicit_credential_handle(&route.credential_handle)?;
+            validate_route_auth(&route.auth)?;
             Ok(AdmittedLocalModelRoute {
                 base_url: route.base_url,
                 model: route.model,
-                credential_handle: route.credential_handle,
+                auth: route.auth,
                 profile_name: local_route_profile_name(index),
             })
         })
@@ -285,26 +313,45 @@ pub fn validate_local_route(base_url: &str, model: &str) -> Result<(), SemanticR
 /// Complete environment fields bypass config discovery. Otherwise select the
 /// explicit file, XDG config, or HOME config in that order without searching CWD.
 pub fn local_route_from_environment() -> Result<(String, String), SemanticRouteError> {
+    let (base_url, model, _) = selected_local_route()?;
+    Ok((base_url, model))
+}
+
+fn selected_local_route() -> Result<(String, String, bool), SemanticRouteError> {
     let env_base = first_value(&["CLIPROXY_BASE_URL", "LOCAL_ROUTER_BASEURL"])?;
     let env_model = first_value(&["LOCAL_MODEL", "LLM_MODEL"])?;
-    let (base_url, model) = if let (Some(base_url), Some(model)) = (&env_base, &env_model) {
-        (base_url.clone(), model.clone())
+    let (base_url, model, no_auth) = if let (Some(base_url), Some(model)) = (&env_base, &env_model)
+    {
+        (base_url.clone(), model.clone(), false)
     } else {
         let configured = explicit_config_route()?;
         match (env_base, env_model, configured) {
-            (Some(base_url), None, Some(config)) => (base_url, config.primary),
+            (Some(base_url), None, Some(config)) => {
+                // Auth belongs to this exact endpoint/model pair, not the file or hostname.
+                let no_auth = config
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| {
+                        endpoint.model == config.primary && endpoint.base_url == base_url
+                    })
+                    .is_some_and(|endpoint| endpoint.no_auth);
+                (base_url, config.primary, no_auth)
+            }
             (None, Some(model), Some(config)) => {
                 endpoint_base_for_model(&config.endpoints, &model)?
             }
             (None, None, Some(config)) => {
                 endpoint_base_for_model(&config.endpoints, &config.primary)?
             }
-            (base_url, model, None) => local_route_from_values(base_url, model)?,
+            (base_url, model, None) => {
+                let (base_url, model) = local_route_from_values(base_url, model)?;
+                (base_url, model, false)
+            }
             (Some(_), Some(_), Some(_)) => unreachable!("both fields returned before config"),
         }
     };
     validate_local_route(&base_url, &model)?;
-    Ok((base_url, model))
+    Ok((base_url, model, no_auth))
 }
 
 pub fn explicit_admitted_routes_from_environment(
@@ -312,21 +359,25 @@ pub fn explicit_admitted_routes_from_environment(
     if !semantic_route_opted_in()? {
         return Ok(None);
     }
-    let (base_url, model) = local_route_from_environment()?;
-    let credential_name = if let Some(name) = env::var_os("PBI_RS_CREDENTIAL_HANDLE") {
-        let name = name
-            .into_string()
-            .map_err(|_| SemanticRouteError::UnapprovedCredentialHandle)?;
-        select_explicit_credential_handle(&name)?.to_owned()
+    let (base_url, model, no_auth) = selected_local_route()?;
+    let route = if no_auth {
+        LocalModelRoute::new_no_auth(base_url, model)
     } else {
-        MODEL_CREDENTIAL_HANDLES
-            .into_iter()
-            .find(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
-            .ok_or(SemanticRouteError::MissingCredential)?
-            .to_owned()
+        let credential_name = if let Some(name) = env::var_os("PBI_RS_CREDENTIAL_HANDLE") {
+            let name = name
+                .into_string()
+                .map_err(|_| SemanticRouteError::UnapprovedCredentialHandle)?;
+            select_explicit_credential_handle(&name)?.to_owned()
+        } else {
+            MODEL_CREDENTIAL_HANDLES
+                .into_iter()
+                .find(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+                .ok_or(SemanticRouteError::MissingCredential)?
+                .to_owned()
+        };
+        LocalModelRoute::new(base_url, model, credential_name)
     };
-    let routes = admit_local_routes(vec![LocalModelRoute::new(base_url, model, credential_name)])?;
-    Ok(Some(routes))
+    Ok(Some(admit_local_routes(vec![route])?))
 }
 
 pub fn local_route_publisher_from_environment(
@@ -370,17 +421,25 @@ pub fn local_route_publisher_from_admitted_routes(
     }
     for route in routes {
         validate_local_route(&route.base_url, &route.model)?;
-        select_explicit_credential_handle(&route.credential_handle)?;
+        validate_route_auth(&route.auth)?;
     }
 
     let make_profile = |route: &AdmittedLocalModelRoute| {
-        OpenAiCompatibleProfile::new(
-            route.profile_name.clone(),
-            "1",
-            route.model.clone(),
-            route.base_url.clone(),
-            CredentialHandle::environment(route.credential_handle.clone()),
-        )
+        match &route.auth {
+            OpenAiCompatibleAuth::Credential(handle) => OpenAiCompatibleProfile::new(
+                route.profile_name.clone(),
+                route.profile_version(),
+                route.model.clone(),
+                route.base_url.clone(),
+                handle.clone(),
+            ),
+            OpenAiCompatibleAuth::NoAuth => OpenAiCompatibleProfile::new_no_auth(
+                route.profile_name.clone(),
+                route.profile_version(),
+                route.model.clone(),
+                route.base_url.clone(),
+            ),
+        }
         .with_provider("openai")
         .with_runtime(ModelRuntimeConfig::default().with_timeout(timeout))
     };
@@ -436,9 +495,15 @@ unsafe fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
     }
 }
 
+struct ConfigEndpoint {
+    model: String,
+    base_url: String,
+    no_auth: bool,
+}
+
 struct ExplicitConfig {
     primary: String,
-    endpoints: Vec<(String, String)>,
+    endpoints: Vec<ConfigEndpoint>,
 }
 
 fn explicit_config_route() -> Result<Option<ExplicitConfig>, SemanticRouteError> {
@@ -482,16 +547,25 @@ fn explicit_config_route() -> Result<Option<ExplicitConfig>, SemanticRouteError>
         .get("endpoints")
         .and_then(toml::Value::as_array)
         .ok_or(SemanticRouteError::InvalidConfig)?;
-    let parsed = endpoints
-        .iter()
-        .filter_map(toml::Value::as_table)
-        .filter_map(|endpoint| {
-            let model = endpoint.get("model").and_then(toml::Value::as_str)?;
-            let base_url = endpoint.get("base_url").and_then(toml::Value::as_str)?;
-            (!model.is_empty() && !base_url.is_empty())
-                .then(|| (model.to_owned(), base_url.to_owned()))
-        })
-        .collect::<Vec<_>>();
+    let mut parsed = Vec::new();
+    for endpoint in endpoints.iter().filter_map(toml::Value::as_table) {
+        let no_auth = match endpoint.get("auth") {
+            None => false,
+            Some(toml::Value::String(value)) if value == "no_auth" => true,
+            Some(_) => return Err(SemanticRouteError::InvalidConfig),
+        };
+        let model = endpoint.get("model").and_then(toml::Value::as_str);
+        let base_url = endpoint.get("base_url").and_then(toml::Value::as_str);
+        if let (Some(model), Some(base_url)) = (model, base_url) {
+            if !model.is_empty() && !base_url.is_empty() {
+                parsed.push(ConfigEndpoint {
+                    model: model.to_owned(),
+                    base_url: base_url.to_owned(),
+                    no_auth,
+                });
+            }
+        }
+    }
     if parsed.is_empty() {
         return Err(SemanticRouteError::InvalidConfig);
     }
@@ -526,14 +600,27 @@ fn route_config_path() -> Result<Option<PathBuf>, SemanticRouteError> {
 }
 
 fn endpoint_base_for_model(
-    endpoints: &[(String, String)],
+    endpoints: &[ConfigEndpoint],
     model: &str,
-) -> Result<(String, String), SemanticRouteError> {
+) -> Result<(String, String, bool), SemanticRouteError> {
     endpoints
         .iter()
-        .find(|(endpoint_model, _)| endpoint_model == model)
-        .map(|(_, base_url)| (base_url.clone(), model.to_owned()))
+        .find(|endpoint| endpoint.model == model)
+        .map(|endpoint| {
+            (
+                endpoint.base_url.clone(),
+                model.to_owned(),
+                endpoint.no_auth,
+            )
+        })
         .ok_or(SemanticRouteError::InvalidConfig)
+}
+
+fn validate_route_auth(auth: &OpenAiCompatibleAuth) -> Result<(), SemanticRouteError> {
+    if let OpenAiCompatibleAuth::Credential(handle) = auth {
+        select_explicit_credential_handle(handle.handle())?;
+    }
+    Ok(())
 }
 
 fn select_explicit_credential_handle(name: &str) -> Result<&str, SemanticRouteError> {
