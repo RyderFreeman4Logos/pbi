@@ -89,6 +89,207 @@ fn matching_config(dir: &Path, primary: &str, second_base: &str) -> std::path::P
 }
 
 #[test]
+fn explicit_no_auth_config_admits_without_any_credential() {
+    let dir = fixture_dir("no-auth");
+    let config = dir.join("config.toml");
+    fs::write(
+        &config,
+        format!("primary_model = \"{NONE}\"\n[[endpoints]]\nmodel = \"{NONE}\"\nbase_url = \"{LOCAL}\"\nauth = \"no_auth\"\n"),
+    )
+    .expect("synthetic config");
+    let _env = enabled(&[
+        ("PBI_CONFIG_FILE", Some(config.to_str().expect("path"))),
+        ("PBI_RS_ADK_ENABLE", None),
+        ("PBI_RS_CREDENTIAL_HANDLE", None),
+        ("CLIPROXY_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("LOCAL_ROUTER_API_KEY", None),
+    ]);
+    let routes = explicit_admitted_routes_from_environment()
+        .expect("explicit NoAuth must not require a key")
+        .expect("ordinary configured route");
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].base_url(), LOCAL);
+    assert_eq!(routes[0].model(), NONE);
+    assert!(local_route_publisher_from_admitted_routes(&routes, Duration::from_secs(2)).is_ok());
+    drop(_env);
+    fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn invalid_no_auth_policy_fails_closed_with_a_credential_available() {
+    let dir = fixture_dir("invalid-no-auth");
+    let config = dir.join("config.toml");
+    let _env = enabled(&[
+        ("PBI_CONFIG_FILE", Some(config.to_str().expect("path"))),
+        ("CLIPROXY_API_KEY", Some("fixture-only-token")),
+    ]);
+    for policy in ["\"none\"", "\"\"", "true", "42"] {
+        fs::write(
+            &config,
+            format!("primary_model = \"{NONE}\"\n[[endpoints]]\nmodel = \"{NONE}\"\nbase_url = \"{LOCAL}\"\nauth = {policy}\n"),
+        )
+        .expect("synthetic config");
+        assert_eq!(
+            explicit_admitted_routes_from_environment(),
+            Err(SemanticRouteError::InvalidConfig),
+            "invalid explicit auth must not silently become Credential"
+        );
+    }
+    drop(_env);
+    fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn no_auth_stays_with_the_selected_endpoint_and_explicit_zero_stays_off() {
+    let dir = fixture_dir("no-auth-selection");
+    let config = dir.join("config.toml");
+    fs::write(&config, format!(
+        "primary_model = \"{NONE}\"\n[[endpoints]]\nmodel = \"{LOW}\"\nbase_url = \"{GB10}\"\n\n[[endpoints]]\nmodel = \"{NONE}\"\nbase_url = \"{LOCAL}\"\nauth = \"no_auth\"\n"
+    )).expect("config");
+    for (base, model, enable, expected) in [
+        (None, None, None, Ok(true)),
+        (Some(LOCAL), None, None, Ok(true)),
+        (
+            None,
+            Some(LOW),
+            None,
+            Err(SemanticRouteError::MissingCredential),
+        ),
+        (
+            Some(GB10),
+            None,
+            None,
+            Err(SemanticRouteError::MissingCredential),
+        ),
+        (
+            Some(LOCAL),
+            Some(NONE),
+            None,
+            Err(SemanticRouteError::MissingCredential),
+        ),
+        (None, None, Some("0"), Ok(false)),
+    ] {
+        let _env = enabled(&[
+            ("PBI_CONFIG_FILE", Some(config.to_str().expect("path"))),
+            ("PBI_RS_ADK_ENABLE", enable),
+            ("PBI_RS_CREDENTIAL_HANDLE", None),
+            ("CLIPROXY_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+            ("LOCAL_ROUTER_API_KEY", None),
+            ("CLIPROXY_BASE_URL", base),
+            ("LOCAL_MODEL", model),
+        ]);
+        let result = explicit_admitted_routes_from_environment().map(|routes| {
+            routes.is_some_and(|routes| {
+                assert_eq!(routes[0].auth(), &OpenAiCompatibleAuth::NoAuth);
+                assert_eq!(routes[0].base_url(), LOCAL);
+                assert_eq!(routes[0].candidate().profile().version(), "2");
+                true
+            })
+        });
+        assert_eq!(
+            result, expected,
+            "base={base:?} model={model:?} enable={enable:?}"
+        );
+    }
+    fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[tokio::test]
+async fn no_auth_consumer_sdk_wire_omits_authorization() {
+    use adk_rust::futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Exercise the consumer's resolved SDK graph, without changing PBI's production allowlist.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("loopback");
+    let address = listener.local_addr().expect("address");
+    let profile = OpenAiCompatibleProfile::new_no_auth(
+        "wire",
+        "2",
+        "wire-model",
+        format!("http://{address}/v1"),
+    );
+    assert_eq!(profile.auth(), &OpenAiCompatibleAuth::NoAuth);
+    let binding = ModelProfileRegistry::new()
+        .with_worker(profile)
+        .expect("profile")
+        .bind_worker(&CredentialBroker::new())
+        .expect("no credential needed");
+    let server = async {
+        let (mut socket, _) = listener.accept().await.expect("one connection");
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0; 4096];
+            let read = socket.read(&mut buffer).await.expect("request");
+            assert!(read > 0 && request.len() + read <= 64 * 1024);
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end])
+            .expect("headers")
+            .to_owned();
+        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        assert!(!headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")));
+        let length: usize = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .expect("length")
+            .1
+            .trim()
+            .parse()
+            .expect("numeric length");
+        assert!(header_end + length <= 64 * 1024);
+        while request.len() < header_end + length {
+            let mut buffer = [0; 4096];
+            let read = socket.read(&mut buffer).await.expect("body");
+            assert!(read > 0 && request.len() + read <= 64 * 1024);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let body: Value =
+            serde_json::from_slice(&request[header_end..header_end + length]).expect("JSON");
+        assert_eq!(body["model"], "wire-model");
+        let reply = r#"{"choices":[{"message":{"role":"assistant","content":"wire-ok"},"finish_reason":"stop"}]}"#;
+        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.expect("response");
+        socket.shutdown().await.expect("close");
+    };
+    let client = async {
+        let mut responses = adk_rust::Llm::generate_content(
+            &binding,
+            adk_rust::LlmRequest::new(
+                "ignored",
+                vec![adk_rust::Content::new("user").with_text("hello")],
+            ),
+            false,
+        )
+        .await
+        .expect("real SDK request");
+        let response = responses
+            .next()
+            .await
+            .expect("response")
+            .expect("successful response");
+        assert!(
+            matches!(response.content.expect("content").parts.first(), Some(adk_rust::Part::Text { text, .. }) if text == "wire-ok")
+        );
+        assert!(responses.next().await.is_none());
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(server, client);
+    })
+    .await
+    .expect("unchanged bounded loopback deadline");
+}
+
+#[test]
 fn ordinary_config_admits_approved_route_without_model_toggles() {
     let dir = fixture_dir("ordinary-route");
     let config = matching_config(&dir, LOW, GB10);
@@ -107,7 +308,10 @@ fn ordinary_config_admits_approved_route_without_model_toggles() {
     assert_eq!(routes.len(), 1);
     assert_eq!(routes[0].base_url(), GB10);
     assert_eq!(routes[0].model(), LOW);
-    assert_eq!(routes[0].credential_handle, "LOCAL_ROUTER_API_KEY");
+    assert_eq!(
+        routes[0].auth(),
+        &OpenAiCompatibleAuth::Credential(CredentialHandle::environment("LOCAL_ROUTER_API_KEY"))
+    );
     drop(_env);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -4,7 +4,17 @@
 
 `pbi-rs search` prints compact source locations and Okapi BM25 scores; `--bm25` adds source blocks from the same bounded native ranker. Both evaluate uppercase Boolean AND/OR/NOT, parentheses, and quoted phrases without a syntax flag. Ordinary keyword bags remain supported. `--strict-elastic-syntax` retains its additional legacy admission rules; `--exact` retains literal matching. Search hits are not semantic citations, and neither search mode invokes a model. The historical Probe shell wrapper is archived under `archive/shell/` and is not the default command.
 
-Bare positional questions and `--message` synthesize answers from verified source evidence when a discovered config selects an approved local route and an approved credential environment handle is available. `PBI_RS_ADK_ENABLE=0` explicitly disables model use; without a configured route, the CLI emits deterministic evidence. The CLI validates model citations against bounded in-root source spans and shares one deadline across retrieval and synthesis. Explicit `--model-route` candidates require `PBI_RS_ADK_ENABLE=1` when no config is discovered.
+Bare positional questions and `--message` synthesize answers from verified source evidence when a discovered config selects an approved local route. Authentication requires an approved credential environment handle by default. A selected endpoint may explicitly set `auth = "no_auth"` to use Kit's NoAuth policy without a key, credential lookup, or Authorization header:
+
+```toml
+primary_model = "abliterated-qwen-latest-27b-none"
+[[endpoints]]
+model = "abliterated-qwen-latest-27b-none"
+base_url = "http://localhost:18317/v1"
+auth = "no_auth"
+```
+
+Omit `auth` for the existing credential behavior; other explicit values fail closed. NoAuth is scoped to the selected endpoint/model pair and never inferred from a model name or hostname. Complete base/model environment overrides and explicit `--model-route` candidates retain authenticated behavior. `PBI_RS_ADK_ENABLE=0` disables model use; without configured opt-in, the CLI emits deterministic evidence. Citations must match bounded in-root source spans, and retrieval and synthesis share one deadline. Explicit CLI candidates require `PBI_RS_ADK_ENABLE=1` when no config is discovered. See [the model seam](docs/model-seam.md) for selection and acceptance limits.
 
 ## Source extraction
 
